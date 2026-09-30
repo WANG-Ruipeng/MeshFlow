@@ -1,4 +1,4 @@
-> **Native T1 extension:** code-only conditional completion and training from external official assets: [native_t1/README.md](native_t1/README.md). No weights or datasets are bundled.
+> **Native T1 extension:** pure T1 and the experimental T_geo candidate, with code-only training from external official assets: [native_t1/README.md](native_t1/README.md). No weights, datasets or generated outputs are bundled.
 
 <div align="center">
 <h2>MeshFlow: Mesh Generation with Equivariant Flow Matching</h2>

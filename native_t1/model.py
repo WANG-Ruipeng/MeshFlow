@@ -155,6 +155,9 @@ class NativeInpaintingModel(nn.Module):
         self.backbone = backbone
         device = next(backbone.parameters()).device
         self.role_embedding = nn.Parameter(torch.zeros((2, 768), dtype=torch.float32, device=device))
+        # Plain None adds no state_dict key and leaves the original arithmetic untouched.
+        self.context_encoder = None
+        self.context_observer = None
         for layer in self.backbone.layers:
             layer.gradient_checkpointing = False
         self.experiment_trainable = bool(trainable)
@@ -193,6 +196,10 @@ class NativeInpaintingModel(nn.Module):
         hidden = hidden.view(batch, faces * 3, -1)
         role = self.role_embedding[known_mask.long()].to(dtype=hidden.dtype)
         hidden = hidden + _corners(role)
+        if self.context_encoder is not None:
+            from .context_geometry import inject_context
+            delta = self.context_encoder(x, known_mask, valid_mask, observer=self.context_observer)
+            hidden = inject_context(hidden, delta, known_mask, observer=self.context_observer)
         # Two original embedder calls preserve official GEMM dimensions.
         c_free = self.backbone.t_embedder(t)
         c_known = self.backbone.t_embedder(torch.ones_like(t))

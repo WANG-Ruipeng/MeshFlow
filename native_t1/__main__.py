@@ -11,17 +11,17 @@ from .sampling import make_noise, clamped_sample, new_counts
 
 
 def build_parser():
-    parser = argparse.ArgumentParser(description="Pure Native T1, fixed N112 and 50 Euler steps")
+    parser = argparse.ArgumentParser(description="Native T1 / T_geo, fixed N112 and 50 Euler steps")
     commands = parser.add_subparsers(dest="command", required=True)
     sample = commands.add_parser("sample", help="Generate from FP32 known faces only")
     sample.add_argument("--condition", type=Path, required=True, help="NPY C or NPZ containing C; no target needed")
     sample.add_argument("--condition-key", help="Required when condition is NPZ")
     sample.add_argument("--seed", type=int, required=True)
     sample.add_argument("--out", type=Path, required=True, help="New output directory; never overwritten")
-    sample.add_argument("--profile", choices=("a-continue", "original-t1", "trained"), default="a-continue",
+    sample.add_argument("--profile", choices=("a-continue", "original-t1", "trained", "trained-geo"), default="a-continue",
                         help="Default: pure-FM A_continue cumulative1500; original-t1 is historical step500")
     sample.add_argument("--checkpoint", type=Path,
-                        help="Required for trained; otherwise a relocated copy of the pinned profile checkpoint")
+                        help="Required for trained/trained-geo; otherwise a relocated copy of the pinned profile checkpoint")
     sample.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     verify = commands.add_parser("verify-historical", aliases=["verify"],
                                  help="Historical original-T1 step500 replay (2 rollouts); not the working baseline")
@@ -41,6 +41,11 @@ def resolve_profile(args):
             raise ValueError("--profile trained requires --checkpoint")
         from .portable_checkpoint import load_trained_checkpoint
         return load_trained_checkpoint, args.checkpoint
+    if args.profile == "trained-geo":
+        if args.checkpoint is None:
+            raise ValueError("--profile trained-geo requires --checkpoint")
+        from .geometry_checkpoint import load_geometry_checkpoint
+        return load_geometry_checkpoint, args.checkpoint
     raise ValueError("Unknown checkpoint profile")
 
 

@@ -1,49 +1,61 @@
 # Dependencies and asset boundaries
 
-Native T1 uses the official MeshFlow code at base commit `8cc74da013d3d2feec1853cccbb1f9ac37814b95`. The new package imports official `models/`, `datasets/mesh_dataset.py` and `utils/ot_utils.py`; it does not import Python code from `experiments/`.
+Native T1 extends the official MeshFlow source based on commit `8cc74da013d3d2feec1853cccbb1f9ac37814b95`. Its production paths import official `models/`, `datasets/mesh_dataset.py` and `utils/ot_utils.py`, with no Python imports from `experiments/`. Maintained public training paths are pure T1 and T_geo; the old multi-arm research controllers are not required.
 
 ## Runtime
 
-Python 3.10, PyTorch 2.7.1+cu128, and the versions pinned in [requirements.txt](requirements.txt) are the tested environment. Native execution uses strict deterministic algorithms, TF32 off, BF16 autocast, FP32 model parameters/integration, and math SDPA only. No FlashAttention, POT, custom Chamfer extension, cloud SDK or upstream demo dependencies are required.
+Use Python 3.10, PyTorch 2.7.1+cu128 and [requirements.txt](requirements.txt). Dependencies include NumPy, SciPy, einops, PyYAML, trimesh and tqdm. Native execution uses strict deterministic algorithms, TF32 off, BF16 backbone autocast, FP32 parameters/integration coordinates and math SDPA. The geo branch computes features, MLP and exit in FP32, then casts the residual to the hidden dtype for addition. There is no all-FP32 backbone production fallback.
 
-Official data preparation uses NumPy, trimesh and the upstream dataset class. CPU SciPy Hungarian matching is used only when producing training samples. It is not a GPU generation operation. Sampling requires a CUDA GPU and does not invoke OT.
+FlashAttention, POT, the custom Chamfer extension, cloud SDKs and upstream demo dependencies are not required. Preparation uses official dataset preprocessing. Training uses CPU SciPy Hungarian matching for nested OT; sampling uses no OT. Pure and geo share the same loss, optimizer definition, input stream and clamped Euler sampler.
 
-## Fixed architecture and official initialization
+Strict deterministic execution covers a fixed operation order. It does not guarantee bitwise output equality after face permutation. The local BF16 full-backbone permutation failure remains documented in [the pilot note](docs/tgeo_pilot.md). Public preflight is explicitly a zero-update forward/backward check, not that historical experiment's complete gate suite. No private evidence is implicitly loaded to waive a numerical comparison.
 
-The official config is `configs/snet/base-120m-ot-v-chair.yaml`: v3, width768, 12 layers, 12 heads, coordinate embedding pe_freq20, RMSNorm/QK normalization. The architecture max length is800; this registered task still uses actual N=112. The generic upstream CFG and optimizer settings in the YAML do not override the Native sampler or training contract.
+## Architecture and official initialization
 
-The portable loader validates the config's UTF-8/LF-normalized SHA256, so Windows CRLF and Linux LF checkouts are equivalent:
+The official config is `configs/snet/base-120m-ot-v-chair.yaml`: v3, width 768, 12 layers, 12 heads, coordinate embedding pe_freq20, RMSNorm/QK normalization. Its architecture max length is 800; this task uses real N=112. Upstream YAML CFG and optimizer defaults do not override the Native contract.
+
+The loader checks the UTF-8/LF-normalized config SHA256, equivalent across Windows CRLF and Linux LF:
 
 ```text
 fb46e1728884d32d2e0119a8d0ab449cf59dbeeabe5180dcfc3ac9a3c61a570f
 ```
 
-Official chair `last.pt` file SHA256:
+The external official chair `last.pt` file SHA256 is:
 
 ```text
 bda891a0f046ca6015f70f745fa24a8036c64dda12175b246d853c957f63b92d
 ```
 
-Its unique `ema` mapping is loaded strictly; the 2×768 role table is initialized to zero. Meta-device construction avoids random backbone initialization. The official coordinate-embedding closure constants are reconstructed on CPU; they are not left as meta tensors. No official source or weight file is modified.
+Its `ema` mapping is loaded strictly, and the Native 2x768 role table starts at zero. Meta-device construction avoids random backbone initialization. Official coordinate-embedding closure constants are reconstructed on CPU. No official source asset or weight file is modified.
 
-## Portable checkpoints
+## Checkpoint identities
 
-The trainer writes `native_t1_training_v1` with explicit Native architecture metadata, model state hash, normalized config hash, input archive hash, progress, input RNG state and optimizer state. Loading verifies architecture, pure-FM loss identity, finished progress and strict tensor keys/shapes. Model state is checked after loading.
+| Identity | Meaning |
+| --- | --- |
+| Official chair EMA | External initialization before Native fine-tuning |
+| `native_t1_training_v1` | User-trained pure Native model, completed updates and stream state |
+| `native_t1_geo_training_v1` | User-trained Native model with explicit geo metadata and parent identity |
+| Legacy geo-only checkpoint | Explicit compatibility for the audited T_geo endpoint; not a graph-to-geo conversion |
+| Historical A1500 | A separately pinned local checkpoint, not included or inferred from an update count |
 
-Inference is frozen FP32/eval. Training explicitly enables all model parameters but keeps modules in eval state to disable dropout. The trainer always creates a fresh AdamW when starting from an existing endpoint; saved optimizer state is not implicitly restored. There are no synthetic or random-weight fallbacks.
+Portable checkpoints retain full model state, architecture/config/input hashes, model-state hash, completed/cumulative updates, input RNG and optimizer state. Loading is strict on schema and tensor keys/shapes. A model with the same update count is not thereby the historical model. The new geo schema is distinct from the legacy fixed-pilot schema.
 
-## Dataset recipe
+`--init-t1` with `--context-encoder geo` creates a fresh zero-exit branch on a pure checkpoint. `--init-geo` preserves an existing trained geo branch. A fresh branch uses the explicit encoder seed (1010 in the pilot); the data stream seed is separate. Source vertex IDs and free GT never enter the encoder. Geometry is reconstructed from C on every forward, without detached cross-update condition caches.
 
-[recipes/chair_n112.json](recipes/chair_n112.json) contains only reproducibility metadata: two official object IDs, binary asset/array hashes, fixed source face indices and preprocessing parameters. It contains no vertices, model tensors, generated geometry or evaluation results.
+Loaders default to frozen FP32 parameters/eval mode. Training explicitly enables every parameter, while retaining eval mode to suppress dropout. Each invocation creates fresh AdamW; saved optimizer momentum is not implicitly restored. For `--init-t1` or `--init-geo`, `--continue-stream` restores input RNG only, requires the same prepared archive, and excludes `--seed`. It is not an exact optimizer resume. `--encoder-seed` applies only when attaching a fresh geo branch, not when loading a trained one.
 
-The preparation command builds targets, C, free complements and original pre-OT arrays directly from separately obtained source NPZ files. Shapes, coordinates, source identities and array hashes are validated. No historical run directory is needed.
+## Task recipe
 
-## Legacy compatibility
+[recipes/chair_n112.json](recipes/chair_n112.json) contains only object IDs, binary asset/array hashes, fixed source face indices and preprocessing parameters. It contains no vertices, model tensors, generated geometry or evaluation arrays.
 
-`checkpoint.py` and `verify.py` retain the original step500 local replay interface. `baseline.py` pins the later pure-FM A_continue cumulative1500 endpoint. These optional profiles reference historical assets by path and hash; those assets are not published. The default local profile is intentionally not replaced by a random or official-only model when its checkpoint is absent.
+Preparation reconstructs targets, C, free complements and pre-OT arrays from separately obtained source NPZ files. It validates shapes, coordinate transforms, source identities and array hashes. Training remains limited to the two registered parents and mixed K4/8/12; the recipe is not a general ShapeNet training split. No historical run directory is needed.
 
-Public from-scratch use is `prepare` → `train --official-checkpoint` → `sample --profile trained`. The independent import tests prohibit experiment module imports and implicit checkpoint/CUDA work during import.
+## Evaluation and compatibility
 
-## Excluded from Git
+Lightweight metrics cover surface/boundary distance, coverage, triangle shape and nonfinite values. They do not certify nonintersection, watertightness or manifoldness. Complete CF/FF and exact topology are `NOT_RUN` unless separately executed. Preserving C by clamping does not establish seam closure.
 
-Weights, source/prepared datasets, training/generated outputs, local validation records, small audit snapshots, Python caches and temporary checkpoints are ignored. The optional lightweight evaluator reports unimplemented topology/intersection work as `NOT_RUN`. Historical research output is not redistributed as part of this code package.
+`baseline.py` retains historical pure A_continue cumulative 1500; `checkpoint.py` and `verify.py` retain original step 500. These optional profiles reference private historical assets and are not prerequisites for public commands. Fresh-clone use is `prepare` → `train --official-checkpoint` → pure continuation or geo training → `sample` with an explicit `trained`/`trained-geo` profile and external checkpoint.
+
+## Published and excluded files
+
+Published material is source code, small CPU tests, documentation and the metadata-only recipe. Weights, source/prepared datasets, training/generated outputs, raw audit arrays, figures, local validation logs, Python caches and temporary checkpoints are excluded. The [pilot note](docs/tgeo_pilot.md) states existing evidence and limits; it is not a redistributed experiment archive or a new experiment.

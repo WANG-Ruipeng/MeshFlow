@@ -1,36 +1,40 @@
 # Native In-Context T1
 
-A standalone, pure flow-matching completion extension to the official MeshFlow backbone. This directory contains code, tests and the small task recipe only. **Checkpoints, datasets, cached files and experiment outputs are not distributed.**
+Two maintained paths extend the official MeshFlow backbone: **pure T1** and **T_geo**, an experimental per-face geometry encoder for the supplied context. This package publishes code, tests and a small task recipe. Checkpoints, datasets, generated meshes, experiment output arrays and caches are not bundled.
 
-The current scope is the registered **two-chair, N=112, mixed K=4/8/12** task. Known faces use time 1; free faces use time t. All backbone and role parameters are fine-tuned. Sampling uses 50 Euler steps and preserves the supplied known faces in all 51 states. There are no FC/FF auxiliary losses, extra interface layers, guidance, welding or geometric repair. This is a reproducible mechanism sandbox, not a claim of generalization to arbitrary meshes.
+The supported task is the registered **two-chair, N=112, mixed K=4/8/12** sandbox. Known faces use time 1; free faces use time t. All parameters train with the original free-only flow-matching loss. Both paths use the same 50-step clamped Euler sampler, preserving known faces in all 51 states. There is no FC/FF auxiliary loss, guidance, welding or mesh repair.
 
-## 1. Environment
+T_geo is a research candidate. In the local pilot it improved free-surface RMS on 8/8 new-patch outputs from already seen objects, but only 3/8 original-patch outputs, with interface-quality tradeoffs. See [pilot evidence and limits](docs/tgeo_pilot.md). This is not a new-object generalization or watertightness claim. T_graph was evaluated but is not a maintained public workflow.
 
-Run from the repository root on Linux or WSL with Python 3.10 and a CUDA GPU supporting BF16. The tested environment is PyTorch 2.7.1+cu128. Create a separate environment; the upstream demo/training dependencies are not required for this extension.
+## Environment
+
+Run from the repository root on Linux or WSL, with Python 3.10 and a CUDA GPU supporting BF16. The tested runtime is PyTorch 2.7.1+cu128. Use this extension's requirements rather than the upstream demo environment:
 
 ```bash
 python -m pip install torch==2.7.1 --index-url https://download.pytorch.org/whl/cu128
 python -m pip install -r native_t1/requirements.txt
 ```
 
-Do not install FlashAttention in this environment: this path requires PyTorch **math SDPA**. The upstream import warning about missing FlashAttention is expected. Strict determinism is enforced; unsupported deterministic operations stop the run instead of silently changing precision or kernels. TF32 is disabled, forwards use BF16, parameters and integration states stay FP32. The package sets CUBLAS workspace configuration before CUDA initialization.
+Do not install FlashAttention in this environment: Native execution uses PyTorch **math SDPA**. The upstream warning about missing FlashAttention is expected. Strict deterministic algorithms are enabled, TF32 is off, the backbone uses BF16 autocast, and parameters/integration coordinates stay FP32. T_geo computes its geometry and encoder in FP32. CUBLAS workspace configuration is set before CUDA initialization; unsupported deterministic operations stop execution.
 
-## 2. External official assets
+Same-input repeatability does not imply exact invariance to a different face order. The BF16 backbone showed order-sensitive rounding in the local pilot. Its original numerical failure is disclosed in the pilot note; production precision has not been changed to hide it. Public commands neither load private regression evidence nor apply its historical exception automatically.
 
-Obtain these official releases separately; downloading is not performed by our code:
+## External official assets
+
+Download the official assets separately; these commands do not download them:
 
 - [Official chair EMA checkpoint, last.pt](https://huggingface.co/datasets/qsun2001/meshflow/resolve/main/v1/120m-ot-v-chair/checkpoints/last.pt).
 - [Official ShapeNet main archive, shapenet.tar.gz](https://huggingface.co/datasets/qsun2001/meshflow/resolve/main/obj_data/shapenet.tar.gz).
 
-The released chair checkpoint is pinned to SHA256:
+The chair checkpoint SHA256 must be:
 
 ```text
 bda891a0f046ca6015f70f745fa24a8036c64dda12175b246d853c957f63b92d
 ```
 
-Only its `ema` dictionary is used. Missing or different assets fail explicitly; there is no random-backbone substitute. The Native known/free role embedding starts at zero.
+Only its `ema` mapping is used. Native known/free role embeddings start at zero. Missing or different assets fail explicitly; random backbone weights are never substituted.
 
-Extract the dataset outside Git. The preparation command accepts the directory containing `objaverse_occ_v5_ids/`, or that NPZ directory itself. The recipe in [recipes/chair_n112.json](recipes/chair_n112.json) identifies the two source objects, source hashes and fixed nested patches:
+Extract the data outside Git. Preparation accepts the directory containing `objaverse_occ_v5_ids/`, or that NPZ directory itself. The [recipe](recipes/chair_n112.json) contains two object IDs, source hashes, fixed face indices and preprocessing metadata:
 
 ```text
 objaverse_occ_v5_ids/
@@ -44,9 +48,9 @@ python -B -m native_t1 prepare \
   --output native_t1/data/chair_n112.npz
 ```
 
-This reconstructs the original coordinates, fixed patches and pre-OT targets using the official preprocessing. It neither pads/truncates real faces nor imports old experiment scripts. K2 is also archived for historical sampling; training uses K4/8/12. The generated NPZ is a local artifact and is ignored by Git.
+Preparation preserves the original coordinate transform, real 112 faces, known/free complements and pre-OT targets. It does not pad or truncate triangles and needs no historical `experiments/` tree. K2 is archived for historical sampling; training uses K4/8/12. The output NPZ is a local artifact ignored by Git.
 
-## 3. Verify the training path without updates
+## Check the path without updates
 
 ```bash
 python -B -m unittest discover -s native_t1/tests -v
@@ -54,80 +58,116 @@ python -B -m unittest discover -s native_t1/tests -v
 python -B -m native_t1 train \
   --inputs native_t1/data/chair_n112.npz \
   --official-checkpoint /weights/last.pt \
-  --check-only \
-  --out native_t1/runs/preflight
+  --context-encoder none --check-only \
+  --out native_t1/runs/preflight_pure
 ```
 
-The CPU tests use small fixtures and mocks, not the real model or dataset. The explicit CUDA preflight loads the real EMA, prepares one effective batch (8 CPU OT calls), and runs **one microbatch forward/backward with zero optimizer updates**. It checks that the parameter hash remains unchanged. It does not claim to exercise a full eight-microbatch optimizer step, and it saves no checkpoint or generation.
+The CUDA `--check-only` path loads real weights, prepares one effective batch (8 CPU OT calls on success), and runs one microbatch forward/backward with **zero optimizer updates**. It checks that model parameters remain unchanged and saves no checkpoint or generation. This is not a full optimizer-step test or the historical permutation/regression suite. CPU test commands use fixtures and mocks; requesting help or importing starts no training. Run the checks in your own environment; publication does not imply unexecuted remote GPU validation.
 
-Each output directory must be new. Importing this package or requesting help does not start training.
+Every output directory must be new. Numerical failures are recorded and propagated without retries or precision fallback.
 
-## 4. Train pure T1
+## Path 1: pure T1
 
-A complete first-stage command, using only the external official assets and the prepared NPZ:
+Start from the external official chair EMA:
 
 ```bash
 python -B -m native_t1 train \
   --inputs native_t1/data/chair_n112.npz \
   --official-checkpoint /weights/last.pt \
-  --seed 10 --updates 500 \
+  --context-encoder none --seed 10 --updates 500 \
   --out native_t1/runs/t1_500
 ```
 
-The trainer uses all model parameters, correct context only, effective batch 8/microbatch 1, logit-normal time, new Gaussian noise, free-only nested OT, and original face/corner permutations. The masked free-coordinate FM velocity MSE and its effective-batch denominator are unchanged.
+`--context-encoder none` is the default. Training uses correct context only, effective batch 8/microbatch 1, logit-normal time, fresh Gaussian noise, free-only nested OT and the original face/corner permutations. The effective-batch denominator counts all free coordinates. All model parameters are trainable; modules stay in eval mode to suppress dropout while autograd remains enabled.
 
-AdamW is freshly created with lr=1e-5, betas=(0.9,0.95), weight_decay=0, grad clip=1. There is no scheduler, new EMA, context dropout or auxiliary loss. Modules remain in eval mode to suppress dropout while normal autograd is enabled.
+AdamW is fresh for every invocation: lr=1e-5, betas=(0.9,0.95), weight_decay=0, grad clip=1. There is no scheduler, new EMA or auxiliary loss. An explicit update budget is required. Checkpoints default to every 250 updates and the endpoint; `--save-every` changes checkpoint spacing, not the budget. Training does not automatically launch sampling.
 
-The explicit update budget is mandatory. There is no automatic continuation or generation at the end. Default checkpoints are written every 250 updates and at the final step; `--save-every` controls checkpoint spacing, not the update budget. Outputs include `run.json`, input-stream hashes and local checkpoints. Numerical failures are recorded and propagated without retry or precision fallback.
-
-To follow the pure-FM 500 → 1000 → 1500 route:
+Build a pure checkpoint with the 500 → 1000 → 1500 schedule:
 
 ```bash
-# Branch A: same model weights, new AdamW, fresh seed10 input stream.
+# New AdamW and a fresh seed10 input stream.
 python -B -m native_t1 train \
   --inputs native_t1/data/chair_n112.npz \
   --init-t1 native_t1/runs/t1_500/additional_step500_cumulative_step500.pt \
-  --seed 10 --updates 500 \
+  --context-encoder none --seed 10 --updates 500 \
   --out native_t1/runs/a_1000
 
-# A_continue: new AdamW; continue A's saved input RNG state.
+# New AdamW, but continue the previous checkpoint's input RNG.
 python -B -m native_t1 train \
   --inputs native_t1/data/chair_n112.npz \
   --init-t1 native_t1/runs/a_1000/additional_step500_cumulative_step1000.pt \
-  --continue-stream --updates 500 \
-  --out native_t1/runs/a_continue_1500
+  --context-encoder none --continue-stream --updates 500 \
+  --out native_t1/runs/a_1500
 ```
 
-`--init-t1` accepts the explicit `native_t1_training_v1` schema from this trainer. It always resets optimizer momentum. `--continue-stream` restores only the saved input RNG and requires the same prepared archive; it cannot be combined with `--seed`. This is branch fine-tuning, not an exact optimizer resume. The code does not promise bitwise-identical retraining across different GPU/software environments.
+`--continue-stream` requires the same prepared archive and cannot be combined with `--seed`. It restores input RNG only, not optimizer momentum. These commands create **your own** pure1500 checkpoint. They do not give it the identity or measured scores of the historical local A1500 checkpoint. Retraining is not promised bitwise-identical across GPU/software environments.
 
-## 5. Sample your trained model
+## Path 2: T_geo candidate
+
+T_geo adds 149,888 trainable parameters. Each known triangle supplies 13 features: centroid, sorted edge lengths, area and six entries of the unsigned unit-normal outer product. A FP32 encoder injects a zero-initialized exit into known-face tokens after coordinate/role embedding. Its context operator is **P=I**: it passes no messages between different known faces. Features use only supplied C, never free GT or source IDs. They are recomputed during training without detached or cross-update condition caches.
+
+For a matched comparison, start both branches from the same pure1500 checkpoint with a fresh seed1010 stream and fresh AdamW. These are two explicit training commands; run only the budgets you intend:
+
+```bash
+# Matched pure-FM baseline: +500 updates.
+python -B -m native_t1 train \
+  --inputs native_t1/data/chair_n112.npz \
+  --init-t1 native_t1/runs/a_1500/additional_step500_cumulative_step1500.pt \
+  --context-encoder none --seed 1010 --updates 500 \
+  --out native_t1/runs/pure_2000
+
+# Candidate: same parent model and data stream, +500 updates.
+python -B -m native_t1 train \
+  --inputs native_t1/data/chair_n112.npz \
+  --init-t1 native_t1/runs/a_1500/additional_step500_cumulative_step1500.pt \
+  --context-encoder geo --encoder-seed 1010 --seed 1010 --updates 500 \
+  --out native_t1/runs/geo_2000
+```
+
+For a real geo forward/backward check without updates, replace `--updates 500` with `--check-only` and choose a distinct `--out`. The geo exit starts at zero. Later nonzero gradients and output changes alone do not establish useful conditioning; all model and encoder parameters still train with the same free-only FM loss.
+
+To preserve an already trained geo branch, use `--context-encoder geo --init-geo /weights/your_geo.pt` instead of `--init-t1`. Do not pass `--encoder-seed`: the learned encoder is loaded, not reinitialized. AdamW is still fresh. Choose either `--seed` for a new input stream or `--continue-stream` for its saved RNG with the same prepared archive. Specify the additional `--updates` budget and a new output directory. Continuation is supported functionality, not an automatic next experiment or evidence from the fixed pilot.
+
+## Sample a trained checkpoint
+
+Pure model:
 
 ```bash
 python -B -m native_t1 sample --profile trained \
-  --checkpoint native_t1/runs/a_continue_1500/additional_step500_cumulative_step1500.pt \
+  --checkpoint native_t1/runs/pure_2000/additional_step500_cumulative_step2000.pt \
   --condition native_t1/data/chair_n112.npz \
   --condition-key parent0_K12_constraints \
-  --seed 9601 \
-  --out native_t1/runs/sample_p0
+  --seed 9601 --out native_t1/runs/sample_pure
 ```
 
-Inference needs only the model and known faces C, not GT. A standalone FP32 `[K,3,3]` or `[K,9]` NPY can replace the input NPZ; omit `--condition-key` in that case. Coordinates must already be in the trained model scale. K is restricted to 2/4/8/12 and total N to 112.
+Geo model with the same condition and seed:
 
-`raw.npz` contains the output, all 51 states and the initial Gaussian. `run.json` records checkpoint identity, runtime assertions, C preservation and actual call counts. No projection or mesh repair is applied.
+```bash
+python -B -m native_t1 sample --profile trained-geo \
+  --checkpoint native_t1/runs/geo_2000/additional_step500_cumulative_step2000.pt \
+  --condition native_t1/data/chair_n112.npz \
+  --condition-key parent0_K12_constraints \
+  --seed 9601 --out native_t1/runs/sample_geo
+```
 
-## Code map
+Inference needs only the model and C, not GT. A standalone FP32 `[K,3,3]` or `[K,9]` NPY can replace the NPZ; omit `--condition-key`. Coordinates must already be in the trained model scale. K is restricted to 2/4/8/12 and total N to 112. Geo also rejects invalid or degenerate known triangles.
 
-| File | Purpose |
+`raw.npz` contains the output, all 51 states and initial Gaussian. `run.json` records checkpoint identity, runtime assertions, C preservation and actual call counts. Neither loader silently substitutes a different model; neither sampler projects or repairs the mesh.
+
+## Code and compatibility boundaries
+
+| Component | Responsibility |
 | --- | --- |
-| `prepare.py`, `recipes/` | Rebuild the registered task from external official data |
-| `portable_checkpoint.py` | Official EMA initialization and portable trained-checkpoint loading |
-| `train_cli.py` | Explicit update budget, stream handling, checkpointing, zero-update preflight |
-| `model.py` | Native per-face time, known/free roles and official Transformer operations |
-| `runtime.py`, `sampling.py` | Strict execution policy and original clamped Euler |
-| `data.py`, `training.py` | Original input stream and masked pure-FM update |
-| `metrics.py`, `metric_geometry.py` | Lightweight offline surface/boundary/coverage diagnostics |
-| `tests/` | CPU fixtures, import isolation, identity and CLI contracts |
+| `prepare.py`, `recipes/` | Rebuild the fixed task from external official data |
+| Pure and geo checkpoint loaders | Strict official, pure and geo checkpoint identities |
+| `train_cli.py` | Explicit single-branch budgets, streams, checkpoints and preflight |
+| `model.py`, `context_geometry.py` | Native known/free time and optional C-only geo encoder |
+| `runtime.py`, `sampling.py` | Stable execution and shared clamped Euler sampler |
+| `data.py`, `training.py` | Input stream, nested OT and masked FM update |
+| `metrics.py`, `metric_geometry.py` | Lightweight offline surface/boundary diagnostics |
 
-Full CF/FF intersection and exact topology audits are not included in the lightweight evaluator; these fields remain `NOT_RUN`. See [DEPENDENCIES.md](DEPENDENCIES.md) for boundaries and pinned assets.
+The portable schemas are `native_t1_training_v1` for pure T1 and `native_t1_geo_training_v1` for geo. Geo loading also explicitly supports the audited legacy **geo-only** schema; it never silently treats a graph checkpoint as geo. See [DEPENDENCIES.md](DEPENDENCIES.md).
 
-For compatibility with local historical work, `baseline.load_baseline()` and the default `sample --profile a-continue` still pin the previously obtained A_continue cumulative1500 file. `original-t1`, `checkpoint.load_t1()`, and `verify-historical` (`verify` alias) retain the original step500 meaning. **Those profiles require separately supplied historical assets, which are not in Git.** A fresh clone should use the prepare/train commands above and `sample --profile trained`; none of those commands needs the historical `experiments/` tree.
+Historical `a-continue`, `original-t1` and `verify-historical` profiles require separately held historical assets, which are not published. The local sampling default `a-continue` is retained for compatibility; fresh clones should explicitly use `--profile trained` or `--profile trained-geo` and their checkpoint. Public commands above need no historical results or private paths.
+
+Lightweight evaluation does not perform full CF/FF intersection or exact topology audits: those checks remain `NOT_RUN` unless separately executed. This code publication performs no new training or generation and redistributes no pilot weights, data, raw outputs or figures.
