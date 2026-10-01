@@ -1,4 +1,4 @@
-> **Native T1 extension:** pure T1 and the experimental T_geo candidate, with code-only training from external official assets: [native_t1/README.md](native_t1/README.md). No weights, datasets or generated outputs are bundled.
+> **Native completion extension:** Native T1 + T_geo with the original FM objective is the baseline; JEdge5 is an optional training-loss recipe. Portable code and official-asset training instructions: [native_t1/README.md](native_t1/README.md). No weights, datasets or generated outputs are bundled.
 
 <div align="center">
 <h2>MeshFlow: Mesh Generation with Equivariant Flow Matching</h2>

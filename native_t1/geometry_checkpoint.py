@@ -19,6 +19,7 @@ from .portable_checkpoint import _read_config, config_sha256, NATIVE_META
 from .context_geometry import ContextGeometryEncoder, ENCODER_METADATA
 
 SCHEMA = "native_t1_geo_training_v1"
+OBJECTIVE_SCHEMA = "native_t1_geo_objective_training_v1"
 LEGACY_SCHEMA = "native_t1_geom_context_v1"
 ENCODER_PARAMETER_COUNT = 149888
 
@@ -50,7 +51,7 @@ def validate_geometry_checkpoint(payload, expected_config_sha256=None):
     in the loader. Input RNG may start after an earlier training segment; this
     segment's progress is recorded separately from cumulative model updates.
     """
-    if not isinstance(payload, Mapping) or payload.get("schema") not in (SCHEMA, LEGACY_SCHEMA):
+    if not isinstance(payload, Mapping) or payload.get("schema") not in (SCHEMA, LEGACY_SCHEMA, OBJECTIVE_SCHEMA):
         raise ValueError("Expected portable Geo or explicit legacy Geo schema")
     legacy = payload["schema"] == LEGACY_SCHEMA
     if payload.get("native_meta") != NATIVE_META:
@@ -89,10 +90,19 @@ def validate_geometry_checkpoint(payload, expected_config_sha256=None):
             raise ValueError("Base checkpoint progress differs from the saved segment")
     elif legacy:
         raise ValueError("Legacy base checkpoint progress is missing")
-    if (payload.get("loss") != "masked_free_fm" or payload.get("train_K") != [4, 8, 12]
+    objective = payload["schema"] == OBJECTIVE_SCHEMA
+    if objective:
+        from .objectives import validate_objective
+        spec = validate_objective(payload.get("training_objective"))
+        if spec["name"] not in ("surface", "edge5"):
+            raise ValueError("Geometry objective schema requires a geometry recipe")
+    elif "training_objective" in payload:
+        raise ValueError("Pure FM schema must not carry geometry objective metadata")
+    expected_loss = "masked_free_fm_plus_geometry" if objective else "masked_free_fm"
+    if (payload.get("loss") != expected_loss or payload.get("train_K") != [4, 8, 12]
             or type(payload.get("num_faces")) is not int or payload["num_faces"] != 112
             or payload.get("optimizer_reset_at_start") is not True):
-        raise ValueError("Pure FM training definition differs")
+        raise ValueError("Training definition differs from the checkpoint schema")
     if any(payload.get(k) is not False for k in ("optimizer_step_in_progress", "batch_in_progress")):
         raise ValueError("Checkpoint must be saved at a completed update boundary")
     stream_seed = _integer(payload.get("stream_seed"), "stream_seed")
@@ -122,7 +132,7 @@ def validate_geometry_checkpoint(payload, expected_config_sha256=None):
 
 
 def save_geometry_checkpoint(path, model, optimizer, stream, archive, *,
-                             config_path, base_identity, completed, base_updates=None):
+                             config_path, base_identity, completed, base_updates=None, loss_recipe="fm"):
     """Save one completed portable Geo segment; never infer a training budget."""
     path = Path(path)
     temporary = path.with_suffix(".pt.partial")
@@ -157,6 +167,10 @@ def save_geometry_checkpoint(path, model, optimizer, stream, archive, *,
         loss="masked_free_fm", num_faces=112, train_K=[4,8,12], optimizer_reset_at_start=True,
         optimizer_step_in_progress=False, batch_in_progress=False,
         model_state_sha256=state_sha256(model))
+    if loss_recipe != "fm":
+        from .objectives import objective_spec
+        payload.update(schema=OBJECTIVE_SCHEMA, loss="masked_free_fm_plus_geometry",
+                       training_objective=objective_spec(loss_recipe))
     validate_geometry_checkpoint(payload, config_sha256(config_path))
     if any(not bool(torch.isfinite(v).all()) for v in payload["model"].values()):
         raise ValueError("Nonfinite model cannot be saved")
@@ -166,10 +180,11 @@ def save_geometry_checkpoint(path, model, optimizer, stream, archive, *,
     return dict(path=str(path.resolve()), bytes=path.stat().st_size, sha256=digest,
                 checkpoint_sha256=digest, model_state_sha256=payload["model_state_sha256"],
                 cumulative_updates=base+completed, completed_updates=completed,
-                schema=SCHEMA, context=payload["context"])
+                schema=payload["schema"], context=payload["context"],
+                training_objective=payload.get("training_objective", {"name": "fm"}))
 
 
-def load_geometry_checkpoint(path, config_path=DEFAULT_CONFIG, *, device="cuda"):
+def load_geometry_checkpoint(path, config_path=DEFAULT_CONFIG, *, device="cuda", expected_recipe=None):
     """Strict FP32 Geo load, including explicitly validated old Geo checkpoints."""
     tick = time.perf_counter()
     path, config_path = Path(path), Path(config_path)
@@ -177,6 +192,9 @@ def load_geometry_checkpoint(path, config_path=DEFAULT_CONFIG, *, device="cuda")
     config = _read_config(config_path)
     payload = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
     context = validate_geometry_checkpoint(payload, config_sha256(config_path))
+    recipe = payload.get("training_objective", {"name": "fm"})["name"]
+    if expected_recipe is not None and recipe != expected_recipe:
+        raise ValueError("Checkpoint is not the requested training recipe: " + expected_recipe)
     state = payload["model"]
     if any(v.device.type != "cpu" for v in state.values()):
         raise ValueError("Loading requires CPU FP32 checkpoint tensors")
@@ -203,7 +221,9 @@ def load_geometry_checkpoint(path, config_path=DEFAULT_CONFIG, *, device="cuda")
         config_sha256=config_sha256(config_path), config_file_sha256=file_sha256(config_path),
         strict=True, missing_keys=list(keys.missing_keys), unexpected_keys=list(keys.unexpected_keys),
         parameters=sum(p.numel() for p in model.parameters()), trainable_parameters=0,
-        legacy_schema=payload["schema"] == LEGACY_SCHEMA, optimizer_restored=False)
+        legacy_schema=payload["schema"] == LEGACY_SCHEMA, optimizer_restored=False,
+        training_objective=payload.get("training_objective", {"name": "fm"}),
+        optimizer_state_removed=payload.get("optimizer_state_removed", False))
     del payload, state
     model.to(device)
     audit["seconds"] = time.perf_counter()-tick

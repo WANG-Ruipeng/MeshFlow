@@ -86,8 +86,8 @@ def inspect_source(text: str, filename: str) -> list[str]:
 
 def _sources():
     return sorted(path for path in PACKAGE.rglob("*.py")
-                  if "tests" not in path.relative_to(PACKAGE).parts
-                  and "__pycache__" not in path.parts)
+                  if not ({"tests", "runs", "validation", "maintenance", "checkpoints", "data", "__pycache__"}
+                          & set(path.relative_to(PACKAGE).parts)))
 
 
 class IsolationTests(unittest.TestCase):

@@ -18,20 +18,27 @@ def build_parser():
     sample.add_argument("--condition-key", help="Required when condition is NPZ")
     sample.add_argument("--seed", type=int, required=True)
     sample.add_argument("--out", type=Path, required=True, help="New output directory; never overwritten")
-    sample.add_argument("--profile", choices=("a-continue", "original-t1", "trained", "trained-geo"), default="a-continue",
-                        help="Default: pure-FM A_continue cumulative1500; original-t1 is historical step500")
+    sample.add_argument("--profile", choices=("fm-geo", "edge5", "a-continue", "original-t1", "trained", "trained-geo"), default="fm-geo",
+                        help="Default: pure-FM T1+Geo L0 cumulative3000; edge5 and historical profiles remain explicit")
     sample.add_argument("--checkpoint", type=Path,
-                        help="Required for trained/trained-geo; otherwise a relocated copy of the pinned profile checkpoint")
+                        help="Explicit checkpoint path; required for trained/trained-geo, optional for named local profiles")
     sample.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     verify = commands.add_parser("verify-historical", aliases=["verify"],
                                  help="Historical original-T1 step500 replay (2 rollouts); not the working baseline")
     verify.add_argument("--out", type=Path, required=True)
     commands.add_parser("prepare", add_help=False, help="Prepare the registered task from external official data")
-    commands.add_parser("train", add_help=False, help="Explicit pure-FM training or a zero-update preflight")
+    commands.add_parser("train-edge5", add_help=False, help="Optional JEdge5 training recipe, explicit budget or zero-update preflight")
+    commands.add_parser("train", add_help=False, help="FM baseline or optional loss training with an explicit update budget or zero-update preflight")
     return parser
 
 
 def resolve_profile(args):
+    if args.profile == "fm-geo":
+        from .working_model import load_fm_geo, DEFAULT_WORKING_CHECKPOINT
+        return load_fm_geo, args.checkpoint or DEFAULT_WORKING_CHECKPOINT
+    if args.profile == "edge5":
+        from .working_model import load_edge5, EDGE5_CHECKPOINT
+        return load_edge5, args.checkpoint or EDGE5_CHECKPOINT
     if args.profile == "a-continue":
         return load_baseline, args.checkpoint or BASELINE_CHECKPOINT
     if args.profile == "original-t1":
@@ -54,6 +61,9 @@ def main(argv=None):
     if argv and argv[0] == "prepare":
         from .prepare import main as prepare_main
         return prepare_main(argv[1:])
+    if argv and argv[0] == "train-edge5":
+        from .train_cli import main as train_main
+        return train_main(argv[1:], recipe="edge5")
     if argv and argv[0] == "train":
         from .train_cli import main as train_main
         return train_main(argv[1:])

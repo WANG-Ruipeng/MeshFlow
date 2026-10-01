@@ -1,9 +1,10 @@
 """Native masked FM training building blocks; importing never starts training.
 
-The original mixed-K effective batch is 8, microbatch is 1, and normalization
-is over *all free coordinates in the effective batch*. No new loss/scheduler,
-EMA, teacher schedule, checkpoint selection, or historical run controller is
-provided. Callers own authorization, budgets, persistence, and interruptions.
+The original mixed-K effective batch is 8, microbatch is 1, and FM normalization
+covers all free coordinates in the effective batch. Optional geometry objectives
+share the backward pass and average their sample losses over all eight samples.
+No scheduler, EMA or checkpoint selection is provided. Callers own the budget,
+persistence and interruptions.
 """
 from __future__ import annotations
 import torch
@@ -36,7 +37,7 @@ def make_optimizer(model):
     return torch.optim.AdamW(parameters,lr=1e-5,betas=(.9,.95),weight_decay=0.)
 
 
-def train_step(model,optimizer,samples,*,device='cuda',counts=None):
+def train_step(model,optimizer,samples,*,device='cuda',counts=None,objective=None,additional_step=None):
     """One explicitly requested original update; called only by an explicit trainer.
 
     Numerical or deterministic failures propagate without fallback. Counters
@@ -63,14 +64,24 @@ def train_step(model,optimizer,samples,*,device='cuda',counts=None):
     denominator=9*sum(int((s['valid_mask']&~s['known_mask']).sum()) for s in samples)
     if denominator not in (7524,7452,7488):
         raise ValueError('Original mixed-K effective denominator changed.')
-    optimizer.zero_grad(set_to_none=True); total=0.
-    for sample in samples:
+    prepared = objective.prepare(samples) if objective is not None else None
+    optimizer.zero_grad(set_to_none=True); total=0.; fm_total=0.; geometry_total=0.; active_count=0
+    geometry_diagnostics=[]
+    for micro, sample in enumerate(samples):
         batch=native_collate([sample],device)
         with native_execution(model,coordinates=batch['xt']) as runtime:
             increment('forward_attempts')
             velocity=model(*model_inputs(batch)).float()
             increment('forward_returns')
             loss=masked_fm_loss(velocity,batch['u'],batch['valid_mask'],batch['known_mask'],denominator=denominator)
+            fm_total += float(loss.detach())
+            if objective is not None:
+                auxiliary, diagnostic = objective.auxiliary(velocity, batch, prepared[micro],
+                                                            additional_step=additional_step)
+                loss = loss + auxiliary
+                geometry_total += float(auxiliary.detach())
+                active_count += int(diagnostic["active"])
+                geometry_diagnostics.append(diagnostic)
             if not bool(torch.isfinite(loss)):
                 raise RuntimeError('Nonfinite free FM loss; no numerical fallback.')
             increment('backward_attempts'); loss.backward(); increment('backward_returns')
@@ -81,5 +92,6 @@ def train_step(model,optimizer,samples,*,device='cuda',counts=None):
         torch.cuda.synchronize()
     if not bool(torch.stack([torch.isfinite(p).all() for p in parameters]).all()):
         raise RuntimeError('Nonfinite parameter after attempted update.')
-    return dict(loss=total,grad_norm_before_clip=norm,free_coordinate_denominator=denominator,
+    return dict(loss=total,FM=fm_total,geometry=geometry_total,active_samples=active_count,
+                geometry_diagnostics=geometry_diagnostics,grad_norm_before_clip=norm,free_coordinate_denominator=denominator,
                 effective_batch=8,microbatch=1,runtime=runtime,counts=dict(counts))

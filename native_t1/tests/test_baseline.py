@@ -74,13 +74,16 @@ class BaselineTests(unittest.TestCase):
         self.assertEqual(signature.parameters['config_path'].default,checkpoint.DEFAULT_CONFIG)
         self.assertNotEqual(checkpoint.DEFAULT_CHECKPOINT,baseline.BASELINE_CHECKPOINT)
 
-    def test_sample_defaults_to_pinned_a_continue(self):
+    def test_sample_defaults_to_fm_geo_and_keeps_historical_pins(self):
         args = self.parse_sample()
-        self.assertEqual(args.profile,'a-continue')
+        self.assertEqual(args.profile,'fm-geo')
         self.assertIsNone(args.checkpoint)
         loader, path = self.resolve(args)
-        self.assertIs(loader,baseline.load_baseline)
-        self.assertEqual(path,baseline.BASELINE_CHECKPOINT)
+        from native_t1.working_model import load_fm_geo, DEFAULT_WORKING_CHECKPOINT, FM_GEO_CHECKPOINT
+        self.assertIs(loader,load_fm_geo)
+        self.assertEqual(path,DEFAULT_WORKING_CHECKPOINT)
+        self.assertEqual(path,FM_GEO_CHECKPOINT)
+        self.assertEqual(path,checkpoint.REPO/'native_t1/checkpoints/ablations/fm_cumulative3000.pt')
         self.assertEqual(baseline.BASELINE_FILE_SHA256,
                          'd8366d8c172407ec97ee4288143863825fae583d2c879d200f3862315747e400')
         self.assertEqual(baseline.BASELINE_STATE_SHA256,
@@ -89,7 +92,10 @@ class BaselineTests(unittest.TestCase):
                          '25d5414e6a3af1cbf1f0f71f27a68010f28318578aaf092af150d80b00e4a1a2')
 
     def test_explicit_profiles_and_relocated_checkpoint_paths(self):
+        from native_t1.working_model import load_fm_geo, load_edge5, FM_GEO_CHECKPOINT, EDGE5_CHECKPOINT
         for profile, expected_loader, default_path in (
+                ('fm-geo',load_fm_geo,FM_GEO_CHECKPOINT),
+                ('edge5',load_edge5,EDGE5_CHECKPOINT),
                 ('a-continue',baseline.load_baseline,baseline.BASELINE_CHECKPOINT),
                 ('original-t1',checkpoint.load_t1,checkpoint.DEFAULT_CHECKPOINT)):
             with self.subTest(profile=profile):
@@ -101,6 +107,42 @@ class BaselineTests(unittest.TestCase):
                 self.assertEqual(path,Path('relocated.pt'))
         with self.assertRaisesRegex(ValueError,'Unknown checkpoint profile'):
             self.resolve(SimpleNamespace(profile='unregistered',checkpoint=None))
+
+    def test_named_geo_profiles_forward_strict_recipe_and_preserve_legacy_symbol(self):
+        from native_t1 import geometry_checkpoint as gc
+        from native_t1 import working_model as working
+        self.assertEqual(working.WORKING_CHECKPOINT,working.EDGE5_CHECKPOINT)
+        self.assertNotEqual(working.DEFAULT_WORKING_CHECKPOINT,working.WORKING_CHECKPOINT)
+        for loader,recipe,path in ((working.load_fm_geo,'fm',working.FM_GEO_CHECKPOINT),
+                                   (working.load_edge5,'edge5',working.EDGE5_CHECKPOINT)):
+            with self.subTest(recipe=recipe), mock.patch.object(gc,'load_geometry_checkpoint',return_value='mock-only') as load:
+                self.assertEqual(loader(device='cpu'),'mock-only')
+                load.assert_called_once_with(path,checkpoint.DEFAULT_CONFIG,device='cpu',expected_recipe=recipe)
+                load.reset_mock()
+                self.assertEqual(loader(Path('relocated.pt'),Path('relocated.yaml'),device='cpu'),'mock-only')
+                load.assert_called_once_with(Path('relocated.pt'),Path('relocated.yaml'),device='cpu',expected_recipe=recipe)
+
+    def test_fm_geo_rejects_auxiliary_checkpoint_before_model_construction(self):
+        from native_t1 import geometry_checkpoint as gc
+        from native_t1.objectives import objective_spec
+        from native_t1.tests.test_geometry_checkpoint import valid_payload
+        from native_t1.working_model import load_fm_geo
+        for recipe in ('surface','edge5'):
+            payload=valid_payload()
+            payload.update(schema=gc.OBJECTIVE_SCHEMA,loss='masked_free_fm_plus_geometry',
+                           training_objective=objective_spec(recipe))
+            with self.subTest(recipe=recipe), \
+                    mock.patch.object(gc,'file_sha256',return_value='2'*64), \
+                    mock.patch.object(gc,'_read_config',return_value={}), \
+                    mock.patch.object(gc,'config_sha256',return_value=payload['config_sha256']), \
+                    mock.patch.object(torch,'load',return_value=payload) as load, \
+                    mock.patch.object(gc,'configure_stable_runtime',side_effect=AssertionError('Rejected recipe configured runtime')), \
+                    mock.patch.object(gc,'DiT',side_effect=AssertionError('Rejected recipe constructed model')), \
+                    mock.patch.object(gc,'NativeInpaintingModel',side_effect=AssertionError('Rejected recipe constructed wrapper')):
+                with self.assertRaisesRegex(ValueError,'requested training recipe: fm'):
+                    load_fm_geo('unread.pt','unread.yaml',device='cpu')
+                load.assert_called_once_with(Path('unread.pt'),map_location='cpu',weights_only=True,mmap=True)
+                TEST_COUNTS['mocked_checkpoint_load_calls']+=load.call_count
 
     def test_both_verify_commands_dispatch_only_historical_regression(self):
         with mock.patch('native_t1.verify.run_regression',return_value='historical-only') as run, \
