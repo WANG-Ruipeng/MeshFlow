@@ -1,6 +1,6 @@
 # Native T1 + Geo + FM baseline
 
-The working baseline is pure free-face flow matching with the Native known/free-time construction and the C-only T_geo encoder. The local L0 cumulative3000 endpoint is the default `fm-geo` sampling profile. It is not the original unconditional MeshFlow checkpoint, nor a JEdge5, FC, angular or boundary-loss model.
+This historical N112 baseline uses pure free-face flow matching with the Native known/free-time construction and the C-only T_geo encoder. The local L0 cumulative3000 endpoint is the explicit legacy `fm-geo` sampling profile. The current default is [Chair HYBRID START](chair_start.md). It is not the original unconditional MeshFlow checkpoint, nor a JEdge5, FC, angular or boundary-loss model.
 
 This is a two-observed-chair N112 sandbox. Choosing a stable comparison baseline does not establish universal superiority or generalization. JEdge5 remains an explicit optional loss recipe; new losses should be compared with FM from the same initialization, saved input stream and update budget.
 

@@ -11,15 +11,16 @@ from .sampling import make_noise, clamped_sample, new_counts
 
 
 def build_parser():
-    parser = argparse.ArgumentParser(description="Native T1 / T_geo, fixed N112 and 50 Euler steps")
+    parser = argparse.ArgumentParser(description="Native T1 / Geo; Chair START N128..256 and explicit legacy N112 profiles")
     commands = parser.add_subparsers(dest="command", required=True)
     sample = commands.add_parser("sample", help="Generate from FP32 known faces only")
     sample.add_argument("--condition", type=Path, required=True, help="NPY C or NPZ containing C; no target needed")
     sample.add_argument("--condition-key", help="Required when condition is NPZ")
     sample.add_argument("--seed", type=int, required=True)
     sample.add_argument("--out", type=Path, required=True, help="New output directory; never overwritten")
-    sample.add_argument("--profile", choices=("fm-geo", "edge5", "a-continue", "original-t1", "trained", "trained-geo"), default="fm-geo",
-                        help="Default: pure-FM T1+Geo L0 cumulative3000; edge5 and historical profiles remain explicit")
+    sample.add_argument("--profile", choices=("chair-hybrid", "fm-geo", "edge5", "a-continue", "original-t1", "trained", "trained-geo"), default="chair-hybrid",
+                        help="Default: Chair HYBRID START total5000; requires --num-faces 128..256")
+    sample.add_argument("--num-faces", type=int, help="Required total N128..256 for chair-hybrid; legacy profiles use N112")
     sample.add_argument("--checkpoint", type=Path,
                         help="Explicit checkpoint path; required for trained/trained-geo, optional for named local profiles")
     sample.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
@@ -33,9 +34,12 @@ def build_parser():
 
 
 def resolve_profile(args):
+    if args.profile == "chair-hybrid":
+        from .working_model import load_chair_start, CHAIR_START_CHECKPOINT
+        return load_chair_start, args.checkpoint or CHAIR_START_CHECKPOINT
     if args.profile == "fm-geo":
-        from .working_model import load_fm_geo, DEFAULT_WORKING_CHECKPOINT
-        return load_fm_geo, args.checkpoint or DEFAULT_WORKING_CHECKPOINT
+        from .working_model import load_fm_geo, FM_GEO_CHECKPOINT
+        return load_fm_geo, args.checkpoint or FM_GEO_CHECKPOINT
     if args.profile == "edge5":
         from .working_model import load_edge5, EDGE5_CHECKPOINT
         return load_edge5, args.checkpoint or EDGE5_CHECKPOINT
@@ -56,6 +60,30 @@ def resolve_profile(args):
     raise ValueError("Unknown checkpoint profile")
 
 
+def validate_sample_num_faces(profile, num_faces=None):
+    if profile == "chair-hybrid":
+        if type(num_faces) is not int or not 128 <= num_faces <= 256:
+            raise ValueError("chair-hybrid requires explicit --num-faces in 128..256")
+        return num_faces
+    if num_faces is not None and (type(num_faces) is not int or num_faces != 112):
+        raise ValueError("Legacy profiles require N112")
+    return 112
+
+
+def validate_sample_condition(C, profile, num_faces=None):
+    N = validate_sample_num_faces(profile, num_faces)
+    if C.dtype != np.float32 or C.ndim not in (2, 3) or C.shape[1:] not in ((9,), (3, 3)):
+        raise ValueError("Condition must be FP32[K,9] or FP32[K,3,3]; no implicit coordinate transform")
+    if not np.isfinite(C).all():
+        raise ValueError("Finite known coordinates required")
+    if profile == "chair-hybrid":
+        if not 0 < len(C) < N:
+            raise ValueError("chair-hybrid requires 0 < K < total N")
+    elif len(C) not in (2, 4, 8, 12):
+        raise ValueError("Legacy profiles require K2/4/8/12")
+    return N
+
+
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv and argv[0] == "prepare":
@@ -71,6 +99,9 @@ def main(argv=None):
     if args.command in ("verify", "verify-historical"):
         from .verify import run_regression
         return run_regression(args.out)
+    validate_sample_num_faces(args.profile, args.num_faces)
+    if args.profile == "chair-hybrid" and not 0 <= args.seed < 2**32:
+        raise ValueError("START seed must be in [0, 2**32)")
     if args.out.exists():
         raise FileExistsError(args.out)
     value = np.load(args.condition, allow_pickle=False)
@@ -83,13 +114,10 @@ def main(argv=None):
             value.close()
     else:
         C = value
-    if C.dtype != np.float32 or C.ndim not in (2, 3) or C.shape[1:] not in ((9,), (3, 3)):
-        raise ValueError("Condition must be FP32[K,9] or FP32[K,3,3]; no implicit coordinate transform")
-    if len(C) not in (2, 4, 8, 12) or not np.isfinite(C).all():
-        raise ValueError("Finite K2/4/8/12 conditions required")
+    N = validate_sample_condition(C, args.profile, args.num_faces)
     args.out.mkdir(parents=True)
     report = dict(status="RUNNING", profile=args.profile, seed=args.seed, condition_file=str(args.condition.resolve()),
-                  condition_key=args.condition_key,
+                  condition_key=args.condition_key, total_faces=N,
                   condition_file_sha256=file_sha256(args.condition), counts=new_counts())
     atomic_json(args.out / "run.json", report)
     try:
@@ -97,8 +125,14 @@ def main(argv=None):
         configure_stable_runtime()
         loader, checkpoint = resolve_profile(args)
         model, report["load"] = loader(checkpoint, args.config)
-        z = make_noise(args.seed)
-        raw, path, report["sampling"] = clamped_sample(model, z.cuda(), torch.from_numpy(C).cuda(), report["counts"])
+        if args.profile == "chair-hybrid":
+            from .chair_sampling import make_noise as chair_noise, clamped_sample as chair_sample
+            z = chair_noise(args.seed, N, len(C))
+            sampler = chair_sample
+        else:
+            z = make_noise(args.seed)
+            sampler = clamped_sample
+        raw, path, report["sampling"] = sampler(model, z.cuda(), torch.from_numpy(C).cuda(), report["counts"])
         report["state_after"] = state_sha256(model)
         if report["state_after"] != report["load"]["state_sha256"]:
             raise RuntimeError("Frozen T1 changed")

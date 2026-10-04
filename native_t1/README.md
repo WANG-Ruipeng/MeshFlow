@@ -1,8 +1,17 @@
-# Native T1 + Geo: FM baseline and optional losses
+# Native T1 + Geo: Chair HYBRID START
 
-The main workflow is **Native In-Context T1 + C-only T_geo + the original free-face FM loss**. The local sampling default is the pure-FM L0 cumulative3000 endpoint. **JEdge5 is an optional training-loss recipe**, alongside surface-only, so later candidates can share the same architecture and inference path.
+The maintained sampling default is **Chair HYBRID START**, the original OT_HYBRID pilot1000/conditional_total5000 endpoint. It uses Native T1 + C-only Geo + FM with the previously trained HYBRID coupling (lambda=.25). MOMENT is retired. The START model supports total N128..256; it is a separate identity from the explicit legacy N112 FM and JEdge5 profiles.
 
-Known triangles use time1; free triangles use sampled time t. The unchanged 50-step clamped Euler sampler preserves C in all51 states. The recipe remains a two-chair, N112, mixed K4/8/12 sandbox; there is no claim of industrial or new-object generalization. See the [baseline identity, complete training lineage and limits](docs/fm_baseline.md).
+See [START identity, sampling and retirement boundaries](docs/chair_start.md). Weights remain external to Git. The complete original START checkpoint is preserved locally, including saved AdamW/RNG state; inference does not resume training.
+
+```bash
+python -B -m native_t1 sample --condition /path/to/C.npy \
+  --num-faces 163 --seed 2452526625 --out native_t1/runs/chair_start_sample
+```
+
+C is FP32 known geometry in the trained coordinate scale; total N must be explicit. The sampler preserves C in all51 states of the original Euler50 dynamics. It does not take GT, add guidance, blend new noise or repair meshes. This rollback establishes the maintained baseline, not a claim of universal quality or watertightness.
+
+The older two-chair N112 training sandbox and optional JEdge5/surface losses remain available below. These are explicit legacy recipes, not an implicit continuation of START.
 
 ## Environment and assets
 
@@ -32,7 +41,7 @@ python -B -m native_t1 prepare \
 
 The [recipe](recipes/chair_n112.json) fixes two source objects, hashes, face indices and the original coordinate transform. Preparation preserves real faces and complements without padding or truncation. It needs no historical output. Data, weights, caches and generated artifacts are excluded from Git.
 
-## Train the FM baseline
+## Train the legacy N112 FM baseline
 
 With the local G0 cumulative2500 checkpoint, this explicit-budget command produces a pure-FM cumulative3000 endpoint:
 
@@ -65,11 +74,11 @@ python -B -m native_t1 train-edge5 \
 
 This shorthand selects `train --context-encoder geo --loss-recipe edge5`. Fixed gated/ramped coefficients are retained without recalibration. Use matched starting weights, saved stream and update budgets when comparing a new loss with FM. See [JEdge5's formula and mixed evidence](docs/jedge5.md). No sweep or candidate selection is automatic.
 
-All maintained recipes use the same `--loss-recipe` selector. See the [optional-loss interface and extension contract](docs/loss_recipes.md) for adding future candidates without changing the FM default or sampler.
+All maintained recipes use the same `--loss-recipe` selector. See the [optional-loss interface and extension contract](docs/loss_recipes.md) for adding future candidates without changing the FM training objective or legacy sampler.
 
 ## Sample from C only
 
-Without `--profile`, sampling uses `fm-geo` and the retained local L0 weight. Fresh clones provide their own trained checkpoint explicitly:
+Without `--profile`, sampling uses `chair-hybrid` and the retained START weight. The following command explicitly selects the legacy N112 L0 profile. Fresh clones provide their own trained checkpoint explicitly:
 
 ~~~bash
 python -B -m native_t1 sample --profile fm-geo \
@@ -81,7 +90,7 @@ python -B -m native_t1 sample --profile fm-geo \
 
 To select JEdge5 explicitly, use `sample --profile edge5` with its checkpoint. `fm-geo` accepts only pure-FM Geo identity; `edge5` accepts only the edge5 objective. `trained-geo` remains a generic explicit-checkpoint compatibility route.
 
-Standalone FP32 `[K,3,3]` or `[K,9]` NPY can replace NPZ; omit `--condition-key`. Coordinates must already use the trained scale. Total N112; supported K2/4/8/12, with K4/8/12 used in training. Invalid/degenerate known triangles are rejected.
+Standalone FP32 `[K,3,3]` or `[K,9]` NPY can replace NPZ; omit `--condition-key`. Coordinates must already use the trained scale. For the explicit legacy profiles only: total N112; supported K2/4/8/12, with K4/8/12 used in training. Invalid/degenerate known triangles are rejected.
 
 Inference reads only learned weights, C and noise. It receives no GT, source IDs or losses and performs no guidance, projection, welding or repair. `raw.npz` stores the output, all51 states and original Gaussian; `run.json` records identity, runtime, C preservation and call counts.
 
@@ -93,6 +102,6 @@ python -B -m unittest discover -s native_t1/tests -v
 
 `train`/`train-edge5 --check-only` with a new output directory performs one microbatch forward/backward and zero updates. It is an explicitly requested GPU check, not an import side effect. Help/imports start no training.
 
-`model.py`, `context_geometry.py` and `sampling.py` define the shared model and sampler. `training.py` retains FM; `objectives.py` and `losses/` hold optional training objectives. `geometry_checkpoint.py` validates recipe identity. Portable execution imports no historical `experiments/` package.
+`chair_model.py`, `chair_checkpoint.py` and `chair_sampling.py` define the default START route. `model.py`, `context_geometry.py` and `sampling.py` retain shared operations and legacy N112 behavior. `training.py` retains FM; `objectives.py` and `losses/` hold optional training objectives. `geometry_checkpoint.py` validates recipe identity. Portable execution imports no historical `experiments/` package.
 
 Known-coordinate preservation does not guarantee seam connectivity or watertightness. Full historical collision/topology audits are separate from portable lightweight metrics; unexecuted audits remain `NOT_RUN`. See [dependencies and checkpoint boundaries](DEPENDENCIES.md). Failed-candidate source is archived locally with its evidence, not part of the main training path.

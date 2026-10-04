@@ -12,7 +12,7 @@ Strict repeatability refers to the same operation order. BF16 face reordering ca
 
 ## Model and assets
 
-The official config is `configs/snet/base-120m-ot-v-chair.yaml`: v3, width 768, 12 layers, 12 heads, coordinate embedding pe_freq20, RMSNorm/QK normalization. Its architecture max length is 800; this task uses real N=112. Native command settings, not upstream optimizer defaults, define training.
+The official config is `configs/snet/base-120m-ot-v-chair.yaml`: v3, width 768, 12 layers, 12 heads, coordinate embedding pe_freq20, RMSNorm/QK normalization. Its architecture max length is 800; START uses real N128..256; the legacy sandbox uses N112. Native command settings, not upstream optimizer defaults, define training.
 
 The loader checks the UTF-8/LF-normalized config SHA256, preserving identity across Windows CRLF and Linux LF:
 
@@ -34,6 +34,7 @@ The geo encoder adds 149,888 parameters. Its features use only C: centroid, sort
 
 | Schema or asset | Meaning |
 | --- | --- |
+| `chair_hybrid_coupling_checkpoint_v1` | Exact retained START; variable N128..256, original full recovery state; inference-only public loader |
 | Official chair EMA | External initialization before native fine-tuning |
 | `native_t1_training_v1` | Pure native FM model |
 | `native_t1_geo_training_v1` | Native model with the geo encoder and FM training |
@@ -47,7 +48,7 @@ The local G0 starting copy is `native_t1/checkpoints/tgeo_g0_cumulative2500.pt`,
 
 `--init-t1 --context-encoder geo` attaches a new zero-exit geo branch. `--init-geo` restores the learned branch without reinitialization. `--encoder-seed` is only for creating a new branch. All model parameters train, with modules in eval mode; loaders otherwise return frozen FP32 models.
 
-Every invocation constructs fresh AdamW. `--continue-stream` restores only saved input RNG, requires the same prepared archive and excludes `--seed`. Saved optimizer momentum is never implicitly resumed. An exported checkpoint that strips optimizer state can therefore still support this continuation.
+Every invocation of the legacy N112 trainer constructs fresh AdamW. `--continue-stream` restores only saved input RNG, requires the same prepared archive and excludes `--seed`. Saved optimizer momentum is never implicitly resumed. An exported checkpoint that strips optimizer state can therefore still support this continuation.
 
 
 ## Local compact checkpoint index
@@ -60,21 +61,21 @@ These retained local exports are outside Git. The export audit verified identica
 | `native_t1/checkpoints/ablations/fm_cumulative3000.pt` | 521689571 | `0f22ce498ca2c27dc74b43890fb8aad20f0f3e7153aa74ee6d3c14ea445a2660` |
 | `native_t1/checkpoints/ablations/surface_cumulative3000.pt` | 521691211 | `93546de419582302e70cf140dae3aa44aad9ab913bd11b394482a8c347203999` |
 
-The FM baseline uses the pure-FM geo schema; surface and JEdge5 use the explicit objective schema. The edge5 sample profile requires an edge5 objective checkpoint and rejects the FM or surface ablations. The default `fm-geo` profile requires pure FM and rejects auxiliary-objective checkpoints. Generic explicit ablations can use `sample --profile trained-geo --checkpoint PATH`.
+The FM baseline uses the pure-FM geo schema; surface and JEdge5 use the explicit objective schema. The edge5 sample profile requires an edge5 objective checkpoint and rejects the FM or surface ablations. The explicit legacy `fm-geo` profile requires pure FM and rejects auxiliary-objective checkpoints. Generic explicit ablations can use `sample --profile trained-geo --checkpoint PATH`.
 
 ## Supervision and inference boundary
 
-The prepared [two-object recipe](recipes/chair_n112.json) contains source identities and hashes, fixed face indices and preprocessing metadata, not model tensors or geometry arrays. Preparation reconstructs data from separately obtained official source files. Training is restricted to these two parents and mixed K4/8/12.
+The prepared [two-object recipe](recipes/chair_n112.json) contains source identities and hashes, fixed face indices and preprocessing metadata, not model tensors or geometry arrays. Preparation reconstructs data from separately obtained official source files. The legacy N112 public trainer is restricted to these two parents and mixed K4/8/12; this is not the START training lineage.
 
 Training-only source identities identify true GT known/free interface edges and corresponding free corners after input permutations. Free targets and fixed GT bbox scales define supervision. These labels do not enter the generator or sampling API. Geometry losses supervise the endpoint estimate from the existing velocity forward; they do not run a second model or project generated coordinates.
 
-Inference needs only model weights, FP32 C and a noise seed. Its N112/50-step definition is identical for the `fm`, `surface` and `edge5` recipes. Auxiliary objectives add no inference modules.
+Inference needs model weights, FP32 C and a noise seed; START additionally requires explicit total N128..256. The legacy N112/50-step definition is identical for the `fm`, `surface` and `edge5` recipes. Auxiliary objectives add no inference modules.
 
 ## Evaluation, compatibility and excluded files
 
 Portable metrics cover surface/boundary distances, coverage, triangle shape and nonfinite values. Full CF/FF collision and exact topology audits remain `NOT_RUN` unless independently executed. Fixed C coordinates do not imply shared seam indices, connected topology or watertightness.
 
-The local sampling default is `fm-geo`; `edge5` is explicit and optional. Fresh clones provide their own `--checkpoint`; no local weight or old result directory is downloaded automatically. Historical pure profiles and the earlier T_geo pilot note are compatibility/provenance references, not prerequisites for the main workflow.
+The local sampling default is `chair-hybrid`, pinned to the retained START file and model state; see [START](docs/chair_start.md). `fm-geo` and `edge5` remain explicit legacy N112 profiles. Fresh clones provide their own `--checkpoint`; no local weight or old result directory is downloaded automatically. Historical pure profiles and the earlier T_geo pilot note are compatibility/provenance references, not prerequisites for the main workflow.
 
 Published material consists of source, small CPU tests, documentation and the metadata-only recipe. Weights, datasets, prepared arrays, generated outputs, figures, caches and local validation records are excluded. Local cleanup may remove temporary checkpoints; its maintenance index records retained identities and removals separately. That index is optional local provenance and is not an input to training, loading or sampling.
 

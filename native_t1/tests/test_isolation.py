@@ -86,7 +86,7 @@ def inspect_source(text: str, filename: str) -> list[str]:
 
 def _sources():
     return sorted(path for path in PACKAGE.rglob("*.py")
-                  if not ({"tests", "runs", "validation", "maintenance", "checkpoints", "data", "__pycache__"}
+                  if not ({"tests", "runs", "validation", "maintenance", "reviews", "analysis", "checkpoints", "data", "__pycache__"}
                           & set(path.relative_to(PACKAGE).parts)))
 
 

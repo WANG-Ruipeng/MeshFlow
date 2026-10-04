@@ -74,16 +74,16 @@ class BaselineTests(unittest.TestCase):
         self.assertEqual(signature.parameters['config_path'].default,checkpoint.DEFAULT_CONFIG)
         self.assertNotEqual(checkpoint.DEFAULT_CHECKPOINT,baseline.BASELINE_CHECKPOINT)
 
-    def test_sample_defaults_to_fm_geo_and_keeps_historical_pins(self):
+    def test_sample_defaults_to_chair_start_and_keeps_historical_pins(self):
         args = self.parse_sample()
-        self.assertEqual(args.profile,'fm-geo')
+        self.assertEqual(args.profile,'chair-hybrid')
         self.assertIsNone(args.checkpoint)
         loader, path = self.resolve(args)
-        from native_t1.working_model import load_fm_geo, DEFAULT_WORKING_CHECKPOINT, FM_GEO_CHECKPOINT
-        self.assertIs(loader,load_fm_geo)
+        from native_t1.working_model import load_chair_start, DEFAULT_WORKING_CHECKPOINT, CHAIR_START_CHECKPOINT
+        self.assertIs(loader,load_chair_start)
         self.assertEqual(path,DEFAULT_WORKING_CHECKPOINT)
-        self.assertEqual(path,FM_GEO_CHECKPOINT)
-        self.assertEqual(path,checkpoint.REPO/'native_t1/checkpoints/ablations/fm_cumulative3000.pt')
+        self.assertEqual(path,CHAIR_START_CHECKPOINT)
+        self.assertEqual(path,checkpoint.REPO/'native_t1/checkpoints/chair_hybrid_start_total5000.pt')
         self.assertEqual(baseline.BASELINE_FILE_SHA256,
                          'd8366d8c172407ec97ee4288143863825fae583d2c879d200f3862315747e400')
         self.assertEqual(baseline.BASELINE_STATE_SHA256,

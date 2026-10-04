@@ -149,7 +149,7 @@ The completed pilot compared five fixed models on two already observed objects, 
 
 These averages have costs. Compared with the combined L3+L5 control, JEdge5 improved macro RMS and FF counts but reduced Gamma coverage. Its P0 patch2 coverage worsened, and one output had a large triangle-shape tail. P1 patch2 accounted for about 97.8% of the net Gamma improvement over that combined control. Surface-only retained a lower average FF count than JEdge5. That original pilot did not contain a D_edge-only arm; the later fixed four-cell check below fills that cell.
 
-Exact known/free shared edges and vertices remained zero in audited outputs. JEdge5 is geometry supervision, not demonstrated connectivity or watertightness repair. The current default is pure FM T1+Geo; JEdge5 and surface-only remain explicit comparison recipes.
+Exact known/free shared edges and vertices remained zero in audited outputs. JEdge5 is geometry supervision, not demonstrated connectivity or watertightness repair. The current sampling default is [Chair HYBRID START](chair_start.md); JEdge5 and surface-only remain explicit N112 comparison recipes.
 
 The historical seven-loss screen is not a public training entry point. Local archives and a cleanup maintenance index may retain provenance after temporary checkpoints are deleted; no historical result JSON, maintenance index or removed checkpoint is required by the commands above. This code/documentation cleanup performs no new training, sampling or performance experiment.
 
