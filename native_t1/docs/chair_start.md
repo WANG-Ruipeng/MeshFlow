@@ -40,3 +40,13 @@ The MOMENT V2 experiment and its finite-surface precursors are retired from acti
 The fixed V2 comparison did not support promoting MOMENT: primary MSE increased2.96% versus equal-budget H_CONT, only3/8 validation parents improved, and validation correct-target columns remained9/24. This is one limited-budget training stream, not a universal impossibility result. The chosen START has its own geometry/control limitations; exact known-coordinate preservation does not imply correct target selection, seam connectivity or watertightness.
 
 Retirement validation consists of strict CPU loading of the retained real checkpoint, exact model-forward AST comparison with its original implementation, frozen-bank Gaussian identity checks, pure-tensor Euler expression checks, CLI/identity rejection tests and the public CPU suite. No new real-model forward, training or generation is part of the rollback. New GPU repeatability claims require a separately authorized run.
+
+## Feedback and CAPPED retirement (2026-10-07)
+
+The feedback exploration, CAPPED replication/gradient-budget and half-weight experiments did not establish a reliable replacement for START. The maintained default remains the exact original total5000 checkpoint above; no feedback or interpolated checkpoint is selected by the portable sampler.
+
+The 22 local experimental checkpoints and 16,000 derived OT cache NPZ files were removed at the user's request. RAW meshes, frozen conditions/noises/queries, feedback pools, per-output scores, reports, visual comparisons, source evidence and review archives remain local. OT attempt logs and training plans are retained. Historical reports describe the files present when those experiments ran; their old resume and sampling commands no longer imply that the removed checkpoints are available. Missing retired assets must not trigger automatic training or regeneration.
+
+The cleanup record is `native_t1/maintenance/capped_retirement_20261007/CLEANUP_REPORT.md` in the original workspace. It is local evidence, outside the portable code package. START's original full checkpoint and its canonical hard link remain intact; official assets and other explicitly retained legacy profiles were outside this cleanup.
+
+Git tracks the START implementation, tests, configuration and the small checkpoint identity manifest. It excludes weights, local datasets, RAW outputs, experiment runs and maintenance archives. A fresh clone needs the exact START weight supplied separately at the canonical path or through `--checkpoint`; the official unconditional EMA is not a substitute for this named profile. Checkpoint exclusion is enforced by the repository's weight-file patterns and `native_t1/.gitignore`.

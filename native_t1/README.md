@@ -4,6 +4,8 @@ The maintained sampling default is **Chair HYBRID START**, the original OT_HYBRI
 
 See [START identity, sampling and retirement boundaries](docs/chair_start.md). Weights remain external to Git. The complete original START checkpoint is preserved locally, including saved AdamW/RNG state; inference does not resume training.
 
+As of 2026-10-07, START remains the maintained baseline after the feedback, CAPPED replication and half-weight experiments. Their weights and derived training caches are retired; local RAW outputs and evaluation evidence remain available. See [the current maintenance boundary](docs/chair_start.md#feedback-and-capped-retirement-2026-10-07).
+
 ```bash
 python -B -m native_t1 sample --condition /path/to/C.npy \
   --num-faces 163 --seed 2452526625 --out native_t1/runs/chair_start_sample
