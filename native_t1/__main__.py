@@ -1,13 +1,16 @@
 """Explicit sample/verify commands; importing this module does not run a model."""
-from .runtime import configure_stable_runtime
 import argparse
 import sys
 from pathlib import Path
 import numpy as np
-from .artifacts import atomic_json, file_sha256, state_sha256
-from .checkpoint import DEFAULT_CHECKPOINT, DEFAULT_CONFIG, load_t1
-from .baseline import BASELINE_CHECKPOINT, load_baseline
-from .sampling import make_noise, clamped_sample, new_counts
+
+
+DEFAULT_CONFIG = Path(__file__).resolve().parents[1] / "configs/snet/base-120m-ot-v-chair.yaml"
+
+
+def configure_stable_runtime():
+    from .runtime import configure_stable_runtime as configure
+    return configure()
 
 
 def build_parser():
@@ -30,6 +33,7 @@ def build_parser():
     commands.add_parser("prepare", add_help=False, help="Prepare the registered task from external official data")
     commands.add_parser("train-edge5", add_help=False, help="Optional JEdge5 training recipe, explicit budget or zero-update preflight")
     commands.add_parser("train", add_help=False, help="FM baseline or optional loss training with an explicit update budget or zero-update preflight")
+    commands.add_parser("postprocess", add_help=False, help="CPU-only C-preserving cleanup of an existing RAW; no model needed")
     return parser
 
 
@@ -44,8 +48,10 @@ def resolve_profile(args):
         from .working_model import load_edge5, EDGE5_CHECKPOINT
         return load_edge5, args.checkpoint or EDGE5_CHECKPOINT
     if args.profile == "a-continue":
+        from .baseline import load_baseline, BASELINE_CHECKPOINT
         return load_baseline, args.checkpoint or BASELINE_CHECKPOINT
     if args.profile == "original-t1":
+        from .checkpoint import load_t1, DEFAULT_CHECKPOINT
         return load_t1, args.checkpoint or DEFAULT_CHECKPOINT
     if args.profile == "trained":
         if args.checkpoint is None:
@@ -86,6 +92,9 @@ def validate_sample_condition(C, profile, num_faces=None):
 
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == "postprocess":
+        from .postprocess_cli import main as postprocess_main
+        return postprocess_main(argv[1:])
     if argv and argv[0] == "prepare":
         from .prepare import main as prepare_main
         return prepare_main(argv[1:])
@@ -115,6 +124,8 @@ def main(argv=None):
     else:
         C = value
     N = validate_sample_condition(C, args.profile, args.num_faces)
+    from .artifacts import atomic_json, file_sha256, state_sha256
+    from .sampling import make_noise, clamped_sample, new_counts
     args.out.mkdir(parents=True)
     report = dict(status="RUNNING", profile=args.profile, seed=args.seed, condition_file=str(args.condition.resolve()),
                   condition_key=args.condition_key, total_faces=N,
@@ -147,4 +158,6 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    main()
+    exit_code = main()
+    if type(exit_code) is int:
+        raise SystemExit(exit_code)

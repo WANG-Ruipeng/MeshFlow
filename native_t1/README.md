@@ -15,6 +15,17 @@ C is FP32 known geometry in the trained coordinate scale; total N must be explic
 
 The older two-chair N112 training sandbox and optional JEdge5/surface losses remain available below. These are explicit legacy recipes, not an implicit continuation of START.
 
+## Optional postprocessing of saved RAW
+
+An explicit CPU command applies the C-preserving GEO_C cleanup from the retained START comparison:
+
+```bash
+python -B -m native_t1 postprocess --input native_t1/runs/chair_start_sample/raw.npz \
+  --known-faces 32 --out native_t1/runs/chair_start_post
+```
+
+Use the actual number of known faces for `--known-faces`; the first K triangles must be C. Input is FP32 in the trained coordinate scale. The command writes separate `post.npz`, indexed `post.ply` and `postprocess.json` with source mappings, deletion reasons and readback checks. It needs only NumPy and no model weights; default sampling continues to output RAW. See [the fixed algorithm, limits and evidence](docs/postprocessing.md).
+
 ## Environment and assets
 
 Run from the repository root on Linux or WSL with Python3.10 and a CUDA GPU supporting BF16. The tested environment uses PyTorch2.7.1+cu128:

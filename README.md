@@ -1,4 +1,4 @@
-> **Native completion extension:** Native T1 + T_geo with the original FM objective is the baseline; JEdge5 is an optional training-loss recipe. Portable code and official-asset training instructions: [native_t1/README.md](native_t1/README.md). No weights, datasets or generated outputs are bundled.
+> **Native completion extension:** Chair HYBRID START is the maintained sampling baseline; legacy FM/JEdge5 profiles remain explicit. Portable code: [native_t1/README.md](native_t1/README.md). Optional [C-preserving CPU postprocessing](native_t1/docs/postprocessing.md) operates on saved RAW. No weights, datasets or generated outputs are bundled.
 
 <div align="center">
 <h2>MeshFlow: Mesh Generation with Equivariant Flow Matching</h2>

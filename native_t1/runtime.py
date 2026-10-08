@@ -10,15 +10,9 @@ from __future__ import annotations
 import os
 import sys
 
-_CUBLAS_CONFIG = ":4096:8"
-_existing_torch = sys.modules.get("torch")
-_existing_config = os.environ.get("CUBLAS_WORKSPACE_CONFIG")
-if _existing_config not in (None, _CUBLAS_CONFIG):
-    raise RuntimeError("Stable execution requires CUBLAS_WORKSPACE_CONFIG=:4096:8; conflicting value found")
-if (_existing_config is None and _existing_torch is not None
-        and _existing_torch.cuda.is_initialized()):
-    raise RuntimeError("Import stable_runtime before CUDA initialization; CUBLAS configuration was absent")
-os.environ["CUBLAS_WORKSPACE_CONFIG"] = _CUBLAS_CONFIG
+from ._runtime_environment import CUBLAS_CONFIG as _CUBLAS_CONFIG, ensure_cublas_environment
+
+ensure_cublas_environment()
 
 from contextlib import contextmanager
 from contextvars import ContextVar

@@ -80,3 +80,8 @@ The local sampling default is `chair-hybrid`, pinned to the retained START file 
 Published material consists of source, small CPU tests, documentation and the metadata-only recipe. Weights, datasets, prepared arrays, generated outputs, figures, caches and local validation records are excluded. Local cleanup may remove temporary checkpoints; its maintenance index records retained identities and removals separately. That index is optional local provenance and is not an input to training, loading or sampling.
 
 The compact historical Edge-only endpoint is `native_t1/checkpoints/ablations/edge_only_cumulative3000.pt` (521710363 bytes, file SHA256 `61d09ce272d2b677ed0ae045e81e8a0c6229cbf77b08de0a612e4a76ff10015f`). Its experimental schema is intentionally not accepted by the public loader. Recover its exact historical loader from the local maintenance source ZIP if needed; it is not required for FM or JEdge5 execution.
+
+
+## CPU-only saved-mesh postprocessing
+
+The explicit `postprocess` command depends on NumPy and the Python standard library only. It uses no checkpoint, backbone import, historical experiment, private scoring asset or PyTorch runtime. The package sets the same pre-CUDA environment guard without importing Torch; model entrypoints still configure the original strict runtime. See [postprocessing](docs/postprocessing.md) for the fixed scale, C contract and output provenance.
