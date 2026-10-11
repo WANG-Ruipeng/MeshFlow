@@ -1,3 +1,5 @@
+> **Conditional denoising and source-preserving export:** The R2 package now provides [single-step D0, optional RBF and fixed-C winding export](r2/docs/denoising.md). [Verified research results and per-output evidence](r2/docs/research_results.md) include both gains and remaining failures. No checkpoints or raw meshes are bundled.
+
 > **R2 condition-training recipe:** Full-course C20/C40 mixing + HYBRID FM now has a separate [r2/](r2/README.md) source entry. See the [training directory map](r2/docs/training_structure.md) for the distinction between original unconditional training, legacy N112 training, START sampling and R2. Weights and frozen data remain external.
 
 > **Native completion extension:** Chair HYBRID START is the maintained sampling baseline; legacy FM/JEdge5 profiles remain explicit. Portable code: [native_t1/README.md](native_t1/README.md). Optional [C-preserving CPU postprocessing](native_t1/docs/postprocessing.md) operates on saved RAW. No weights, datasets or generated outputs are bundled.

@@ -14,3 +14,15 @@ Only necessary components are migrated. Historical models, data and artifacts ar
 
 Runtime dependencies retain their own licenses. Weights and datasets must be provided separately;
 their distribution is not authorized by this code license.
+
+## Portable official D0 decoder
+
+The new `denoiser_models` package traces its architecture to qiisun/MeshFlow commit
+`db86bc32423c316c00bcc2f645a26243e8010f20`. See
+[`PROVENANCE.md`](src/meshflow_control/denoiser_models/PROVENANCE.md), the packaged
+source manifest and `LICENSE_MeshFlow` for precise provenance and the later
+upstream MIT license source. Standard RMSNorm, sinusoidal embeddings and the
+math-SDPA wrapper are independently implemented here; the legacy Llama and NVIDIA
+utility implementations are not vendored into this denoiser package. This does
+not change the separate historical backbone notice above. Official checkpoints
+are external and are not redistributed.

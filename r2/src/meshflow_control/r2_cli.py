@@ -30,6 +30,31 @@ def build_parser():
     p.add_argument("--num-faces", required=True, type=int)
     p.add_argument("--seed", required=True, type=int)
     p.add_argument("--out", required=True)
+    p = sub.add_parser("prepare-condition", help="Capture user C source order before canonicalization; CPU only")
+    p.add_argument("--input", required=True)
+    p.add_argument("--input-key", default="C", help="Use indexed for NPZ vertices/faces")
+    p.add_argument("--vertex-ids-key")
+    p.add_argument("--permutation-key")
+    p.add_argument("--face-ids-key")
+    p.add_argument("--out", required=True)
+    p = sub.add_parser("orient", help="Restore source C and orient free in an existing GEO_C NPZ; no model/GEO")
+    p.add_argument("--input", required=True)
+    p.add_argument("--condition", required=True)
+    p.add_argument("--out", required=True)
+    p = sub.add_parser("denoise", help="One official D0 (or verified cached proposal), GEO_C and source-oriented export")
+    p.add_argument("--input", required=True)
+    p.add_argument("--input-key", default="raw")
+    p.add_argument("--known-faces", required=True, type=int)
+    p.add_argument("--condition")
+    group = p.add_mutually_exclusive_group(required=True)
+    group.add_argument("--checkpoint")
+    group.add_argument("--proposal")
+    p.add_argument("--proposal-receipt")
+    p.add_argument("--coordination", choices=("none", "rbf"), default="none")
+    p.add_argument("--reference-length", type=float)
+    p.add_argument("--winding", choices=("source", "canonical"), default="source")
+    p.add_argument("--resume", action="store_true")
+    p.add_argument("--out", required=True)
     return parser
 
 
@@ -43,6 +68,10 @@ def main(argv=None):
         from .r2_checkpoints import inspect_checkpoint
         args["path"] = args.pop("checkpoint")
         result = inspect_checkpoint(**args)
+    elif command in {"prepare-condition", "orient", "denoise"}:
+        from . import denoise
+        function = {"prepare-condition": denoise.prepare_condition, "orient": denoise.orient, "denoise": denoise.run}[command]
+        result = function(**args)
     elif command == "sample":
         from .r2_sampling import run
         result = run(**args)
