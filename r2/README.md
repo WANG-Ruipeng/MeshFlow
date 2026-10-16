@@ -4,6 +4,8 @@ R2 是从官方 Chair EMA 权重开始的条件后训练配方：**Native/T1 + r
 
 这是现有 MeshFlow 仓库中的独立源码目录，权重、数据和运行产物保留在仓库外。旧 `native_t1` 的 START 默认采样入口继续保留。
 
+- [SEAM_SLOT 共享原边候选：核心代码、训练路径与当前边界](docs/seam_slot.md)
+- [SEAM 实际接续收益、FF/I 代价与全部 16 张配对图](docs/seam_slot_results.md)
 - [单步 D0、可选 RBF 与来源方向导出](docs/denoising.md)
 - [当前路线的正结果及代价（含逐例 CSV）](docs/research_results.md)
 - [去噪迁移与独立安装验证](docs/denoise_validation.md)

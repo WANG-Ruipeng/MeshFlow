@@ -1,3 +1,5 @@
+> **SEAM_SLOT research candidate:** [Shared-edge conditional generation](r2/docs/seam_slot.md) now includes an installable mechanism core, the executed training/sampling source, and [per-output results with all 16 paired figures](r2/docs/seam_slot_results.md). The four-condition pilot improves attachment, while FF/I costs remain. This does not replace the maintained default; weights and raw meshes remain external.
+
 > **Conditional denoising and source-preserving export:** The R2 package now provides [single-step D0, optional RBF and fixed-C winding export](r2/docs/denoising.md). [Verified research results and per-output evidence](r2/docs/research_results.md) include both gains and remaining failures. No checkpoints or raw meshes are bundled.
 
 > **R2 condition-training recipe:** Full-course C20/C40 mixing + HYBRID FM now has a separate [r2/](r2/README.md) source entry. See the [training directory map](r2/docs/training_structure.md) for the distinction between original unconditional training, legacy N112 training, START sampling and R2. Weights and frozen data remain external.

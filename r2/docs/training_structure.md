@@ -1,4 +1,14 @@
-# MeshFlow 仓库的三条路径
+# MeshFlow 仓库的训练路径
+
+## SEAM_SLOT 研究候选（2026-10-17）
+
+[SEAM 说明](seam_slot.md)中的可安装核心位于 `src/meshflow_control/seam/`；已执行的固定 200 步实验入口位于 `pilots/seam_slot_c200_v1/`，原型与原始计算定义位于 `prototypes/seam_slot_c200_v1/`。这些入口不改变下述原版、START 或 R2 CLI。
+
+SEAM 的 `train.py` 从 FULL_S6000 的 live 生成器、匹配 AdamW/RNG 出发（累计 12000 步），与 `FULL4_C200` 对照各续训 200 步。它增加独立占用头与逐角 known/free 的共享边表示：生成器仍以自由角 FM 更新，头以独立 BCE/AdamW 更新。训练的来源占用与推理的 C-only 预测占用分开记录。该四条件实验保留本地冻结资产和路径校验，不是一个任意数据集的通用训练入口。
+
+`generate.py` 执行最终权重的 Euler50；`postprocess.py` 执行一次官方 D0、恢复 C 和 seam 锚角、原 GEO_C 与来源方向导出。实际评估源码以原字节保存在 `research/seam_slot_c200_v1/scoring_source/`，完整来源清单说明其历史外部依赖。旧实验源码保持不变；新安装核心与旧核心的 SHA256 对应关系可核验。
+
+实际接续与视觉正信号和 FF/I 代价见[结果](seam_slot_results.md)。权重、来源数据与 RAW/POST 网格不随 Git 发布。
 
 ## 目录与职责
 
