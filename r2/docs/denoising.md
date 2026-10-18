@@ -116,3 +116,17 @@ RBF 是显式候选，不是默认质量改进开关。旧面板上有 3/12 输�
 需要旧规范化合同的调用方必须显式使用 `--winding canonical`；该选项不宣称恢复原输入方向。不同合同的输出分别保存，不能覆盖旧结果。
 
 [迁移与安装验证](denoise_validation.md)记录真实验证范围；[几何来源](denoise_geometry_provenance.json)与[模型来源](../src/meshflow_control/denoiser_models/PROVENANCE.md)记录实际实现与许可出处。
+
+## 可选的 HINGE 与 HINGE V2 研究后处理
+
+SEAM 研究输出另有两份独立 CPU 归档，处理位置在单次 D0、GEO_C 和来源定向导出之后：
+
+```text
+已保存来源定向 POST → HINGE_OPP015 → 可选 ALPHA → 可选三边环 HOLE
+```
+
+[HINGE_OPP015](../research/hinge_opposite_v1/README.md)使用1.5%L累计位移门限合并自由簇，要求全部新增双面共边反向。[HINGE V2](../research/hinge_v2_cpu_v1/README.md)在同一门限下增加有限位置选择，并可为实际索引围成的合格三边环补一张明确标记的BRIDGE面；C与原面来源身份受到保护。两者都有实际实现、数组入口、源码hash、逐输出指标和固定截面图。
+
+V2相对HINGE的28份配对结果中，固定原面分母FF为13.49022%→13.04628%，合法共边增加111条，I增加0.012207个百分点；DEV的原BULK可达≥30%仍为0/12。它是局部改善的后处理候选，不能描述为全面无退化或普遍接通。完整代价和不同分母见归档。
+
+这些入口要求原GEO簇、来源角点、SEAM锚点和评分缓存等身份元数据，不能直接用于任意PLY。本节仅提供已验证研究流程的导航；`meshflow-r2 denoise`的默认行为不变，也不会自动执行HINGE、补面或重新调用模型。
