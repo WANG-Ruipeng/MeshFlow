@@ -1,0 +1,1 @@
+三轴交集仅为既有实际AI_PROXY标签的描述性联合计数：REASONABLE且PLAUSIBLE且PRESENT；不是新冻结主指标，不认证无碎片、无折层、无相交或拓扑接续。五轴原标签、UNKNOWN/UNCERTAIN和逐项备注完整保留。没有从数值分数产生标签。

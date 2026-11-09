@@ -1,0 +1,1139 @@
+--- r2/pilots/full_seat_learning_curve_v1/train.py
++++ r2/pilots/full_contour_readout_v1/train.py
+@@ -1,6 +1,6 @@
+-"""Frozen EXP67 -> FULL_SEAT continuation, with detached interface diagnostics.
+-
+-Only the original world-coordinate Native/T1+role+Geo FM is differentiated.
++"""Paired EXP67 -> source-contour readout continuation, with original FM diagnostics.
++
++The full world-coordinate generator and new contour branch receive the original FM.
+ This module never dispatches itself: the root controller owns resource checks,
+ cleanup completion and interleaved evaluation at fixed 0/1000/3000/6000 steps.
+ """
+@@ -21,9 +21,11 @@
+ import torch
+ from meshflow_control.config import MODEL_CONFIG
+ from meshflow_control.models.native import build_model,native_execution
++from .model import build_candidate
++from .topology import TopologyInputs
+ from meshflow_control.checkpoints import state_hash,rng_state,restore_rng
+ from meshflow_control.training import schedule40 as base
+-from meshflow_control.training.context_checkpoint import _cpu_copy,_check_generator
++from meshflow_control.training.context_checkpoint import _cpu_copy,_check_generator as _check_old_generator
+ from meshflow_control.training.losses import masked_fm_loss
+ from meshflow_control.data.dataset import collate,model_inputs,training_time
+ from meshflow_control.data.io import read_json,atomic_json,freeze_json,append_event,digest,save_npz,json_hash,array_hash
+@@ -34,7 +36,7 @@
+ BASE_STEP=6000
+ UPDATES=6000
+ FIXED=(1000,3000,6000)
+-SCHEMA='r2_full_seat_learning_curve_training_v1'
++SCHEMA='r2_full_contour_readout_training_v1'
+ 
+ 
+ def seed(*parts):
+@@ -48,6 +50,8 @@
+     if r.get('source_global_step',BASE_STEP)!=BASE_STEP:raise ValueError('EXP67 step6000 required')
+     if digest(C.resolve(r['source_data']))!=r['source_data_sha256']:raise ValueError('Source dataset changed')
+     if digest(C.resolve(r['interface_manifest_path']))!=r['interface_manifest_sha256']:raise ValueError('Interface label manifest changed')
++    for path_key,hash_key in (('replay_exposure_path','replay_exposure_sha256'),('topology_manifest_path','topology_manifest_sha256'),('baseline_registration_path','baseline_registration_sha256')):
++        if digest(C.resolve(r[path_key]))!=r[hash_key]:raise ValueError('Frozen replay/topology asset changed: '+path_key)
+     bins=np.asarray(r['diagnostic_time_bin_edges'],np.float64)
+     if bins.ndim!=1 or len(bins)<2 or bins[0]!=0 or bins[-1]!=1 or np.any(np.diff(bins)<=0):raise ValueError('Invalid frozen time bins')
+     for path,expected in r.get('training_code_hashes',{}).items():
+@@ -109,59 +113,62 @@
+ 
+ 
+ def prepare_plan():
+-    reg=registration();d=olddata.Dataset(C.resolve(reg['source_data']));tasks=sorted(reg['train_task_ids'])
+-    if len(tasks)!=len(set(tasks)) or len(tasks)<8:raise ValueError('At least eight distinct frozen FULL tasks required')
+-    by={}
+-    masks=InterfaceMasks(reg,d)
+-    for tid in tasks:
+-        t=d.tasks[tid]
+-        if t['condition_type']!='SEAT_FULL' or t['K']<2:raise ValueError('Only K>=2 SEAT_FULL tasks')
+-        if t['uid'] in by:raise ValueError('This arm requires exactly one FULL condition per parent')
+-        d.verify_condition(tid);masks.source(tid);by[t['uid']]=tid
+-    parents=sorted(by);counts=Counter({u:0 for u in parents});prng=np.random.RandomState(seed('parent_balance'));rows=[]
+-    for b in range(UPDATES):
+-        shuffle=prng.permutation(len(parents));picked=sorted(shuffle,key=lambda j:counts[parents[int(j)]])[:8]
+-        arng=np.random.RandomState(seed('augmentation',b));alpha=np.r_[np.ones(4,np.float32),arng.uniform(.9,1.1,4).astype(np.float32)];alpha=alpha[arng.permutation(8)]
+-        if np.count_nonzero(alpha==1)!=4:raise ValueError('Ambiguous augmentation; no redraw')
+-        for slot,j in enumerate(picked):
+-            uid=parents[int(j)];tid=by[uid];t=d.tasks[tid];counts[uid]+=1;i=b*8+slot;ts=seed('time',i)
+-            rows.append(dict(sample_index=i,effective_batch_index=b,step=b+1,global_step=BASE_STEP+b+1,slot_index=slot,
+-                             arm=ARM,uid=uid,task_id=tid,N=t['N'],K=t['K'],ratio=t['K']/t['N'],alpha=float(alpha[slot]),
+-                             t_seed=ts,t=float(training_time(ts)),gaussian_seed=seed('gaussian',i),epsilon_seed=seed('epsilon',i),
+-                             permutation_seed=seed('permutation',i),condition_type='SEAT_FULL',region_type='seat'))
+-    if max(counts.values())-min(counts.values())>1:raise ValueError('Parent exposure imbalance')
+-    plan=dict(schema='r2_full_seat_training_plan_v1',arm=ARM,records=rows,parent_counts=dict(counts),
+-              condition_counts=dict(Counter(r['task_id'] for r in rows)),registration_sha256=digest(C.OUT/'registration.json'),
+-              interface_manifest_sha256=reg['interface_manifest_sha256'],source_data_sha256=reg['source_data_sha256'],
+-              updates=UPDATES,samples=len(rows),free_coordinate_count=sum(9*(r['N']-r['K']) for r in rows),
+-              semantics='Balanced distinct parents; one fixed coherent FULL condition per parent; original R2 noise/time/width distributions')
+-    freeze_json(C.checked(C.OUT/'plans'/f'{ARM}.json'),plan)
+-    return dict(status='PASS',plan_path=str(C.OUT/'plans'/f'{ARM}.json'),plan_sha256=digest(C.OUT/'plans'/f'{ARM}.json'),
+-                parents=len(parents),samples=len(rows),updates=UPDATES,model_calls=0)
+-
+-
+-def batch(d,masks,records,index,plan_sha):
+-    folder=C.checked(C.OUT/'ot'/ARM);folder.mkdir(parents=True,exist_ok=True);path=folder/f'{index:05d}.npz'
+-    key=json_hash(records);receipt=path.with_suffix('.json');attempt=path.with_suffix('.attempt.json')
+-    identity=dict(records_sha256=key,plan_sha256=plan_sha,batch_index=index)
+-    if receipt.exists():
+-        r=read_json(receipt)
+-        if r['identity']!=identity or r['sha256']!=digest(path):raise ValueError('OT cache changed')
+-        with np.load(path,allow_pickle=False) as z:maps={k:z[k].copy() for k in z.files}
+-    else:
+-        if attempt.exists() or path.exists():raise RuntimeError('Incomplete OT attempt; explicit repair required')
+-        freeze_json(attempt,dict(identity=identity,unix=time.time()));maps=None
++    raise RuntimeError('Plan regeneration forbidden; reuse original frozen bytes')
++
++
++def batch(d,masks,records,index,plan_sha,topology,expected_exposures):
++    folder=C.BASELINE/'ot'/'FULL_SEAT';path=folder/f'{index:05d}.npz'
++    receipt=path.with_suffix('.json')
++    if not path.is_file() or not receipt.is_file():raise RuntimeError('Missing original OT cache; no recomputation')
++    identity=dict(records_sha256=json_hash(records),plan_sha256=plan_sha,batch_index=index)
++    r=read_json(receipt)
++    if r['identity']!=identity or r['sha256']!=digest(path):raise ValueError('Read-only original OT cache changed')
++    with np.load(path,allow_pickle=False) as z:maps={k:z[k].copy() for k in z.files}
+     builder=olddata.Builder(d,maps)
+-    samples=[masks.attach(olddata.validate_sample(builder.sample(r),r)) for r in records]
+-    if maps is None:
+-        save_npz(path,**builder.new_maps);atomic_json(receipt,dict(identity=identity,sha256=digest(path),actual_OT=8,status='PASS'))
++    samples=[masks.attach(olddata.validate_sample(builder.sample(row),row)) for row in records]
++    if builder.new_maps:raise ValueError('Unexpected new matching')
++    for sample in samples:
++        old=expected_exposures[int(sample['sample_index'])]
++        for key in ('input_bytehash','label_bytehash','interface_mask_sha256','ot_cache_key'):
++            if sample[key]!=old[key]:raise ValueError('Paired original exposure mismatch: '+key)
++        sample['boundary_edge_mask']=topology.for_training(sample)
++        sample['boundary_edge_mask_sha256']=array_hash(sample['boundary_edge_mask'])
+     return samples
+ 
+ 
++def _check_generator(state):
++    old={n:v for n,v in state.items() if not n.startswith('contour_readout.')}
++    new={n:v for n,v in state.items() if n.startswith('contour_readout.')}
++    _check_old_generator(old)
++    if sum(v.numel() for v in new.values())!=412032 or any(v.dtype!=torch.float32 or not bool(torch.isfinite(v).all()) for v in new.values()):raise ValueError('Candidate branch shape/dtype/finite contract differs')
++
++
++def parameter_groups(model):
++    old=[(n,p) for n,p in model.named_parameters() if not n.startswith('contour_readout.')]
++    new=[(n,p) for n,p in model.named_parameters() if n.startswith('contour_readout.')]
++    if len(old)!=194 or sum(p.numel() for _,p in new)!=412032:raise ValueError('Unexpected old/new parameter ownership')
++    return old,new
++
++
++def optimizer_names(model):
++    return [['generator.'+n for n,p in group] for group in parameter_groups(model)]
++
++
+ def _validate_optimizer(model,opt,global_step,hyper):
+-    if not BASE_STEP<=global_step<=BASE_STEP+UPDATES:raise ValueError('Continuation clock outside6000..12000')
+-    base.validate_optimizer(model,None,opt,'COMMON',global_step)
++    local=global_step-BASE_STEP
++    if not 0<=local<=UPDATES or model.training or len(opt.param_groups)!=2:raise ValueError('Invalid dual-clock optimizer')
+     if support.optimizer_hyperparameters(opt)!=hyper:raise ValueError('Inherited AdamW hyperparameters changed')
++    for gi,((named),group) in enumerate(zip(parameter_groups(model),opt.param_groups)):
++        if [id(p) for n,p in named]!=[id(p) for p in group['params']]:raise ValueError('Parameter group identity/order differs')
++        if (group['lr'],tuple(group['betas']),group['eps'],group['weight_decay'])!=(1e-5,(.9,.95),1e-8,0.):raise ValueError('Changed AdamW hyperparameters')
++        expected_step=global_step if gi==0 else local
++        for name,p in named:
++            state=opt.state.get(p,{})
++            if p.dtype!=torch.float32 or not p.requires_grad:raise ValueError('Nontrainable or nonFP32 '+name)
++            if expected_step==0 and not state:continue
++            if set(state)!={'step','exp_avg','exp_avg_sq'} or float(state['step'])!=expected_step:raise ValueError('Actual AdamW clock differs '+name)
++            if any(state[k].shape!=p.shape or state[k].dtype!=torch.float32 for k in ('exp_avg','exp_avg_sq')):raise ValueError('Moment identity differs '+name)
++    return True
+ 
+ 
+ def diagnostic(sample,prediction,target,bins):
+@@ -189,7 +196,7 @@
+ 
+ 
+ def update(model,opt,samples,ledger,step,hyper,bins):
+-    den=support.validate_samples(samples,ARM,step,effective_batch=True)
++    den=support.validate_samples(samples,'FULL_SEAT',step,effective_batch=True)
+     if any(s['K']<2 or s['condition_type']!='SEAT_FULL' for s in samples):raise ValueError('Non-FULL training exposure')
+     g=BASE_STEP+step;_validate_optimizer(model,opt,g-1,hyper)
+     torch.cuda.reset_peak_memory_stats();opt.zero_grad(set_to_none=True);tick=time.perf_counter()
+@@ -198,7 +205,8 @@
+     for micro,s in enumerate(samples):
+         b=collate([s],'cuda');ctx=dict(local_step=step,global_step=g,microbatch=micro,sample_index=s['sample_index'],input_bytehash=s['input_bytehash'],label_bytehash=s['label_bytehash'])
+         with native_execution(model,coordinates=(b['xt'],b['t']),autocast=True):
+-            v,sec=ledger.call('train_forward',lambda:model(*model_inputs(b)).float(),ctx);result['forward_seconds']+=sec
++            edge=torch.from_numpy(s['boundary_edge_mask'][None]).to('cuda')
++            v,sec=ledger.call('train_forward',lambda:model(*model_inputs(b),boundary_edge_mask=edge).float(),ctx);result['forward_seconds']+=sec
+             loss=masked_fm_loss(v,b['u'],b['valid_mask'],b['known_mask'],denominator=den)
+             if not bool(torch.isfinite(loss)):raise FloatingPointError('Nonfinite FM')
+             value=float(loss.detach());_,sec=ledger.call('train_backward',loss.backward,ctx);result['backward_seconds']+=sec
+@@ -207,7 +215,21 @@
+         diagnostics.append(di);result['FM']+=value;result['sample_losses'].append(dict(sample_index=s['sample_index'],FM_contribution=value));del v,loss,b
+     params=list(model.parameters())
+     if any(p.grad is None for p in params):raise RuntimeError('Unused generator parameter')
++    old_params,new_params=parameter_groups(model)
++    def gradnorm(named):return float(torch.linalg.vector_norm(torch.stack([torch.linalg.vector_norm(p.grad.detach().float()) for _,p in named])))
++    result['old_gradient_norm']=gradnorm(old_params);result['new_gradient_norm']=gradnorm(new_params)
++    result['new_parameter_gradient_norms']={n:float(torch.linalg.vector_norm(p.grad.detach().float())) for n,p in new_params} if step<=2 else {}
+     result['gradient_norm']=float(torch.nn.utils.clip_grad_norm_(params,1.,error_if_nonfinite=True))
++    result['actual_clip_coefficient']=min(1.,1./(result['gradient_norm']+1e-6))
++    if step==1:
++        prior=json.loads((C.BASELINE/'training/FULL_SEAT/training_log.jsonl').open().readline())
++        match=result['sample_losses']==prior['sample_losses'] and result['FM']==prior['FM']
++        zero=getattr(model,'initial_zero_observations',[])
++        if not match or len(zero)!=8 or any(not x['zero_residual_exact'] or not x['unchanged_hidden_exact'] for x in zero):raise ValueError('Normal first-batch zero initialization comparison failed')
++        C.write(C.OUT/'audits/zero_initialization.json',dict(status='PASS',normal_training_microbatches=8,zero_residual_exact=True,unchanged_hidden_exact=True,
++            first_batch_FM_matches=match,old_state_sha256_matches=True,baseline_first_batch_FM=prior['FM'],candidate_first_batch_FM=result['FM'],observations=zero,
++            interpretation='No extra forward; exact first normal training batch loss + zero injection. Step0 rollouts inferred equivalent and reused, not newly measured.'))
++        model.initial_zero_observations=None
+     _,result['optimizer_seconds']=ledger.call('optimizer_update',opt.step,dict(local_step=step,global_step=g))
+     if any(not bool(torch.isfinite(p).all()) for p in params):raise FloatingPointError('Nonfinite updated generator')
+     _validate_optimizer(model,opt,g,hyper)
+@@ -237,16 +259,6 @@
+     return binding
+ 
+ 
+-def export_initial():
+-    reg=registration();path=C.resolve(reg.get('step0_inference_path',C.OLD/'inference/USER_EXPANDED_67_generator_step6000.pt'))
+-    receipt=read_json(path.with_suffix('.json'));expected=reg.get('step0_inference_sha256',receipt['sha256'])
+-    if digest(path)!=expected:raise ValueError('Existing EXP67 inference file changed')
+-    p=torch.load(path,map_location='cpu',weights_only=True,mmap=True)
+-    if p['global_step']!=BASE_STEP or p['generator_state_sha256']!=reg['source_generator_sha256'] or state_hash(p['generator_state'])!=reg['source_generator_sha256']:
+-        raise ValueError('Step0 inference does not match live continuation generator')
+-    if any(k in p for k in ('optimizer','rng','ema')):raise ValueError('Unexpected state in inference export')
+-    return bind('FULL_S0000',dict(path=str(path),sha256=expected,generator_state_sha256=p['generator_state_sha256']),0)
+-
+ 
+ def _resource():
+     r=C.resources()
+@@ -260,8 +272,8 @@
+     reg=registration();cleanup=C.resolve(reg['cleanup_receipt_path'])
+     if digest(cleanup)!=reg['cleanup_receipt_sha256'] or C.read(cleanup).get('status') not in ('COMPLETE','PASS'):
+         raise ValueError('User requested old unused checkpoint cleanup before any training; completion receipt missing')
+-    planpath=C.OUT/'plans'/f'{ARM}.json';plan=read_json(planpath);plan_sha=digest(planpath)
+-    if plan['registration_sha256']!=digest(C.OUT/'registration.json') or plan['arm']!=ARM or len(plan['records'])!=UPDATES*8:raise ValueError('Plan/registration differs')
++    planpath=C.resolve(reg['replay_plan_path']);plan=read_json(planpath);plan_sha=digest(planpath)
++    if plan_sha!=reg['replay_plan_sha256'] or plan['arm']!='FULL_SEAT' or len(plan['records'])!=UPDATES*8:raise ValueError('Original replay plan differs')
+     folder=C.checked(C.OUT/'training'/ARM);folder.mkdir(parents=True,exist_ok=True)
+     status=folder/'status.json';previous=read_json(status) if status.exists() else None
+     if previous and previous['status']=='COMPLETE':return previous
+@@ -277,7 +289,9 @@
+     ledger=support.CallLedger(folder/'calls.jsonl',dict(train_forward=8*UPDATES,train_backward=8*UPDATES,optimizer_update=UPDATES),ARM,attempt)
+     state=dict(status='LOADING',arm=ARM,local_step=step,global_step=BASE_STEP+step,attempt=attempt,stop_step=stop_step)
+     d=olddata.Dataset(C.resolve(reg['source_data']));masks=InterfaceMasks(reg,d);bins=reg['diagnostic_time_bin_edges']
+-    observer=support.GPUObserver('full_seat_train',interval=3.);pending={};pool=ThreadPoolExecutor(max_workers=2)
++    topology=TopologyInputs();expected_exposures=[json.loads(line) for line in (C.BASELINE/'training/FULL_SEAT/exposure.jsonl').read_text().splitlines()]
++    if len(expected_exposures)!=UPDATES*8:raise ValueError('Expected 48000 original exposures')
++    observer=support.GPUObserver('full_contour_train',interval=3.);pending={};pool=ThreadPoolExecutor(max_workers=2)
+     flag={'stop':False};start=time.perf_counter();handlers={}
+     def interrupt(*unused):flag['stop']=True
+     for sig in (signal.SIGINT,signal.SIGTERM):handlers[sig]=signal.signal(sig,interrupt)
+@@ -290,11 +304,32 @@
+             p=_source_payload(reg,source,expected);ledger.require_exact_cursor(step)
+             if previous and (p.get('schema')!=SCHEMA or p['local_step']!=step or p['protocol']!=reg or p['plan_sha256']!=plan_sha):raise ValueError('Resume branch/protocol/stream differs')
+             if p['global_step']!=BASE_STEP+step:raise ValueError('Source optimizer clock differs')
+-            model=build_model(copy.deepcopy(MODEL_CONFIG),readout_mode='none',trainable=True).eval()
+-            if p['optimizer_parameter_names']!=base.optimizer_names(model,None):raise ValueError('Optimizer parameter order differs')
+-            model.load_state_dict(p['generator_state'],strict=True);model.to('cuda');opt=base.make_optimizer(model,None);opt.load_state_dict(p['optimizer']);restore_rng(p['rng'])
+-            if state_hash(model.state_dict())!=p['generator_state_sha256'] or base.tree_hash(opt.state_dict())!=p['optimizer_state_sha256'] or base.tree_hash(rng_state())!=p['rng_sha256']:
+-                raise ValueError('Exact live generator/AdamW/RNG restoration failed')
++            model=build_candidate(copy.deepcopy(MODEL_CONFIG),trainable=True,seed=reg['new_module_seed']).eval()
++            old_named,new_named=parameter_groups(model)
++            if previous:
++                if p['optimizer_parameter_names']!=optimizer_names(model):raise ValueError('Candidate optimizer order differs')
++                model.load_state_dict(p['generator_state'],strict=True);model.to('cuda')
++                opt=torch.optim.AdamW([dict(params=[p for n,p in old_named]),dict(params=[p for n,p in new_named])],lr=1e-5,betas=(.9,.95),eps=1e-8,weight_decay=0.)
++                opt.load_state_dict(p['optimizer'])
++                if state_hash(model.state_dict())!=p['generator_state_sha256'] or base.tree_hash(opt.state_dict())!=p['optimizer_state_sha256']:raise ValueError('Candidate exact resume failed')
++            else:
++                if p['optimizer_parameter_names']!=[['generator.'+n for n,v in old_named]]:raise ValueError('Old optimizer identity/order differs')
++                incompatible=model.load_state_dict(p['generator_state'],strict=False)
++                if incompatible.unexpected_keys or set(incompatible.missing_keys)!={n for n,v in new_named}:raise ValueError('Unexpected incomplete source load')
++                model.to('cuda')
++                inherited={n:v for n,v in model.state_dict().items() if not n.startswith('contour_readout.')}
++                if state_hash(inherited)!=p['generator_state_sha256']:raise ValueError('Old weights not exact')
++                opt=torch.optim.AdamW([dict(params=[v for n,v in old_named])],lr=1e-5,betas=(.9,.95),eps=1e-8,weight_decay=0.)
++                opt.load_state_dict(p['optimizer'])
++                if base.tree_hash(opt.state_dict())!=p['optimizer_state_sha256']:raise ValueError('Old AdamW restore not exact')
++                opt.add_param_group(dict(params=[v for n,v in new_named],**{k:v for k,v in opt.param_groups[0].items() if k!='params'}))
++                model.initial_zero_observations=[]
++                C.write(adir/'new_parameter_initialization.json',dict(new_parameter_names=[n for n,v in new_named],
++                    new_parameter_count=sum(v.numel() for n,v in new_named),new_state_sha256=state_hash({n:v for n,v in model.state_dict().items() if n.startswith('contour_readout.')}),
++                    old_state_sha256=state_hash(inherited),old_optimizer_sha256=p['optimizer_state_sha256'],new_optimizer_state_empty=all(not opt.state.get(v) for n,v in new_named)))
++            if step==0:model.initial_zero_observations=[]
++            restore_rng(p['rng'])
++            if base.tree_hash(rng_state())!=p['rng_sha256']:raise ValueError('Exact original RNG restoration failed')
+             hyper=support.optimizer_hyperparameters(opt);_validate_optimizer(model,opt,BASE_STEP+step,hyper)
+             lineage=dict(source_file_sha256=reg['source_checkpoint_sha256'],source_generator_sha256=reg['source_generator_sha256'],source_optimizer_sha256=reg['source_optimizer_sha256'],source_rng_sha256=reg['source_rng_sha256'],
+                          optimizer_restored=True,rng_restored=True,EMA=False,EMA_status='NOT_PRESENT_IN_SOURCE',source_stream_provenance_only=True,new_full_seat_plan_sha256=plan_sha)
+@@ -306,12 +341,12 @@
+                 g,o,rng=_cpu_copy(model.state_dict()),_cpu_copy(opt.state_dict()),_cpu_copy(rng_state());_check_generator(g)
+                 p=dict(schema=SCHEMA,experiment=C.VERSION,arm=ARM,local_step=step,global_step=BASE_STEP+step,update_in_progress=False,
+                        generator_state=g,generator_state_sha256=state_hash(g),optimizer=o,optimizer_state_sha256=base.tree_hash(o),rng=rng,rng_sha256=base.tree_hash(rng),
+-                       optimizer_parameter_names=base.optimizer_names(model,None),model_config=copy.deepcopy(MODEL_CONFIG),protocol=reg,lineage=lineage,plan_sha256=plan_sha,
++                       optimizer_parameter_names=optimizer_names(model),model_config=copy.deepcopy(MODEL_CONFIG),protocol=reg,lineage=lineage,plan_sha256=plan_sha,
+                        stream_state=dict(batch_index=step,next_sample_index=step*8,parent_exposure_counts=dict(Counter(x['uid'] for x in plan['records'][:step*8]))),execution=ledger.snapshot(),EMA=False)
+                 state['checkpoint']=save(C.OUT/'checkpoints'/f'{ARM}_step{step}.pt',p)
+                 if step in FIXED:
+-                    label=f'FULL_S{step:04d}';q={k:p[k] for k in ('experiment','arm','local_step','global_step','generator_state','generator_state_sha256','model_config','lineage')}
+-                    q.update(schema='r2_full_seat_learning_curve_generator_v1',inference_contract=dict(readout_mode='none',forward='BF16',parameters='FP32',integration='FP32'),training_checkpoint_sha256=state['checkpoint']['sha256'],EMA=False)
++                    label=f'CONTOUR_S{step}';q={k:p[k] for k in ('experiment','arm','local_step','global_step','generator_state','generator_state_sha256','model_config','lineage')}
++                    q.update(schema='r2_full_contour_readout_generator_v1',inference_contract=dict(readout_mode='finite_surface_source_contour',forward='BF16 with FP32 branch/add',parameters='FP32',integration='FP32',source_topology_required=True),training_checkpoint_sha256=state['checkpoint']['sha256'],EMA=False)
+                     state['inference_export']=save(C.OUT/'inference'/f'{label}_generator.pt',q);bind(label,state['inference_export'],step)
+                 append_event(adir/'events.jsonl',dict(event='CHECKPOINT',**state['checkpoint']))
+             segment_start=step
+@@ -322,14 +357,14 @@
+                         checkpoint();state['status']='INTERRUPTED_SAFE';state['reason']='signal_or_resource_headroom';break
+                 began=time.perf_counter()
+                 for bidx in range(current-1,min(stop_step,current+1)):
+-                    if bidx not in pending:pending[bidx]=pool.submit(batch,d,masks,plan['records'][bidx*8:(bidx+1)*8],bidx,plan_sha)
++                    if bidx not in pending:pending[bidx]=pool.submit(batch,d,masks,plan['records'][bidx*8:(bidx+1)*8],bidx,plan_sha,topology,expected_exposures)
+                 samples=pending.pop(current-1).result();input_s=time.perf_counter()-began
+                 if flag['stop']:
+                     checkpoint();state['status']='INTERRUPTED_SAFE';state['reason']='signal_after_input_before_model';break
+                 for s in samples:
+                     append_event(folder/'exposure.jsonl',dict(local_step=current,global_step=BASE_STEP+current,sample_index=s['sample_index'],uid=s['object_id'],task_id=s['task_id'],condition_type=s['condition_type'],
+                         N=int(s['y']),K=s['K'],alpha=s['alpha'],t=float(s['t']),input_bytehash=s['input_bytehash'],label_bytehash=s['label_bytehash'],ot_cache_key=s['ot_cache_key'],
+-                        free_coordinate_count=s['free_coordinate_count'],interface_corner_count=int(s['interface_corner_mask'].sum()),interface_mask_sha256=s['interface_mask_sha256']))
++                        free_coordinate_count=s['free_coordinate_count'],interface_corner_count=int(s['interface_corner_mask'].sum()),interface_mask_sha256=s['interface_mask_sha256'],boundary_edge_mask_sha256=s['boundary_edge_mask_sha256'],paired_baseline_hashes_match=True))
+                 result,di=update(model,opt,samples,ledger,current,hyper,bins);step=current
+                 append_event(folder/'training_log.jsonl',dict(local_step=step,global_step=BASE_STEP+step,input_seconds=input_s,**result))
+                 for row in di:append_event(folder/'interface_diagnostics.jsonl',row)
+@@ -351,8 +386,7 @@
+ 
+ 
+ def main():
+-    p=argparse.ArgumentParser(description=__doc__);p.add_argument('--stage',choices=['prepare-plan','export-initial','train'],required=True);p.add_argument('--stop-step',type=int,choices=FIXED);p.add_argument('--attempt')
+-    a=p.parse_args();value=prepare_plan() if a.stage=='prepare-plan' else export_initial() if a.stage=='export-initial' else train(a.stop_step,a.attempt)
+-    print(json.dumps(value,indent=2))
+-
+-if __name__=='__main__':main()+    p=argparse.ArgumentParser(description=__doc__);p.add_argument('--stop-step',type=int,choices=FIXED,required=True);p.add_argument('--attempt')
++    a=p.parse_args();print(json.dumps(train(a.stop_step,a.attempt),indent=2))
++
++if __name__=='__main__':main()
+--- r2/pilots/full_seat_learning_curve_v1/common.py
++++ r2/pilots/full_contour_readout_v1/common.py
+@@ -8,20 +8,20 @@
+ import numpy as np
+ 
+ ROOT = Path(__file__).resolve().parents[3]
+-CODE = ROOT / 'r2/pilots/full_seat_learning_curve_v1'
+-OUT = ROOT / 'experiments/r2_full_seat_learning_curve_v1'
++CODE = ROOT / 'r2/pilots/full_contour_readout_v1'
++OUT = ROOT / 'experiments/r2_full_contour_readout_v1'
+ OLD = ROOT / 'experiments/r2_user_data_scaling_32_67_v1'
+-VERSION = 'R2_FULL_SEAT_LEARNING_CURVE_V1'
++VERSION = 'R2_FULL_CONTOUR_READOUT_V1'
+ WROOT = ROOT / 'experiments/r2_condition_width_response_v1'
+ QUICK = ROOT / 'experiments/r2_seat_quick_learnability_v1'
+ NOISE = ROOT / 'experiments/r2_seat_noise_transfer_v1'
+ SCALING = ROOT / 'experiments/r2_user_data_scaling_32_67_v1'
+ SOURCE = SCALING / 'checkpoints/USER_EXPANDED_67_step6000.pt'
+ DATA = SCALING / 'data/train_manifest.json'
+-TRAIN_LABEL = 'FULL_SEAT'
++TRAIN_LABEL = 'CONTOUR'
+ BASE = ROOT / 'experiments/r2_regular_patch_control_v1'
+ EVALUATION_STEPS = [0,1000,3000,6000]
+-EVALUATION_LABELS = ['FULL_S0000','FULL_S1000','FULL_S3000','FULL_S6000']
++EVALUATION_LABELS = ['CONTOUR_S0','CONTOUR_S1000','CONTOUR_S3000','CONTOUR_S6000']
+ L = float(np.sqrt(3.) * 2 / .3762)
+ 
+ def resolve(path):
+@@ -156,3 +156,5 @@
+ 
+ def csvread(path):
+     with resolve(path).open(encoding='utf-8-sig',newline='') as f:return list(csv.DictReader(f))
++
++BASELINE = ROOT / 'experiments/r2_full_seat_learning_curve_v1'
+--- r2/pilots/full_seat_learning_curve_v1/orchestrate.py
++++ r2/pilots/full_contour_readout_v1/orchestrate.py
+@@ -11,7 +11,7 @@
+ 
+ ORCH=C.OUT/'orchestration'
+ MAIN=tuple(C.EVALUATION_LABELS)
+-REFERENCES=('SMALL_C200','CREF_C200')
++REFERENCES=('FULL_S0000','FULL_S1000','FULL_S3000','FULL_S6000')
+ POLL_SECONDS=5
+ EXTERNAL_POLL_SECONDS=30
+ CPU_WORKERS=2
+@@ -178,11 +178,11 @@
+         if kind=='GPU' and self.active('GPU'):raise RuntimeError('Second experiment GPU stage forbidden')
+         resource_snapshot,resource_path=self.resources('dispatch_'+key)
+         source=C.CODE/(module+'.py');folder=ORCH/'jobs'/key
+-        r=dict(job_id=key,kind=kind,label=label,phase=phase,command=[sys.executable,'-B','-m','r2.pilots.full_seat_learning_curve_v1.'+module,*args],
++        r=dict(job_id=key,kind=kind,label=label,phase=phase,command=[sys.executable,'-B','-m','r2.pilots.full_contour_readout_v1.'+module,*args],
+             module_source=str(source),module_sha256=C.sha(source),registration_sha256=C.sha(C.OUT/'registration.json'),CPU_workers=CPU_WORKERS if kind=='CPU_PIPELINE' else None)
+         C.write(folder/'request.json',r);self.jobs[key]=r
+         log=(folder/'stdout.log').open('ab',buffering=0)
+-        process=subprocess.Popen([sys.executable,'-B','-m','r2.pilots.full_seat_learning_curve_v1.orchestrate','--worker-request',str(folder/'request.json')],cwd=C.ROOT,stdout=log,stderr=subprocess.STDOUT)
++        process=subprocess.Popen([sys.executable,'-B','-m','r2.pilots.full_contour_readout_v1.orchestrate','--worker-request',str(folder/'request.json')],cwd=C.ROOT,stdout=log,stderr=subprocess.STDOUT)
+         self.processes[key]=process;self.handles[key]=log
+         _event('JOB_DISPATCHED',job_id=key,kind=kind,phase=phase,label=label,pid=process.pid,command=r['command'],stdout_path=str(folder/'stdout.log'),resources_path=resource_path)
+         self.snapshot();return key
+@@ -257,10 +257,10 @@
+             raise RuntimeError('Training ended safely before target; stop scheduling until explicit resume')
+ 
+     def evaluate_gpu(self,label):
+-        self.run_job('cache_'+label,'evaluate',['--stage','cache','--label',label],label=label)
+-        self.run_job('generate_'+label,'evaluate',['--stage','generate','--label',label,'--worker','0','--workers','1'],'GPU',label=label,phase='generation')
+-        self.run_job('post_'+label,'evaluate',['--stage','post','--label',label,'--worker','0','--workers','1'],'GPU',label=label,phase='D0')
+-        self.run_job('collect_'+label,'evaluate',['--stage','collect','--label',label],label=label)
++        self.run_job('cache_'+label,'evaluation',['--stage','cache','--label',label],label=label)
++        if label!='CONTOUR_S0':self.run_job('generate_'+label,'evaluation',['--stage','generate','--label',label,'--worker','0','--workers','1'],'GPU',label=label,phase='generation')
++        if label!='CONTOUR_S0':self.run_job('post_'+label,'evaluation',['--stage','post','--label',label,'--worker','0','--workers','1'],'GPU',label=label,phase='D0')
++        self.run_job('collect_'+label,'evaluation',['--stage','collect','--label',label],label=label)
+         if not _cpu_complete(label) and label not in self.cpu_queue:self.cpu_queue.append(label)
+         self.pump_cpu()
+ 
+@@ -274,24 +274,25 @@
+         # Adopt durable children if the controller itself was interrupted.
+         for key in list(self.active('GPU')):self.wait_job(key)
+         self.ensure_train(1000)
+-        self.evaluate_gpu('FULL_S0000');self.evaluate_gpu('FULL_S1000')
+-        self.ensure_train(3000);self.evaluate_gpu('FULL_S3000')
+-        self.ensure_train(6000);self.evaluate_gpu('FULL_S6000')
++        self.evaluate_gpu('CONTOUR_S0');self.evaluate_gpu('CONTOUR_S1000')
++        self.ensure_train(3000);self.evaluate_gpu('CONTOUR_S3000')
++        self.ensure_train(6000);self.evaluate_gpu('CONTOUR_S6000')
+         for label in REFERENCES:
+             if not _cpu_complete(label):
+-                self.run_job('cache_'+label,'evaluate',['--stage','cache','--label',label],label=label)
++                self.run_job('cache_'+label,'evaluation',['--stage','cache','--label',label],label=label)
+                 if label not in self.cpu_queue:self.cpu_queue.append(label)
+         while self.cpu_queue or self.active('CPU_PIPELINE'):
+             self.pump_cpu()
+             if self.failure or self.stopping:raise RuntimeError('CPU failure or stop; no new dispatch')
+             self.pause()
+         if not all(_cpu_complete(label) for label in MAIN+REFERENCES):raise RuntimeError('Some paired evaluation labels incomplete')
+-        for module in ('analysis','comparison','render','sections'):
+-            self.run_job('final_'+module,'{}'.format(module),[],'CPU_FINAL')
+-        analysis=C.read(C.OUT/'training_analysis/latest.json');comparison=C.read(C.OUT/'evaluation/comparison/latest.json');gallery=C.read(C.OUT/'evaluation/gallery/manifest.json');sections=C.read(C.OUT/'evaluation/sections_gallery/manifest.json')
+-        if analysis.get('status')!='COMPLETE' or comparison.get('status')!='COMPLETE' or gallery.get('status')!='COMPLETE' or sections.get('status')!='COMPLETE_RENDERING_NOT_REVIEW':raise RuntimeError('Final analysis/comparison/gallery/sections remains partial')
++        for module in ('training_analysis','analyze','gallery'):
++            self.run_job('final_'+module,module,[],'CPU_FINAL')
++        self.run_job('final_sections','gallery',['--stage','sections'],'CPU_FINAL')
++        self.run_job('review_template','gallery',['--stage','template'],'CPU_FINAL')
+         self.snapshot('COMPLETE_PENDING_ACTUAL_IMAGE_REVIEW_AND_REPORT',new_AI_PROXY_records=0,new_interpretive_conclusions=0)
+-        return dict(status='COMPLETE_PENDING_ACTUAL_IMAGE_REVIEW_AND_REPORT',training_steps=6000,labels=list(MAIN+REFERENCES),actual_gallery_pages=len(gallery['images']),actual_section_pages=len(sections['images']),new_AI_PROXY_records=0)
++        return dict(status='COMPLETE_PENDING_ACTUAL_IMAGE_REVIEW_AND_REPORT',training_steps=6000,labels=list(MAIN+REFERENCES),new_AI_PROXY_records=0)
++
+ 
+ 
+ def all_stages():
+--- r2/pilots/full_seat_learning_curve_v1/run.py
++++ r2/pilots/full_contour_readout_v1/run.py
+@@ -10,7 +10,7 @@
+ from . import common as C
+ 
+ TRAIN_LABELS=tuple(C.EVALUATION_LABELS)
+-REFERENCES=('SMALL_C200','CREF_C200')
++REFERENCES=('FULL_S0000','FULL_S1000','FULL_S3000','FULL_S6000')
+ LABELS=TRAIN_LABELS+REFERENCES
+ 
+ 
+@@ -30,7 +30,7 @@
+ 
+ 
+ def child(module,args,phase,**identity):
+-    command=[sys.executable,'-B','-m','r2.pilots.full_seat_learning_curve_v1.'+module,*args]
++    command=[sys.executable,'-B','-m','r2.pilots.full_contour_readout_v1.'+module,*args]
+     environment=os.environ.copy()
+     for key in ('OMP_NUM_THREADS','MKL_NUM_THREADS','OPENBLAS_NUM_THREADS','NUMEXPR_NUM_THREADS'):environment[key]='2'
+     environment['CUBLAS_WORKSPACE_CONFIG']=':4096:8'
+@@ -54,7 +54,7 @@
+             r=s['checkpoint']
+             if C.sha(r['path'])!=r['sha256']:raise ValueError('Completed segment checkpoint changed')
+             return dict(status='ALREADY_COMPLETE',requested_step=stop_step,current_step=s['local_step'],new_updates=0)
+-    args=['--stage','train','--stop-step',str(stop_step)]
++    args=['--stop-step',str(stop_step)]
+     if attempt:args+=['--attempt',attempt]
+     child('train',args,'training',stop_step=stop_step)
+     return C.read(path)
+@@ -65,21 +65,21 @@
+     for stage in ('collect','score','boundary','aggregate'):
+         args=['--stage',stage,'--label',label]
+         if stage in ('score','boundary'):args+=['--workers',str(workers)]
+-        child('evaluate',args,'CPU_'+stage,label=label,requested_CPU_workers=workers)
++        child('evaluation',args,'CPU_'+stage,label=label,requested_CPU_workers=workers)
+     return dict(status='COMPLETE',label=label,stages=['collect','score','boundary','aggregate'],new_model_calls=0)
+ 
+ 
+ def eval_label(label,workers=2):
+     if label not in LABELS:raise ValueError('Unknown label')
+-    child('evaluate',['--stage','cache','--label',label],'cache',label=label)
+-    if label in TRAIN_LABELS:
+-        child('evaluate',['--stage','generate','--label',label,'--worker','0','--workers','1'],'generation',label=label,workers=1)
++    child('evaluation',['--stage','cache','--label',label],'cache',label=label)
++    if label in TRAIN_LABELS and label!='CONTOUR_S0':
++        child('evaluation',['--stage','generate','--label',label,'--worker','0','--workers','1'],'generation',label=label,workers=1)
+         # The evaluator enforces all 24 RAW complete before any D0 of this label.
+-        child('evaluate',['--stage','post','--label',label,'--worker','0','--workers','1'],'D0',label=label,workers=1)
++        child('evaluation',['--stage','post','--label',label,'--worker','0','--workers','1'],'D0',label=label,workers=1)
+     result=cpu_label(label,workers)
+     result.pop('new_model_calls',None)
+     result['model_call_accounting']='Per-stage frozen receipts and call ledgers; cache and completed stages reuse only'
+-    result.update(stages=['cache']+(['generate','post'] if label in TRAIN_LABELS else [])+result['stages'])
++    result.update(stages=['cache']+(['generate','post'] if label in TRAIN_LABELS and label!='CONTOUR_S0' else [])+result['stages'])
+     return result
+ 
+ 
+--- /dev/null
++++ r2/pilots/full_contour_readout_v1/model.py
+@@ -0,0 +1,243 @@
++"""One independent FULL-contour readout after complete Native block 6.
++
++Old parameter objects, names and traversal order are retained.  No hook, loss,
++projection, coordinate change, source-Y information or hidden cache is added.
++"""
++from __future__ import annotations
++
++import math
++from meshflow_control import runtime as _stable  # CUBLAS policy before CUDA.
++import torch
++from torch import nn
++from meshflow_control.models.native import (
++    NativeModel, assert_native_runtime, build_model, native_block_forward,
++    native_final_forward,
++)
++from meshflow_control.models.readout import corner_indices
++
++from .relations import (
++    FEATURE_NAMES, LENGTH_SCALE, RELATION_DIM, TIE_EPS_FACTOR,
++    relation_features,
++)
++
++READOUT_LAYER = 6
++READOUT_DIM = 128
++READOUT_HEADS = 4
++EXTRA_PARAMETERS = 412032
++INITIALIZATION_SEED = 20261014
++
++
++class ContourReadout(nn.Module):
++    def __init__(self, hidden_dim=768, readout_dim=READOUT_DIM, heads=READOUT_HEADS):
++        super().__init__()
++        if hidden_dim < 1 or readout_dim < 1 or heads < 1 or readout_dim % heads:
++            raise ValueError("Invalid readout dimensions")
++        self.hidden_dim, self.readout_dim, self.heads = hidden_dim, readout_dim, heads
++        self.head_dim = readout_dim // heads
++        self.norm = nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-5)
++        linear = dict(bias=False, device="cpu", dtype=torch.float32)
++        self.W_Q = nn.Linear(hidden_dim, readout_dim, **linear)
++        self.W_K = nn.Linear(hidden_dim, readout_dim, **linear)
++        self.W_V = nn.Linear(hidden_dim, readout_dim, **linear)
++        self.phi = nn.Sequential(
++            nn.Linear(RELATION_DIM, readout_dim, bias=True, device="cpu", dtype=torch.float32),
++            nn.SiLU(),
++            nn.Linear(readout_dim, readout_dim, bias=True, device="cpu", dtype=torch.float32),
++        )
++        self.W_O = nn.Linear(readout_dim, hidden_dim, **linear)
++        for module in (self.W_Q, self.W_K, self.W_V):
++            nn.init.xavier_uniform_(module.weight)
++        nn.init.zeros_(self.W_O.weight)
++
++    def forward(self, query, memory, points, triangles, boundary_edge_mask, time, *, observer=None):
++        if query.ndim != 2 or memory.ndim != 2 or query.shape[1] != self.hidden_dim or memory.shape[1] != self.hidden_dim:
++            raise ValueError("Expected free query[Q,D] and C face memory[K,D]")
++        if query.shape[0] != points.shape[0] or memory.shape[0] != triangles.shape[0]:
++            raise ValueError("Hidden and geometry identities differ")
++        if memory.shape[0] == 0:
++            raise ValueError("Contour readout requires at least one valid C face")
++        if memory.device != query.device or any(p.device != query.device or p.dtype != torch.float32 for p in self.parameters()):
++            raise ValueError("Contour branch parameters must be colocated FP32")
++        with torch.autocast(device_type=query.device.type, enabled=False):
++            q0, s0 = self.norm(query.float()), self.norm(memory.float())
++            q = self.W_Q(q0).reshape(-1, self.heads, self.head_dim).transpose(0, 1)
++            k = self.W_K(s0).reshape(-1, self.heads, self.head_dim).transpose(0, 1)
++            v = self.W_V(s0).reshape(-1, self.heads, self.head_dim).transpose(0, 1)
++            weights = (q @ k.transpose(-2, -1) / math.sqrt(self.head_dim)).softmax(dim=-1)
++            descriptors = relation_features(points, triangles, boundary_edge_mask, time)
++            pair_value = self.phi(descriptors).reshape(query.shape[0], memory.shape[0], self.heads, self.head_dim).permute(2, 0, 1, 3)
++            # Geometry remains query-dependent through the sum over C.  There
++            # is no free-dimension average, distance logit bias, or top-k mask.
++            message = weights @ v + (weights[..., None] * pair_value).sum(-2)
++            message = message.transpose(0, 1).reshape(query.shape[0], self.readout_dim)
++            residual = self.W_O(message)
++            if observer is not None:
++                observer(dict(site="contour_readout", query_corners=query.shape[0],
++                              source_faces=memory.shape[0], branch_dtype=str(residual.dtype),
++                              residual=residual.detach(), relation_features=descriptors.detach()))
++        return residual
++
++
++def apply_contour_readout(hidden, memory, x, t, known_mask, valid_mask,
++                          boundary_edge_mask, module, *, observer=None):
++    """FP32(hidden + delta), then cast, and copy only valid free corners."""
++    batch, faces = known_mask.shape
++    rows = []
++    for b in range(batch):
++        free_indices = corner_indices(valid_mask[b] & ~known_mask[b])
++        source_faces = torch.nonzero(known_mask[b] & valid_mask[b], as_tuple=False).flatten()
++        query = hidden[b].index_select(0, free_indices)
++        coordinates = x[b].reshape(faces * 3, 3).index_select(0, free_indices)
++        triangles = x[b].reshape(faces, 3, 3).index_select(0, source_faces)
++        mask = boundary_edge_mask[b].index_select(0, source_faces)
++        def observe(record):
++            if observer is not None:
++                observer(dict(record, batch_index=b, layer=READOUT_LAYER))
++        residual = module(query, memory[b], coordinates, triangles, mask, t[b],
++                          observer=observe if observer is not None else None)
++        with torch.autocast(device_type=hidden.device.type, enabled=False):
++            updated = (query.float() + residual).to(hidden.dtype)
++        rows.append(hidden[b].index_copy(0, free_indices, updated))
++        if observer is not None:
++            observer(dict(site="contour_addition", layer=READOUT_LAYER, batch_index=b,
++                          free_corner_indices=free_indices.detach(), before=query.detach(),
++                          residual=residual.detach(), after=updated.detach()))
++    return torch.stack(rows)
++
++
++class ContourModel(NativeModel):
++    """Independent forward with the original Native operations left intact."""
++    def contour_metadata(self):
++        return dict(version="FULL_CONTOUR_READOUT_V1", insertion="after_complete_block",
++                    layer=READOUT_LAYER, hidden_dimension=768, readout_dimension=READOUT_DIM,
++                    heads=READOUT_HEADS, head_dimension=READOUT_DIM // READOUT_HEADS,
++                    feature_names=list(FEATURE_NAMES), relation_dimension=RELATION_DIM,
++                    fixed_length_scale=LENGTH_SCALE, length_scale_formula="sqrt(3)*2/0.3762",
++                    boundary_domain="per_C_face_source_ID_incidence_1_edges",
++                    edge_order=[[0, 1], [1, 2], [2, 0]], topology_ids_are_features=False,
++                    boundary_ties="symmetric_mean_closest_vector_and_tangent_dyad",
++                    boundary_distance="actual_minimum_distance_not_norm_of_mean_vector",
++                    tie_rounding_tolerance="8*fp32_eps*max(min_distance_squared,fp32_eps*L_squared)",
++                    tie_eps_factor=TIE_EPS_FACTOR, missing_boundary_features="finite_zero_with_exists_0",
++                    face_memory="current_forward_H0_after_coordinate_role_Geo_three_corner_FP32_mean",
++                    detached_memory=False, detached_query=False, cross_forward_cache=False,
++                    attention_domain="all_valid_C_faces", geometry_attention_bias=False,
++                    top_k=False, query_dependent_pair_value=True, trainable_multiplicative_gate=False,
++                    branch_dtype="float32_autocast_disabled", residual_add="cast_original(float32(hidden)+delta_fp32)",
++                    qkv_bias=False, output_bias=False, mlp_bias=True,
++                    layernorm_affine=False, layernorm_eps=1e-5,
++                    layernorm="same_nonaffine_LN_applied_separately_to_query_and_face_memory",
++                    mlp_widths=[17, 128, 128], mlp_activation="SiLU",
++                    qkv_initialization="xavier_uniform", mlp_initialization="torch_Linear_default",
++                    output_initialization="zeros", initialization_seed=self.contour_seed,
++                    extra_parameters=sum(p.numel() for p in self.contour_readout.parameters()),
++                    expected_extra_parameters=EXTRA_PARAMETERS,
++                    extra_parameter_names=[n for n, _ in self.named_parameters() if n.startswith("contour_readout.")])
++
++    def forward(self, x, t, y, valid_mask=None, known_mask=None, *,
++                boundary_edge_mask=None, observer=None):
++        assert_native_runtime(self, coordinates=(x, t))
++        if x.ndim != 3 or x.shape[-1] != 9:
++            raise ValueError("Expected FP32 x[B,padded_N,9]")
++        batch, faces, _ = x.shape
++        if t.shape != (batch,) or y.shape != (batch,) or y.dtype != torch.int64:
++            raise ValueError("Expected free t[B] and integer total N[B]")
++        if not bool(torch.isfinite(x).all() and torch.isfinite(t).all()):
++            raise ValueError("Nonfinite coordinates/time")
++        if bool(((t < 0) | (t > 1)).any()):
++            raise ValueError("Free time outside [0,1]")
++        for mask in (valid_mask, known_mask):
++            if mask is None or mask.dtype != torch.bool or mask.shape != (batch, faces) or mask.device != x.device:
++                raise ValueError("Colocated separate bool[B,padded_N] masks required")
++        if bool((known_mask & ~valid_mask).any()):
++            raise ValueError("Known faces must be valid")
++        if not torch.equal(valid_mask.sum(1), y) or bool(((y < 128) | (y > 256)).any()):
++            raise ValueError("y must count real faces only, N128..256")
++        if bool((known_mask.sum(1) == 0).any()) or bool(((valid_mask & ~known_mask).sum(1) == 0).any()):
++            raise ValueError("Each sample requires known and free faces")
++        if boundary_edge_mask is None or boundary_edge_mask.dtype != torch.bool or boundary_edge_mask.shape != (batch, faces, 3) or boundary_edge_mask.device != x.device:
++            raise ValueError("Actual-FULL source boundary_edge_mask[B,padded_N,3] is required")
++        if bool((boundary_edge_mask & ~known_mask[..., None]).any()):
++            raise ValueError("Source contour metadata must be false outside C")
++        hidden, role = self._embed(x, known_mask, valid_mask)
++        # The current embedding remains differentiable back to original params.
++        with torch.autocast(device_type=hidden.device.type, enabled=False):
++            face_memory = hidden.float().reshape(batch, faces, 3, -1).mean(dim=2)
++        memory = tuple(face_memory[b][known_mask[b] & valid_mask[b]] for b in range(batch))
++        c_free = self.backbone.t_embedder(t)
++        c_known = self.backbone.t_embedder(torch.ones_like(t))
++        count = self.backbone.y_embedder(y // self.backbone.face_bin, False)
++        c_free, c_known = c_free + count, c_known + count
++        face_time = torch.where(known_mask, torch.ones_like(t[:, None]), t[:, None])
++        if observer is not None:
++            observer(dict(site="embedding", hidden=hidden, role=role,
++                          known_mask=known_mask, valid_mask=valid_mask, face_time=face_time,
++                          c_free=c_free, c_known=c_known))
++        for index, block in enumerate(self.backbone.layers, 1):
++            hidden = native_block_forward(block, hidden, c_free, c_known, known_mask,
++                valid_mask, observer=observer, layer_index=index, face_time=face_time)
++            if index == READOUT_LAYER:
++                before = hidden
++                first_records = [] if isinstance(getattr(self, "initial_zero_observations", None), list) else None
++                def observe_branch(record):
++                    if self.contour_observer is not None:
++                        self.contour_observer(record)
++                    if first_records is not None and record["site"] == "contour_addition":
++                        # First authorized batch only; no retained graph/tensor.
++                        residual = record["residual"]
++                        first_records.append(dict(
++                            zero_residual_exact=bool((residual == 0).all()),
++                            finite_residual=bool(torch.isfinite(residual).all()),
++                            free_corners=int(residual.shape[0]),
++                            branch_dtype=str(residual.dtype)))
++                hidden = apply_contour_readout(hidden, memory, x, t, known_mask, valid_mask,
++                    boundary_edge_mask, self.contour_readout,
++                    observer=observe_branch if first_records is not None or self.contour_observer is not None else None)
++                if first_records is not None:
++                    self.initial_zero_observations.append(dict(
++                        layer=READOUT_LAYER,
++                        zero_residual_exact=all(r["zero_residual_exact"] for r in first_records),
++                        unchanged_hidden_exact=torch.equal(before, hidden),
++                        finite_residual=all(r["finite_residual"] for r in first_records),
++                        branch_dtype="torch.float32",
++                        free_corners=sum(r["free_corners"] for r in first_records)))
++        output = native_final_forward(self.backbone.final_layer, hidden, c_free,
++            c_known, known_mask, observer=observer, face_time=face_time)
++        return output.view(batch, faces, 9)
++
++
++def upgrade_model(base, seed=INITIALIZATION_SEED):
++    """Add a branch without recreating any old parameter or changing its name.
++
++    Restore the old optimizer before appending the new parameter group.  CPU
++    fork_rng protects initialization; the caller restores the source checkpoint
++    RNG after its complete model/optimizer construction and device transfer.
++    """
++    if type(base) is not NativeModel or base.readout_mode != "none" or len(base.readouts):
++        raise ValueError("Upgrade requires a clean original NativeModel without readouts")
++    if type(seed) is not int or not 0 <= seed < 2**63:
++        raise ValueError("Invalid contour initialization seed")
++    original_parameters = tuple((n, id(p)) for n, p in base.named_parameters())
++    with torch.random.fork_rng(devices=[]):
++        torch.random.default_generator.manual_seed(seed)
++        branch = ContourReadout()
++    if sum(p.numel() for p in branch.parameters()) != EXTRA_PARAMETERS:
++        raise RuntimeError("Registered contour capacity differs")
++    branch.requires_grad_(base.experiment_trainable)
++    branch.eval()
++    device = next(base.parameters()).device
++    if device.type not in ("cpu", "meta"):
++        branch.to(device)
++    base.__class__ = ContourModel
++    base.contour_readout = branch
++    base.contour_seed = seed
++    base.contour_observer = None
++    base.initial_zero_observations = None
++    if tuple((n, id(p)) for n, p in base.named_parameters() if not n.startswith("contour_readout.")) != original_parameters:
++        raise RuntimeError("Adding the branch changed old parameter identity/order")
++    return base
++
++
++def build_candidate(model_config, trainable=True, seed=INITIALIZATION_SEED):
++    """Construction only.  No weights, model forward, or CUDA initialization."""
++    return upgrade_model(build_model(model_config, readout_mode="none", trainable=trainable), seed=seed)
+--- /dev/null
++++ r2/pilots/full_contour_readout_v1/relations.py
+@@ -0,0 +1,161 @@
++"""Finite C-surface and per-face source-contour descriptors, version 1.
++
++This module never infers topology by welding coordinates.  The caller supplies
++one boolean for each local edge (01, 12, 20), established from C-only source-ID
++incidence and transported with the actual current corner ordering.
++"""
++from __future__ import annotations
++
++import math
++import torch
++
++LENGTH_SCALE = math.sqrt(3.0) * 2.0 / 0.3762
++RELATION_DIM = 17
++EDGE_CORNERS = ((0, 1), (1, 2), (2, 0))
++TIE_EPS_FACTOR = 8.0
++DYAD_COMPONENTS = ("xx", "yy", "zz", "xy", "xz", "yz")
++FEATURE_NAMES = (
++    "surface_dx_over_L", "surface_dy_over_L", "surface_dz_over_L",
++    "surface_distance_over_L", "boundary_dx_over_L", "boundary_dy_over_L",
++    "boundary_dz_over_L", "boundary_distance_over_L", "tangent_xx",
++    "tangent_yy", "tangent_zz", "tangent_xy", "tangent_xz", "tangent_yz",
++    "boundary_exists", "boundary_edge_count_over_3", "free_time",
++)
++
++
++def _lexicographic_rows(value):
++    """Canonical arithmetic order only; it neither welds nor changes topology."""
++    result = value
++    for coordinate in reversed(range(value.shape[-1])):
++        order = torch.argsort(result[..., coordinate], dim=-1, stable=True)
++        result = result.gather(-2, order[..., None].expand_as(result))
++    return result
++
++
++def _segment(points, a, b):
++    # Endpoints supplied in a deterministic geometry order by callers.
++    edge = b - a
++    denominator = edge.square().sum(-1, keepdim=True)
++    safe = torch.where(denominator > 0, denominator, torch.ones_like(denominator))
++    fraction = (((points - a) * edge).sum(-1, keepdim=True) / safe).clamp(0, 1)
++    return a + fraction * edge
++
++
++def closest_point_triangle(points, triangles):
++    """FP32 queries [Q,3] and finite triangles [K,3,3] -> [Q,K,3].
++
++    Uses plane projection only when inside a numerically resolved triangle,
++    otherwise its finite edges.  The symmetric 64*eps**2 area test and finite
++    edge fallback follow the earlier G_closest implementation, copied into this
++    independent pilot rather than importing a retired activity package.
++    """
++    vertices = _lexicographic_rows(triangles)
++    a, b, c = (v[None] for v in vertices.unbind(-2))
++    query = points[:, None, :]
++    ab, ac, bc = b - a, c - a, c - b
++    normal = torch.linalg.cross(ab, ac, dim=-1)
++    area_squared = normal.square().sum(-1, keepdim=True)
++    longest_squared = torch.stack((ab.square().sum(-1), ac.square().sum(-1),
++                                   bc.square().sum(-1)), -1).amax(-1, keepdim=True)
++    eps = torch.finfo(points.dtype).eps
++    usable = area_squared > 64 * eps**2 * longest_squared.square()
++    safe_area = torch.where(usable, area_squared, torch.ones_like(area_squared))
++    projection = query - ((query - a) * normal).sum(-1, keepdim=True) / safe_area * normal
++    offset = projection - a
++    coord_b = (torch.linalg.cross(offset, ac.expand_as(offset), dim=-1) * normal).sum(-1, keepdim=True) / safe_area
++    coord_c = (torch.linalg.cross(ab.expand_as(offset), offset, dim=-1) * normal).sum(-1, keepdim=True) / safe_area
++    inside = usable & (coord_b >= 0) & (coord_c >= 0) & (coord_b + coord_c <= 1)
++    candidates = torch.stack((projection, _segment(query, a, b),
++                              _segment(query, a, c), _segment(query, b, c)), -2)
++    distances = (candidates - query[..., None, :]).square().sum(-1)
++    distances = torch.cat((distances[..., :1].masked_fill(~inside, torch.inf),
++                           distances[..., 1:]), -1)
++    # Canonical triangle arithmetic removes any input-order tie preference.
++    selected = distances.argmin(-1, keepdim=True)
++    return candidates.gather(-2, selected[..., None].expand(*selected.shape, 3)).squeeze(-2)
++
++
++def _canonical_edges(triangles, boundary_edge_mask):
++    starts = triangles[:, [0, 1, 2], :]
++    ends = triangles[:, [1, 2, 0], :]
++    endpoints = _lexicographic_rows(torch.stack((starts, ends), -2))
++    flattened = endpoints.flatten(-2)
++    mask = boundary_edge_mask
++    # A canonical arithmetic order makes summing tied candidates invariant to
++    # corner permutations.  IDs never enter this ordering or the descriptors.
++    for coordinate in reversed(range(6)):
++        order = torch.argsort(flattened[..., coordinate], dim=-1, stable=True)
++        flattened = flattened.gather(-2, order[..., None].expand_as(flattened))
++        mask = mask.gather(-1, order)
++    return flattened.reshape(-1, 3, 2, 3), mask
++
++
++def relation_features(points, triangles, boundary_edge_mask, time):
++    """Return [Q,K,17] finite FP32 pair descriptors without changing geometry.
++
++    B_j contains only current C face j's incidence-one edges.  For numerically
++    equal nearest edges, average closest-point vectors and unsigned tangent
++    dyads symmetrically.  Distance remains the actual minimum distance, not the
++    norm of the averaged vector.  The tie tolerance is a fixed FP32 rounding
++    rule, 8*eps*max(d_min**2, eps*L**2), not a spatial support hyperparameter.
++    """
++    if points.ndim != 2 or points.shape[-1] != 3 or triangles.ndim != 3 or triangles.shape[1:] != (3, 3):
++        raise ValueError("Expected points[Q,3], triangles[K,3,3]")
++    if points.dtype != torch.float32 or triangles.dtype != torch.float32:
++        raise ValueError("Relation coordinates must be the actual FP32 state")
++    if boundary_edge_mask.dtype != torch.bool or boundary_edge_mask.shape != triangles.shape[:2]:
++        raise ValueError("Expected boolean source-topology boundary mask[K,3]")
++    if not (points.device == triangles.device == boundary_edge_mask.device):
++        raise ValueError("Relation inputs must be colocated")
++    if not isinstance(time, torch.Tensor) or time.numel() != 1 or time.device != points.device or time.dtype != torch.float32:
++        raise ValueError("Expected one colocated FP32 free time")
++    with torch.autocast(device_type=points.device.type, enabled=False):
++        surface_vector = closest_point_triangle(points, triangles) - points[:, None, :]
++        surface_distance = torch.linalg.vector_norm(surface_vector, dim=-1, keepdim=True)
++        edges, mask = _canonical_edges(triangles, boundary_edge_mask)
++        a, b = edges[:, :, 0, :], edges[:, :, 1, :]
++        edge = b - a
++        edge_length = torch.linalg.vector_norm(edge, dim=-1, keepdim=True)
++        unit = edge / torch.where(edge_length > 0, edge_length, torch.ones_like(edge_length))
++        ux, uy, uz = unit.unbind(-1)
++        dyad = torch.stack((ux * ux, uy * uy, uz * uz, ux * uy, ux * uz, uy * uz), -1)
++        closest = _segment(points[:, None, None, :], a[None], b[None])
++        vectors = closest - points[:, None, None, :]
++        distances_squared = vectors.square().sum(-1)
++        has_boundary = mask.any(-1)
++        minimum = distances_squared.masked_fill(~mask[None], torch.inf).amin(-1)
++        # Remove infinities before computing ties, distances or MLP inputs.
++        minimum = torch.where(has_boundary[None], minimum, torch.zeros_like(minimum))
++        eps = torch.finfo(torch.float32).eps
++        tolerance = TIE_EPS_FACTOR * eps * minimum.abs().clamp_min(eps * LENGTH_SCALE**2)
++        tied = mask[None] & ((distances_squared - minimum[..., None]).abs() <= tolerance[..., None])
++        weights = tied.float() / tied.sum(-1, keepdim=True).clamp_min(1)
++        boundary_vector = (vectors * weights[..., None]).sum(-2)
++        boundary_distance = minimum.clamp_min(0).sqrt()[..., None]
++        boundary_dyad = (dyad[None] * weights[..., None]).sum(-2)
++        shape = (*surface_vector.shape[:2], 1)
++        exists = has_boundary.float()[None, :, None].expand(shape)
++        count = (mask.sum(-1).float() / 3.0)[None, :, None].expand(shape)
++        free_time = time.reshape(1, 1, 1).expand(shape)
++        result = torch.cat((surface_vector / LENGTH_SCALE, surface_distance / LENGTH_SCALE,
++                            boundary_vector / LENGTH_SCALE, boundary_distance / LENGTH_SCALE,
++                            boundary_dyad, exists, count, free_time), -1)
++    return result
++
++
++def boundary_mask_from_vertex_ids(vertex_ids):
++    """Small CPU helper for explicit C topology, also used by unit tests.
++
++    No coordinate inference, source Y or ID magnitudes are used.  An edge with
++    incidence > 2 is not open; this descriptor does not repair nonmanifold C.
++    """
++    if vertex_ids.device.type != "cpu" or vertex_ids.ndim != 2 or vertex_ids.shape[1] != 3 or vertex_ids.dtype != torch.int64:
++        raise ValueError("Expected CPU int64 C vertex IDs[K,3]")
++    rows = vertex_ids.tolist()
++    incidence = {}
++    for row in rows:
++        for a, b in EDGE_CORNERS:
++            key = tuple(sorted((row[a], row[b])))
++            incidence[key] = incidence.get(key, 0) + 1
++    return torch.tensor([[incidence[tuple(sorted((row[a], row[b])))] == 1
++                          for a, b in EDGE_CORNERS] for row in rows], dtype=torch.bool).reshape(-1, 3)
+--- /dev/null
++++ r2/pilots/full_contour_readout_v1/topology.py
+@@ -0,0 +1,244 @@
++"""C-only source topology for the fixed FULL contour readout experiment.
++
++No torch/model imports, no coordinate welding, no source-Y interface labels.
++The only network input returned here is bool[N,3], edges (01,12,20), aligned
++with the actual C corners in the current model input. Source IDs stay here.
++"""
++from __future__ import annotations
++from collections import Counter
++from functools import lru_cache
++from pathlib import Path
++import hashlib, json, os, re
++import numpy as np
++
++ROOT = Path(__file__).resolve().parents[3]
++OUT = ROOT / 'experiments/r2_full_contour_readout_v1'
++BASE = ROOT / 'experiments/r2_full_seat_learning_curve_v1'
++MANIFEST = OUT / 'inputs/topology_manifest.json'
++VERSION = 'r2_full_contour_readout_c_topology_v1'
++EDGES = np.asarray([[0, 1], [1, 2], [2, 0]], np.int64)
++EDGE_LOOKUP = np.asarray([[-1, 0, 2], [0, -1, 1], [2, 1, -1]], np.int64)
++
++
++def resolve(path):
++    s = str(path).replace('\\', '/')
++    if os.name != 'nt' and re.match(r'^[A-Za-z]:/', s): s = '/mnt/' + s[0].lower() + s[2:]
++    elif os.name == 'nt' and re.match(r'^/mnt/[a-z]/', s): s = s[5].upper() + ':/' + s[7:]
++    p = Path(s)
++    return p if p.is_absolute() else ROOT / p
++
++
++def read(path): return json.loads(resolve(path).read_text(encoding='utf-8-sig'))
++
++
++def sha(path):
++    h = hashlib.sha256()
++    with resolve(path).open('rb') as f:
++        for block in iter(lambda: f.read(1024 * 1024), b''): h.update(block)
++    return h.hexdigest()
++
++
++def array_sha(array):
++    a = np.ascontiguousarray(array)
++    return hashlib.sha256(str(a.dtype).encode() + str(a.shape).encode() + a.tobytes()).hexdigest()
++
++
++def bits(a, b):
++    return a.dtype == b.dtype and a.shape == b.shape and np.ascontiguousarray(a).tobytes() == np.ascontiguousarray(b).tobytes()
++
++
++def freeze(path, value):
++    p = resolve(path).resolve()
++    if not p.is_relative_to(OUT.resolve()) or not p.name.startswith('topology'):
++        raise ValueError('Topology writes are restricted to new topology artifacts')
++    if p.exists():
++        if read(p) != value: raise ValueError('Frozen topology artifact differs: ' + str(p))
++        return sha(p)
++    p.parent.mkdir(parents=True, exist_ok=True)
++    with p.open('x', encoding='utf-8', newline='\n') as f:
++        json.dump(value, f, ensure_ascii=False, sort_keys=True, indent=2)
++        f.write('\n'); f.flush(); os.fsync(f.fileno())
++    return sha(p)
++
++
++def boundary_mask(vertex_ids):
++    """Count only input-C undirected indexed edges; IDs need not be contiguous."""
++    ids = np.asarray(vertex_ids)
++    if ids.dtype.kind not in 'iu' or ids.ndim != 2 or ids.shape[1] != 3:
++        raise ValueError('Expected integer C vertex identities [K,3]')
++    if np.any(ids < 0) or any(len(set(x.tolist())) != 3 for x in ids):
++        raise ValueError('Missing vertex identities or repeated vertex in a face')
++    pairs = np.sort(ids[:, EDGES], axis=-1)
++    counts = Counter(tuple(int(v) for v in p) for p in pairs.reshape(-1, 2))
++    incidence = np.asarray([[counts[tuple(int(v) for v in p)] for p in face] for face in pairs], np.int64).reshape(len(ids), 3)
++    mask = incidence == 1
++    return mask, dict(boundary_edges=int(mask.sum()), internal_edges=sum(v == 2 for v in counts.values()),
++                      nonmanifold_edges=sum(v > 2 for v in counts.values()), unique_edges=len(counts),
++                      incidence_histogram={str(v): list(counts.values()).count(v) for v in sorted(set(counts.values()))})
++
++
++def permute_edge_mask(mask, corners):
++    """Transport edge attributes, not corner attributes, through any permutation."""
++    mask = np.asarray(mask); corners = np.asarray(corners)
++    if mask.dtype != np.bool_ or mask.shape != corners.shape or corners.ndim != 2 or corners.shape[1] != 3:
++        raise ValueError('Edge-mask/corner permutation dimensions differ')
++    if not np.array_equal(np.sort(corners, axis=1), np.tile(np.arange(3), (len(corners), 1))):
++        raise ValueError('Corner permutation is not bijective')
++    edge_order = EDGE_LOOKUP[corners[:, EDGES[:, 0]], corners[:, EDGES[:, 1]]]
++    return mask[np.arange(len(mask))[:, None], edge_order]
++
++
++def _condition(path, expected, uid, n, k, region_ids=None):
++    p = resolve(path)
++    if sha(p) != expected: raise ValueError('C source hash differs: ' + str(p))
++    # Explicit C-only allowlist: no free_source_ids, Y, source interfaces or quality.
++    keys = ('C', 'C_original', 'C_source_vertex_ids', 'C_original_source_vertex_ids',
++            'C_source_corner_permutations', 'C_original_source_face_ids', 'source_face_ids',
++            'region_source_face_ids', 'N', 'K', 'parent_uid', 'condition_type')
++    with np.load(p, allow_pickle=False) as z: d = {key: z[key].copy() for key in keys}
++    if (int(d['N']), int(d['K']), str(d['parent_uid'].item()), str(d['condition_type'].item())) != (n, k, uid, 'SEAT_FULL'):
++        raise ValueError('Actual condition identity is not the registered FULL request')
++    c, original = d['C'], d['C_original']; ids = d['C_source_vertex_ids']; order = d['C_source_corner_permutations']
++    if c.dtype != np.float32 or c.shape != (k, 3, 3) or not np.isfinite(c).all():
++        raise ValueError('C must be finite FP32[K,3,3]')
++    if not np.array_equal(np.sort(order, axis=1), np.tile(np.arange(3), (k, 1))):
++        raise ValueError('Saved original-to-canonical corner map is invalid')
++    if not bits(original[np.arange(k)[:, None], order], c):
++        raise ValueError('Saved corner mapping does not recover actual C')
++    if not np.array_equal(d['C_original_source_vertex_ids'][np.arange(k)[:, None], order], ids):
++        raise ValueError('Saved corner mapping does not transport vertex identities')
++    faces = d['source_face_ids']
++    if faces.shape != (k,) or len(set(faces.tolist())) != k or not np.array_equal(faces, d['region_source_face_ids']):
++        raise ValueError('FULL condition must equal its complete region source face set')
++    if region_ids is not None and not np.array_equal(faces, np.asarray(region_ids, np.int64)):
++        raise ValueError('Actual FULL region differs from recorded region identity')
++    mask, stats = boundary_mask(ids)
++    original_mask, _ = boundary_mask(d['C_original_source_vertex_ids'])
++    if not np.array_equal(mask, permute_edge_mask(original_mask, order)):
++        raise ValueError('Canonical boundary mask does not match original source topology')
++    # Coordinate validation uses identities; coincident different IDs stay distinct.
++    seen = {}
++    for vertex, coord in zip(ids.reshape(-1), c.reshape(-1, 3)):
++        key = int(vertex)
++        if key in seen and not bits(seen[key], coord): raise ValueError('One C vertex ID has inconsistent coordinates')
++        seen[key] = coord.copy()
++    result = dict(parent_id=uid, N=n, K=k, condition_type='SEAT_FULL', condition_path=str(p), condition_sha256=expected,
++                  source_face_ids=faces.tolist(), region_source_face_ids=d['region_source_face_ids'].tolist(),
++                  C_source_vertex_ids=ids.tolist(), C_source_corner_permutations=order.tolist(), C=c.tolist(),
++                  C_sha256=array_sha(c), boundary_edge_mask=mask.tolist(), boundary_edge_mask_sha256=array_sha(mask),
++                  topology=stats, topology_scope='C_ONLY_UNDIRECTED_SOURCE_VERTEX_ID_INCIDENCE',
++                  original_mapping_verified=True, coordinate_welding=False, source_Y_used=False)
++    return result
++
++
++def prepare():
++    """Verify 47 training C and 24 actual FULL requests; freeze C-only sidecar."""
++    regpath = BASE / 'registration.json'; reg = read(regpath)
++    datapath = resolve(reg['source_data'])
++    if sha(datapath) != reg['source_data_sha256']: raise ValueError('Baseline source data hash differs')
++    data = read(datapath); sidepath = BASE / 'audits/metadata_identity_sidecar.json'; side = read(sidepath)
++    if side['source_registration_sha256'] != sha(regpath) or side['affected_requests'] != 8:
++        raise ValueError('Baseline FULL metadata identity sidecar does not match')
++    dependencies = {str(regpath): sha(regpath), str(datapath): sha(datapath), str(sidepath): sha(sidepath)}
++    training = {}; requests = {}
++    for tid in reg['train_task_ids']:
++        t = data['tasks'][tid]; p = data['parents'][t['uid']]
++        row = _condition(t['npz'], t['sha256'], t['uid'], t['N'], t['K'], t['region_source_face_ids'])
++        if not np.array_equal(row['source_face_ids'], t['source_face_ids']): raise ValueError('Training source C face IDs differ')
++        parentpath = resolve(p['npz'])
++        if sha(parentpath) != p['sha256']: raise ValueError('Training source parent hash differs')
++        indices = np.asarray(row['source_face_ids'], np.int64)
++        # These arrays are indexed to C immediately; no Y geometry or labels enters topology.
++        with np.load(parentpath, allow_pickle=False) as z:
++            c = z['full_target'].reshape(t['N'], 3, 3)[indices]
++            vids = z['source_face_vertex_ids'][indices]
++            mapped = z['model_vertices'][vids]
++        if not bits(c, np.asarray(row['C'], np.float32)) or not bits(mapped, c): raise ValueError('Training C does not match parent indexed geometry')
++        if not np.array_equal(vids, row['C_source_vertex_ids']): raise ValueError('Training source C vertex map differs')
++        row.update(task_id=tid, parent_path=str(parentpath), parent_sha256=p['sha256'])
++        training[tid] = row; dependencies[str(parentpath)] = p['sha256']; dependencies[row['condition_path']] = row['condition_sha256']
++    for q in reg['requests']:
++        # condition_source, actual N/K and actual FULL region are authoritative.
++        # Inherited task_id/source_face_ids/npz/free_source_ids are intentionally ignored.
++        row = _condition(q['condition_source'], q['condition_source_sha256'], q['parent_id'], q['N'], q['K'], q.get('region_source_face_ids'))
++        path = resolve(q['input_path'])
++        if sha(path) != q['input_sha256']: raise ValueError('Fixed evaluation input file changed')
++        with np.load(path, allow_pickle=False) as z:
++            c = z['C'].copy(); n = int(z['N']); k = int(z['K'])
++        if (n, k) != (q['N'], q['K']) or not bits(c, np.asarray(row['C'], np.float32)) or array_sha(c) != q['C_sha256']:
++            raise ValueError('Actual evaluation C differs from FULL source geometry')
++        full_mask = np.zeros((n, 3), bool); full_mask[:k] = np.asarray(row['boundary_edge_mask'], bool)
++        row.update(request_id=q['request_id'], condition_id=q['condition_id'], split=q['split'],
++                   input_path=str(path), input_sha256=q['input_sha256'], model_mask_sha256=array_sha(full_mask),
++                   ignored_stale_fields=[name for name in ('task_id','source_face_ids','npz','free_source_ids') if name in q],
++                   inherited_HALF_metadata_ignored=q['parent_id'].startswith(('2d08a6', '610b16')))
++        requests[q['request_id']] = row
++        dependencies[str(path)] = q['input_sha256']; dependencies[row['condition_path']] = row['condition_sha256']
++    if len(training) != 47 or len(requests) != 24: raise ValueError('Frozen baseline scope changed')
++    value = dict(schema=VERSION, status='FROZEN', training=training, requests=requests, source_files=dependencies,
++                 edge_order=EDGES.tolist(), network_input='bool[B,N,3] only; numerical source identities are not features',
++                 boundary_rule='incidence_C(undirected source vertex-ID pair) == 1',
++                 source_Y_used=False, source_interface_labels_used=False, coordinate_welding=False,
++                 metadata_policy='Actual FULL condition_source NPZ and request C; legacy HALF descriptors never used')
++    digest = freeze(MANIFEST, value)
++    audit = dict(status='PASS', topology_manifest_path=str(MANIFEST), topology_manifest_sha256=digest,
++                 training_conditions=len(training), evaluation_requests=len(requests), evaluation_conditions=len({r['condition_id'] for r in requests.values()}),
++                 inherited_HALF_requests_verified=sum(r['inherited_HALF_metadata_ignored'] for r in requests.values()),
++                 training_nonmanifold_C=sum(r['topology']['nonmanifold_edges'] > 0 for r in training.values()),
++                 evaluation_nonmanifold_C=sum(r['topology']['nonmanifold_edges'] > 0 for r in requests.values()),
++                 source_files=len(dependencies), model_calls=0, updates=0, new_OT=0, noise_draws=0,
++                 implementation_sha256=sha(__file__))
++    freeze(OUT / 'audits/topology_prepare.json', audit)
++    return audit
++
++
++class TopologyInputs:
++    def __init__(self, path=MANIFEST, verify_sources=True):
++        self.path = resolve(path); self.manifest = read(self.path); self.manifest_sha256 = sha(self.path)
++        if self.manifest.get('schema') != VERSION or self.manifest.get('status') != 'FROZEN': raise ValueError('Unfrozen topology manifest')
++        if verify_sources:
++            for p, h in self.manifest['source_files'].items():
++                if sha(p) != h: raise ValueError('Topology dependency changed: ' + p)
++        self.training = self.manifest['training']; self.requests = self.manifest['requests']
++
++    @lru_cache(maxsize=128)
++    def _training(self, task_id):
++        r = self.training[task_id]
++        return r, np.asarray(r['C'], np.float32), np.asarray(r['source_face_ids'], np.int64), np.asarray(r['boundary_edge_mask'], bool)
++
++    def for_training(self, sample):
++        """Return bool[N,3] aligned through final face and corner permutations."""
++        row, c, face_ids, source_mask = self._training(sample['task_id'])
++        n, k = int(sample['y']), int(sample['K']); known = np.asarray(sample['known_mask'])
++        valid = np.asarray(sample['valid_mask'])
++        if (n, k, sample['object_id']) != (row['N'], row['K'], row['parent_id']): raise ValueError('Training topology identity differs')
++        if known.dtype != np.bool_ or known.shape != (n,) or known.sum() != k or np.any(known & ~valid): raise ValueError('Invalid known mask')
++        ids = np.asarray(sample['source_face_ids'])[known]; corners = np.asarray(sample['corner_permutations'])[known]
++        if not np.array_equal(np.sort(ids), np.sort(face_ids)): raise ValueError('Actual known source IDs differ from C-only topology')
++        lookup = {int(v): i for i, v in enumerate(face_ids)}; order = np.asarray([lookup[int(v)] for v in ids], np.int64)
++        expected = c.copy(); expected[:, :, 0] *= np.float32(sample['alpha'])
++        expected = expected[order][np.arange(k)[:, None], corners]
++        actual = np.asarray(sample['context']).reshape(n, 3, 3)[known]
++        if not bits(expected, actual) or not bits(np.asarray(sample['xt']).reshape(n, 3, 3)[known], actual):
++            raise ValueError('C topology/geometry transport differs after width and corner permutation')
++        mask = np.zeros((n, 3), bool); mask[known] = permute_edge_mask(source_mask[order], corners)
++        if mask[~known].any() or int(mask.sum()) != int(source_mask.sum()): raise ValueError('Boundary-mask transport changed edge count')
++        return mask
++
++    def attach(self, sample):
++        mask = self.for_training(sample)
++        sample['boundary_edge_mask'] = mask
++        sample['boundary_edge_mask_sha256'] = array_sha(mask)
++        sample['boundary_topology_manifest_sha256'] = self.manifest_sha256
++        return sample
++
++    def for_request(self, request_id):
++        """Canonical C occupies first K slots in the frozen inference input."""
++        row = self.requests[request_id]; mask = np.zeros((row['N'], 3), bool)
++        mask[:row['K']] = np.asarray(row['boundary_edge_mask'], bool)
++        if array_sha(mask) != row['model_mask_sha256']: raise ValueError('Evaluation boundary mask changed')
++        return mask
++
++
++if __name__ == '__main__':
++    print(json.dumps(prepare(), indent=2))

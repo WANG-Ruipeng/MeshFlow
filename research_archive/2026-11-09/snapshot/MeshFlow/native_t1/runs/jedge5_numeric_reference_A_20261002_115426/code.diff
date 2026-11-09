@@ -1,0 +1,2231 @@
+diff --git a/experiments/mf_h1_local0/jedge5_numeric_reference_A/analysis.py b/experiments/mf_h1_local0/jedge5_numeric_reference_A/analysis.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..933f559949afc51f1fadf38149f20b50dd0f3172
+--- /dev/null
++++ b/experiments/mf_h1_local0/jedge5_numeric_reference_A/analysis.py
+@@ -0,0 +1,251 @@
++"""Window A endpoint convergence evidence, frozen GT scores, and fixed-view figures.
++
++These four observed cases are deliberately selected diagnostics. No solver is
++selected using GT error; no representative win rate or ODE truth is inferred.
++"""
++from pathlib import Path
++import argparse
++import csv
++import time
++import numpy as np
++from .assets import read_json, write_json, file_sha256
++from .scoring import own_out
++from native_t1.metrics import symmetric_surface_rms
++
++SOLVERS=('R1','R2','D1','D2')
++ORDER=('E50','E100','E200')+SOLVERS
++LABELS={'E50':'Euler 50','E100':'Euler 100','E200':'Euler 200',
++        'R1':'RK4 100 (400 NFE)','R2':'RK4 200 (800 NFE)',
++        'D1':'Dopri5 rtol=1e-4','D2':'Dopri5 rtol=1e-5'}
++KEYS=('remainder_symmetric_RMS_bbox_pct','free_to_R12_RMS_bbox_pct',
++      'R12_to_free_RMS_bbox_pct','fixed_R12_coverage_RMS_bbox_pct',
++      'fixed_R12_coverage_within_1pct_fraction','boundary_RMS_bbox_pct',
++      'boundary_p95_bbox_pct','boundary_coverage_fraction',
++      'Gamma_to_free_edges_RMS_bbox_pct','Gamma_to_free_edges_p95_bbox_pct',
++      'CF_proper_affected_free_fraction','CF_proper_pair_count',
++      'CF_coplanar_pair_count','CF_unresolved_or_degenerate_pair_count',
++      'FF_proper_pair_count','FF_coplanar_pair_count','FF_illegal_pair_count',
++      'FF_unresolved_or_degenerate_pair_count','free_total_surface_area',
++      'free_near_degenerate_count','free_exact_zero_area_count',
++      'free_minimum_angle_lt5_fraction','free_angle_p05_degrees',
++      'nan_coordinate_count','inf_coordinate_count','whole_symmetric_RMS_bbox_pct')
++
++
++def write_csv(path, rows):
++    path=Path(path);path.parent.mkdir(parents=True,exist_ok=True)
++    keys=[]
++    for row in rows:
++        for key in row:
++            if key not in keys:keys.append(key)
++    with path.open('w',newline='',encoding='utf-8') as f:
++        w=csv.DictWriter(f,fieldnames=keys);w.writeheader();w.writerows(rows)
++
++
++def load_raw(row,out):
++    path=Path(row['path'])
++    if not path.is_absolute():path=Path(out)/path
++    if file_sha256(path)!=row['sha256']:
++        raise ValueError('Endpoint raw checksum differs: '+str(path))
++    with np.load(path,allow_pickle=False) as z:
++        a=z['raw'].copy().reshape(112,3,3)
++    if a.dtype!=np.float32 or not np.isfinite(a).all():
++        raise ValueError('Endpoint coordinates must be finite FP32')
++    return a
++
++
++def endpoint_difference(left,right,bbox):
++    """Compare free coordinates and independent area-sampled surface geometry.
++
++    Coordinate RMS is per coordinate; vertex RMS is also supplied to remove
++    convention ambiguity. Surface comparison has no source-slot correspondence.
++    Its 512 samples/direction follow the unchanged seed9911 scoring helper.
++    """
++    left=np.asarray(left).reshape(112,3,3)
++    right=np.asarray(right).reshape(112,3,3)
++    if left[:12].tobytes()!=right[:12].tobytes():
++        raise ValueError('Compared endpoints do not have identical C')
++    d=left[12:].astype(np.float64)-right[12:].astype(np.float64)
++    vertex=np.linalg.norm(d,axis=-1)
++    surface=symmetric_surface_rms(left[12:],right[12:],bbox)
++    return dict(coordinate_RMS=float(np.sqrt(np.mean(d*d))),
++        coordinate_max_abs=float(np.max(np.abs(d))),
++        vertex_RMS=float(np.sqrt(np.mean(vertex*vertex))),
++        vertex_max_L2=float(vertex.max()),
++        coordinate_RMS_bbox_pct=float(100*np.sqrt(np.mean(d*d))/bbox),
++        vertex_RMS_bbox_pct=float(100*np.sqrt(np.mean(vertex*vertex))/bbox),
++        coordinate_max_abs_bbox_pct=float(100*np.max(np.abs(d))/bbox),
++        vertex_max_L2_bbox_pct=float(100*vertex.max()/bbox),
++        surface=surface,
++        interpretation='Slot differences are not semantic errors; sampled surface differences are not certified numerical bounds')
++
++
++def collect(out):
++    out=own_out(out);protocol=read_json(out/'registration/protocol.json')
++    rows=[]
++    for path in sorted((out/'trajectories').glob('*/result.json')):
++        row=read_json(path);ident=path.parent.name
++        if row.get('repeat') or row.get('is_repeat') or 'repeat' in ident.lower():continue
++        record=dict(row,source='new_formal',trajectory_id=ident)
++        scorepath=out/'scores'/ident/'result.json'
++        if scorepath.exists():
++            score=read_json(scorepath)
++            if score['status']=='PASS':
++                if score['row']['sha256']!=row['sha256']:
++                    raise ValueError('Score belongs to a different endpoint')
++                record.update(scalars=score['scalars'],score_status='AVAILABLE',score_path=str(scorepath.relative_to(out)))
++            else:record.update(scalars={},score_status=score['status'])
++        else:record.update(scalars={},score_status='NOT_AVAILABLE')
++        rows.append(record)
++    for row in read_json(out/'registration/old_euler_index.json')['rows']:
++        score=row.get('score',{})
++        rows.append(dict(row,source='old_Euler_read_only',solver='E'+str(row['nfe']),
++                         complete=row['status']=='AVAILABLE',scalars=score.get('scalars',{}),
++                         score_status=score.get('status','NOT_AVAILABLE')))
++    return protocol,rows
++
++
++def fixed_view_figure(out,protocol,rows,free_only=False):
++    import matplotlib
++    matplotlib.use('Agg')
++    import matplotlib.pyplot as plt
++    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
++    out=own_out(out)
++    lookup={(r['case_id'],r['model'],r['solver']):r for r in rows}
++    fig=plt.figure(figsize=(21,22))
++    for cidx,case in enumerate(protocol['cases']):
++        cid=case['id'];available=[]
++        for model in ('B','J'):
++            for solver in ORDER:
++                row=lookup.get((cid,model,solver))
++                if row and row.get('complete'):
++                    available.append(load_raw(row,out))
++        if available:
++            joined=np.concatenate(available).reshape(-1,3)
++            low=joined.min(0);high=joined.max(0);center=(low+high)/2
++            radius=max(float((high-low).max())*.55,1e-3)
++        else:center=np.zeros(3);radius=1
++        for mi,model in enumerate(('B','J')):
++            for si,solver in enumerate(ORDER):
++                ax=fig.add_subplot(8,7,(2*cidx+mi)*7+si+1,projection='3d')
++                row=lookup.get((cid,model,solver))
++                if row and row.get('complete'):
++                    a=load_raw(row,out)
++                    free=Poly3DCollection(a[12:,:,[0,2,1]],facecolors='#5d91ad',edgecolors='#244a60',linewidths=.12,alpha=.96)
++                    ax.add_collection3d(free)
++                    if not free_only:
++                        known=Poly3DCollection(a[:12,:,[0,2,1]],facecolors='#dca74c',edgecolors='#665028',linewidths=.3,alpha=1)
++                        ax.add_collection3d(known)
++                    s=row.get('scalars',{}).get('remainder_symmetric_RMS_bbox_pct')
++                    detail=('RMS %.4f%%'%s) if s is not None else 'score unavailable'
++                else:detail=row.get('status','NOT_AVAILABLE') if row else 'NOT_AVAILABLE'
++                display=center[[0,2,1]]
++                ax.set_xlim(display[0]-radius,display[0]+radius)
++                ax.set_ylim(display[1]-radius,display[1]+radius)
++                ax.set_zlim(display[2]-radius,display[2]+radius)
++                ax.set_box_aspect((1,1,1));ax.view_init(elev=24,azim=-54);ax.set_axis_off()
++                ax.set_title(f"{model} | {LABELS[solver]}\n{detail}",fontsize=8)
++                if si==0:
++                    ax.text2D(-.10,.55,cid,transform=ax.transAxes,rotation=90,va='center',fontsize=9)
++    fig.suptitle('Four deliberately selected observed cases | '+('free surfaces only' if free_only else 'full outputs: known C gold, free blue')+
++                 '\nFP32; same view and bounds within each case; absent/incomplete results are not endpoints',fontsize=13,y=.995)
++    fig.subplots_adjust(left=.05,right=.995,top=.925,bottom=.005,wspace=.00,hspace=.10)
++    path=out/('fixed_view_free_only.png' if free_only else 'fixed_view_full.png')
++    fig.savefig(path,dpi=135);plt.close(fig)
++    return dict(path=path.name,sha256=file_sha256(path),free_only=free_only,
++                view=dict(elev=24,azim=-54,display_coordinate_order='X,Z,Y',bounds='shared across all methods and B/J within each case'))
++
++
++def analyze(out,figures=True):
++    tick=time.perf_counter();out=own_out(out);protocol,rows=collect(out)
++    lookup={(r['case_id'],r['model'],r['solver']):r for r in rows}
++    if len(lookup)!=len(rows):raise ValueError('Duplicate formal comparison rows')
++    pairs=[];missing=[];table=[];jb=[];convergence=[];arrays={}
++    def array(row):
++        key=(row['case_id'],row['model'],row['solver'])
++        if key not in arrays:arrays[key]=load_raw(row,out)
++        return arrays[key]
++    for row in rows:
++        table.append(dict(model=row['model'],case_id=row['case_id'],parent=row['parent'],patch=row['patch'],
++                          seed=row['seed'],solver=row['solver'],source=row['source'],status=row['status'],
++                          complete=row.get('complete',False),nfe=row.get('nfe'),score_status=row['score_status'],
++                          **row.get('scalars',{})))
++    for case in protocol['cases']:
++        cid=case['id'];bbox=case['bbox']
++        for model in ('B','J'):
++            comparisons=[('R1','R2'),('D1','D2'),('D2','R2'),('R1','D1')]
++            comparisons += [(e,s) for e in ('E50','E100','E200') for s in SOLVERS]
++            comparisons += [('E50','E100'),('E100','E200')]
++            local={}
++            for a,b in comparisons:
++                left=lookup.get((cid,model,a));right=lookup.get((cid,model,b))
++                info=dict(model=model,case_id=cid,left_solver=a,right_solver=b)
++                if not (left and right and left.get('complete') and right.get('complete')):
++                    missing.append(dict(info,status='NOT_AVAILABLE',left_status=left.get('status') if left else 'MISSING',right_status=right.get('status') if right else 'MISSING'))
++                    continue
++                delta=endpoint_difference(array(left),array(right),bbox)
++                record=dict(info,status='PASS',**delta,
++                            left_own_GT=left.get('scalars',{}),right_own_GT=right.get('scalars',{}))
++                pairs.append(record);local[a+'__'+b]=record
++            def ratio(n,d,kind):
++                x=local.get(n);y=local.get(d)
++                if not x or not y:return None
++                xv=x['surface']['symmetric_rms_bbox_pct'] if kind=='surface' else x['coordinate_RMS_bbox_pct']
++                yv=y['surface']['symmetric_rms_bbox_pct'] if kind=='surface' else y['coordinate_RMS_bbox_pct']
++                return xv/yv if yv else None
++            convergence.append(dict(model=model,case_id=cid,
++                R1_R2_coordinate_vs_E50_E100_ratio=ratio('R1__R2','E50__E100','coordinate'),
++                R1_R2_surface_vs_E50_E100_ratio=ratio('R1__R2','E50__E100','surface'),
++                D2_R2_coordinate_vs_R1_D1_ratio=ratio('D2__R2','R1__D1','coordinate'),
++                D2_R2_surface_vs_R1_D1_ratio=ratio('D2__R2','R1__D1','surface'),
++                pair_values={key:dict(coordinate_RMS_bbox_pct=r['coordinate_RMS_bbox_pct'],
++                                     surface_RMS_bbox_pct=r['surface']['symmetric_rms_bbox_pct']) for key,r in local.items()},
++                automatic_classification='NOT_ASSIGNED: inspect coordinate and surface evidence; no GT-based solver selection'))
++        for solver in ORDER:
++            b=lookup.get((cid,'B',solver));j=lookup.get((cid,'J',solver))
++            if not (b and j and b.get('complete') and j.get('complete') and b['score_status']=='AVAILABLE' and j['score_status']=='AVAILABLE'):
++                jb.append(dict(case_id=cid,solver=solver,status='NOT_AVAILABLE'))
++                continue
++            shared=set(b['scalars'])&set(j['scalars']);deltas={}
++            for key in sorted(shared):
++                bv=b['scalars'][key];jv=j['scalars'][key]
++                if isinstance(bv,(int,float)) and isinstance(jv,(int,float)):
++                    deltas[key]=float(jv-bv)
++            jb.append(dict(case_id=cid,solver=solver,status='PASS',B=b['scalars'],J=j['scalars'],J_minus_B=deltas,
++                           generated_endpoint_difference=endpoint_difference(array(b),array(j),bbox)))
++    # Do not pool the intentionally imbalanced four diagnostic cases into a population win rate.
++    counts=dict(formal_rows=sum(r['source']=='new_formal' for r in rows),
++                formal_complete=sum(r['source']=='new_formal' and r.get('complete',False) for r in rows),
++                formal_scored=sum(r['source']=='new_formal' and r['score_status']=='AVAILABLE' for r in rows),
++                old_Euler_available=sum(r['source']=='old_Euler_read_only' and r.get('complete',False) for r in rows),
++                paired_endpoint_comparisons=len(pairs),B_J_endpoint_comparisons=sum(r['status']=='PASS' for r in jb),
++                missing_pair_comparisons=len(missing),model_forwards=0)
++    write_csv(out/'per_case.csv',table)
++    pairtable=[]
++    for r in pairs:
++        pairtable.append({**{k:v for k,v in r.items() if not isinstance(v,(dict,list))},
++            **{'surface_'+k:v for k,v in r['surface'].items() if isinstance(v,(str,int,float))}})
++    write_csv(out/'endpoint_differences.csv',pairtable)
++    write_csv(out/'J_minus_B.csv',[dict(case_id=r['case_id'],solver=r['solver'],status=r['status'],**r.get('J_minus_B',{})) for r in jb])
++    figure_records=[]
++    if figures:
++        figure_records=[fixed_view_figure(out,protocol,rows,False),fixed_view_figure(out,protocol,rows,True)]
++    result=dict(status='PASS',schema='numeric_reference_A_analysis_v1',counts=counts,
++                source_rows=rows,endpoint_differences=pairs,missing_comparisons=missing,
++                convergence_evidence=convergence,J_minus_B=jb,figures=figure_records,
++                CPU_analysis_seconds=time.perf_counter()-tick,model_forwards=0,backward_calls=0,OT_calls=0,
++                surface_comparison=dict(kind='independent generated-free-surface to generated-free-surface',
++                    helper='native_t1.metrics.symmetric_surface_rms',points_per_surface=512,seed=9911,
++                    denominator='same original parent full bbox diagonal',
++                    coordinate_RMS='sqrt(mean across all free face-corner coordinates))',
++                    note='Independent surface difference is not same-slot difference, own GT score, semantic label, or certified ODE error'),
++                scope='Four intentionally chosen observed cases; no population/generalization estimate; no solver selected by GT quality')
++    write_json(out/'analysis.json',result)
++    return result
++
++
++def main(argv=None):
++    p=argparse.ArgumentParser();p.add_argument('--out',required=True,type=Path);p.add_argument('--no-figures',action='store_true')
++    a=p.parse_args(argv);r=analyze(a.out,not a.no_figures)
++    print({'status':r['status'],'counts':r['counts'],'CPU_analysis_seconds':r['CPU_analysis_seconds']},flush=True)
++
++if __name__=='__main__':main()
+diff --git a/experiments/mf_h1_local0/jedge5_numeric_reference_A/assets.py b/experiments/mf_h1_local0/jedge5_numeric_reference_A/assets.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..8549830a0f6764398e32fc444813075b77e2360e
+--- /dev/null
++++ b/experiments/mf_h1_local0/jedge5_numeric_reference_A/assets.py
+@@ -0,0 +1,152 @@
++﻿"""Window A frozen assets. Only exact archived arrays, no noise draws or OT."""
++from native_t1 import runtime as _runtime  # sets CUBLAS before a possible later CUDA load
++from pathlib import Path
++import json
++import os
++import sys
++import numpy as np
++import torch
++from native_t1.artifacts import file_sha256, state_sha256, array_hash
++from native_t1.geometry_checkpoint import load_geometry_checkpoint
++
++ROOT = Path(__file__).resolve().parents[3]
++EVALUATION = ROOT/'native_t1/runs/edge_factorial_20261001_123000/registration/evaluation_inputs.npz'
++EVALUATION_SHA = '2154881d77b946a2a18959503930fd1d405f88f0d1f56d64a8f0d86710ed01b4'
++CASE_SPECS = ((0,0,10401),(1,0,10401),(0,4,10401),(0,4,10402))
++ASSETS = {
++ 'B': dict(path=ROOT/'native_t1/checkpoints/ablations/fm_cumulative3000.pt', recipe='fm',
++           state='f006c49c8c70efa4bf2df6ca96431c844a25a1bdd38e2db4756115a37a23545b',
++           file='0f22ce498ca2c27dc74b43890fb8aad20f0f3e7153aa74ee6d3c14ea445a2660'),
++ 'J': dict(path=ROOT/'native_t1/checkpoints/jedge5_cumulative3000.pt', recipe='edge5',
++           state='b9c1df5326ad4815ec3c32ed20e08dc34ff6248ff05be2c412e051fcb728aae3',
++           file='cc7a248fa9a8570059f225cd1c313f21f08585925407a79418df6d63c9cae0e9')}
++
++
++def _json(value):
++    if isinstance(value, Path): return str(value)
++    if isinstance(value, np.ndarray): return value.tolist()
++    if isinstance(value, np.generic): return value.item()
++    if torch.is_tensor(value): return value.detach().cpu().tolist()
++    raise TypeError(type(value).__name__)
++
++
++def write_json(path, value):
++    path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)
++    temporary = path.with_suffix(path.suffix+'.tmp')
++    temporary.write_text(json.dumps(value, default=_json, ensure_ascii=False, indent=2, allow_nan=False)+'\n', encoding='utf-8')
++    os.replace(temporary, path)
++
++
++def read_json(path):
++    return json.loads(Path(path).read_text(encoding='utf-8-sig'))
++
++
++def case_id(parent, patch, seed):
++    return f'P{parent}_patch{patch}_seed{seed}'
++
++
++def load_model(label, device='cpu'):
++    spec = ASSETS[label]
++    if file_sha256(spec['path']) != spec['file']:
++        raise ValueError(f'{label} checkpoint file identity changed')
++    with torch.random.fork_rng(devices=[]):
++        model, audit = load_geometry_checkpoint(spec['path'], device=device, expected_recipe=spec['recipe'])
++    if audit['state_sha256'] != spec['state'] or audit['cumulative_updates'] != 3000:
++        raise ValueError(f'{label} generator/cumulative identity mismatch')
++    if not audit['strict'] or audit['missing_keys'] or audit['unexpected_keys']:
++        raise ValueError('Strict checkpoint loading contract failed')
++    return model, audit
++
++
++def discover_archive():
++    """Select latest matching report using content identities, not a timestamp literal."""
++    candidates = []; rejected = []
++    for report in (ROOT/'native_t1/runs').rglob('JEDGE5_DIAGNOSIS_REPORT.md'):
++        folder = report.parent
++        try:
++            protocol = read_json(folder/'registration/protocol.json')
++            if (protocol.get('schema') != 'jedge5_diagnosis_v1'
++                or protocol.get('generation_seeds') != [10401,10402]
++                or protocol.get('primary_order') != ['A','B','C','D']):
++                raise ValueError('Protocol/seeds/stages differ')
++            identities = {r['label']:r for r in protocol['checkpoint_identities']}
++            for label, spec in ASSETS.items():
++                if identities[label]['state_sha256'] != spec['state']:
++                    raise ValueError(label+' identity differs')
++                replay = read_json(folder/'stage_d'/('R_'+label)/'replay.json')
++                if (replay.get('status') != 'PASS_EXACT_REPLAY'
++                    or replay.get('raw500_state_sha256') != spec['state']
++                    or replay.get('raw500_bitwise_reference_equal') is not True):
++                    raise ValueError(label+' replay identity differs')
++                a = read_json(folder/'A'/label/'results.json')
++                if a.get('status') != 'PASS' or a.get('state_after') != spec['state']:
++                    raise ValueError(label+' A phase incomplete')
++            if not (folder/'B').is_dir() or not (folder/'stage_c').is_dir():
++                raise ValueError('Missing B/C archive stage')
++            candidates.append(dict(path=str(folder),report=str(report),mtime_ns=report.stat().st_mtime_ns))
++        except (ValueError, KeyError, OSError) as exc:
++            rejected.append(dict(path=str(folder),reason=str(exc)))
++    if not candidates:
++        raise FileNotFoundError('No ABCD archive with the prescribed B/J replay and seeds; '+str(rejected))
++    candidates.sort(key=lambda row:(row['mtime_ns'],row['path']), reverse=True)
++    return Path(candidates[0]['path']), dict(selection='latest report mtime among identity-matching ABCD archives',
++                                            candidates=candidates,rejected=rejected)
++
++
++def load_registered_cases(out):
++    """Return the four registered input records; every continuous array is archived."""
++    out = Path(out); p = read_json(out/'registration/protocol.json')
++    source = out/'registration/inputs.npz'
++    if file_sha256(source) != p['registered_inputs_sha256']:
++        raise ValueError('Registered input archive changed')
++    rows = []
++    with np.load(source, allow_pickle=False) as z:
++        for meta in p['cases']:
++            row = dict(meta)
++            for name in ('noise','C','known','valid','y','known_slots','free_slots','initial_full','initial_free'):
++                row[name] = z[meta['id']+'__'+name].copy()
++                if array_hash(row[name]) != meta['array_hashes'][name]:
++                    raise ValueError('Registered array changed: '+meta['id']+'/'+name)
++            rows.append(row)
++    return rows
++
++
++def load_case(out, identifier):
++    rows = load_registered_cases(out)
++    if isinstance(identifier, int): return rows[identifier]
++    return next(row for row in rows if row['id'] == identifier)
++
++
++def noise_bank(out):
++    rows = load_registered_cases(out)
++    return {row['seed']:row['noise'].copy() for row in rows}
++
++
++def actually_imported_sources():
++    """Hash only local imported source modules, excluding either window's output/code."""
++    own = Path(__file__).resolve().parent
++    paths = set()
++    for module in tuple(sys.modules.values()):
++        file = getattr(module, '__file__', None)
++        if not file: continue
++        path = Path(file).resolve()
++        if not path.is_file() or path.suffix != '.py' or ROOT not in path.parents or own in path.parents: continue
++        # No other window's runtime/output files become immutable by association.
++        rel = str(path.relative_to(ROOT)).replace('\\','/')
++        if 'jedge5_local' in rel or 'jedge5_numeric_reference_A_' in rel: continue
++        paths.add(path)
++    return [dict(path=str(p),sha256=file_sha256(p),kind='read_source') for p in sorted(paths)]
++
++
++def verify_protected(out):
++    """Check only registered read assets; unrelated window outputs are ignored."""
++    registration = Path(out)/'registration/protected_assets.json'
++    payload = read_json(registration); rows=[]
++    for record in payload['files']:
++        path=Path(record['path']); actual=file_sha256(path) if path.is_file() else None
++        rows.append(dict(path=str(path),expected=record['sha256'],actual=actual,
++                         unchanged=actual==record['sha256'],kind=record['kind']))
++    return dict(status='PASS' if all(r['unchanged'] for r in rows) else 'FAIL',
++                checked=len(rows),changed=[r for r in rows if not r['unchanged']],
++                scope=payload['scope'])
++
+diff --git a/experiments/mf_h1_local0/jedge5_numeric_reference_A/dispatch.py b/experiments/mf_h1_local0/jedge5_numeric_reference_A/dispatch.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..ac4aa893884e27ddc610fc462d75bae8ab29a6b0
+--- /dev/null
++++ b/experiments/mf_h1_local0/jedge5_numeric_reference_A/dispatch.py
+@@ -0,0 +1,57 @@
++﻿"""Budgeted matrix dispatcher: one GPU subprocess, independent CPU scoring."""
++import argparse
++from concurrent.futures import ThreadPoolExecutor
++import json
++import os
++from pathlib import Path
++import subprocess
++import sys
++import time
++
++
++def main():
++    p=argparse.ArgumentParser();p.add_argument('--out',required=True,type=Path);args=p.parse_args();out=args.out.resolve()
++    prefix='experiments.mf_h1_local0.jedge5_numeric_reference_A.'
++    def run(module,tail,log):
++        start=time.perf_counter();log.parent.mkdir(parents=True,exist_ok=True)
++        with log.open('x') as stream:
++            result=subprocess.run([sys.executable,'-B','-m',prefix+module,'--out',str(out)]+tail,stdout=stream,stderr=subprocess.STDOUT)
++        return dict(returncode=result.returncode,seconds=time.perf_counter()-start,log=str(log))
++    records=[]
++    for model in ('B','J'):
++        path=out/'prechecks'/f'{model}_precheck'/'result.json'
++        if not path.exists():
++            record=run('worker',['--model',model,'--precheck'],out/'logs'/f'{model}_precheck.log');records.append(record)
++        if not path.exists() or json.loads(path.read_text())['status']!='PASS':raise RuntimeError('GPU precheck failed '+model)
++    init=run('scoring',['--initialize'],out/'logs'/'score_initialize.log')
++    if init['returncode']:raise RuntimeError('Scorer initialization failed')
++    executor=ThreadPoolExecutor(max_workers=2);futures=[]
++    def score(path,ident):return run('scoring',['--trajectory',str(path)],out/'logs'/('score_'+ident+'.log'))
++    # Frozen ordering is independent of scores and worker completion times.
++    cases=('P0_patch0_seed10401','P1_patch0_seed10401','P0_patch4_seed10401','P0_patch4_seed10402')
++    for solver in ('R1','R2','D1','D2'):
++        for case_index,case_id in enumerate(cases):
++            for model in ('B','J'):
++                ident=f'{model}_{case_id}_{solver}';path=out/'trajectories'/ident/'result.json'
++                if path.exists():raise FileExistsError('No silent resume/retry '+str(path))
++                record=run('worker',['--model',model,'--case',str(case_index),'--solver',solver],out/'logs'/(ident+'.log'))
++                records.append(dict(id=ident,**record))
++                if not path.exists():raise RuntimeError('Missing worker record '+ident)
++                payload=json.loads(path.read_text())
++                print(json.dumps(dict(id=ident,status=payload['status'],nfe=payload.get('nfe'),t=payload.get('last_accepted_time'))),flush=True)
++                (out/'dispatch_progress.json').write_text(json.dumps(records,indent=2))
++                if payload['status']=='WORKER_FAILURE' or record['returncode']:raise RuntimeError('Worker error; no retry '+ident)
++                if payload['complete']:futures.append(executor.submit(score,path,ident))
++    # Exactly one preregistered independent process repeat, not selected by quality.
++    ident='B_P0_patch0_seed10401_R1_repeat'
++    record=run('worker',['--model','B','--case','0','--solver','R1','--repeat'],out/'logs'/(ident+'.log'))
++    records.append(dict(id=ident,**record))
++    if record['returncode']:raise RuntimeError('Repeat worker failed')
++    scores=[f.result() for f in futures];executor.shutdown()
++    for row in scores:
++        if row['returncode']:raise RuntimeError('CPU score failed '+row['log'])
++    (out/'dispatch.json').write_text(json.dumps(dict(status='PASS',GPU_workers_this_window=1,CPU_scoring_workers=2,
++        tasks=records,scoring=scores,timing_note='Worker wall includes GPU-lock wait and load. Concurrent CPU scoring wall is not isolated throughput.'),indent=2))
++    print('MATRIX_FINISHED',flush=True)
++
++if __name__=='__main__':main()
+diff --git a/experiments/mf_h1_local0/jedge5_numeric_reference_A/finalize.py b/experiments/mf_h1_local0/jedge5_numeric_reference_A/finalize.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..5446d19bf4b7660d3699d277e3c091313b498d0d
+--- /dev/null
++++ b/experiments/mf_h1_local0/jedge5_numeric_reference_A/finalize.py
+@@ -0,0 +1,314 @@
++"""Final CPU audit/export for window A; run only after its fixed matrix ends.
++
++This module never calls a model, a solver, OT, an optimizer or git mutation.
++It audits persisted facts and validates an added-file patch in a run-local tree.
++"""
++from pathlib import Path
++import argparse
++import csv
++import hashlib
++import io
++import importlib.metadata
++import json
++import os
++import re
++import subprocess
++import tempfile
++import time
++import numpy as np
++from .assets import ROOT, ASSETS, read_json, write_json, file_sha256, array_hash, load_registered_cases, verify_protected
++
++
++def require(ok, message):
++    if not ok: raise ValueError(message)
++
++
++def bits(left,right):
++    left=np.ascontiguousarray(left);right=np.ascontiguousarray(right)
++    return left.shape==right.shape and left.dtype==right.dtype and left.tobytes()==right.tobytes()
++
++
++def own_run(value):
++    out=Path(value).resolve()
++    require(out.parent==ROOT/'native_t1/runs' and out.name.startswith('jedge5_numeric_reference_A_'), 'Wrong window A run')
++    return out
++
++
++def _dtype_values(value):
++    if isinstance(value,dict):
++        return ([value['dtype']] if 'dtype' in value else [])+sum((_dtype_values(v) for k,v in value.items() if k!='dtype'),[])
++    if isinstance(value,list): return sum((_dtype_values(v) for v in value),[])
++    return []
++
++
++def check_runtime(audit,model):
++    require(audit['state_sha256_before']==ASSETS[model]['state']==audit['state_sha256_after'], 'Frozen state changed')
++    require(audit['GPU_workers_this_window']==1, 'GPU worker-count contract changed')
++    for key in ('training_updates','backward_calls','OT_calls'):
++        require(audit[key]==0, 'Unexpected '+key)
++    require(audit['postprocessing'] is None, 'Unexpected postprocessing')
++    runtime=audit['runtime']
++    for key in ('deterministic_algorithms','sdpa_math_enabled','all_modules_eval'):
++        require(runtime[key] is True, 'Runtime flag must be true: '+key)
++    for key in ('deterministic_warn_only','tf32_matmul','tf32_cudnn','cuda_autocast_enabled','gradient_enabled','sdpa_flash_enabled','sdpa_mem_efficient_enabled','sdpa_cudnn_enabled'):
++        require(runtime[key] is False, 'Runtime flag must be false: '+key)
++    require(runtime['cublas_workspace_config']==':4096:8' and runtime['parameter_dtype']=='torch.float32', 'CUBLAS/parameter dtype differs')
++    actual=_dtype_values(audit['actual_dtypes'])
++    require(actual and all(v=='torch.float32' for v in actual), 'Actual floating dtype audit differs')
++
++
++def trajectory_audit(out,folder,case):
++    row=read_json(folder/'result.json');progress=read_json(folder/'progress.json')
++    require(row['id']==folder.name==progress['id'], 'Trajectory identifier mismatch')
++    require(row['case_id']==case['id'], 'Case identity mismatch')
++    require(row['input_hashes']==case['array_hashes'], 'Input identity mismatch')
++    check_runtime(row['audit'],row['model'])
++    nfe=row['nfe'];audit=row['audit']
++    require(nfe==progress['model_forward_attempts']==progress['model_forward_returns']==audit['model_forward_attempts']==audit['model_forward_returns'], 'NFE/actual forward accounting mismatch')
++    solver=row['solver'];cap={'R1':400,'R2':800,'D1':1200,'D2':1200}[solver]
++    require(0<=nfe<=cap and progress['cap']==cap, 'Per-trajectory NFE limit exceeded')
++    functions=read_json(folder/'function_log.json');steps=read_json(folder/'solver_step_log.json')
++    require(len(functions)==nfe and [r['nfe'] for r in functions]==list(range(1,nfe+1)), 'Actual function ledger differs')
++    for f in functions:
++        for name in ('controller_time','library_function_time','actual_function_time'):
++            require(0<=f[name]<=1, 'Function time beyond original ODE domain: '+name)
++        require(all(f[k]=='torch.float32' for k in ('function_time_dtype','state_dtype','velocity_dtype')), 'Non-FP32 function input/output')
++        require(float(np.float32(f['library_function_time']))==f['actual_function_time'], 'Actual network time differs from FP32 conversion')
++    require([s['step_index'] for s in steps]==list(range(len(steps))), 'Step ledger index differs')
++    accepted=[s for s in steps if s['accepted'] is True];rejected=[s for s in steps if s['accepted'] is False]
++    require(len(accepted)==row['accepted_steps'] and len(rejected)==row['rejected_steps'], 'Accepted/rejected counts differ')
++    current=0.;previous_nfe=steps[0]['nfe_before'] if steps else nfe
++    initial_nfe=previous_nfe
++    for step in steps:
++        require(abs(step['t0']-current)<1e-12 and 0<=step['t0']<=step['t1']<=1 and step['h']>0, 'Step time/width contract differs')
++        require(step['nfe_before']==previous_nfe and step['nfe_after']-step['nfe_before']==step['nfe_in_attempt'], 'Step NFE accounting differs')
++        previous_nfe=step['nfe_after']
++        if step['accepted']:current=step['t1']
++        if solver.startswith('R') and step['accepted']:
++            require(step['nfe_in_attempt']==4, 'Classical RK4 must use four function calls')
++        if solver.startswith('D') and step['accepted'] is not None:
++            require(step['error_ratio'] is not None and np.isfinite(step['error_ratio']), 'Adaptive error estimate absent')
++    require(previous_nfe==nfe and abs(current-row['last_accepted_time'])<1e-12, 'Last accepted state accounting differs')
++    require(row['complete']==(row['status']=='COMPLETE' and row['last_accepted_time']==1.), 'Incomplete state mislabeled as endpoint')
++    if solver.startswith('R'):
++        expected_steps=100 if solver=='R1' else 200
++        require(row['complete'] and nfe==4*expected_steps and len(accepted)==expected_steps, 'Fixed RK4 matrix incomplete')
++    rawpath=out/row['path']
++    require(out in rawpath.resolve().parents and file_sha256(rawpath)==row['sha256'], 'Raw path/hash differs')
++    with np.load(rawpath,allow_pickle=False) as z:
++        raw=z['raw'].copy();states=z['states'].copy();times=z['state_times'].copy();C=z['C'].copy()
++        last=float(z['last_accepted_time'])
++    require(raw.dtype==np.float32 and states.dtype==np.float32 and raw.shape==(112,9) and states.shape[1:]==(112,9), 'Raw state dtype/shape differs')
++    require(np.isfinite(raw).all() and np.isfinite(states).all(), 'Nonfinite saved state')
++    require(bits(C,case['C']) and bits(raw[:12],case['C'].reshape(12,9)), 'Known coordinates changed')
++    require(bits(states[:,:12],np.broadcast_to(case['C'].reshape(1,12,9),(len(states),12,9))), 'Saved C state changed')
++    require(bits(states[0],case['initial_full'][0]) and times[0]==0., 'Initial state differs from actual registered Gaussian/C')
++    require(array_hash(raw)==row['raw_array_sha256'] and last==row['last_accepted_time'], 'Saved endpoint/time identity differs')
++    require(all(0<=t<=last for t in times) and len(times)==row['saved_state_count'], 'Saved fixed times outside accepted state range')
++    if row['complete']:require(times[-1]==1. and bits(states[-1],raw), 'Complete endpoint not the final saved state')
++    require(row['saved_C_bitwise'] and row['total_faces']==112 and row['free_faces']==100 and row['state_shape']==[1,100,9], 'State/C/face contract differs')
++    if not row['repeat'] and row['complete']:
++        score=read_json(out/'scores'/folder.name/'result.json')
++        require(score['status']=='PASS' and score['row']['sha256']==row['sha256'], 'Missing or wrong endpoint score')
++        require(file_sha256(out/score['metric_path'])==score['metric_sha256'], 'Detailed metric hash differs')
++        for key in ('model_forwards','backward_calls','OT_calls','repairs'):require(score[key]==0, 'Offline scoring made unexpected model/repair call')
++    return dict(id=row['id'],model=row['model'],case_id=row['case_id'],solver=solver,repeat=row['repeat'],status=row['status'],complete=row['complete'],
++                nfe=nfe,initial_function_evaluations_outside_step_ledger=initial_nfe,accepted=len(accepted),rejected=len(rejected),
++                last_accepted_time=last,raw_sha256=row['sha256'],function_log_sha256=file_sha256(folder/'function_log.json'),
++                solver_step_log_sha256=file_sha256(folder/'solver_step_log.json'),audit=audit)
++
++
++def _parse_csv_numbers(snapshot):
++    result=[]
++    payload=snapshot.get('gpu',{})
++    if payload.get('returncode')!=0:return result
++    for row in csv.DictReader(io.StringIO(payload.get('stdout',''))):
++        normalized={k.strip():v.strip() for k,v in row.items()}
++        vals={}
++        for token,name in (('memory.total','total_MiB'),('memory.used','used_MiB'),('memory.free','free_MiB'),('utilization.gpu','compute_percent')):
++            found=next((v for k,v in normalized.items() if k.startswith(token)),None)
++            match=re.search(r'[-+]?\d+(?:\.\d+)?',found or '')
++            vals[name]=float(match.group()) if match else None
++        vals['name']=next((v for k,v in normalized.items() if k=='name'),None)
++        result.append(vals)
++    return result
++
++
++def resource_summary(out,worker_rows):
++    sampled=[];references=[];process_na=False
++    for row in worker_rows:
++        relative=row['audit']['resource_snapshots_path'];path=out/relative
++        snapshots=read_json(path);references.append(dict(path=relative,sha256=file_sha256(path),snapshots=len(snapshots)))
++        for shot in snapshots:
++            sampled.extend(_parse_csv_numbers(shot))
++            text=shot.get('processes',{}).get('stdout','')
++            process_na=process_na or 'N/A' in text or 'Not Supported' in text
++    def maximum(name):return max((r[name] for r in sampled if r.get(name) is not None),default=None)
++    return dict(GPU_names=sorted({r['name'] for r in sampled if r.get('name')}),
++        global_memory_used_peak_MiB=maximum('used_MiB'),global_memory_free_min_MiB=min((r['free_MiB'] for r in sampled if r.get('free_MiB') is not None),default=None),
++        global_GPU_compute_peak_percent=maximum('compute_percent'),global_GPU_total_MiB=maximum('total_MiB'),
++        torch_peak_allocated_bytes=max((r['audit']['peak_cuda_allocated'] for r in worker_rows),default=None),
++        torch_peak_reserved_bytes=max((r['audit']['peak_cuda_reserved'] for r in worker_rows),default=None),
++        process_VRAM_peak_bytes=None,process_VRAM_status='NOT_AVAILABLE_WDDM_NA' if process_na else 'NOT_DERIVED_FROM_GLOBAL_MEMORY',
++        note='Global snapshots include unrelated allocations. Allocated is within reserved; do not add them. WDDM process N/A is not a process peak. GPU lock makes this a shared-machine diagnostic, not isolated throughput.',
++        GPU_workers_this_window=1,CPU_scoring_workers=2,resources=references)
++
++
++def code_export(out):
++    """Added-file diff, exact source snapshot, git-apply byte roundtrip; no git index."""
++    source=Path(__file__).resolve().parent
++    paths=sorted(p for p in source.rglob('*') if p.is_file() and p.suffix in ('.py','.json') and '__pycache__' not in p.parts)
++    require(paths and sum(p.stat().st_size for p in paths)<5*1024*1024, 'Unexpectedly large source export')
++    snapshot=out/'source_snapshot';require(not snapshot.exists(), 'Source snapshot already exists')
++    chunks=[];records=[]
++    for p in paths:
++        relative=p.relative_to(ROOT).as_posix();raw=p.read_bytes()
++        require(b'\x00' not in raw, 'Unexpected binary source')
++        blob=hashlib.sha1(b'blob '+str(len(raw)).encode()+b'\0'+raw).hexdigest()
++        chunks.append(f'diff --git a/{relative} b/{relative}\nnew file mode 100644\nindex {"0"*40}..{blob}\n--- /dev/null\n+++ b/{relative}\n'.encode())
++        lines=raw.splitlines(keepends=True)
++        if lines:
++            chunks.append(f'@@ -0,0 +1,{len(lines)} @@\n'.encode())
++            for line in lines:
++                chunks.append(b'+'+line)
++                if not line.endswith(b'\n'):chunks.append(b'\n\\ No newline at end of file\n')
++        target=snapshot/relative;target.parent.mkdir(parents=True,exist_ok=True);target.write_bytes(raw)
++        records.append(dict(path=relative,sha256=file_sha256(p),bytes=len(raw)))
++    diff=out/'code.diff';require(not diff.exists(), 'code.diff already exists')
++    diff.write_bytes(b''.join(chunks))
++    # Stop repository discovery at the run boundary; git apply only writes the
++    # fresh run-local temporary directory, never the real index or work tree.
++    sandbox=Path(tempfile.mkdtemp(prefix='code_diff_roundtrip_',dir=out))
++    env=dict(os.environ)
++    for key in ('GIT_DIR','GIT_WORK_TREE','GIT_INDEX_FILE'):env.pop(key,None)
++    env['GIT_CEILING_DIRECTORIES']=str(out)
++    commands=[]
++    for mode in ('check','apply'):
++        cmd=['git','-c','core.autocrlf=false','apply']+(['--check'] if mode=='check' else [])+[str(diff)]
++        run=subprocess.run(cmd,cwd=sandbox,env=env,text=True,capture_output=True)
++        commands.append(dict(mode=mode,returncode=run.returncode,stdout=run.stdout,stderr=run.stderr))
++        require(run.returncode==0, 'git apply '+mode+' failed: '+run.stderr)
++    for record in records:
++        require(file_sha256(sandbox/record['path'])==record['sha256'], 'Code diff byte roundtrip mismatch: '+record['path'])
++    require({p.relative_to(sandbox).as_posix() for p in sandbox.rglob('*') if p.is_file()}=={r['path'] for r in records}, 'Unexpected files in patch roundtrip')
++    return dict(status='PASS',source_files=records,code_diff_sha256=file_sha256(diff),source_snapshot=str(snapshot.relative_to(out)),
++                roundtrip_directory=str(sandbox.relative_to(out)),git_commands=commands,
++                index_or_repository_mutation=False,weights_or_data_copied=False)
++
++
++def finalize(out):
++    out=own_run(out);tick=time.perf_counter()
++    require(not (out/'final_audit.json').exists(), 'Final audit already exists')
++    dispatch=read_json(out/'dispatch.json');require(dispatch['status']=='PASS', 'Fixed matrix has not finished')
++    protocol=read_json(out/'registration/protocol.json');cases=load_registered_cases(out);case_by_id={r['id']:r for r in cases}
++    expected={(m,c['id'],s) for m in ASSETS for c in cases for s in ('R1','R2','D1','D2')}
++    workers=[];formal=[];repeats=[]
++    for folder in sorted((out/'trajectories').iterdir()):
++        if not folder.is_dir():continue
++        row=read_json(folder/'result.json')
++        audit=trajectory_audit(out,folder,case_by_id[row['case_id']]);workers.append(audit)
++        (repeats if row['repeat'] else formal).append(audit)
++    require(len(formal)==32 and {(r['model'],r['case_id'],r['solver']) for r in formal}==expected, 'Formal matrix differs')
++    require(len(repeats)==1 and (repeats[0]['model'],repeats[0]['case_id'],repeats[0]['solver'])==('B','P0_patch0_seed10401','R1'), 'Repeat differs from preregistration')
++    original=out/'trajectories/B_P0_patch0_seed10401_R1/raw.npz';repeat=out/'trajectories/B_P0_patch0_seed10401_R1_repeat/raw.npz'
++    with np.load(original,allow_pickle=False) as a,np.load(repeat,allow_pickle=False) as b:
++        require(set(a.files)==set(b.files) and all(bits(a[k],b[k]) for k in a.files), 'Separate-process repeat is not bitwise identical')
++    for label in ASSETS:
++        path=out/'prechecks'/(label+'_precheck')/'result.json';row=read_json(path);audit=row['audit']
++        require(row['status']=='PASS' and row['old_FP32_entry_bitwise_equal'], 'FP32 entry precheck failed')
++        require(len(row['endpoint_t1_checks'])==4 and all(r['actual_t']==1. and r['finite'] for r in row['endpoint_t1_checks']), 'True t=1 checks incomplete')
++        require(audit['model_forward_attempts']==audit['model_forward_returns']==6, 'Precheck forward count differs')
++        check_runtime(audit,label);workers.append(dict(id=label+'_precheck',audit=audit))
++    progress_rows=[];unknown=[]
++    for path in sorted(out.glob('**/progress.json')):
++        p=read_json(path);result_path=path.parent/'result.json'
++        record=dict(path=str(path.relative_to(out)),**p)
++        if not result_path.exists():
++            failure_path=path.parent/'failure.json';require(failure_path.exists(), 'Unfinished worker without preserved failure')
++            failure=read_json(failure_path)
++            record['failure']=failure
++            record['returns_unknown']=p['model_forward_attempts']-p['model_forward_returns']
++            unknown.append(record)
++        progress_rows.append(record)
++    attempts=sum(r['model_forward_attempts'] for r in progress_rows)
++    confirmed=sum(r['model_forward_returns'] for r in progress_rows)
++    unknown_returns=sum(r['returns_unknown'] for r in unknown)
++    require(attempts<=30000 and confirmed+unknown_returns==attempts, 'Global hard budget or uncertain-return accounting differs')
++    require(len(unknown)==1 and unknown[0]['path']=='prechecks/B_precheck_attempt1/progress.json' and unknown[0]['model_forward_attempts']==6 and unknown[0]['model_forward_returns']==5, 'Unexpected unfinished attempt')
++    formal_F=sum(r['nfe'] for r in formal);repeat_F=sum(r['nfe'] for r in repeats)
++    require(formal_F+repeat_F+12+6==attempts, 'Actual global count differs from independent decomposition')
++    fixed_F=sum(r['nfe'] for r in formal if r['solver'].startswith('R'));adaptive_F=formal_F-fixed_F
++    require(fixed_F==9600 and adaptive_F<=19200 and repeat_F==400, 'Solver budget differs')
++    protection=verify_protected(out);require(protection['status']=='PASS', 'Read asset changed')
++    score_identity=read_json(out/'registration/scoring_identity.json');extra=[]
++    for path,expected_hash in score_identity['read_source_sha256'].items():
++        actual=file_sha256(path);require(actual==expected_hash, 'Scoring read source changed')
++        extra.append(dict(path=path,sha256=actual))
++    later_sources=read_json(out/'registration/additional_read_sources.json')
++    later_checks=[]
++    for record in later_sources['files']:
++        actual=file_sha256(record['path'])
++        require(actual==record['sha256'], 'Additional actually imported source changed')
++        later_checks.append(dict(path=record['path'],sha256=actual))
++    addendum=read_json(out/'registration/precheck_accounting_addendum.json')
++    require(addendum['total_charged_precheck_calls']==18 and addendum['revised_maximum_charged_calls']==29218, 'Precheck accounting addendum differs')
++    score_rows=[read_json(p) for p in sorted((out/'scores').glob('*/result.json'))]
++    require(len(score_rows)==sum(r['complete'] for r in formal), 'Score count differs from complete formal endpoints')
++    analysis=read_json(out/'analysis.json')
++    require(analysis['status']=='PASS' and analysis['counts']['formal_rows']==32 and analysis['model_forwards']==0, 'Analysis missing or model forward in CPU analysis')
++    fixture=read_json(out/'registration/cpu_fixture.json')
++    require(fixture['status']=='PASS' and fixture['counts']['cpu_fixture_function_evaluations']==1682, 'Unexpected solver fixture record')
++    # Two previously executed 1682-evaluation fixture passes were reported by
++    # the solver task; this finalizer only reads/copies their retained result.
++    fixture_accounting=dict(actual_CPU_fixture_function_evaluations=3364,executions=2,per_execution=1682,
++        source='Final retained JSON proves 1682 CPU function evaluations; another 1682 development verification evaluations are reported in the solver-agent execution/tool record, whose stdout was not retained as a separate file',
++        final_file_evidence_function_evaluations=1682,additional_agent_execution_record_function_evaluations=1682,additional_raw_stdout_file=None,
++        retained_final_fixture='registration/cpu_fixture.json',finalizer_reruns=0,actual_neural_model_forwards=0)
++    test_path=Path(__file__).resolve().parent/'tests/test_analysis.json'
++    analysis_test=read_json(test_path);require(analysis_test['status']=='PASS' and analysis_test['model_forwards']==0, 'CPU analysis fixture failed')
++    write_json(out/'registration/analysis_CPU_test.json',analysis_test)
++    resource=resource_summary(out,workers)
++    timing=dict(recorded_lock_wait_seconds=sum(r['audit']['lock_wait_seconds'] for r in workers)+sum(r.get('lock_wait_seconds',0) for r in unknown),
++        recorded_locked_wall_seconds=sum(r['audit']['locked_wall_seconds'] for r in workers),
++        recorded_model_load_seconds=sum(r['audit']['model_load_seconds'] for r in workers),
++        recorded_model_and_solver_wall_seconds=sum(r['audit']['model_and_solver_wall_seconds'] for r in workers),
++        recorded_model_forward_CUDA_event_seconds=sum(r['audit']['model_forward_cuda_event_seconds'] for r in workers),
++        CPU_geometry_scoring_seconds_sum=sum(r['seconds'] for r in score_rows),CPU_analysis_seconds=analysis['CPU_analysis_seconds'],
++        unknown_failed_attempt_GPU_seconds=None,
++        note='Timing columns overlap and must not be summed as total wall time. Failed initial precheck did not persist compute/resources; its GPU duration is unknown. CPU scoring ran concurrently in two workers. Lock waits are separated; no isolated throughput claim.')
++    dependency=read_json(out/'registration/dependency_info.json')
++    current_dependency_version=importlib.metadata.version('torchdiffeq')
++    require(current_dependency_version==dependency['torchdiffeq_version'], 'Installed torchdiffeq version changed')
++    dependency_sources=[]
++    for path,expected_hash in dependency['sources_sha256'].items():
++        actual_hash=file_sha256(path)
++        require(actual_hash==expected_hash, 'Installed solver dependency source changed: '+path)
++        dependency_sources.append(dict(path=path,expected_sha256=expected_hash,actual_sha256=actual_hash,unchanged=True))
++    dependency_protection=dict(status='PASS',version_before=dependency['torchdiffeq_version'],
++        version_after=current_dependency_version,sources=dependency_sources,
++        environment_modified=False,model_forwards=0)
++    code=code_export(out)
++    result=dict(schema='numeric_reference_A_final_audit_v1',status='PASS',scientific_completeness='COMPLETE' if all(r['complete'] for r in formal) else 'PARTIAL',
++        actual_counts=dict(model_forward_attempts=attempts,confirmed_model_forward_returns=confirmed,unconfirmed_return_count=unknown_returns,
++            formal_trajectory_attempts=32,formal_complete=sum(r['complete'] for r in formal),formal_incomplete=sum(not r['complete'] for r in formal),
++            extra_repeat_complete=1,formal_RK4_NFE=fixed_F,formal_adaptive_NFE=adaptive_F,repeat_NFE=repeat_F,successful_precheck_NFE=12,failed_precheck_attempted_NFE=6,
++            CPU_strict_checkpoint_loads=4,optimizer_updates=0,backward_calls=0,OT_calls=0,CPU_fixture_function_evaluations=3364,finalizer_model_forwards=0),
++        per_trajectory=formal+repeats,precheck_attempts=progress_rows,unknown_return_evidence=unknown,
++        same_solver_separate_process_repeat='ALL_SAVED_ARRAYS_BITWISE_IDENTICAL',protected_assets=protection,
++        additional_scoring_protected_sources=extra,
++        additional_actual_import_protection=dict(scope=later_sources['scope'],files=later_checks),
++        precheck_accounting_addendum=addendum,
++        resources=resource,timing=timing,CPU_fixture_accounting=fixture_accounting,
++        CPU_analysis_fixture=analysis_test,installed_solver_dependency_protection=dependency_protection,
++        code_export=code,production_configuration_changed=False,committed_or_pushed=False,
++        HEAD_start=protocol['HEAD'],HEAD_end=subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip(),
++        note='Artifact/runtime/accounting audit, not a numerical convergence or geometry-success claim.')
++    result['finalizer_CPU_wall_seconds']=time.perf_counter()-tick
++    write_json(out/'final_audit.json',result)
++    print(json.dumps(dict(status=result['status'],scientific_completeness=result['scientific_completeness'],counts=result['actual_counts'])),flush=True)
++    return result
++
++
++if __name__=='__main__':
++    p=argparse.ArgumentParser();p.add_argument('--out',type=Path,required=True)
++    finalize(p.parse_args().out)
+diff --git a/experiments/mf_h1_local0/jedge5_numeric_reference_A/preflight.py b/experiments/mf_h1_local0/jedge5_numeric_reference_A/preflight.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..5dde70557997aa7de315f9146573c2915ed5ac3a
+--- /dev/null
++++ b/experiments/mf_h1_local0/jedge5_numeric_reference_A/preflight.py
+@@ -0,0 +1,219 @@
++"""CPU-only window A preregistration. No CUDA initialization, Gaussian draw, or OT."""
++from .assets import *
++import argparse
++import importlib.metadata
++import importlib.util
++import platform
++import subprocess
++import time
++
++
++def _bits(a,b):
++    a=np.ascontiguousarray(a); b=np.ascontiguousarray(b)
++    return a.dtype==b.dtype and a.shape==b.shape and a.tobytes()==b.tobytes()
++
++
++def _run_command(args):
++    try:
++        result=subprocess.run(args,capture_output=True,text=True,check=False)
++        return dict(returncode=result.returncode,stdout=result.stdout,stderr=result.stderr)
++    except OSError as exc:
++        return dict(error=str(exc))
++
++
++def run(out):
++    out=Path(out).resolve()
++    if out.parent != ROOT/'native_t1/runs' or not out.name.startswith('jedge5_numeric_reference_A_'):
++        raise ValueError('Window A may only write its own named run directory')
++    registration=out/'registration'
++    registration.mkdir(parents=True,exist_ok=False)
++    tick=time.perf_counter(); protected={}
++    def remember(path,kind):
++        path=Path(path).resolve()
++        record=dict(path=str(path),sha256=file_sha256(path),bytes=path.stat().st_size,kind=kind)
++        protected[str(path)]=record
++        return record
++    def read(path,kind='read_metadata'):
++        remember(path,kind)
++        return read_json(path)
++    before_cuda=torch.cuda.is_initialized()
++    if before_cuda: raise RuntimeError('CPU preflight must run before any CUDA initialization')
++    start=dict(HEAD=subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip(),
++               git_status=subprocess.check_output(['git','status','--porcelain'],cwd=ROOT,text=True),
++               git_status_note='Informational only; unrelated window files are not protected assets.')
++    write_json(registration/'start_state.json',start)
++    archive,discovery=discover_archive()
++    old_protocol=read(archive/'registration/protocol.json')
++    remember(archive/'JEDGE5_DIAGNOSIS_REPORT.md','archive_identity')
++    noise_path=archive/'registration/noises.npz'
++    if remember(noise_path,'Gaussian_archive')['sha256']!=old_protocol['noise_sha256']:
++        raise ValueError('Original Gaussian archive checksum mismatch')
++    with np.load(noise_path,allow_pickle=False) as z:
++        noises={int(k.removeprefix('seed_')):z[k].copy() for k in z.files}
++    if set(noises)!={10401,10402}:
++        raise ValueError('Original Gaussian bank differs from registered seeds')
++    for noise in noises.values():
++        if noise.shape!=(1,112,9) or noise.dtype!=np.float32 or not np.isfinite(noise).all():
++            raise ValueError('Missing original FP32 Gaussian values')
++    if remember(EVALUATION,'evaluation_inputs')['sha256']!=EVALUATION_SHA:
++        raise ValueError('Evaluation input hash mismatch')
++    # This loads and validates original source/complement, C, boundary and scoring arrays;
++    # it does not run optimal transport or draw model Gaussian noise.
++    from experiments.mf_h1_local0.jedge5_diagnosis.common import load_cases
++    all_cases=load_cases()
++    old_rows={};old_scores={}
++    for label,spec in ASSETS.items():
++        replay=read(archive/'stage_d'/('R_'+label)/'replay.json')
++        if replay['raw500_state_sha256']!=spec['state'] or not replay['raw500_bitwise_reference_equal']:
++            raise ValueError('Raw replay does not recover prescribed model')
++        matrix=read(archive/'A'/label/'results.json')
++        old_rows[label]={(r['parent'],r['patch'],r['seed'],r['nfe']):r for r in matrix['rows'] if r['precision']=='fp32'}
++        score_path=archive/'scores'/('A_'+label)/'results.json'
++        if score_path.is_file():
++            score=read(score_path)
++            old_scores[label]={(r['parent'],r['patch'],r['seed'],r['nfe']):r for r in score['rows'] if r['precision']=='fp32'}
++        else: old_scores[label]={}
++    registered={};case_records=[];euler_rows=[]
++    for p,j,seed in CASE_SPECS:
++        ident=case_id(p,j,seed);case=all_cases[p,j]
++        C=np.asarray(case['C'],dtype=np.float32).copy();noise=noises[seed]
++        source_evidence=[]
++        for label in ASSETS:
++            for nfe in (50,100,200):
++                row=old_rows[label].get((p,j,seed,nfe))
++                desc=dict(case_id=ident,model=label,parent=p,patch=j,seed=seed,precision='fp32',nfe=nfe)
++                if row is None:
++                    euler_rows.append(dict(desc,status='NOT_AVAILABLE',reason='Not in original Euler matrix; no additional Euler run authorized'))
++                    continue
++                raw_path=archive/row['path']
++                if not raw_path.exists():
++                    euler_rows.append(dict(desc,status='NOT_AVAILABLE',reason='Original raw archive missing'))
++                    continue
++                if remember(raw_path,'old_Euler_raw')['sha256']!=row['sha256']:
++                    raise ValueError('Old Euler raw checksum mismatch')
++                a=row['audit']
++                expected_known=list(range(12));expected_free=list(range(12,112))
++                if (a['known_slots']!=expected_known or a['free_slots']!=expected_free
++                    or a['total_faces']!=112 or a['valid_faces']!=112
++                    or a['integration_dtype']!='torch.float32' or a['precision']!='fp32'
++                    or not a['known_all_states_bitwise'] or not a['full_from_noise']):
++                    raise ValueError('Archived slot/precision/C contract differs')
++                if a['noise_sha256']!=array_hash(torch.from_numpy(noise)):
++                    raise ValueError('Actual Gaussian disagrees with archived forward input hash')
++                if a['condition_sha256']!=array_hash(torch.from_numpy(C.reshape(12,9))):
++                    raise ValueError('Actual C disagrees with archived input hash')
++                with np.load(raw_path,allow_pickle=False) as z:
++                    raw=z['raw'].copy();states=z['states'].copy();indices=z['state_indices'].copy();archived_C=z['C'].copy()
++                if not _bits(C,archived_C.reshape(12,3,3)):
++                    raise ValueError('Euler archive C values differ')
++                if (raw.dtype!=np.float32 or raw.shape!=(112,9) or states.dtype!=np.float32
++                    or states.shape[1:]!=(112,9) or indices[0]!=0 or indices[-1]!=nfe
++                    or not _bits(states[-1],raw) or not _bits(states[0,12:],noise[0,12:])):
++                    raise ValueError('Archived Euler initial/free/final values differ')
++                if not _bits(states[:,:12],np.broadcast_to(C.reshape(1,12,9),(len(states),12,9))):
++                    raise ValueError('C not bitwise fixed in archived trajectory')
++                score=old_scores[label].get((p,j,seed,nfe))
++                score_record=dict(status='NOT_AVAILABLE',reason='Old score absent; raw comparison remains available')
++                if score is not None:
++                    if score['sha256']!=row['sha256'] or score['path']!=row['path']:
++                        raise ValueError('Old score does not belong to this raw trajectory')
++                    score_file=archive/score['score_path']
++                    if score_file.is_file():
++                        rec=remember(score_file,'old_Euler_score')
++                        score_record=dict(status='AVAILABLE',path=str(score_file),sha256=rec['sha256'],scalars=score['scalars'])
++                record=dict(desc,status='AVAILABLE',path=str(raw_path),sha256=row['sha256'],score=score_record,
++                            state_indices=indices.tolist(),raw_array_sha256=array_hash(raw),
++                            initial_array_sha256=array_hash(states[0]),known_slots=expected_known,free_slots=expected_free)
++                euler_rows.append(record);source_evidence.append(dict(model=label,nfe=nfe,path=str(raw_path),sha256=row['sha256']))
++        # At least one true old initial state is mandatory for each model/case.
++        if set(r['model'] for r in source_evidence)!={'B','J'}:
++            raise FileNotFoundError('Missing original Gaussian/C/state evidence for '+ident)
++        known=np.zeros((1,112),dtype=np.bool_);known[:,:12]=True
++        valid=np.ones_like(known);y=np.array([112],dtype=np.int64)
++        initial=noise.copy();initial[:,:12]=C.reshape(1,12,9)
++        arrays=dict(noise=noise.copy(),C=C,known=known,valid=valid,y=y,
++                    known_slots=np.arange(12,dtype=np.int64),free_slots=np.arange(12,112,dtype=np.int64),
++                    initial_full=initial,initial_free=initial[:,12:].copy())
++        for name,a in arrays.items():registered[ident+'__'+name]=a
++        case_records.append(dict(id=ident,parent=p,patch=j,seed=seed,N=112,K=12,free_faces=100,bbox=case['bbox'],
++            arrays_source='Continuous arrays copied from verified original Gaussian/Euler/C archives',
++            mask_y_provenance='Exact reconstruction from archived known/free slot lists, valid/total face counts, and unchanged original sampler y=[112]; mask/y were not serialized as separate raw tensors',
++            source_evidence=source_evidence,array_hashes={k:array_hash(v) for k,v in arrays.items()}))
++    with (registration/'inputs.npz').open('xb') as stream:
++        np.savez_compressed(stream,**registered)
++    identities=[]
++    for label,spec in ASSETS.items():
++        remember(spec['path'],'frozen_raw_checkpoint')
++        model,audit=load_model(label,device='cpu')
++        identities.append(dict(label=label,**audit));del model
++    try:
++        td_spec=importlib.util.find_spec('torchdiffeq')
++        td=dict(available=td_spec is not None,version=importlib.metadata.version('torchdiffeq') if td_spec else None,
++                origin=td_spec.origin if td_spec else None)
++    except importlib.metadata.PackageNotFoundError:
++        td=dict(available=True,version='UNKNOWN',origin=td_spec.origin)
++    from .solvers import dependency_info
++    verified_dependency=dependency_info()
++    fixture_path=Path(__file__).resolve().parent/'tests/cpu_fixture_final.json'
++    fixture=read_json(fixture_path)
++    if (fixture.get('status')!='PASS' or fixture.get('actual_neural_model_forwards')!=0
++        or fixture.get('cuda_initialized') is not False
++        or fixture.get('dependency')!=verified_dependency):
++        raise ValueError('Existing CPU fixture does not match current solver dependency')
++    (registration/'cpu_fixture.json').write_bytes(fixture_path.read_bytes())
++    write_json(registration/'dependency_info.json',verified_dependency)
++    for path,expected in verified_dependency.get('sources_sha256',{}).items():
++        if remember(Path(path),'verified_solver_dependency')['sha256']!=expected:
++            raise ValueError('Solver dependency changed after fixture')
++    for row in actually_imported_sources():protected[row['path']]=row
++    # The original sampler is read as part of the exact mask/face-condition contract.
++    for relative in ('experiments/mf_h1_local0/jedge5_diagnosis/sampling.py',
++                     'experiments/mf_h1_local0/jedge5_diagnosis/stages_ab.py',
++                     'configs/snet/base-120m-ot-v-chair.yaml'):
++        remember(ROOT/relative,'read_source_contract')
++    task=Path('/mnt/c/Users/warpwang/.codex/attachments/b09d5c04-eff9-45b7-b5cd-a099a4cad5ce/Pasted text.txt')
++    task_sha=file_sha256(task)
++    (registration/'request.txt').write_bytes(task.read_bytes())
++    protocol=dict(schema='jedge5_numeric_reference_A_v1',status='FROZEN',window='A',source_archive=str(archive),
++        task_sha256=task_sha,generation_seeds=[10401,10402],selection='purposefully selected observed diagnostic cases, not a new confirmation set',
++        cases=case_records,models=identities,registered_inputs_sha256=file_sha256(registration/'inputs.npz'),
++        evaluation_path=str(EVALUATION),evaluation_sha256=EVALUATION_SHA,
++        ODE_state='only FP32 free coordinates [1,100,9]',model_autocast=False,parameter_dtype='FP32',velocity_dtype='FP32',
++        N=112,K=12,free=100,known_time=1,free_time='actual controller time converted to FP32',
++        GPU_lock='/tmp/wrp_meshflow_jedge5_diag_gpu0.lock',GPU_workers_per_window=1,
++        R1=dict(method='classical_RK4',steps=100,dt=.01,NFE=400),
++        R2=dict(method='classical_RK4',steps=200,dt=.005,NFE=800),
++        D1=dict(method='Dormand_Prince_5_4',rtol=1e-4,atol=1e-6,first_step=.01,maximum_NFE=1200),
++        D2=dict(method='Dormand_Prince_5_4',rtol=1e-5,atol=1e-7,first_step=.01,maximum_NFE=1200),
++        budgets=dict(formal_trajectories_max=32,extra_repeat_trajectories_max=2,RK4_NFE=9600,adaptive_NFE_max=19200,total_model_forward_hard_limit=30000,
++                     training_updates=0,backward_calls=0,OT_calls=0),
++        adaptive_dependency=verified_dependency,production_changes=False,read_only_Euler_reuse=True,HEAD=start['HEAD'],
++        planned_extra_repeat=dict(model='B',case_id='P0_patch0_seed10401',solver='R1',NFE=400,maximum_trajectories=1),
++        planned_GPU_preflight=dict(model_forward_calls=12),
++        total_model_forward_planned_maximum=29212,
++        CPU_fixture=dict(path='registration/cpu_fixture.json',sha256=file_sha256(registration/'cpu_fixture.json'),
++                         copied_existing_result=True,reexecuted=False,counts=fixture['counts']))
++    write_json(registration/'protocol.json',protocol)
++    write_json(registration/'discovery.json',discovery)
++    write_json(registration/'old_euler_index.json',dict(source_archive=str(archive),rows=euler_rows))
++    write_json(registration/'protected_assets.json',dict(scope='Actual read assets/sources only; not the entire workspace',files=list(protected.values())))
++    environment=dict(python=platform.python_version(),torch=torch.__version__,numpy=np.__version__,CUDA_build=torch.version.cuda,
++        CUDA_initialized=torch.cuda.is_initialized(),torchdiffeq=td,cpu_count=os.cpu_count(),cpu_memory=Path('/proc/meminfo').read_text().splitlines()[:3],
++        GPU=_run_command(['nvidia-smi','--query-gpu=name,memory.total,memory.used,memory.free,utilization.gpu','--format=csv']),
++        GPU_processes=_run_command(['nvidia-smi','--query-compute-apps=pid,process_name,used_memory','--format=csv']),
++        CPU_load=Path('/proc/loadavg').read_text().strip(),disk=_run_command(['df','-B1','/mnt/e']))
++    write_json(registration/'environment.json',environment)
++    if torch.cuda.is_initialized():raise RuntimeError('CPU preflight initialized CUDA')
++    result=dict(status='PASS',CPU_strict_checkpoint_loads=2,model_forwards=0,backwards=0,optimizer_updates=0,OT_calls=0,
++        original_Gaussian_reused=True,cases=4,old_Euler_available=sum(r['status']=='AVAILABLE' for r in euler_rows),
++        old_Euler_missing=[r for r in euler_rows if r['status']!='AVAILABLE'],
++        model_input_contract='C/continuous values verified against actual arrays; exact discrete masks/y recovered from saved slot audit',
++        torchdiffeq=td,CUDA_initialized=False,seconds=time.perf_counter()-tick)
++    write_json(registration/'preflight.json',result)
++    print(json.dumps(result,ensure_ascii=False),flush=True)
++    return result
++
++
++if __name__=='__main__':
++    p=argparse.ArgumentParser();p.add_argument('--out',required=True,type=Path)
++    run(p.parse_args().out)
+diff --git a/experiments/mf_h1_local0/jedge5_numeric_reference_A/report.py b/experiments/mf_h1_local0/jedge5_numeric_reference_A/report.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..1df24e47ee20e72be5a823df1ec3d4a50e032226
+--- /dev/null
++++ b/experiments/mf_h1_local0/jedge5_numeric_reference_A/report.py
+@@ -0,0 +1,145 @@
++﻿"""Render the audited window-A result, without any model execution."""
++import argparse
++from pathlib import Path
++from .assets import read_json,write_json,file_sha256
++
++
++def table(headers,rows):
++    return '\n'.join(['| '+' | '.join(headers)+' |','| '+' | '.join(['---']*len(headers))+' |']+['| '+' | '.join(map(str,row))+' |' for row in rows])
++
++
++def main():
++    p=argparse.ArgumentParser();p.add_argument('--out',required=True,type=Path);a=p.parse_args();out=a.out
++    protocol=read_json(out/'registration/protocol.json');analysis=read_json(out/'analysis.json');audit=read_json(out/'final_audit.json')
++    judgments=read_json(out/'diagnostic_judgments.json')
++    lookup={(r['case_id'],r['model'],r['solver']):r for r in analysis['source_rows']}
++    def scalar(case,model,solver,key):
++        row=lookup[(case,model,solver)]
++        if not row.get('complete'):return '未完成' if row['source']=='new_formal' else '缺失'
++        v=row.get('scalars',{}).get(key)
++        return '缺失' if v is None else f'{v:.6f}'
++    mainrows=[]
++    for c in protocol['cases']:
++        for model in ('B','J'):
++            mainrows.append([c['id'],model]+[scalar(c['id'],model,s,'remainder_symmetric_RMS_bbox_pct') for s in ('E50','E100','E200','R1','R2','D1','D2')])
++    refs=[]
++    for r in analysis['convergence_evidence']:
++        vals=[]
++        for pair in ('R1__R2','D1__D2','D2__R2'):
++            v=r['pair_values'].get(pair)
++            vals.append('不可配对' if v is None else f"{v['coordinate_RMS_bbox_pct']:.6f} / {v['surface_RMS_bbox_pct']:.6f}")
++        refs.append([r['case_id'],r['model']]+vals)
++    jb=[]
++    for r in analysis['J_minus_B']:
++        if r['solver'] not in ('R1','R2','D1','D2'):continue
++        keys=('remainder_symmetric_RMS_bbox_pct','boundary_RMS_bbox_pct','boundary_p95_bbox_pct','CF_proper_pair_count','FF_illegal_pair_count')
++        jb.append([r['case_id'],r['solver']]+(['不可配对']*len(keys) if r['status']!='PASS' else [f"{r['J_minus_B'][k]:+.6f}" for k in keys]))
++    adaptive=[]
++    for r in analysis['source_rows']:
++        if r['source']=='new_formal' and r['solver'].startswith('D'):
++            adaptive.append([r['case_id'],r['model'],r['solver'],r['nfe'],r['accepted_steps'],r['rejected_steps'],f"{r['last_accepted_time']:.10f}",r['status']])
++    complete=[r for r in analysis['source_rows'] if r['source']=='new_formal' and r.get('complete')]
++    quality={key:dict(min=min(r['scalars'][key] for r in complete),max=max(r['scalars'][key] for r in complete)) for key in (
++        'CF_proper_affected_free_fraction','CF_proper_pair_count','FF_illegal_pair_count','free_total_surface_area',
++        'free_minimum_angle_lt5_fraction','free_near_degenerate_count','free_exact_zero_area_count','nan_coordinate_count','inf_coordinate_count',
++        'CF_unresolved_or_degenerate_pair_count','FF_unresolved_or_degenerate_pair_count')}
++    counts=audit['actual_counts'];timing=audit['timing'];resource=audit['resources']
++    results=dict(schema='jedge5_numeric_reference_A_results_v1',execution_audit=audit['status'],scientific_completeness=audit['scientific_completeness'],
++        conclusions=judgments,actual_counts=counts,analysis=analysis,quality_ranges=quality,timing=timing,resources=resource,
++        model_identities=protocol['models'],input_identity=dict(evaluation_sha256=protocol['evaluation_sha256'],registered_inputs_sha256=protocol['registered_inputs_sha256'],source_archive=protocol['source_archive']),
++        audit_path='final_audit.json',audit_sha256=file_sha256(out/'final_audit.json'),code_diff_sha256=file_sha256(out/'code.diff'))
++    write_json(out/'results.json',results)
++    text=f'''# A Numerical Reference Report
++
++{judgments['summary']}
++
++## 实际执行与范围
++
++执行审计 **{audit['status']}**，数值参考矩阵完整性 **{audit['scientific_completeness']}**。
++32个正式设置：{counts['formal_complete']}条完整、{counts['formal_incomplete']}条预算内未完成；另有1条预登记的独立进程重复，全部保存数组逐位一致。
++本窗口模型前向尝试共 **{counts['model_forward_attempts']}**，其中正式RK4 {counts['formal_RK4_NFE']}、正式Dopri {counts['formal_adaptive_NFE']}、重复400、有效预检12、日志故障预检6；硬上限30000。
++前向返回已确认{counts['confirmed_model_forward_returns']}次，故障预检最后1次返回状态未持久化，已保守计入预算。训练更新、反向、OT均为0。
++
++只研究4个有意选择、已经观察过的案例，不是新确认集或总体胜率估计。N112/K12/free100，冻结累计3000步raw B/J，不用EMA。
++旧Euler只读复用22条；P0/patch4/10402两模型的Euler200原本缺失，标缺失且未补跑。
++存档发现、原数组、全部SHA及缺失项见registration。Gaussian实际数组复用，没有按seed重抽；mask/y由存档槽位、有效面数与旧入口合同精确恢复，来源已明示。
++
++## 数值实现与门禁
++
++仅自由坐标进入ODE和误差范数。C按原槽位直接复制，known时间恒1，free使用真实FP32时间；面数条件112不变。
++参数、速度、坐标与加权更新均FP32，关闭autocast/TF32，严格确定性、SDPA math、eval/no_grad；实际前向dtype钩子检查通过。
++全部成功任务的模型state哈希前后一致；真实t=1在B/J四例中均有限；旧FP32调用与新接口逐位一致。已保存状态与每次完整输入组装C均逐位保持。
++
++R1/R2为明确写出的经典四阶段RK4，100/200步分别400/800 NFE。D1/D2调用环境原有torchdiffeq 0.2.5的Dopri5Solver，rtol/atol分别1e-4/1e-6与1e-5/1e-7。
++采用原库控制器和系数，first_step=.01、FP64时间控制、step_t=[1]；绕开公共包装器的端点nextafter扰动，实际评估t=1，不越界、不clip。
++标准FSAL仅复用算法端点导数，没有新增几何/模型特征缓存。误差范数为free坐标上的RMS(error/(atol+rtol*max(abs(y0),abs(y_candidate))))；atol为原坐标单位。
++[Dopri选项文档](https://github.com/rtqichen/torchdiffeq/blob/master/FURTHER_DOCUMENTATION.md)和本地实际源码均核对，依赖版本/源码保护通过。
++D的固定时点中间状态明确标为库密集插值；不能当作接受步节点。真实函数时间与controller时间分别写入function_log。
++
++CPU FP64解析门禁通过（恒定、线性、时间相关ODE；RK4误差比15.35；更紧D容差改善两类解析误差）。两次开发/最终CPU验证共3364次解析函数调用，其中最终1682次有JSON证据，前一次1682次仅保留代理执行记录，未伪造第二份原始stdout。它们均不计作神经模型前向。
++CPU表面距离/坐标公式/C保护测试通过。首次CPU预检因动态伪源路径记录报错、首次B GPU预检因日志哈希API类型错误中断，均保留记录；修复只涉及登记代码，未改数值公式。有效预检随后通过。
++
++## 数值收敛证据
++
++表中每格为“同槽逐坐标RMS / 独立双向表面RMS”，单位均为原bbox百分比；不是各自GT误差，也不是认证误差界。
++
++{table(['案例','模型','R1 vs R2','D1 vs D2','D2 vs R2'],refs)}
++
++{judgments['classification_text']}
++
++不以GT误差最低挑选求解器；不同算法内部稳定，也不能自动替代跨算法一致性。
++
++## 各自剩余GT误差
++
++以下为排除C后的剩余对称RMS，单位% bbox。全部为FP32，不能与上轮BF16数字混用。
++
++{table(['案例','模型','Euler50','Euler100','Euler200','R1','R2','D1','D2'],mainrows)}
++
++{judgments['geometry_text']}
++
++## 同配置 J−B 与质量取舍
++
++RMS/Gamma单位为百分点；相交为对数差。负值仅表示对应列更低，不构成综合胜出。
++
++{table(['案例','设置','剩余RMS差','Gamma RMS差','Gamma p95差','CF proper差','FF illegal差'],jb)}
++
++完整两个方向误差、固定目标覆盖、整条Gamma到free表面与有限边的RMS/p95/各阈值coverage、CF/FF共面重叠/UNRESOLVED、窄角、退化及面积均保存在per_case.csv和逐输出metrics.json。
++新完整输出质量范围：
++
++{table(['指标','最小','最大'],[[k,f"{v['min']:.6g}",f"{v['max']:.6g}"] for k,v in quality.items()])}
++
++源C的静态拓扑异常审计只读复用，不混作free生成错误。精确共边/水密/流形等本轮没有新增拓扑审计：NOT_RUN；CF/FF相交诊断已实际执行。没有Pair、Stage2、焊接或后处理。
++
++## 自适应成本与未完成状态
++
++{table(['案例','模型','设置','NFE','接受','拒绝','最后接受t','状态'],adaptive)}
++
++未完成轨迹只保存最后接受状态及已有固定时点，不对t<1打终点分，也不补预算、放宽容差或重试。
++
++## 资源、时间与保护
++
++每个GPU worker在CUDA初始化/模型加载前取得共享OS flock，单轨迹后退出。窗口A实际GPU并发1，独立CPU评分并发上限2；没有读取或汇总窗口B实验结果。
++已记录锁等待{timing['recorded_lock_wait_seconds']:.3f}s；模型加载{timing['recorded_model_load_seconds']:.3f}s；模型与求解器墙钟合计{timing['recorded_model_and_solver_wall_seconds']:.3f}s；模型前向CUDA事件合计{timing['recorded_model_forward_CUDA_event_seconds']:.3f}s；CPU几何评分合计{timing['CPU_geometry_scoring_seconds_sum']:.3f}s；CPU端点分析/绘图{timing['CPU_analysis_seconds']:.3f}s。
++各列有重叠，不能相加当总墙钟，也不是隔离吞吐基准。首次日志故障预检没有持久化完整GPU耗时，标UNKNOWN，不按0伪计。
++Torch峰值allocated {resource['torch_peak_allocated_bytes']/2**30:.3f}GiB、reserved {resource['torch_peak_reserved_bytes']/2**30:.3f}GiB；GPU全局used峰值{resource['global_memory_used_peak_MiB']:.0f}MiB，最少free {resource['global_memory_free_min_MiB']:.0f}MiB。
++全局数据包含无关进程。WDDM进程显存峰值不可得（NOT_AVAILABLE），不由全局减法或权重大小估算。
++
++读取权重、输入、公共源码及求解库保护均通过；HEAD {audit['HEAD_start']} → {audit['HEAD_end']}。只写窗口A两个授权目录。
++实际新增代码diff已在本run独立临时目录git apply逐字节验证。没有修改生产默认采样器、模型、loss或精度，没有commit/push。
++
++## 交付与结论边界
++
++- results.json：本轮结论、完整指标/端点差、实际计数与时间。
++- per_case.csv / endpoint_differences.csv / J_minus_B.csv：逐输出与配对结果。
++- trajectories/*/raw.npz、solver_step_log.json、function_log.json：含未完成状态的原始证据。
++- fixed_view_full.png / fixed_view_free_only.png：固定视角、每案例跨模型与设置同范围；缺失/未完成格留空。
++- final_audit.json、registration、code.diff、source_snapshot：身份、测试、保护及可回放代码。
++
++{judgments['final_text']}
++
++固定矩阵及预登记重复已结束，本轮停止。未自动换求解器、扩大预算或开始新训练。
++'''
++    (out/'A_NUMERICAL_REFERENCE_REPORT.md').write_text(text,encoding='utf-8')
++    print(dict(report=str(out/'A_NUMERICAL_REFERENCE_REPORT.md'),results_sha256=file_sha256(out/'results.json')))
++
++if __name__=='__main__':main()
+diff --git a/experiments/mf_h1_local0/jedge5_numeric_reference_A/scoring.py b/experiments/mf_h1_local0/jedge5_numeric_reference_A/scoring.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..665e20783bacdbf4f0b6a4111d2dd93401581537
+--- /dev/null
++++ b/experiments/mf_h1_local0/jedge5_numeric_reference_A/scoring.py
+@@ -0,0 +1,120 @@
++﻿"""Window A: read-only frozen evaluator, isolated CPU score outputs."""
++from pathlib import Path
++import argparse
++import json
++import os
++import time
++import numpy as np
++from .assets import ROOT, EVALUATION, EVALUATION_SHA, read_json, write_json, file_sha256
++from experiments.mf_h1_local0.jedge5_diagnosis import scoring as archived
++
++
++def own_out(value):
++    out = Path(value).resolve()
++    if out.parent != ROOT/'native_t1/runs' or not out.name.startswith('jedge5_numeric_reference_A_'):
++        raise ValueError('Writes must remain inside the isolated window A run')
++    return out
++
++
++def initialize(out):
++    """Copy the verified, immutable CC audit; do not launch an extra geometry matrix."""
++    import fcntl
++    out = own_out(out)
++    folder = out/'registration'
++    with (folder/'scoring_init.lock').open('a+') as lock:
++        fcntl.flock(lock, fcntl.LOCK_EX)
++        protocol = read_json(folder/'protocol.json')
++        source = Path(protocol['source_archive'])/'registration/static_context_audit.json'
++        cache = folder/'static_context_audit.json'
++        if not cache.exists():
++            cache.write_bytes(source.read_bytes())
++        if file_sha256(cache) != file_sha256(source):
++            raise ValueError('The copied static CC cache differs from the archive')
++        banks = archived.banks_with_context_audit(out)
++        hashes = {}
++        for path in (Path(archived.__file__).resolve(), archived.REFERENCE/'evaluation.py',
++                     archived.REFERENCE/'edge_metric.py', source, EVALUATION):
++            hashes[str(path)] = file_sha256(path)
++        record = dict(status='PASS',static_context_audit_source=str(source),
++                      static_context_audit_sha256=file_sha256(source),
++                      frozen_evaluation_sha256=EVALUATION_SHA,read_source_sha256=hashes,
++                      copied_static_audit=True,new_CC_audits=0,model_forwards=0,
++                      note='Same registered surface/Gamma/coverage points and unchanged independent evaluator')
++        if not (folder/'scoring_identity.json').exists():
++            write_json(folder/'scoring_identity.json', record)
++        fcntl.flock(lock, fcntl.LOCK_UN)
++    return banks
++
++
++def score_one_cli(out, trajectory):
++    import torch
++    if torch.cuda.is_initialized():
++        raise RuntimeError('Offline score worker must be CPU-only')
++    out = own_out(out)
++    trajectory = Path(trajectory)
++    if not trajectory.is_absolute():
++        trajectory = out/trajectory
++    trajectory = trajectory.resolve()
++    if out not in trajectory.parents:
++        raise ValueError('Trajectory result must be in this run')
++    row = read_json(trajectory)
++    ident = trajectory.parent.name
++    dest = out/'scores'/ident
++    result_path = dest/'result.json'
++    if result_path.exists():
++        raise FileExistsError(result_path)
++    if not row.get('complete') or row.get('repeat') or row.get('is_repeat') or 'repeat' in ident.lower():
++        write_json(result_path,dict(status='NOT_RUN',reason='Only complete formal endpoints are scored',
++                                   trajectory=str(trajectory.relative_to(out)),row=row,model_forwards=0))
++        return read_json(result_path)
++    banks = initialize(out)
++    raw_path = Path(row['path'])
++    if not raw_path.is_absolute():
++        raw_path = out/raw_path
++    if out not in raw_path.resolve().parents:
++        raise ValueError('Raw output is outside window A run')
++    if file_sha256(raw_path) != row['sha256']:
++        raise ValueError('Generated raw SHA differs')
++    with np.load(raw_path,allow_pickle=False) as z:
++        raw = z['raw'].copy().reshape(112,3,3)
++        C = z['C'].copy().reshape(12,3,3)
++        states = z['states'].copy().reshape(-1,112,3,3)
++    if raw.dtype != np.float32 or not np.isfinite(raw).all():
++        raise ValueError('Endpoint is not finite FP32')
++    if not np.array_equal(raw[:12].view(np.uint32), C.view(np.uint32)):
++        raise ValueError('Endpoint changed C')
++    if not np.array_equal(states[:,:12].view(np.uint32),np.broadcast_to(C,(len(states),12,3,3)).copy().view(np.uint32)):
++        raise ValueError('Saved fixed-time state changed C')
++    tick = time.perf_counter(); ledger = {}
++    metrics, scalars = archived.score_one(raw,banks[int(row['patch'])],int(row['parent']),int(row['patch']),ledger)
++    detail = dest/'metrics.json'
++    write_json(detail, metrics)
++    result = dict(status='PASS',trajectory=str(trajectory.relative_to(out)),
++                  row=row,scalars=scalars,cross_remainder=metrics['remainder']['cross'],
++                  metric_path=str(detail.relative_to(out)),metric_sha256=file_sha256(detail),
++                  seconds=time.perf_counter()-tick,ledger=ledger,
++                  C_saved_states_bitwise=True,full_faces=112,free_faces=100,
++                  model_forwards=0,backward_calls=0,OT_calls=0,repairs=0,
++                  scoring_version_sha256=file_sha256(archived.REFERENCE/'evaluation.py'),
++                  evaluation_inputs_sha256=EVALUATION_SHA)
++    if torch.cuda.is_initialized():
++        raise RuntimeError('CPU score unexpectedly initialized CUDA')
++    write_json(result_path,result)
++    return result
++
++
++def main(argv=None):
++    p=argparse.ArgumentParser()
++    p.add_argument('--out',required=True,type=Path)
++    p.add_argument('--trajectory',type=Path)
++    p.add_argument('--initialize',action='store_true')
++    a=p.parse_args(argv)
++    if a.initialize:
++        initialize(a.out)
++        print(json.dumps(dict(status='PASS',action='initialize',model_forwards=0)))
++    else:
++        if a.trajectory is None: p.error('--trajectory is required unless --initialize')
++        r=score_one_cli(a.out,a.trajectory)
++        print(json.dumps(dict(status=r['status'],trajectory=str(a.trajectory),seconds=r.get('seconds')),allow_nan=False),flush=True)
++
++if __name__=='__main__':main()
+diff --git a/experiments/mf_h1_local0/jedge5_numeric_reference_A/solvers.py b/experiments/mf_h1_local0/jedge5_numeric_reference_A/solvers.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..79a97212922d53e46a5ac109581e3a520d5d7231
+--- /dev/null
++++ b/experiments/mf_h1_local0/jedge5_numeric_reference_A/solvers.py
+@@ -0,0 +1,372 @@
++﻿"""Isolated numerical-reference solvers; never imports or edits production samplers.
++
++Classic RK4 is written explicitly.  Adaptive stepping delegates to the installed
++TorchDiffEq Dopri5Solver (not a reimplementation).  Its public odeint wrapper
++perturbs endpoint times with nextafter, so this module deliberately supplies an
++unperturbed adapter to the existing solver and records both controller and
++actual function times.  No training, gradients, CUDA initialization or RNG here.
++"""
++from __future__ import annotations
++
++import hashlib
++import inspect
++import math
++import time
++from pathlib import Path
++from typing import Callable
++
++import torch
++
++FIXED_TIMES = (0.0, 0.2, 0.5, 0.8, 1.0)
++SETTINGS = {
++    'R1': {'method': 'classic_RK4', 'steps': 100, 'nfe_limit': 400},
++    'R2': {'method': 'classic_RK4', 'steps': 200, 'nfe_limit': 800},
++    'D1': {'method': 'Dopri5', 'rtol': 1e-4, 'atol': 1e-6, 'first_step': .01, 'nfe_limit': 1200},
++    'D2': {'method': 'Dopri5', 'rtol': 1e-5, 'atol': 1e-7, 'first_step': .01, 'nfe_limit': 1200},
++}
++DOCUMENTATION_URL = 'https://github.com/rtqichen/torchdiffeq/blob/master/FURTHER_DOCUMENTATION.md'
++
++
++class SolverStop(RuntimeError):
++    def __init__(self, status, message):
++        super().__init__(message)
++        self.status = status
++
++
++class NFEBudgetExceeded(SolverStop):
++    def __init__(self, limit):
++        super().__init__('NFE_BUDGET_EXHAUSTED', f'Function call cap {limit} reached; no retry.')
++
++
++def dependency_info():
++    """Fingerprint the actually installed implementation without importing CUDA."""
++    try:
++        import torchdiffeq
++        from torchdiffeq._impl.dopri5 import Dopri5Solver
++        from torchdiffeq._impl.rk_common import RKAdaptiveStepsizeODESolver, _runge_kutta_step
++        from torchdiffeq._impl.interp import _interp_evaluate
++        from torchdiffeq._impl.misc import _compute_error_ratio, _PerturbFunc
++        signature = inspect.signature(RKAdaptiveStepsizeODESolver.__init__)
++        required = {'first_step', 'step_t', 'dtype', 'min_step', 'max_step'}
++        if not required.issubset(signature.parameters):
++            raise RuntimeError(f'Unsupported installed adaptive API: {signature}')
++        objects = [Dopri5Solver, RKAdaptiveStepsizeODESolver, _runge_kutta_step,
++                   _interp_evaluate, _compute_error_ratio, _PerturbFunc]
++        sources = {}
++        for obj in objects:
++            path = Path(inspect.getfile(obj))
++            sources[str(path)] = hashlib.sha256(path.read_bytes()).hexdigest()
++        return {
++            'status': 'AVAILABLE_VERIFIED_INTERFACE', 'torchdiffeq_version': torchdiffeq.__version__,
++            'torch_version': torch.__version__, 'sources_sha256': sources,
++            'documentation': DOCUMENTATION_URL, 'constructor_signature': str(signature),
++            'implementation': 'installed torchdiffeq._impl.dopri5.Dopri5Solver',
++            'endpoint_policy': 'Direct adapter ignores PREV perturb request; exact stage endpoint is evaluated. No nextafter or clipping.',
++            'state_update_dtype': 'same as initial (FP32 in experiment, FP64 in CPU analytic fixtures)',
++            'controller_dtype': 'float64', 'initial_step': .01, 'forced_step_t': [1.0],
++            'error_norm': 'sqrt(mean((embedded_error / (atol + rtol * max(abs(y0), abs(y_candidate))))**2)) over free coordinates only',
++            'FSAL': 'library Dormand-Prince cached endpoint derivative; not a geometry or model-feature cache',
++        }
++    except (ImportError, AttributeError, RuntimeError) as exc:
++        return {'status': 'BLOCKED_DEPENDENCY', 'reason': repr(exc), 'documentation': DOCUMENTATION_URL}
++
++
++def _float(t):
++    return float(t.detach().cpu()) if isinstance(t, torch.Tensor) else float(t)
++
++
++def _validate_state(initial, cpu_fixture):
++    if not isinstance(initial, torch.Tensor) or not initial.is_floating_point() or initial.numel() == 0:
++        raise TypeError('Initial state must be a nonempty floating-point free-coordinate tensor.')
++    if cpu_fixture:
++        if initial.device.type != 'cpu' or initial.dtype not in (torch.float32, torch.float64):
++            raise ValueError('CPU fixtures require CPU FP32/FP64 state.')
++    elif initial.dtype != torch.float32:
++        raise ValueError('Real-model numerical references require FP32 state.')
++    if initial.requires_grad:
++        raise ValueError('Numerical-reference integration is no_grad only.')
++    if not bool(torch.isfinite(initial).all()):
++        raise ValueError('Initial state is not finite.')
++
++
++class _CountedFunction:
++    """No perturbation, clipping, sorting, RNG, context state or target geometry."""
++    def __init__(self, func, initial, limit, counts=None, cpu_fixture=False):
++        self.func = func
++        self.shape = initial.shape
++        self.dtype = initial.dtype
++        self.device = initial.device
++        self.limit = int(limit)
++        self.nfe = 0
++        self.rows = []
++        self.counts = counts
++        self.cpu_fixture = cpu_fixture
++        self.step_index = -1
++        self.stage_index = 0
++        self.controller_t0 = None
++        self.controller_dt = None
++        self.controller_alpha = None
++        self.explicit_controller_time = None
++        self.progress_observations = []
++        self.last_error_ratio = None
++
++    def __call__(self, t, x, *, perturb=None):
++        if self.nfe >= self.limit:
++            raise NFEBudgetExceeded(self.limit)
++        if x.shape != self.shape or x.dtype != self.dtype or x.device != self.device:
++            raise SolverStop('STATE_CONTRACT_FAILURE', 'Free shape/dtype/device changed.')
++        actual = _float(t)
++        if not math.isfinite(actual) or not 0.0 <= actual <= 1.0:
++            raise SolverStop('TIME_DOMAIN_FAILURE', f'Function time outside [0,1]: {actual}')
++        if self.explicit_controller_time is not None:
++            controller = float(self.explicit_controller_time)
++        elif self.controller_t0 is not None:
++            a = self.controller_alpha[self.stage_index]
++            controller = self.controller_t0 + a * self.controller_dt
++        else:
++            controller = actual
++        if not 0.0 <= controller <= 1.0:
++            raise SolverStop('TIME_DOMAIN_FAILURE', f'Controller stage outside [0,1]: {controller}')
++        # The library already casts its stage times to state dtype. Explicit RK4
++        # supplies float64 controller times; network receives the original API's FP32.
++        passed_t = torch.as_tensor(t, dtype=self.dtype, device=self.device)
++        passed = _float(passed_t)
++        self.nfe += 1
++        if self.counts is not None:
++            key = 'cpu_fixture_function_evaluations' if self.cpu_fixture else 'solver_function_evaluations'
++            self.counts[key] = int(self.counts.get(key, 0)) + 1
++        row = {
++            'nfe': self.nfe, 'step_index': self.step_index, 'stage_index': self.stage_index,
++            'controller_time': controller, 'library_function_time': actual,
++            'actual_function_time': passed,
++            'controller_to_function_time_error': passed - controller,
++            'library_perturb_request_ignored': str(perturb) if perturb is not None else None,
++            'function_time_dtype': str(passed_t.dtype), 'state_dtype': str(x.dtype),
++        }
++        self.rows.append(row)
++        self.stage_index += 1
++        velocity = self.func(passed_t, x)
++        if velocity.shape != self.shape or velocity.dtype != self.dtype or velocity.device != self.device:
++            raise SolverStop('VELOCITY_CONTRACT_FAILURE', 'Velocity shape/dtype/device differs from free state.')
++        if not bool(torch.isfinite(velocity).all()):
++            raise SolverStop('NONFINITE_VELOCITY', 'Function returned NaN/Inf.')
++        row['velocity_dtype'] = str(velocity.dtype)
++        return velocity
++
++    def callback_step(self, t0, y0, dt):
++        # TorchDiffEq calls this BEFORE its step_t clipping. The outer driver
++        # records the actual forced terminal interval, not this proposal.
++        pass
++
++    def callback_accept_step(self, t0, y0, dt):
++        pass
++
++    def callback_reject_step(self, t0, y0, dt):
++        pass
++
++    def norm(self, scaled_error):
++        value = scaled_error.square().mean().sqrt()
++        self.last_error_ratio = _float(value)
++        return value
++
++
++def _snap(x):
++    return x.detach().cpu().clone()
++
++
++def _finish(initial, x, current_time, status, message, states, state_kinds, steps, counted, start, config):
++    accepted = [r for r in steps if r.get('accepted') is True]
++    rejected = [r for r in steps if r.get('accepted') is False]
++    widths = [r['h'] for r in steps]
++    complete = status == 'COMPLETE' and current_time == 1.0
++    return {
++        'status': status, 'complete': complete, 'failure': message,
++        'endpoint': _snap(x), 'last_accepted_time': current_time,
++        'states': states, 'state_kinds': state_kinds,
++        'step_log': steps, 'function_log': counted.rows, 'nfe': counted.nfe,
++        'accepted_steps': len(accepted), 'rejected_steps': len(rejected),
++        'unfinished_attempts': sum(r.get('accepted') is None for r in steps),
++        'min_step': min(widths) if widths else None, 'max_step': max(widths) if widths else None,
++        'min_accepted_step': min([r['h'] for r in accepted], default=None),
++        'max_accepted_step': max([r['h'] for r in accepted], default=None),
++        'wall_seconds': time.perf_counter() - start,
++        'configuration': config, 'state_dtype': str(initial.dtype),
++        'state_shape': list(initial.shape), 'controller_dtype': 'torch.float64',
++        'finite_last_accepted_state': bool(torch.isfinite(x).all()),
++        'function_time_min': min([r['actual_function_time'] for r in counted.rows], default=None),
++        'function_time_max': max([r['actual_function_time'] for r in counted.rows], default=None),
++        'actual_t1_function_calls': sum(r['actual_function_time'] == 1.0 for r in counted.rows),
++        'gradient_calls': 0, 'OT_calls': 0,
++    }
++
++
++@torch.no_grad()
++def classic_rk4(func: Callable, initial: torch.Tensor, *, steps: int,
++                fixed_times=FIXED_TIMES, counts=None, cpu_fixture=False, max_nfe=None):
++    """Classical (not 3/8) RK4. Every step makes exactly four function calls."""
++    _validate_state(initial, cpu_fixture)
++    if steps <= 0:
++        raise ValueError('Positive step count required.')
++    fixed_times = tuple(sorted(set(float(v) for v in fixed_times)))
++    index_times = {}
++    for value in fixed_times:
++        idx = int(round(value * steps))
++        if not 0 <= value <= 1 or abs(idx / steps - value) > 1e-13:
++            raise ValueError('RK4 fixed outputs must be actual registered step nodes.')
++        index_times[idx] = value
++    start = time.perf_counter()
++    x = initial.detach().clone()
++    limit = 4 * steps if max_nfe is None else min(int(max_nfe), 4 * steps)
++    counted = _CountedFunction(func, x, limit, counts, cpu_fixture)
++    snapshots, kinds, rows = {}, {}, []
++    if 0 in index_times:
++        snapshots[index_times[0]] = _snap(x)
++        kinds[index_times[0]] = 'initial_state'
++    current_time = 0.0
++    status, message = 'COMPLETE', None
++    h = torch.tensor(1.0 / steps, dtype=x.dtype, device=x.device)
++    for i in range(steps):
++        row = {'step_index': i, 't0': i / steps, 't1': (i + 1) / steps,
++               'h': 1.0 / steps, 'nfe_before': counted.nfe, 'accepted': None,
++               'error_ratio': None, 'error_estimate': 'not embedded; RK4 has no per-step error estimate'}
++        rows.append(row)
++        counted.step_index, counted.stage_index = i, 0
++        try:
++            def call_at(value, state):
++                counted.explicit_controller_time = value
++                return counted(torch.tensor(value, dtype=torch.float64, device=x.device), state)
++            k1 = call_at(i / steps, x)
++            k2 = call_at((i + .5) / steps, x + h * k1 / 2)
++            k3 = call_at((i + .5) / steps, x + h * k2 / 2)
++            k4 = call_at((i + 1) / steps, x + h * k3)
++            candidate = x + h * (k1 + 2 * k2 + 2 * k3 + k4) / 6
++            if not bool(torch.isfinite(candidate).all()):
++                raise SolverStop('NONFINITE_STATE', 'RK4 weighted state update is not finite.')
++            x = candidate
++            current_time = (i + 1) / steps
++            row['accepted'] = True
++            if i + 1 in index_times:
++                output_t = index_times[i + 1]
++                snapshots[output_t] = _snap(x)
++                kinds[output_t] = 'accepted_step_node'
++        except SolverStop as exc:
++            status, message = exc.status, str(exc)
++            break
++        finally:
++            row['nfe_after'] = counted.nfe
++            row['nfe_in_attempt'] = counted.nfe - row['nfe_before']
++    return _finish(initial, x, current_time, status, message, snapshots, kinds, rows, counted, start,
++                   {'method': 'classic_RK4', 'steps': steps, 'h': 1 / steps,
++                    'tableau': 'a21=1/2,a32=1/2,a43=1;b=(1,2,2,1)/6', 'nfe_limit': limit})
++
++
++@torch.no_grad()
++def dopri5(func: Callable, initial: torch.Tensor, *, rtol: float, atol: float,
++           fixed_times=FIXED_TIMES, counts=None, cpu_fixture=False, max_nfe=1200):
++    """Drive installed Dopri5 one attempt at a time, preserving its arithmetic.
++
++    State is free coordinates only. Controller uses library FP64 time/step size.
++    Every actual stage call, including rejected/incomplete attempts, counts.
++    On budget exhaustion only the last ACCEPTED state is returned as incomplete.
++    """
++    _validate_state(initial, cpu_fixture)
++    dep = dependency_info()
++    if dep['status'] != 'AVAILABLE_VERIFIED_INTERFACE':
++        return {'status': 'BLOCKED_DEPENDENCY', 'complete': False, 'nfe': 0, 'dependency': dep}
++    from torchdiffeq._impl.dopri5 import Dopri5Solver
++    from torchdiffeq._impl.interp import _interp_evaluate
++    times = tuple(sorted(set(float(v) for v in fixed_times)))
++    if any(not 0 <= v <= 1 for v in times):
++        raise ValueError('Fixed output times must lie in [0,1].')
++    start = time.perf_counter()
++    x = initial.detach().clone()
++    counted = _CountedFunction(func, x, min(int(max_nfe), 1200), counts, cpu_fixture)
++    # This is the existing library solver; no copied/reimplemented controller.
++    solver = Dopri5Solver(func=counted, y0=x, rtol=rtol, atol=atol,
++                         first_step=.01, step_t=torch.tensor([1.], dtype=torch.float64, device=x.device),
++                         dtype=torch.float64, norm=counted.norm)
++    snapshots, kinds, rows = {}, {}, []
++    if 0.0 in times:
++        snapshots[0.0], kinds[0.0] = _snap(x), 'initial_state'
++    status, message, current_time = 'COMPLETE', None, 0.0
++    alpha = [float(a) for a in solver.tableau.alpha.detach().cpu()]
++    try:
++        solver._before_integrate(torch.tensor([0., 1.], dtype=torch.float64, device=x.device))
++        while _float(solver.rk_state.t1) < 1.0:
++            old = solver.rk_state
++            t0 = _float(old.t1)
++            proposal = _float(old.dt)
++            # Exactly the installed step_t=[1] restriction. It is applied by
++            # the library too; here it only prepares audit times and checks.
++            forced_endpoint = t0 < 1.0 < t0 + proposal
++            end = 1.0 if forced_endpoint else t0 + proposal
++            width = 1.0 - t0 if forced_endpoint else proposal
++            row = {'step_index': len(rows), 't0': t0, 't1': end, 'h': width,
++                   'proposed_h': proposal, 'accepted': None, 'nfe_before': counted.nfe,
++                   'nfe_after': counted.nfe, 'nfe_in_attempt': 0, 'forced_endpoint': forced_endpoint,
++                   'error_ratio': None, 'error_estimate': 'free-coordinate normalized embedded 5(4) RMS',
++                   'time_fp32_endpoint_equal': float(torch.tensor(t0, dtype=torch.float32)) == float(torch.tensor(end, dtype=torch.float32))}
++            rows.append(row)
++            if not math.isfinite(width) or not width > 0 or not end > t0:
++                raise SolverStop('STEP_UNDERFLOW', f'No positive controller time advance: {t0}, {width}')
++            # A step whose start/end collapse under model FP32 time cannot
++            # provide a trustworthy tighter-time solve. Stop, never epsilon-hop.
++            if not cpu_fixture and row['time_fp32_endpoint_equal']:
++                raise SolverStop('TIME_FP32_ROUNDING_LIMIT', f'Step endpoints both round to model time at {t0}')
++            counted.step_index, counted.stage_index = len(rows) - 1, 0
++            counted.controller_t0, counted.controller_dt = t0, width
++            counted.controller_alpha = alpha
++            counted.last_error_ratio = None
++            try:
++                new = solver._adaptive_step(old)
++                solver.rk_state = new
++                ratio = counted.last_error_ratio
++                row['error_ratio'] = ratio
++                accepted = _float(new.t1) > t0
++                row['accepted'] = accepted
++                row['next_h'] = _float(new.dt)
++                if ratio is None or not math.isfinite(ratio):
++                    raise SolverStop('NONFINITE_ERROR_ESTIMATE', f'Embedded ratio is {ratio}')
++                if _float(new.t1) > 1.0:
++                    raise SolverStop('TIME_DOMAIN_FAILURE', 'Library accepted a step beyond 1.')
++                if accepted:
++                    x = new.y1
++                    current_time = _float(new.t1)
++                    if not bool(torch.isfinite(x).all()):
++                        raise SolverStop('NONFINITE_STATE', 'Dopri weighted state update is not finite.')
++                    for output_t in times:
++                        if output_t in snapshots or not t0 <= output_t <= current_time:
++                            continue
++                        if output_t == current_time:
++                            snapshots[output_t] = _snap(x)
++                            kinds[output_t] = 'accepted_step_node'
++                        else:
++                            ti = torch.tensor(output_t, dtype=torch.float64, device=x.device)
++                            snapshots[output_t] = _snap(_interp_evaluate(new.interp_coeff, new.t0, new.t1, ti))
++                            kinds[output_t] = 'library_dense_interpolated_output'
++            finally:
++                row['nfe_after'] = counted.nfe
++                row['nfe_in_attempt'] = counted.nfe - row['nfe_before']
++    except SolverStop as exc:
++        status, message = exc.status, str(exc)
++    except AssertionError as exc:
++        # Installed assertions describe time underflow / nonfinite state; do
++        # not silently switch algorithm, relax tolerance or retry.
++        status, message = 'LIBRARY_NUMERICAL_ASSERTION', str(exc)
++    config = {'method': 'installed_Dopri5_5(4)', 'rtol': rtol, 'atol': atol,
++              'first_step': .01, 'step_t': [1.0], 'nfe_limit': counted.limit,
++              'error_norm': dep['error_norm'], 'dependency': dep,
++              'endpoint_policy': dep['endpoint_policy'],
++              'intermediate_alpha_source': 'installed tableau in state dtype; audit reconstructs controller-stage time using these actual coefficients'}
++    return _finish(initial, x, current_time, status, message, snapshots, kinds, rows, counted, start, config)
++
++
++def solve(kind, func, initial, *, counts=None, cpu_fixture=False, fixed_times=FIXED_TIMES, max_nfe=None):
++    settings = SETTINGS[kind]
++    if kind.startswith('R'):
++        return classic_rk4(func, initial, steps=settings['steps'], counts=counts,
++                          cpu_fixture=cpu_fixture, fixed_times=fixed_times, max_nfe=max_nfe)
++    return dopri5(func, initial, rtol=settings['rtol'], atol=settings['atol'], counts=counts,
++                  cpu_fixture=cpu_fixture, fixed_times=fixed_times,
++                  max_nfe=settings['nfe_limit'] if max_nfe is None else max_nfe)
++
+diff --git a/experiments/mf_h1_local0/jedge5_numeric_reference_A/tests/cpu_fixture_final.json b/experiments/mf_h1_local0/jedge5_numeric_reference_A/tests/cpu_fixture_final.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..7a21ae14a1ccff51c06acaece29679a538949666
+--- /dev/null
++++ b/experiments/mf_h1_local0/jedge5_numeric_reference_A/tests/cpu_fixture_final.json
+@@ -0,0 +1,153 @@
++{
++  "status": "PASS",
++  "dependency": {
++    "status": "AVAILABLE_VERIFIED_INTERFACE",
++    "torchdiffeq_version": "0.2.5",
++    "torch_version": "2.7.1+cu128",
++    "sources_sha256": {
++      "/home/warpwang/miniforge3/envs/meshflow/lib/python3.10/site-packages/torchdiffeq/_impl/dopri5.py": "8d9f7f1370ffa0de3a90ef9cc96185ec8a3b089b6d863728c8085629b9a38809",
++      "/home/warpwang/miniforge3/envs/meshflow/lib/python3.10/site-packages/torchdiffeq/_impl/rk_common.py": "bd9f0e5a50cf1939e4a3136b7aeff550e04d6d8d76601991676ceb7ab2974989",
++      "/home/warpwang/miniforge3/envs/meshflow/lib/python3.10/site-packages/torchdiffeq/_impl/interp.py": "436b6e8e346716dd466fede0a9038cc6e6e9c6573ffef526f028a890ab0222d6",
++      "/home/warpwang/miniforge3/envs/meshflow/lib/python3.10/site-packages/torchdiffeq/_impl/misc.py": "49a4707d4c2bdd2ad162fa449fcad3bedec5719159cfddf1caec516bc28db5be"
++    },
++    "documentation": "https://github.com/rtqichen/torchdiffeq/blob/master/FURTHER_DOCUMENTATION.md",
++    "constructor_signature": "(self, func, y0, rtol, atol, min_step=0, max_step=inf, first_step=None, step_t=None, jump_t=None, safety=0.9, ifactor=10.0, dfactor=0.2, max_num_steps=2147483647, dtype=torch.float64, **kwargs)",
++    "implementation": "installed torchdiffeq._impl.dopri5.Dopri5Solver",
++    "endpoint_policy": "Direct adapter ignores PREV perturb request; exact stage endpoint is evaluated. No nextafter or clipping.",
++    "state_update_dtype": "same as initial (FP32 in experiment, FP64 in CPU analytic fixtures)",
++    "controller_dtype": "float64",
++    "initial_step": 0.01,
++    "forced_step_t": [
++      1.0
++    ],
++    "error_norm": "sqrt(mean((embedded_error / (atol + rtol * max(abs(y0), abs(y_candidate))))**2)) over free coordinates only",
++    "FSAL": "library Dormand-Prince cached endpoint derivative; not a geometry or model-feature cache"
++  },
++  "checks": [
++    {
++      "test": "constant_velocity",
++      "solver": "R1",
++      "max_error": 1.9539925233402755e-14,
++      "nfe": 400,
++      "t1_calls": 1,
++      "state_kinds": {
++        "0.0": "initial_state",
++        "0.2": "accepted_step_node",
++        "0.5": "accepted_step_node",
++        "0.8": "accepted_step_node",
++        "1.0": "accepted_step_node"
++      }
++    },
++    {
++      "test": "constant_velocity",
++      "solver": "R2",
++      "max_error": 2.4868995751603507e-14,
++      "nfe": 800,
++      "t1_calls": 1,
++      "state_kinds": {
++        "0.0": "initial_state",
++        "0.2": "accepted_step_node",
++        "0.5": "accepted_step_node",
++        "0.8": "accepted_step_node",
++        "1.0": "accepted_step_node"
++      }
++    },
++    {
++      "test": "constant_velocity",
++      "solver": "D1",
++      "max_error": 4.440892098500626e-16,
++      "nfe": 19,
++      "t1_calls": 2,
++      "state_kinds": {
++        "0.0": "initial_state",
++        "0.2": "library_dense_interpolated_output",
++        "0.5": "library_dense_interpolated_output",
++        "0.8": "library_dense_interpolated_output",
++        "1.0": "accepted_step_node"
++      }
++    },
++    {
++      "test": "constant_velocity",
++      "solver": "D2",
++      "max_error": 4.440892098500626e-16,
++      "nfe": 19,
++      "t1_calls": 2,
++      "state_kinds": {
++        "0.0": "initial_state",
++        "0.2": "library_dense_interpolated_output",
++        "0.5": "library_dense_interpolated_output",
++        "0.8": "library_dense_interpolated_output",
++        "1.0": "accepted_step_node"
++      }
++    },
++    {
++      "test": "rk4_linear_order",
++      "steps": [
++        10,
++        20
++      ],
++      "errors": [
++        2.0843238792700447e-06,
++        1.3580270996627064e-07
++      ],
++      "error_ratio": 15.34817589271767
++    },
++    {
++      "test": "dopri_tolerance_trend",
++      "ode": "linear",
++      "loose_error": 0.0024926020167725937,
++      "tight_error": 0.00045887386552578846,
++      "loose_nfe": 43,
++      "tight_nfe": 61,
++      "loose_rejected": 0,
++      "tight_rejected": 0
++    },
++    {
++      "test": "dopri_tolerance_trend",
++      "ode": "smooth_time",
++      "loose_error": 1.1893504641147246e-06,
++      "tight_error": 2.5965242567149716e-08,
++      "loose_nfe": 43,
++      "tight_nfe": 67,
++      "loose_rejected": 1,
++      "tight_rejected": 2
++    },
++    {
++      "test": "C_clamping_noncontiguous_free_only_state",
++      "free_shape": [
++        3,
++        9
++      ],
++      "known_shape": [
++        2,
++        9
++      ],
++      "nfe": 19
++    },
++    {
++      "test": "hard_NFE_cap",
++      "nfe": 10,
++      "last_accepted_time": 0.01,
++      "unfinished_attempts": 1
++    },
++    {
++      "test": "FP32_updates_and_true_endpoint",
++      "nfe": 19,
++      "max_time": 1.0,
++      "true_endpoint_calls": 2
++    },
++    {
++      "test": "existing_library_autonomous_parity",
++      "max_error": 1.1546319456101628e-14,
++      "public_function_calls": 31
++    }
++  ],
++  "counts": {
++    "cpu_fixture_function_evaluations": 1682
++  },
++  "actual_neural_model_forwards": 0,
++  "backwards": 0,
++  "optimizer_updates": 0,
++  "OT_calls": 0,
++  "cuda_initialized": false
++}
+\ No newline at end of file
+diff --git a/experiments/mf_h1_local0/jedge5_numeric_reference_A/tests/test_analysis.json b/experiments/mf_h1_local0/jedge5_numeric_reference_A/tests/test_analysis.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..eba61e146a733ec96305ff2e1634d02abaf14033
+--- /dev/null
++++ b/experiments/mf_h1_local0/jedge5_numeric_reference_A/tests/test_analysis.json
+@@ -0,0 +1,12 @@
++{
++  "status": "PASS",
++  "analytic_endpoint_cases": 3,
++  "C_identity_failure_case": true,
++  "identical_surface_rms": 4.4814301773904865e-17,
++  "translation_coordinate_rms": 0.005773500770517842,
++  "model_forwards": 0,
++  "backward_calls": 0,
++  "OT_calls": 0,
++  "CUDA_initialized": false,
++  "seconds": 0.05497691300001861
++}
+diff --git a/experiments/mf_h1_local0/jedge5_numeric_reference_A/tests/test_analysis.py b/experiments/mf_h1_local0/jedge5_numeric_reference_A/tests/test_analysis.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..65c353623429f61c8279acb266ecda9b93f980c0
+--- /dev/null
++++ b/experiments/mf_h1_local0/jedge5_numeric_reference_A/tests/test_analysis.py
+@@ -0,0 +1,40 @@
++﻿"""Small CPU-only tests for the endpoint comparison conventions."""
++import json
++from pathlib import Path
++import time
++import numpy as np
++import torch
++from ..analysis import endpoint_difference
++from ..assets import write_json
++
++
++def run():
++    tick=time.perf_counter()
++    a=np.empty((112,3,3),np.float32)
++    base=np.array([[0.,0.,0.],[1.,0.,0.],[0.,1.,0.]],np.float32)
++    for i in range(112):a[i]=base+np.array([0.,0.,i*.01],np.float32)
++    identity=endpoint_difference(a,a.copy(),3.)
++    assert identity['coordinate_RMS']==0
++    assert identity['surface']['symmetric_rms']<1e-12
++    b=a.copy();b[12:,:,0]+=.01
++    shift=endpoint_difference(a,b,3.)
++    assert abs(shift['coordinate_RMS']-.01/np.sqrt(3))<1e-8
++    assert abs(shift['vertex_RMS']-.01)<1e-8
++    assert shift['surface']['symmetric_rms']>0
++    assert a[12:,:,[0,2,1]].shape==(100,3,3)
++    b[0,0,0]+=.01
++    try:endpoint_difference(a,b,3.)
++    except ValueError:known_rejected=True
++    else:known_rejected=False
++    assert known_rejected
++    assert not torch.cuda.is_initialized()
++    result=dict(status='PASS',analytic_endpoint_cases=3,C_identity_failure_case=True,
++        identical_surface_rms=identity['surface']['symmetric_rms'],
++        translation_coordinate_rms=shift['coordinate_RMS'],
++        model_forwards=0,backward_calls=0,OT_calls=0,CUDA_initialized=False,
++        seconds=time.perf_counter()-tick)
++    write_json(Path(__file__).with_suffix('.json'),result)
++    print(json.dumps(result),flush=True)
++    return result
++
++if __name__=='__main__':run()
+diff --git a/experiments/mf_h1_local0/jedge5_numeric_reference_A/tests/test_solvers.py b/experiments/mf_h1_local0/jedge5_numeric_reference_A/tests/test_solvers.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..2de555ca39e54ecd8aad931171ee7417040d041b
+--- /dev/null
++++ b/experiments/mf_h1_local0/jedge5_numeric_reference_A/tests/test_solvers.py
+@@ -0,0 +1,149 @@
++﻿"""CPU-only analytic gates for the isolated reference integrators."""
++from __future__ import annotations
++
++import argparse
++import json
++import math
++from pathlib import Path
++
++import torch
++
++from ..solvers import classic_rk4, dependency_info, dopri5, solve
++
++
++def run():
++    assert not torch.cuda.is_initialized()
++    counts = {}
++    checks = []
++    dependency = dependency_info()
++    x0 = torch.tensor([.25, -.5, 2.0], dtype=torch.float64)
++    speed = torch.tensor([2.0, -3.0, .125], dtype=torch.float64)
++    expected = x0 + speed
++    for kind in ('R1', 'R2', 'D1', 'D2'):
++        out = solve(kind, lambda t, x: speed, x0, counts=counts, cpu_fixture=True)
++        assert out['status'] == 'COMPLETE', out.get('failure')
++        assert out['last_accepted_time'] == 1.0
++        assert out['actual_t1_function_calls'] >= 1
++        assert out['function_time_min'] >= 0 and out['function_time_max'] <= 1
++        err = float((out['endpoint'] - expected).abs().max())
++        assert err < 2e-12, (kind, err)
++        if kind.startswith('R'):
++            assert out['nfe'] == (400 if kind == 'R1' else 800)
++        else:
++            assert out['nfe'] == 1 + 6 * len(out['step_log'])
++            assert out['step_log'][0]['h'] == .01
++            assert out['step_log'][-1]['t1'] == 1.0
++        checks.append({'test': 'constant_velocity', 'solver': kind, 'max_error': err, 'nfe': out['nfe'],
++                       't1_calls': out['actual_t1_function_calls'], 'state_kinds': out['state_kinds']})
++
++    errors = []
++    for steps in (10, 20):
++        out = classic_rk4(lambda t, x: x, torch.ones(1, dtype=torch.float64),
++                          steps=steps, counts=counts, cpu_fixture=True)
++        error = abs(float(out['endpoint']) - math.e)
++        errors.append(error)
++    ratio = errors[0] / errors[1]
++    assert 14.0 < ratio < 18.0, ratio
++    checks.append({'test': 'rk4_linear_order', 'steps': [10, 20], 'errors': errors, 'error_ratio': ratio})
++
++    for name, fn, expected in (
++            ('linear', lambda t, x: 4.0 * x, math.exp(4.0)),
++            ('smooth_time', lambda t, x: torch.ones_like(x) * (torch.cos(7 * t) + t * t), math.sin(7) / 7 + 1 / 3),
++    ):
++        init = torch.ones(1, dtype=torch.float64) if name == 'linear' else torch.zeros(1, dtype=torch.float64)
++        loose = dopri5(fn, init, rtol=1e-4, atol=1e-6, counts=counts, cpu_fixture=True)
++        tight = dopri5(fn, init, rtol=1e-5, atol=1e-7, counts=counts, cpu_fixture=True)
++        assert loose['complete'] and tight['complete']
++        le = abs(float(loose['endpoint']) - expected)
++        te = abs(float(tight['endpoint']) - expected)
++        assert te < le, (name, le, te)
++        assert tight['nfe'] >= loose['nfe']
++        checks.append({'test': 'dopri_tolerance_trend', 'ode': name,
++                       'loose_error': le, 'tight_error': te,
++                       'loose_nfe': loose['nfe'], 'tight_nfe': tight['nfe'],
++                       'loose_rejected': loose['rejected_steps'], 'tight_rejected': tight['rejected_steps']})
++
++    # Preserve arbitrary noncontiguous known/free positions; the state and norm
++    # contain ONLY free coordinates. This toy embedding has no neural calls.
++    full = torch.arange(45, dtype=torch.float64).reshape(5, 9)
++    known = torch.tensor([True, False, True, False, False])
++    C = full[known].clone()
++    free = full[~known].clone()
++    seen_shapes = []
++    def clamped(t, state):
++        reconstructed = torch.empty_like(full)
++        reconstructed[known] = C
++        reconstructed[~known] = state
++        assert torch.equal(reconstructed[known].view(torch.int64), C.view(torch.int64))
++        seen_shapes.append(tuple(state.shape))
++        return torch.ones_like(state)
++    out = solve('D1', clamped, free, counts=counts, cpu_fixture=True)
++    assert set(seen_shapes) == {(3, 9)}
++    for state in out['states'].values():
++        reconstructed = full.clone()
++        reconstructed[~known] = state
++        assert torch.equal(reconstructed[known].view(torch.int64), C.view(torch.int64))
++    checks.append({'test': 'C_clamping_noncontiguous_free_only_state', 'free_shape': [3, 9], 'known_shape': [2, 9], 'nfe': out['nfe']})
++
++    # Hard cap in the middle of a Dopri attempt: count all 10 real function
++    # invocations and preserve the preceding accepted (not unfinished) state.
++    capped = dopri5(lambda t, x: x, torch.ones(1, dtype=torch.float64),
++                    rtol=1e-4, atol=1e-6, max_nfe=10, counts=counts, cpu_fixture=True)
++    assert capped['status'] == 'NFE_BUDGET_EXHAUSTED'
++    assert capped['nfe'] == 10 and not capped['complete']
++    assert capped['last_accepted_time'] == .01
++    assert capped['unfinished_attempts'] == 1
++    checks.append({'test': 'hard_NFE_cap', 'nfe': capped['nfe'], 'last_accepted_time': capped['last_accepted_time'],
++                   'unfinished_attempts': capped['unfinished_attempts']})
++
++    # Function time 1 is literal 1.0, with no hidden torchdiffeq nextafter.
++    visited = []
++    def endpoint_exact(t, x):
++        visited.append(float(t))
++        return torch.zeros_like(x)
++    out = solve('D1', endpoint_exact, torch.zeros(2, dtype=torch.float32), counts=counts, cpu_fixture=True)
++    assert out['complete'] and 1.0 in visited and max(visited) == 1.0
++    assert out['endpoint'].dtype == torch.float32
++    assert all(r['velocity_dtype'] == 'torch.float32' for r in out['function_log'])
++    checks.append({'test': 'FP32_updates_and_true_endpoint', 'nfe': out['nfe'], 'max_time': max(visited),
++                   'true_endpoint_calls': visited.count(1.0)})
++
++    # In the autonomous case the only deliberate adapter distinction (time
++    # perturbation) has no effect; compare to public existing odeint arithmetic.
++    from torchdiffeq import odeint
++    fn = lambda t, x: 2 * x
++    initial = torch.tensor([.2, -.7], dtype=torch.float64)
++    wrapped = dopri5(fn, initial, rtol=1e-4, atol=1e-6, counts=counts, cpu_fixture=True)
++    public_calls = {'count': 0}
++    def public_fn(t, x):
++        public_calls['count'] += 1
++        return fn(t, x)
++    public = odeint(public_fn, initial, torch.tensor([0., 1.], dtype=torch.float64),
++                    method='dopri5', rtol=1e-4, atol=1e-6,
++                    options={'first_step': .01, 'step_t': torch.tensor([1.], dtype=torch.float64)})[-1]
++    counts['cpu_fixture_function_evaluations'] += public_calls['count']
++    gap = float((wrapped['endpoint'] - public).abs().max())
++    assert gap < 1e-12, gap
++    checks.append({'test': 'existing_library_autonomous_parity', 'max_error': gap, 'public_function_calls': public_calls['count']})
++    assert not torch.cuda.is_initialized()
++    return {'status': 'PASS', 'dependency': dependency, 'checks': checks,
++            'counts': counts, 'actual_neural_model_forwards': 0, 'backwards': 0,
++            'optimizer_updates': 0, 'OT_calls': 0, 'cuda_initialized': torch.cuda.is_initialized()}
++
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument('--out', type=Path)
++    args = p.parse_args()
++    result = run()
++    payload = json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False)
++    if args.out:
++        args.out.parent.mkdir(parents=True, exist_ok=True)
++        if args.out.exists():
++            raise FileExistsError(args.out)
++        args.out.write_text(payload, encoding='utf-8')
++    print(payload)
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/experiments/mf_h1_local0/jedge5_numeric_reference_A/worker.py b/experiments/mf_h1_local0/jedge5_numeric_reference_A/worker.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..f5a00fba58053a6e57fce4148c2cad3f2f3e49e1
+--- /dev/null
++++ b/experiments/mf_h1_local0/jedge5_numeric_reference_A/worker.py
+@@ -0,0 +1,168 @@
++"""One locked GPU task per process. No training, random draws or geometry repair."""
++import argparse
++import fcntl
++import json
++import os
++from pathlib import Path
++import subprocess
++import threading
++import time
++
++
++def resources():
++    def command(args):
++        p = subprocess.run(args, capture_output=True, text=True)
++        return dict(returncode=p.returncode, stdout=p.stdout, stderr=p.stderr)
++    return dict(time=time.time(), gpu=command(['nvidia-smi', '--query-gpu=name,memory.total,memory.used,memory.free,utilization.gpu', '--format=csv']),
++                processes=command(['nvidia-smi','--query-compute-apps=pid,process_name,used_memory','--format=csv']),
++                cpu_cores=os.cpu_count(), memory=Path('/proc/meminfo').read_text().splitlines()[:3],
++                load=Path('/proc/loadavg').read_text().strip())
++
++
++def main():
++    p=argparse.ArgumentParser();p.add_argument('--out',type=Path,required=True)
++    p.add_argument('--model',choices=['B','J'],required=True);p.add_argument('--case',type=int,default=0)
++    p.add_argument('--solver',choices=['R1','R2','D1','D2']);p.add_argument('--precheck',action='store_true')
++    p.add_argument('--repeat',action='store_true');args=p.parse_args()
++    if args.precheck == (args.solver is not None):raise ValueError('Choose exactly precheck or solver')
++    # Importing this package/stdlib has not initialized CUDA. Lock precedes torch.
++    start=time.perf_counter()
++    lock=open('/tmp/wrp_meshflow_jedge5_diag_gpu0.lock','a+')
++    fcntl.flock(lock,fcntl.LOCK_EX)
++    lock_wait=time.perf_counter()-start;lock_start=time.perf_counter()
++    os.environ['CUBLAS_WORKSPACE_CONFIG']=':4096:8'
++    from native_t1.runtime import configure_stable_runtime
++    import numpy as np
++    import torch
++    from native_t1.model import native_execution
++    from native_t1.artifacts import array_hash,state_sha256,file_sha256
++    from .assets import ROOT,ASSETS,load_model,load_case,load_registered_cases,read_json,write_json
++    from .solvers import solve,SETTINGS
++    from experiments.mf_h1_local0.jedge5_diagnosis.sampling import DTypeRecorder,_bits_equal
++    if torch.cuda.is_initialized():raise RuntimeError('Unexpected pre-runtime CUDA initialization')
++    args.out=args.out.resolve()
++    if args.out.parent!=ROOT/'native_t1/runs' or not args.out.name.startswith('jedge5_numeric_reference_A_'):
++        raise ValueError('Wrong window output root')
++    case=load_case(args.out,args.case)
++    ident=(args.model+'_precheck') if args.precheck else f"{args.model}_{case['id']}_{args.solver}"+('_repeat' if args.repeat else '')
++    folder=args.out/('prechecks' if args.precheck else 'trajectories')/ident
++    folder.mkdir(parents=True,exist_ok=False)
++    progress=folder/'progress.json'
++    actual_before=sum(read_json(f).get('model_forward_attempts',0) for f in args.out.glob('**/progress.json'))
++    cap=6 if args.precheck else SETTINGS[args.solver]['nfe_limit']
++    if actual_before+cap>30000:raise RuntimeError('Window total budget insufficient for registered task')
++    count=dict(model_forward_attempts=0,model_forward_returns=0)
++    snapshots=[resources()];stop=threading.Event()
++    def monitor():
++        while not stop.wait(2):snapshots.append(resources())
++    thread=threading.Thread(target=monitor,daemon=True);thread.start()
++    configure_stable_runtime();torch.set_num_threads(1)
++    tick=time.perf_counter();model,identity=load_model(args.model,device='cuda');load_seconds=time.perf_counter()-tick
++    torch.cuda.synchronize();torch.cuda.reset_peak_memory_stats()
++    events=[];Cchecks=0;dtype_facts=[];runtime_facts={}
++    def persist():
++        write_json(progress,dict(count,id=ident,model=args.model,cap=cap,window_prior_forward_attempts=actual_before,
++                                 lock_wait_seconds=lock_wait,status='RUNNING'))
++    persist()
++    def call(full,t,y,valid,known):
++        if count['model_forward_attempts']>=cap or actual_before+count['model_forward_attempts']>=30000:
++            raise RuntimeError('Actual model forward hard cap')
++        count['model_forward_attempts']+=1;persist()
++        begin,end=torch.cuda.Event(enable_timing=True),torch.cuda.Event(enable_timing=True);begin.record()
++        velocity=model(full,t,y,valid,known);end.record();events.append((begin,end))
++        count['model_forward_returns']+=1
++        if velocity.dtype!=torch.float32 or velocity.requires_grad or not bool(torch.isfinite(velocity).all()):
++            raise RuntimeError('Nonfinite/non-FP32/gradient velocity')
++        return velocity
++    class Field:
++        def __init__(self,record):
++            self.record=record
++            self.C=torch.from_numpy(record['C'].reshape(1,12,9)).cuda()
++            self.known=torch.from_numpy(record['known']).cuda();self.valid=torch.from_numpy(record['valid']).cuda()
++            self.y=torch.from_numpy(record['y']).cuda();self.observed=False
++        def full(self,free):
++            nonlocal Cchecks
++            if free.dtype!=torch.float32 or free.shape!=(1,100,9):raise RuntimeError('Free state contract')
++            result=torch.cat((self.C,free),dim=1)
++            if not _bits_equal(result[:,:12],self.C):raise RuntimeError('C bits changed')
++            Cchecks+=1;return result
++        def __call__(self,t,free):
++            if t.dtype!=torch.float32 or not 0<=float(t)<=1:raise RuntimeError('Real model time domain/dtype')
++            full=self.full(free);recorder=None if self.observed else DTypeRecorder(model)
++            try:
++                velocity=call(full,t.reshape(1),self.y,self.valid,self.known)
++                if recorder is not None:
++                    dtype_facts.append(recorder.finish(velocity,'fp32'));self.observed=True
++                return velocity[:,12:]
++            finally:
++                if recorder is not None:recorder.close()
++    output=None;failure=None;gpu_start=time.perf_counter()
++    try:
++        with torch.no_grad():
++            if args.precheck:
++                old=read_json(args.out/'registration/old_euler_index.json')['rows'];rows=[]
++                for record in load_registered_cases(args.out):
++                    field=Field(record)
++                    source=next(r for r in old if r['case_id']==record['id'] and r['model']==args.model and r['nfe']==100 and r['status']=='AVAILABLE')
++                    with np.load(source['path']) as z:free=torch.from_numpy(z['raw'][None,12:].copy()).cuda()
++                    with native_execution(model,coordinates=free,autocast=False) as facts:
++                        runtime_facts=facts;v=field(torch.tensor(1.,device='cuda',dtype=torch.float32),free)
++                    rows.append(dict(case_id=record['id'],actual_t=1.,finite=True,velocity_sha256=array_hash(v),source=source['path']))
++                # Compare new free-only wrapper with the previous FP32 call contract at an actual saved state.
++                field=Field(case);source=next(r for r in old if r['case_id']==case['id'] and r['model']==args.model and r['nfe']==100 and r['status']=='AVAILABLE')
++                with np.load(source['path']) as z:
++                    index=list(z['state_indices']).index(50);full=torch.from_numpy(z['states'][index][None].copy()).cuda()
++                t=torch.tensor([.5],device='cuda',dtype=torch.float32)
++                with native_execution(model,coordinates=full,autocast=False):
++                    old_v=call(full,t,field.y,field.valid,field.known)[:,12:]
++                    new_v=field(t[0],full[:,12:])
++                if not _bits_equal(old_v,new_v):raise RuntimeError('Old FP32 entry parity failed')
++                output=dict(status='PASS',complete=False,endpoint_t1_checks=rows,old_FP32_entry_bitwise_equal=True)
++            else:
++                field=Field(case);initial=torch.from_numpy(case['initial_free']).cuda()
++                with native_execution(model,coordinates=initial,autocast=False) as facts:
++                    runtime_facts=facts;solved=solve(args.solver,field,initial)
++                if solved['nfe']!=count['model_forward_attempts']:raise RuntimeError('Solver/model count mismatch')
++                times=sorted(solved['states']);C=case['C'].reshape(1,12,9)
++                def assemble(free):return np.concatenate((C,free.numpy()),axis=1)[0]
++                raw=assemble(solved['endpoint']);states=np.stack([assemble(solved['states'][t]) for t in times])
++                if not np.array_equal(states[:,:12].view(np.uint32),np.broadcast_to(C,(len(times),12,9)).copy().view(np.uint32)):
++                    raise RuntimeError('Saved C bit preservation failure')
++                path=folder/'raw.npz'
++                np.savez_compressed(path,raw=raw,states=states,state_times=np.array(times,dtype=np.float64),C=case['C'],
++                                    last_accepted_time=np.array(solved['last_accepted_time']))
++                write_json(folder/'solver_step_log.json',solved.pop('step_log'))
++                write_json(folder/'function_log.json',solved.pop('function_log'))
++                solved.pop('endpoint');solved.pop('states')
++                output=dict(solved,id=ident,model=args.model,case_id=case['id'],parent=case['parent'],patch=case['patch'],seed=case['seed'],
++                            solver=args.solver,repeat=args.repeat,path=str(path.relative_to(args.out)),sha256=file_sha256(path),
++                            raw_array_sha256=array_hash(raw),input_hashes=case['array_hashes'],total_faces=112,free_faces=100,
++                            saved_C_bitwise=True,saved_state_count=len(times))
++        if output.get("status") not in ("PASS", "COMPLETE", "NFE_BUDGET_EXHAUSTED", "TIME_FP32_ROUNDING_LIMIT", "STEP_UNDERFLOW", "BLOCKED_DEPENDENCY"):
++            failure="Numerical task failure: "+str(output.get("status"))
++        torch.cuda.synchronize()
++    except BaseException as exc:
++        failure=repr(exc);output=dict(status='WORKER_FAILURE',complete=False,failure=failure,id=ident,model=args.model)
++    finally:
++        torch.cuda.synchronize();compute_seconds=time.perf_counter()-gpu_start
++        after=state_sha256(model)
++        stop.set();thread.join();snapshots.append(resources())
++        if after!=ASSETS[args.model]['state']:failure='FROZEN_STATE_CHANGED';output.update(status=failure,complete=False)
++        audit=dict(count,window_prior_forward_attempts=actual_before,lock_wait_seconds=lock_wait,
++                   locked_wall_seconds=time.perf_counter()-lock_start,model_load_seconds=load_seconds,
++                   model_and_solver_wall_seconds=compute_seconds,model_forward_cuda_event_seconds=sum(a.elapsed_time(b) for a,b in events)/1000,
++                   peak_cuda_allocated=torch.cuda.max_memory_allocated(),peak_cuda_reserved=torch.cuda.max_memory_reserved(),
++                   peak_scope='reset after model load; includes resident model; process/global VRAM snapshots separate',
++                   state_sha256_before=identity['state_sha256'],state_sha256_after=after,runtime=runtime_facts,actual_dtypes=dtype_facts,
++                   C_assembly_bitwise_checks=Cchecks,training_updates=0,backward_calls=0,OT_calls=0,postprocessing=None,
++                   GPU_workers_this_window=1,resource_snapshots_path=str((folder/'resources.json').relative_to(args.out)))
++        output['audit']=audit
++        write_json(folder/'resources.json',snapshots);write_json(folder/'result.json',output)
++        write_json(progress,dict(count,id=ident,status=output['status'],cap=cap,window_prior_forward_attempts=actual_before))
++        print(json.dumps(dict(id=ident,status=output['status'],nfe=count['model_forward_attempts'],seconds=compute_seconds,
++                              lock_wait=lock_wait,result=str(folder/'result.json'))),flush=True)
++    # CUDA model/context exits with this short-lived worker; file descriptor unlock follows process exit.
++    if failure:raise RuntimeError(failure)
++
++
++if __name__=='__main__':main()

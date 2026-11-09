@@ -1,0 +1,875 @@
+--- /dev/null
++++ b/native_t1/runs/chair_hybrid_coupling_v1/independent_audit/audit_final_ledger.py
+@@ -0,0 +1,500 @@
++"""Independent, standard-library-only final ledger/exposure audit.
++
++Do not run while a worker is active. This file lives outside frozen experiment
++code. It imports no experiment module, NumPy, torch, model, or scorer, and never
++changes a source artifact. Missing/failed evidence yields BLOCKED; no rows are
++filled in and no experiments are dispatched. Endpoint PT files are byte-hashed,
++never deserialized; their metadata are checked from the bound JSON sidecars.
++"""
++from __future__ import annotations
++import argparse
++from collections import Counter, defaultdict
++import csv
++import hashlib
++import io
++import json
++import math
++import os
++from pathlib import Path
++import time
++import traceback
++
++ARMS = ('OT_BASE', 'OT_HYBRID')
++FORWARDS = ('training_forward', 'sampling_forward', 'diagnostic_bf16', 'diagnostic_fp32', 'precheck_forward')
++EXPECTED_TRAINING = {'training_forward': 16000, 'training_backward': 16000, 'optimizer_update': 2000}
++SOURCE_SHA = '190a16e2aec96a1f84f63460b5f97b00e23499338102f82e7530218ecb185ebf'
++
++
++def canonical_hash(value):
++    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()).hexdigest()
++
++
++def stat_identity(path):
++    s = Path(path).stat()
++    return {'bytes': s.st_size, 'mtime_ns': s.st_mtime_ns}
++
++
++def dump_json(path, value):
++    path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)
++    tmp = path.with_name(path.name + '.tmp.' + str(os.getpid()))
++    with tmp.open('w', encoding='utf-8') as f:
++        json.dump(value, f, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False)
++        f.write('\n'); f.flush(); os.fsync(f.fileno())
++    os.replace(tmp, path)
++
++
++def dump_csv(path, rows):
++    if not rows:
++        return
++    with Path(path).open('w', encoding='utf-8', newline='') as f:
++        writer = csv.DictWriter(f, fieldnames=list(rows[0]))
++        writer.writeheader(); writer.writerows(rows); f.flush(); os.fsync(f.fileno())
++
++
++class Audit:
++    def __init__(self, out):
++        self.out = Path(out).resolve()
++        self.dest = self.out/'independent_audit'
++        self.dest.mkdir(parents=True, exist_ok=True)
++        self.inputs = {}
++        self.checks = Counter()
++        self.failures = Counter()
++        self.examples = []
++        self.sections = {}
++
++    def require(self, condition, check, detail=None):
++        self.checks[check] += 1
++        if not condition:
++            self.failures[check] += 1
++            if len(self.examples) < 150:
++                self.examples.append({'check': check, 'detail': detail})
++        return bool(condition)
++
++    def record_input(self, path, before, sha):
++        path = Path(path).resolve()
++        self.require(stat_identity(path) == before, 'input_unchanged_during_read', str(path))
++        if str(path) in self.inputs:
++            self.require(self.inputs[str(path)]['sha256'] == sha, 'input_same_across_reads', str(path))
++        self.inputs[str(path)] = dict(before, sha256=sha)
++
++    def read_bytes(self, path):
++        path = Path(path)
++        before = stat_identity(path)
++        value = path.read_bytes()
++        self.record_input(path, before, hashlib.sha256(value).hexdigest())
++        return value
++
++    def json(self, path):
++        return json.loads(self.read_bytes(path).decode('utf-8-sig'))
++
++    def csv(self, path):
++        return list(csv.DictReader(io.StringIO(self.read_bytes(path).decode('utf-8-sig'))))
++
++    def jsonl(self, path):
++        path = Path(path)
++        before = stat_identity(path); h = hashlib.sha256(); rows = []
++        with path.open('rb') as f:
++            for number, raw in enumerate(f, 1):
++                h.update(raw)
++                if raw.strip():
++                    try:
++                        rows.append(json.loads(raw))
++                    except Exception as exc:
++                        raise ValueError(f'Invalid complete JSONL row {path}:{number}: {exc}') from exc
++        self.record_input(path, before, h.hexdigest())
++        return rows
++
++    def hash_file(self, path):
++        path = Path(path); before = stat_identity(path); h = hashlib.sha256()
++        with path.open('rb') as f:
++            for block in iter(lambda: f.read(8 * 1024 * 1024), b''):
++                h.update(block)
++        result = h.hexdigest(); self.record_input(path, before, result)
++        return result
++
++    def section(self, name, operation):
++        before = sum(self.failures.values())
++        try:
++            value = operation()
++            self.sections[name] = {'status': 'PASS' if sum(self.failures.values()) == before else 'BLOCKED'}
++            return value
++        except Exception as exc:
++            self.require(False, name+'_exception', repr(exc))
++            self.sections[name] = {'status': 'BLOCKED', 'error': repr(exc), 'traceback': traceback.format_exc()}
++            return None
++
++
++def readiness(a, require_complete):
++    for arm in ARMS:
++        stage = a.json(a.out/'stages'/f'train_{arm}.json')
++        status = a.json(a.out/'training'/f'{arm}_status.json')
++        a.require(stage.get('status') == 'DONE', 'training_stage_done', arm)
++        a.require(status.get('status') == 'DONE' and status.get('pilot_step') == 1000,
++                  'training_status_final_1000', arm)
++    for folder in ('stages', 'controller'):
++        for path in sorted((a.out/folder).glob('*.json')):
++            value = a.json(path)
++            a.require(value.get('status') not in ('RUNNING', 'TRAINING', 'BLOCKED', 'INTERRUPTED_SAFE'),
++                      'no_active_or_blocked_worker', {'path': str(path), 'status': value.get('status')})
++    complete_path = a.out/'RUN_COMPLETE.json'
++    if require_complete:
++        value = a.json(complete_path)
++        a.require(value.get('status') == 'DONE', 'run_complete_marker')
++    return {'require_run_complete': require_complete, 'RUN_COMPLETE_exists': complete_path.exists()}
++
++
++def classify_ledger_row(row, path):
++    """Recognize exact observed CPU scoring metadata; never hide a CALL row."""
++    if not isinstance(row, dict):
++        raise ValueError('Ledger record is not an object')
++    event = row.get('event')
++    if event in ('CALL_BEGIN', 'CALL_RETURN', 'CALL_FAILED'):
++        required = {'event', 'call_id', 'kind', 'stage', 'context'}
++        if event != 'CALL_BEGIN':
++            required |= {'error', 'wall_seconds'}
++        if not required <= set(row) or not isinstance(row['context'], dict):
++            raise ValueError('Malformed known CALL record: '+repr(row))
++        if any(not isinstance(row[key], str) or not row[key] for key in ('call_id','kind','stage')):
++            raise ValueError('Invalid CALL identity fields')
++        return 'CALL'
++    # A missing/unknown CALL event or call identity is an error, even if its
++    # kind happens to resemble the recognized CPU metadata below.
++    if 'event' in row or any(key in row for key in ('call_id','stage','context','wall_seconds','error')):
++        raise ValueError('Unknown or malformed CALL/event record: '+repr(row))
++    common = {'kind','pid','time_unix','checkpoint_label'}
++    schemas = {
++        'score_attempt': common | {'case_id'},
++        'score_return': common | {'case_id','elapsed_seconds','historical_cache','status'},
++        'width_group_attempt': common | {'uid','noise_index'},
++        'width_group_return': common | {'uid','noise_index','elapsed_seconds','model_forwards','surface_distance_calls'},
++    }
++    kind = row.get('kind')
++    if Path(path).name != 'cpu_scoring.jsonl' or kind not in schemas or set(row) != schemas[kind]:
++        raise ValueError('Unrecognized non-CALL metadata schema: '+repr(row))
++    if row['checkpoint_label'] not in ('START','OT_BASE','OT_HYBRID'):
++        raise ValueError('Unknown CPU scoring checkpoint label')
++    if 'model_forwards' in row and row['model_forwards'] != 0:
++        raise ValueError('CPU metadata claims a model forward; cannot exclude from call audit')
++    if 'elapsed_seconds' in row and (not math.isfinite(float(row['elapsed_seconds'])) or row['elapsed_seconds'] < 0):
++        raise ValueError('Invalid CPU scoring metadata duration')
++    return 'CPU_SCORING_METADATA'
++
++
++def audit_calls(a, protocol):
++    attempts, returns, failed, seconds = Counter(), Counter(), Counter(), Counter()
++    begins, terminals, pending = {}, {}, {}
++    metadata_rows = []; metadata_counts = Counter()
++    paths = sorted((a.out/'ledger').glob('*.jsonl'))
++    a.require(bool(paths), 'actual_call_ledgers_present')
++    for path in paths:
++        for record_index, row in enumerate(a.jsonl(path), 1):
++            classification = classify_ledger_row(row, path)
++            if classification == 'CPU_SCORING_METADATA':
++                metadata_counts[row['kind']] += 1
++                metadata_rows.append(dict(source_file=str(path), nonblank_record_index=record_index,
++                    classification=classification, excluded_from_model_CALL_counts=True, original_record=row))
++                continue
++            event, cid, kind = row['event'], row['call_id'], row['kind']
++            a.require(kind in protocol['budget'], 'registered_call_kind', {'call_id': cid, 'kind': kind})
++            a.require(row['stage'] == path.stem, 'call_stage_matches_file', cid)
++            if event == 'CALL_BEGIN':
++                a.require(cid not in begins, 'unique_call_id', cid)
++                begins[cid] = row; pending[cid] = row; attempts[kind] += 1
++            elif event in ('CALL_RETURN', 'CALL_FAILED'):
++                a.require(cid in pending, 'terminal_has_pending_begin', cid)
++                a.require(cid not in terminals, 'single_terminal_per_call', cid)
++                begin = pending.pop(cid, None)
++                if begin is not None:
++                    a.require(all(begin.get(k) == row.get(k) for k in ('kind', 'stage', 'context')),
++                              'begin_terminal_identity', cid)
++                terminals[cid] = row
++                (returns if event == 'CALL_RETURN' else failed)[kind] += 1
++                duration = float(row['wall_seconds'])
++                a.require(math.isfinite(duration) and duration >= 0, 'finite_nonnegative_call_time', cid)
++                seconds[kind] += duration
++                a.require((row.get('error') is None) == (event == 'CALL_RETURN'), 'terminal_error_semantics', cid)
++            else:
++                a.require(False, 'known_call_event', row)
++    metadata_summary = dict(total_rows=len(metadata_rows), kinds=dict(metadata_counts),
++        scope='Exact recognized cpu_scoring.jsonl attempt/return metadata; preserved explicitly and excluded only from actual model CALL_* counters. Unknown CALL/non-CALL schemas fail.')
++    dump_json(a.dest/'non_call_metadata_rows.json',metadata_rows)
++    dump_json(a.dest/'non_call_metadata_summary.json',metadata_summary)
++    a.require(not pending, 'no_unresolved_actual_calls', list(pending)[:10])
++    a.require(not sum(failed.values()), 'no_failed_actual_calls', dict(failed))
++    accounting = a.json(a.out/'accounting.json')
++    for name, calculated in (('attempts', attempts), ('returns', returns), ('failed', failed)):
++        actual = accounting[name]
++        for kind in set(actual) | set(calculated):
++            a.require(int(actual.get(kind, 0)) == calculated[kind], 'accounting_'+name,
++                      {'kind': kind, 'recorded': actual.get(kind, 0), 'reconstructed': calculated[kind]})
++    for kind in set(seconds) | set(accounting['wall_seconds_by_kind']):
++        a.require(math.isclose(seconds[kind], accounting['wall_seconds_by_kind'].get(kind, 0.), rel_tol=1e-10, abs_tol=1e-7),
++                  'accounting_call_seconds', kind)
++    total_forward = sum(attempts[k] for k in FORWARDS)
++    a.require(total_forward == accounting['total_forward_attempts'], 'accounting_forward_total')
++    a.require(not accounting.get('pending'), 'accounting_no_pending')
++    for kind, limit in protocol['budget'].items():
++        a.require(attempts[kind] <= limit, 'hard_kind_budget', {'kind': kind, 'actual': attempts[kind], 'limit': limit})
++    a.require(total_forward <= protocol['overall_forward_limit'], 'hard_total_forward_budget', total_forward)
++    for kind, expected in EXPECTED_TRAINING.items():
++        a.require(attempts[kind] == returns[kind] == expected, 'fixed_training_actual_calls',
++                  {'kind': kind, 'attempts': attempts[kind], 'returns': returns[kind], 'expected': expected})
++    generated = []
++    for path in sorted((a.out/'evaluation').glob('*/generated_rows.json')):
++        value = a.json(path)
++        a.require(value['status'] == 'COMPLETE', 'generated_panel_complete', str(path))
++        ids = [r['case_id'] for r in value['rows']]
++        a.require(len(ids) == len(set(ids)), 'unique_generation_case_per_label', path.parent.name)
++        a.require(len(ids) == 144, 'registered_generation_rows_per_label', {'label': path.parent.name, 'rows': len(ids)})
++        generated.extend(value['rows'])
++    summary = dict(optimizer_updates=returns['optimizer_update'],
++        registered_unique_generation_requests=len(generated),
++        applicable_unique_generation_requests=sum(r['status'] != 'NOT_APPLICABLE' for r in generated),
++        actual_full_sampling_attempts=attempts['sampling'], actual_full_sampling_returns=returns['sampling'],
++        historical_raw_cache_hits=sum(r['status'] == 'CACHED' for r in generated),
++        generation_not_applicable=sum(r['status'] == 'NOT_APPLICABLE' for r in generated),
++        extra_diagnostic_bf16_forwards=attempts['diagnostic_bf16'], extra_diagnostic_fp32_forwards=attempts['diagnostic_fp32'],
++        precheck_forwards=attempts['precheck_forward'], precheck_zero_update_backwards=attempts['precheck_backward'],
++        training_microbatch_forwards=attempts['training_forward'], training_backwards=attempts['training_backward'],
++        sampling_forwards=attempts['sampling_forward'], total_model_forwards=total_forward,
++        failed_actual_calls=sum(failed.values()), unresolved_calls=len(pending))
++    for key, value in summary.items():
++        a.require(accounting.get('summary', {}).get(key) == value, 'accounting_summary',
++                  {'field': key, 'recorded': accounting.get('summary', {}).get(key), 'reconstructed': value})
++    a.require(len(generated) <= protocol['unique_generation_request_limit'], 'unique_request_limit')
++    count_rows = [dict(kind=k, actual_begin=attempts[k], actual_return=returns[k], actual_failed=failed[k],
++                       accounting_attempts=accounting['attempts'].get(k, 0),
++                       accounting_returns=accounting['returns'].get(k, 0), limit=protocol['budget'][k],
++                       call_wall_seconds=seconds[k]) for k in protocol['budget']]
++    dump_csv(a.dest/'call_count_audit.csv', count_rows)
++    return dict(begins=begins, terminals=terminals, summary=summary, non_call_metadata=metadata_summary)
++
++
++def audit_training(a, protocol, calls):
++    plan = a.json(a.out/'train_plan.json')
++    plan_records = plan['records']
++    a.require(len(plan_records) == 8000, 'frozen_plan_8000')
++    a.require(a.inputs[str((a.out/'train_plan.json').resolve())]['sha256'] == protocol['training_plan']['sha256'],
++              'frozen_plan_file_hash')
++    declared_parents = set(plan['object_counts'])
++    a.require(len(declared_parents) == 32 and set(plan['object_counts'].values()) == {250}, 'frozen_parent_counts')
++    exposures = {}; batch_rows = []; parent_rows = []
++    events_by_arm = {}; logs_by_arm = {}
++    for arm in ARMS:
++        rows = a.csv(a.out/'training'/f'{arm}_sample_exposure.csv')
++        logs = a.csv(a.out/'training'/f'{arm}_training_log.csv')
++        events = a.jsonl(a.out/'training'/f'{arm}_events.jsonl')
++        a.require(len(rows) == 8000, 'exposure_row_count', {'arm': arm, 'actual': len(rows)})
++        a.require(len(logs) == 1000, 'training_log_row_count', {'arm': arm, 'actual': len(logs)})
++        a.require([int(r['sample_index']) for r in rows] == list(range(8000)), 'ordered_unique_sample_indices', arm)
++        a.require([int(r['pilot_step']) for r in logs] == list(range(1, 1001)), 'ordered_unique_training_steps', arm)
++        exposures[arm] = rows
++        logs_by_arm[arm] = {int(r['pilot_step']): r for r in logs}
++        selected = {}
++        for event in ('INPUT_BEGIN', 'INPUT_DONE', 'UPDATE_BEGIN', 'UPDATE_DONE'):
++            values = [r for r in events if r.get('event') == event]
++            a.require([r['pilot_step'] for r in values] == list(range(1, 1001)), 'event_exact_1000_ordered',
++                      {'arm': arm, 'event': event, 'actual': len(values)})
++            selected[event] = {r['pilot_step']: r for r in values}
++        events_by_arm[arm] = selected
++        a.require(not [r for r in events if r.get('event') == 'ARM_FAILED'], 'no_training_failure_event', arm)
++        by_parent = defaultdict(list); by_batch = defaultdict(list)
++        for row in rows:
++            index = int(row['sample_index']); step = int(row['pilot_step'])
++            a.require(row['arm'] == arm and step == index//8+1, 'exposure_arm_step_cursor', {'arm': arm, 'index': index})
++            a.require(0 <= index < len(plan_records), 'exposure_registered_index', index)
++            if not 0 <= index < len(plan_records):
++                continue
++            record = plan_records[index]
++            equal = all(row[key] == str(record[key]) for key in ('uid', 'task_id', 'N', 'K'))
++            equal &= all(float(row[key]) == float(record[key]) for key in ('ratio', 'alpha'))
++            a.require(equal, 'exposure_matches_frozen_task_alpha_NK', {'arm': arm, 'index': index})
++            n, k = int(row['N']), int(row['K'])
++            a.require(int(row['free_coordinates']) == 9*(n-k) and 0 < k < n, 'sample_effective_free_coordinates',
++                      {'arm': arm, 'index': index})
++            a.require(math.isfinite(float(row['t'])) and 0 <= float(row['t']) <= 1, 'finite_training_time', index)
++            a.require(.9-1e-7 <= float(row['alpha']) <= 1.1+1e-7, 'registered_alpha_range', index)
++            for key in ('shared_input_sha256', 'coupled_input_sha256', 'ot_cache_key'):
++                value = row[key]
++                a.require(len(value) == 64 and all(c in '0123456789abcdef' for c in value), 'complete_actual_tensor_hash',
++                          {'arm': arm, 'index': index, 'key': key})
++            by_parent[row['uid']].append(row); by_batch[step].append(row)
++        a.require(set(by_parent) == declared_parents, 'exact_original_training_parents', arm)
++        for uid, values in sorted(by_parent.items()):
++            a.require(len(values) == 250, 'actual_parent_exposure_250', {'arm': arm, 'uid': uid, 'count': len(values)})
++            parent_rows.append(dict(arm=arm,uid=uid,exposures=len(values),unique_C_tasks=len({r['task_id'] for r in values}),
++                alpha1_count=sum(float(r['alpha']) == 1. for r in values),
++                ratio20_count=sum(float(r['ratio']) == .2 for r in values),
++                ratio40_count=sum(float(r['ratio']) == .4 for r in values),
++                free_coordinates_total=sum(int(r['free_coordinates']) for r in values)))
++        for step in range(1, 1001):
++            values = by_batch[step]
++            denominator = sum(int(r['free_coordinates']) for r in values)
++            unit_count = sum(float(r['alpha']) == 1. for r in values)
++            a.require(len(values) == 8 and unit_count == 4, 'batch_8_with_4_unit_alpha', {'arm': arm, 'step': step})
++            shared_hash = hashlib.sha256(''.join(r['shared_input_sha256'] for r in values).encode()).hexdigest()
++            coupled_hash = hashlib.sha256(''.join(r['coupled_input_sha256'] for r in values).encode()).hexdigest()
++            log = logs_by_arm[arm][step]; event = selected['UPDATE_DONE'][step]; inp = selected['INPUT_DONE'][step]
++            a.require(int(log['free_coordinate_denominator']) == event['free_coordinate_denominator'] ==
++                      inp['effective_free_coordinates'] == denominator, 'batch_global_coordinate_denominator', {'arm': arm, 'step': step})
++            a.require(log['shared_batch_sha256'] == event['shared_batch_sha256'] == inp['shared_batch_sha256'] == shared_hash,
++                      'batch_hash_reconstructed_from_actual_sample_hashes', {'arm': arm, 'step': step})
++            a.require(log['coupled_batch_sha256'] == event['coupled_batch_sha256'] == coupled_hash,
++                      'coupled_batch_hash_reconstructed', {'arm': arm, 'step': step})
++            a.require(float(log['FM']) == float(log['loss']) == float(event['FM']) == float(event['loss']),
++                      'original_FM_only_logged_loss', {'arm': arm, 'step': step})
++            diagnostics = event['sample_diagnostics']
++            a.require(len(diagnostics) == 8 and [r['sample_index'] for r in diagnostics] == [int(r['sample_index']) for r in values],
++                      'FM_diagnostic_sample_alignment', {'arm': arm, 'step': step})
++            contribution = sum(float(r['FM_contribution']) for r in diagnostics)
++            a.require(math.isclose(contribution, float(log['FM']), rel_tol=1e-12, abs_tol=1e-12),
++                      'FM_contributions_sum_to_batch', {'arm': arm, 'step': step})
++            for diagnostic, exposure in zip(diagnostics, values):
++                a.require(int(diagnostic['free_coordinates']) == int(exposure['free_coordinates']), 'FM_effective_coordinates_match_exposure')
++                expected = float(diagnostic['FM_contribution'])*denominator/int(exposure['free_coordinates'])
++                a.require(math.isclose(expected,float(diagnostic['FM_per_sample_MSE']),rel_tol=1e-12,abs_tol=1e-12),
++                          'per_sample_MSE_uses_true_coordinate_count')
++            ot_attempts, ot_returns, ot_hits = (int(log[k]) for k in ('actual_OT_attempts', 'actual_OT_returns', 'OT_cache_hits'))
++            a.require(ot_attempts == ot_returns and ot_returns+ot_hits == 8, 'complete_batch_OT_accounting', {'arm': arm, 'step': step})
++            batch_rows.append(dict(arm=arm,pilot_step=step,samples=len(values),alpha1_count=unit_count,
++                expected_free_coordinates=denominator,logged_free_coordinates=int(log['free_coordinate_denominator']),
++                denominator_equal=denominator==int(log['free_coordinate_denominator']),
++                shared_batch_sha256=shared_hash,FM=float(log['FM']),FM_contribution_sum=contribution,
++                actual_OT_attempts=ot_attempts,actual_OT_returns=ot_returns,OT_cache_hits=ot_hits))
++    paired=[]
++    if all(len(exposures.get(arm, [])) == 8000 for arm in ARMS):
++        keys=('pilot_step','sample_index','task_id','uid','N','K','ratio','alpha','t','free_coordinates','shared_input_sha256','ot_cache_key')
++        for left,right in zip(exposures['OT_BASE'],exposures['OT_HYBRID']):
++            same=all(left[k] == right[k] for k in keys)
++            a.require(same,'paired_actual_input_identity',int(left['sample_index']))
++            a.require(left['coupled_input_sha256'] != right['coupled_input_sha256'],'coupling_changes_actual_path_label',int(left['sample_index']))
++            paired.append(dict(sample_index=int(left['sample_index']),pilot_step=int(left['pilot_step']),uid=left['uid'],
++                task_id=left['task_id'],N=int(left['N']),K=int(left['K']),alpha=float(left['alpha']),t=float(left['t']),
++                free_coordinates=int(left['free_coordinates']),paired_identity_equal=same,
++                base_shared_sha256=left['shared_input_sha256'],hybrid_shared_sha256=right['shared_input_sha256']))
++    shared_ledger=a.jsonl(a.out/'training/shared_batch_hashes.jsonl')
++    a.require([r['pilot_step'] for r in shared_ledger] == list(range(1,1001)), 'registered_shared_batches_exact_1000')
++    for row in shared_ledger:
++        step=row['pilot_step']
++        a.require(all(logs_by_arm[arm][step]['shared_batch_sha256']==row['shared_batch_sha256'] for arm in ARMS),
++                  'paired_batch_registration_equal',step)
++    if calls is not None:
++        call_slots=Counter()
++        for cid,begin in calls['begins'].items():
++            kind=begin['kind']
++            if kind not in EXPECTED_TRAINING:
++                continue
++            ctx=begin['context'];arm=ctx['arm'];step=int(ctx['pilot_step'])
++            a.require(arm in ARMS and 1<=step<=1000,'training_call_registered_arm_step',cid)
++            if arm not in exposures or not 1<=step<=1000:
++                continue
++            micro=int(ctx.get('microbatch',0))
++            call_slots[(arm,step,kind,micro)]+=1
++            a.require(begin['stage']=='train_'+arm,'training_call_stage_arm',cid)
++            a.require(calls['terminals'].get(cid,{}).get('event')=='CALL_RETURN','training_call_completed',cid)
++            if kind!='optimizer_update':
++                index=8*(step-1)+micro
++                row=exposures[arm][index]
++                a.require(ctx['sample_index']==index and ctx['shared_input_sha256']==row['shared_input_sha256'],
++                          'actual_forward_backward_matches_exposure',cid)
++        for arm in ARMS:
++            for step in range(1,1001):
++                for kind in EXPECTED_TRAINING:
++                    for micro in (range(8) if kind!='optimizer_update' else (0,)):
++                        a.require(call_slots[(arm,step,kind,micro)]==1,'exact_one_actual_call_per_registered_slot',
++                                  {'arm':arm,'step':step,'kind':kind,'micro':micro,'count':call_slots[(arm,step,kind,micro)]})
++    dump_csv(a.dest/'paired_input_audit.csv',paired)
++    dump_csv(a.dest/'parent_exposure_audit.csv',parent_rows)
++    dump_csv(a.dest/'batch_normalization_audit.csv',batch_rows)
++    return dict(exposure_rows={k:len(v) for k,v in exposures.items()},paired_rows=len(paired),parents_per_arm=32,
++                updates_per_arm=1000,normalization='sum squared errors / (9 * total valid free faces across all 8 microbatches)')
++
++
++def audit_endpoints(a,protocol):
++    identities=[]
++    for arm in ARMS:
++        path=a.out/'checkpoints'/f'{arm}_pilot1000_total5000.pt'
++        side=a.json(path.with_suffix('.json'));meta=side['metadata']
++        actual=a.hash_file(path)
++        a.require(actual==side['checkpoint_sha256'],'endpoint_actual_file_SHA256',arm)
++        a.require(Path(side['path']).resolve()==path.resolve(),'endpoint_sidecar_path',arm)
++        expected=dict(arm=arm,pilot_step=1000,conditional_total_step=5000,completed_updates=1000,
++                      source_checkpoint_sha256=SOURCE_SHA,context_encoder='geo',loss_recipe='fm',
++                      lambda_variance=0. if arm=='OT_BASE' else .25,full_recovery_state=True,
++                      optimizer_reset=False,model_parameters='FP32',optimizer_state='FP32',protocol_sha256=canonical_hash(protocol))
++        for key,value in expected.items():
++            a.require(meta.get(key)==value,'endpoint_fixed_metadata',{'arm':arm,'field':key,'actual':meta.get(key),'expected':value})
++        for key in ('model_state_sha256','optimizer_state_sha256','rng_sha256','stream_state_sha256','config_sha256'):
++            a.require(isinstance(meta.get(key),str) and len(meta[key])==64,'endpoint_complete_state_identity',{'arm':arm,'field':key})
++        pointer=a.json(a.out/'training'/f'{arm}_pointer.json')
++        a.require(pointer['metadata']==meta and pointer['checkpoint_sha256']==actual and Path(pointer['path']).resolve()==path.resolve(),
++                  'endpoint_recovery_pointer_matches_fixed',arm)
++        events=a.jsonl(a.out/'training'/f'{arm}_events.jsonl')
++        fixed=[r for r in events if r.get('event')=='CHECKPOINT_DONE' and r.get('pilot_step')==1000]
++        a.require(len(fixed)==1 and fixed[0]['checkpoint']['checkpoint_sha256']==actual,'endpoint_durable_save_event',arm)
++        identities.append(dict(arm=arm,path=str(path),bytes=path.stat().st_size,actual_sha256=actual,metadata=meta,
++                               scope='Actual PT file SHA256 plus bound sidecar metadata; no tensor deserialization'))
++    manifest=a.out/'checkpoint_manifest.json'
++    if manifest.exists():
++        records=a.json(manifest)['endpoints']
++        for identity in identities:
++            matching=[r for r in records if r['metadata']['arm']==identity['arm']]
++            a.require(len(matching)==1 and matching[0]['checkpoint_sha256']==identity['actual_sha256'] and
++                      matching[0]['metadata']==identity['metadata'],'final_manifest_endpoint_identity',identity['arm'])
++    dump_json(a.dest/'endpoint_identity_audit.json',identities)
++    return identities
++
++
++def run(out,require_complete):
++    a=Audit(out);started=time.perf_counter()
++    ready=a.section('readiness',lambda:readiness(a,require_complete))
++    if a.failures:
++        # Do not read mutating ledgers or derive a final result during training.
++        result=dict(status='BLOCKED',reason='Required stages are missing, active, blocked, or incomplete; no live training audit performed',
++                    sections=a.sections,failed_checks=dict(a.failures),failure_examples=a.examples,
++                    model_forwards=0,model_backwards=0,optimizer_updates=0)
++        dump_json(a.dest/'audit_result.json',result)
++        return result
++    protocol=a.section('protocol',lambda:a.json(a.out/'protocol.json'))
++    calls=training=endpoints=None
++    if protocol is not None:
++        calls=a.section('actual_call_ledger',lambda:audit_calls(a,protocol))
++        training=a.section('paired_training_exposure',lambda:audit_training(a,protocol,calls))
++        endpoints=a.section('fixed_endpoints',lambda:audit_endpoints(a,protocol))
++    for path,identity in a.inputs.items():
++        a.require(stat_identity(path)=={k:identity[k] for k in ('bytes','mtime_ns')},'input_stable_through_complete_audit',path)
++    result=dict(status='BLOCKED' if a.failures else 'PASS',readiness=ready,sections=a.sections,
++        check_counts=dict(a.checks),failed_checks=dict(a.failures),failure_examples=a.examples,
++        reconstructed_accounting=calls['summary'] if calls else None,training=training,
++        non_call_metadata=calls['non_call_metadata'] if calls else None,
++        endpoint_files_checked=len(endpoints) if endpoints else 0,
++        input_files_checked=len(a.inputs),wall_seconds=time.perf_counter()-started,
++        script_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
++        model_forwards=0,model_backwards=0,optimizer_updates=0,OT_calls=0,
++        limits='This is an independent artifact/ledger consistency audit, not a model-quality judgement or tensor re-execution. Endpoint tensors are not deserialized. No absent or failed rows are filled in.')
++    dump_json(a.dest/'audited_input_sha256.json',a.inputs)
++    dump_json(a.dest/'audit_result.json',result)
++    summary=calls['summary'] if calls else {}
++    lines=['# Independent ledger and exposure audit','',f"Status: **{result['status']}**",'',
++           f"Actual optimizer returns: {summary.get('optimizer_updates','BLOCKED')}; training forwards: {summary.get('training_microbatch_forwards','BLOCKED')}; training backwards: {summary.get('training_backwards','BLOCKED')}.",
++           f"Failed actual calls: {summary.get('failed_actual_calls','BLOCKED')}; unresolved calls: {summary.get('unresolved_calls','BLOCKED')}.",'',
++           'Checks reconstruct CALL_BEGIN/RETURN/FAILED counts from durable ledgers, compare accounting.json, require 1000 UPDATE_DONE and 8000 exposure rows per arm, compare paired sample input hashes, enforce 32 parents × 250 exposures and four alpha=1 slots per batch, and compare the full batch free-coordinate denominator with logs and per-sample FM contributions.',
++           '', 'Recognized non-CALL CPU scoring metadata are listed in non_call_metadata_rows.json and counted in non_call_metadata_summary.json. They do not count as model forwards; unknown or malformed CALL/event records remain audit errors. Endpoint identity checks use actual PT bytes and their metadata sidecars: pilot_step=1000, conditional_total_step=5000, original Geo4000 source, full AdamW/RNG/stream identity, and the frozen protocol. PT files are never deserialized.',
++           '', 'Missing, failed, duplicated or inconsistent evidence is BLOCKED. This audit does not modify training, model weights, protocol, frozen code or data, and does not repair missing rows.',
++           '', 'Artifacts: audit_result.json; call_count_audit.csv; paired_input_audit.csv; parent_exposure_audit.csv; batch_normalization_audit.csv; endpoint_identity_audit.json; audited_input_sha256.json.']
++    if a.failures:
++        lines+=['','Failed checks:','']+[f'- {name}: {count}' for name,count in sorted(a.failures.items())]
++    (a.dest/'INDEPENDENT_LEDGER_EXPOSURE_AUDIT.md').write_text('\n'.join(lines)+'\n',encoding='utf-8')
++    return result
++
++
++def main():
++    p=argparse.ArgumentParser()
++    p.add_argument('--out',type=Path,default=Path(__file__).resolve().parents[1])
++    p.add_argument('--require-run-complete',action='store_true',help='Also require the final RUN_COMPLETE.json marker (recommended for final delivery).')
++    args=p.parse_args();result=run(args.out,args.require_run_complete)
++    print(json.dumps({k:result.get(k) for k in ('status','reconstructed_accounting','failed_checks','wall_seconds')},sort_keys=True))
++    raise SystemExit(0 if result['status']=='PASS' else 2)
++
++
++if __name__=='__main__':main()
+--- /dev/null
++++ b/native_t1/runs/chair_hybrid_coupling_v1/independent_audit/audit_results.py
+@@ -0,0 +1,109 @@
++"""Independent arithmetic audit of saved final results; zero model calls."""
++import hashlib
++import json
++import math
++from collections import defaultdict
++from pathlib import Path
++from statistics import mean, median
++import numpy as np
++
++OUT = Path(__file__).resolve().parents[1]
++P = OUT / 'paired_results'
++def read(name):
++    return json.loads((P / (name + '.json')).read_text(encoding='utf-8'))
++def sha(p):
++    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
++def close(a, b):
++    assert math.isclose(a, b, rel_tol=1e-11, abs_tol=1e-13), (a, b)
++
++rows = read('per_output')
++assert len(rows) == 432
++assert sum(r['status'] == 'NOT_APPLICABLE' for r in rows) == 18
++assert sum(r['status'] == 'PASS' for r in rows) == 414
++for r in rows:
++    if r['status'] != 'PASS':
++        continue
++    assert r['C_preserved'] and r['N_preserved'] and r['finite']
++    assert sha(r['fixed_vector_path']) == r['fixed_vector_sha256']
++    with np.load(r['fixed_vector_path'], allow_pickle=False) as f:
++        d = f['distances_L']
++        assert len(d) == r['Q'] == 512
++        close(float(np.mean(d*d)), r['fixed_query_MSE'])
++        close(float(np.mean(d <= .01)), r['coverage_fraction'])
++        close(float(np.quantile(d, .95)), r['fixed_query_p95_L'])
++
++primary = [r for r in rows if r['table'] == 'A' and r['split'] == 'validation' and r['ratio'] == .2]
++lookup = {(r['checkpoint_label'], r['uid'], r['noise_index']): r for r in primary}
++assert len(primary) == len(lookup) == 48
++uids = sorted({r['uid'] for r in primary})
++assert len(uids) == 8
++derived = []
++for before, after in [('START', 'OT_BASE'), ('OT_BASE', 'OT_HYBRID'), ('START', 'OT_HYBRID')]:
++    parent_deltas = []
++    before_values = []
++    after_values = []
++    for uid in uids:
++        b = mean(lookup[before, uid, n]['fixed_query_MSE'] for n in (0, 1))
++        a = mean(lookup[after, uid, n]['fixed_query_MSE'] for n in (0, 1))
++        for n in (0, 1):
++            x, y = lookup[before, uid, n], lookup[after, uid, n]
++            for field in ('input_sha256', 'query_sha256', 'noise_sha256', 'mask_sha256', 'L'):
++                assert x[field] == y[field]
++        before_values.append(b); after_values.append(a); parent_deltas.append(a-b)
++    name = after + '-' + before
++    saved = next(r for r in read('primary_summary') if r['comparison'] == name)
++    for field, value in [('delta_mean', mean(parent_deltas)), ('paired_delta_median', median(parent_deltas)),
++                         ('before_mean', mean(before_values)), ('after_mean', mean(after_values))]:
++        close(saved[field], value)
++    assert saved['improved_count'] == sum(d < 0 for d in parent_deltas)
++    assert saved['valid_pairs'] == 8
++    derived.append(dict(comparison=name, before=mean(before_values), after=mean(after_values),
++                        mean_delta=mean(parent_deltas), paired_delta_median=median(parent_deltas),
++                        improved=sum(d < 0 for d in parent_deltas), parents=8))
++
++key_fields = ('checkpoint_label', 'candidate', 'uid', 'noise_index')
++matrices = defaultdict(dict)
++for r in read('cross_matrix'):
++    key = tuple(r[k] for k in key_fields)
++    cell = (r['alpha'], r['target_beta'])
++    assert cell not in matrices[key]
++    matrices[key][cell] = r['E_RMS_L0']
++assert len(matrices) == 144 and all(len(m) == 9 for m in matrices.values())
++alphas = (.9, 1., 1.1)
++assert sum(r['candidate'] == 'No-response' for r in read('target_column_audit')) == 144
++for r in read('target_column_audit'):
++    m = matrices[tuple(r[k] for k in key_fields)]
++    beta = r['target_beta']
++    value = mean(m[a, beta] for a in alphas if a != beta) - m[beta, beta]
++    close(value, r['A_column'])
++    assert r['column_strict_win'] == all(m[beta, beta] < m[a, beta] for a in alphas if a != beta)
++    if r['candidate'] == 'No-response':
++        close(value, 0.)
++        assert not r['column_strict_win']
++
++for r in read('width_per_curve'):
++    if r['response_status'] != 'PASS':
++        continue
++    close(r['r_base'], r['W_10'] / r['W_GT_10'])
++    close(r['b_self'], (r['W_11'] - r['W_09']) / (.2*r['W_10']))
++    close(r['b_GT'], (r['W_11'] - r['W_09']) / (.2*r['W_GT_10']))
++    close(r['b_self_abs_error'], abs(r['b_self'] - 1.))
++    close(r['b_GT_abs_error'], abs(r['b_GT'] - 1.))
++
++parts = defaultdict(list)
++for r in read('coverage_partition'):
++    parts[r['comparison'], r['case_id']].append(r)
++for group in parts.values():
++    assert {r['partition'] for r in group} == {'both_in', 'enter', 'leave', 'both_out'}
++    close(sum(r['fraction'] for r in group), 1.)
++    close(sum(r['fixed_query_MSE_contribution'] for r in group), group[0]['total_MSE_delta'])
++
++result = dict(status='PASS', actual_model_calls=0, fixed_vector_rows_recomputed=414,
++              primary=derived, full_matrices=144, matrix_cells=1296, target_columns=432,
++              width_curves=144, paired_coverage_outputs=len(parts),
++              inputs={str(f.relative_to(OUT)): sha(f) for f in sorted(P.glob('*.json'))},
++              audit_script_sha256=sha(__file__),
++              limits='Independent saved-distance and arithmetic audit; no new surface queries or inference.')
++(OUT / 'independent_audit/results_arithmetic_audit.json').write_text(
++    json.dumps(result, indent=2, sort_keys=True) + '\n', encoding='utf-8')
++print(json.dumps({k:v for k,v in result.items() if k != 'inputs'}))
+--- /dev/null
++++ b/native_t1/runs/chair_hybrid_coupling_v1/reporting_corrections/finalize_decision.py
+@@ -0,0 +1,83 @@
++"""Add evidence-specific decisions to the completed report; no experiment calls."""
++import hashlib
++import json
++from pathlib import Path
++from statistics import mean
++
++OUT = Path(__file__).resolve().parents[1]
++def read(path):
++    return json.loads((OUT/path).read_text(encoding='utf-8'))
++def sha(path):
++    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
++assert read('RUN_COMPLETE.json')['status'] == 'DONE'
++assert read('independent_audit/audit_result.json')['status'] == 'PASS'
++assert read('independent_audit/results_arithmetic_audit.json')['status'] == 'PASS'
++result = read('paired_results/results.json')
++primary = next(r for r in result['primary'] if r['comparison'] == 'OT_HYBRID-OT_BASE')
++quality = read('paired_results/quality_paired_summary.json')
++def metric(name, table='A', split='validation', ratio=.2):
++    return next(r for r in quality if r['comparison']=='OT_HYBRID-OT_BASE' and
++                (r['metric'], r['table'], r['split'], r['ratio']) == (name, table, split, ratio))
++coverage = metric('coverage_fraction'); tail = metric('fixed_query_p95_L')
++angles = metric('free_minimum_angle_lt5_fraction')
++hold_cov = metric('coverage_fraction', 'C', 'holdout')
++hold_cf = metric('CF_proper_affected_free_fraction', 'C', 'holdout')
++train40_cov = metric('coverage_fraction', 'A', 'train', .4)
++train40_gamma = metric('Gamma_to_free_edges_RMS_bbox_pct', 'A', 'train', .4)
++curves = [r for r in read('paired_results/width_per_curve.json') if r['candidate']=='MODEL' and
++          r['split']=='validation' and r['checkpoint_label']=='OT_HYBRID']
++assert len(curves) == 8
++all_correct = sum(r['all_three_strict_win'] for r in curves)
++universal = sum(r['one_input_strictly_wins_all_targets'] for r in curves)
++parts = [r for r in read('paired_results/coverage_partition.json') if r['comparison']=='OT_HYBRID-OT_BASE'
++         and r['table']=='A' and r['split']=='validation' and r['ratio']==.2 and r['partition']=='both_out']
++tail_contribution = mean(r['fixed_query_MSE_contribution'] for r in parts)
++priority = ('优先做现有 raw 的小角面收益归因，先核查主几何收益是否依赖新增细长三角面。'
++            '假说：HYBRID 新增的最小角<5°面承担了不成比例的固定查询距离下降；'
++            '下一步只需用原冻结查询点的最近三角面归属分解误差收益，并按父对象、噪声报告。'
++            '若该假说不成立且收益主要落在普通面，再优先安排同协议的独立训练随机流重复。'
++            '本轮不执行这项新分析或重复，不更改 loss、默认模型或采样器。')
++summary = dict(quality_result=result['quality_result'], stages=result['stages'],
++               actual_counts=read('accounting.json')['summary'], primary=primary,
++               primary_relative_reduction=-primary['delta_mean']/primary['before_mean'],
++               coverage=coverage, p95=tail, small_angles=angles,
++               validation_all_three_correct_curves=all_correct,
++               validation_one_input_wins_all_targets_curves=universal,
++               validation_curve_denominator=8, both_out_net_MSE_contribution=tail_contribution,
++               both_out_share_of_net_MSE_reduction=tail_contribution/primary['delta_mean'],
++               priority=priority, hypothesis_status='PROPOSED_NOT_EXECUTED',
++               independent_ledger_audit='PASS', independent_arithmetic_audit='PASS')
++(OUT/'decision_summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2)+'\n', encoding='utf-8')
++
++paragraphs = [
++    '## 六个决策问题', '',
++    f"1. **验证 α=1 的自由几何：有开发性改善信号。** 主 MSE 从 {primary['before_mean']:.8f} 降至 {primary['after_mean']:.8f}，降低 {-primary['delta_mean']/primary['before_mean']*100:.2f}%；父均值配对差 {primary['delta_mean']:.8f}，配对差中位数 {primary['paired_delta_median']:.8f}，6/8 父改善。HYBRID 相对共同起点也为6/8父改善。两份噪声相对BASE的主均值均下降，分别7/8与6/8父改善；这是一个训练随机流的开发试验，不是显著性结论。", '',
++    f"2. **收益也体现在距离尾部。** 验证A20 coverage 从 {coverage['before_mean']*100:.3f}% 升至 {coverage['after_mean']*100:.3f}%（+{coverage['delta_mean']*100:.3f}个百分点）；p95/L 从 {tail['before_mean']:.6f} 降至 {tail['after_mean']:.6f}，7/8父改善。相同查询点的 both_out 组对净MSE下降的代数贡献为 {tail_contribution/primary['delta_mean']*100:.1f}%，不是仅由跨过覆盖阈值的点产生。注意HYBRID验证覆盖仍略低于共同起点32.715%，不能把相对BASE的改善写成所有比较都改善。", '',
++    f"3. **控制只有局部改善，跨噪声不一致。** 验证逐曲线 |b_self−1| 平均从0.691874降至0.638633，平均目标列优势从0.00059752升至0.00097195；但noise0的宽度绝对斜率误差和列优势退化，noise1改善。β=1列优势变差，β=.9严格列胜率下降。HYBRID仍只有 {all_correct}/8 曲线在三个目标上都正确胜出，{universal}/8 曲线由同一个输入对三个目标全部胜出。不能把平均列优势增加理解为条件选择性已解决。144个No-response目标列均为零优势、无严格胜出；Post-scale保留在逐曲线表中。", '',
++    f"4. **质量代价明确存在。** 验证A20最小角<5°自由面比例从 {angles['before_mean']*100:.3f}% 升至 {angles['after_mean']*100:.3f}%，6/8父退化。A40训练父覆盖下降 {-train40_cov['delta_mean']*100:.3f}个百分点，接口Gamma RMS上升 {train40_gamma['delta_mean']:.4f}%L（7个适用父）；验证A40 CF受影响面比例也增加。已观察留出覆盖下降 {-hold_cov['delta_mean']*100:.3f}个百分点、CF受影响面比例增加 {hold_cf['delta_mean']*100:.3f}个百分点。另一方面，验证A20接口RMS及CF/FF比例改善，留出MSE也下降，故必须保留各项并列结果。原定义FF非法相交影响面比例在验证A20仍约92.63%，不代表可用的干净网格。", '',
++    '5. **响应分解尚不能确定主要机制。** 三检查点的Euler与I/P/S独立重算均通过；局部反向与积分抵消确实存在，但不能由其范数推断控制正确或Jacobian刚性。预选FP32复核中，BASE有1处可比状态的I/P方向判断与BF16不同；因此不把条件注入不足或状态传播抵消写成已证实主因，也不把有限编辑分解写成OT的唯一因果证明。', '',
++    '6. **一个优先下一步及检验假说。** '+priority, '',
++    '## 最终独立核验与可追溯修正', '',
++    '独立账本审计核对两臂各1000 UPDATE_DONE、8000逐例曝光、逐例共同输入hash、32父各250次曝光、每batch四个alpha=1、整体free坐标归一、固定终点实际SHA及调用计数，结果PASS。独立算术审计从414份保存距离向量重算指标，并核对主终点、144个完整3×3矩阵、432个目标列和覆盖分区闭合，结果PASS；两项审计均无模型调用。', '',
++    '账本审计首版不能识别CPU评分元数据，修正后显式区分924条CPU记录并保留未知格式拒绝规则；首轮脚本、结果、修正diff和哈希保存在 independent_audit/attempt1 与 parser_correction.*。独立算术审计补正了No-response文本标签匹配，并要求实际覆盖144列；前版和diff保留在 independent_audit/arithmetic_revision1。正式训练、评价、账本和冻结协议均未改动或重跑。', '',
++    '冻结报告代码的局部中文编码损坏只在最终文案层恢复；原自动报告、文案修正前后版本及SHA保存在 reporting_corrections。机器可读的最终决策文案以 decision_summary.json 为准，原统计JSON和CSV保持原值。运行/恢复说明见 RUN_AND_RESUME.md；固定任务已完成，当前无继续训练或自动重复任务。', ''
++]
++report = OUT/'CHAIR_HYBRID_COUPLING_REPORT.md'
++before = sha(report)
++text = report.read_text(encoding='utf-8')
++archive = OUT/'reporting_corrections'/f'CHAIR_HYBRID_COUPLING_REPORT.prose_corrected.{before[:12]}.md'
++archive.write_bytes(report.read_bytes())
++assert '## 六个决策问题' in text
++text = text.split('## 六个决策问题')[0] + '\n'.join(paragraphs)
++lead = ('本轮有基准几何改善信号，但尚无联合质量成功：验证主MSE下降约40%，'
++        '同时存在小角面增加、部分上下文/留出退化和条件响应跨噪声不一致。'
++        '首要后续是核查细长面与几何收益的关系，检验假说见报告末尾；本轮固定预算完成即停止。\n\n')
++text = text.replace('## 主终点\n', lead+'## 主终点\n', 1)
++report.write_text(text, encoding='utf-8')
++audit = dict(status='PASS', action='Evidence-specific prose and proposed next hypothesis only',
++             previous_report_sha256=before, final_report_sha256=sha(report),
++             prior_report_path=str(archive), final_decision_sha256=sha(OUT/'decision_summary.json'),
++             statistical_source_sha256=sha(OUT/'paired_results/results.json'),
++             editor_sha256=sha(__file__), actual_model_calls=0)
++(OUT/'reporting_corrections/final_decision_edit.json').write_text(json.dumps(audit, indent=2)+'\n', encoding='utf-8')
++print(json.dumps(audit))
+--- /dev/null
++++ b/native_t1/runs/chair_hybrid_coupling_v1/reporting_corrections/finalize_delivery.py
+@@ -0,0 +1,55 @@
++"""Inventory final local deliverables without invoking experiment code."""
++import difflib
++import hashlib
++import json
++import re
++from pathlib import Path
++
++OUT = Path(__file__).resolve().parents[1]
++ROOT = OUT.parents[2]
++def read(p):
++    return json.loads(Path(p).read_text(encoding='utf-8'))
++def sha(p):
++    h = hashlib.sha256()
++    with Path(p).open('rb') as f:
++        for b in iter(lambda: f.read(1024*1024), b''):
++            h.update(b)
++    return h.hexdigest()
++
++assert read(OUT/'RUN_COMPLETE.json')['status'] == 'DONE'
++assert read(OUT/'independent_audit/audit_result.json')['status'] == 'PASS'
++assert read(OUT/'independent_audit/results_arithmetic_audit.json')['status'] == 'PASS'
++for p in (OUT/'controller').glob('*.json'):
++    assert read(p)['status'] == 'DONE', p
++frozen = read(OUT/'registration/implementation_hashes.json')
++for rel, value in frozen.items():
++    assert sha(ROOT/rel) == value, rel
++for target in re.findall(r'\]\(([^)]+)\)', (OUT/'DELIVERY_INDEX.md').read_text(encoding='utf-8')):
++    assert (OUT/target).is_file(), target
++
++scripts = sorted((OUT/'independent_audit').glob('*.py')) + sorted((OUT/'reporting_corrections').glob('*.py'))
++diff = []
++for p in scripts:
++    diff.extend(difflib.unified_diff([], p.read_text(encoding='utf-8').splitlines(True),
++                 fromfile='/dev/null', tofile='b/'+p.relative_to(ROOT).as_posix()))
++(OUT/'supplemental_code.diff').write_text(''.join(diff), encoding='utf-8')
++
++selected = set(p for p in OUT.iterdir() if p.is_file() and p.suffix in ('.md','.json','.diff','.sha256'))
++selected.discard(OUT/'delivery_manifest.json')
++for folder in ('registration','cpu_tests','tests','paired_results','diagnostic_results','independent_audit','reporting_corrections','resources','stages','controller'):
++    selected.update(p for p in (OUT/folder).glob('*') if p.is_file() and
++                    p.suffix in ('.md','.json','.csv','.diff','.py','.png','.sha256'))
++selected.update(p for p in (OUT/'training').glob('*') if p.suffix in ('.csv','.json'))
++selected.update(p for p in (OUT/'checkpoints').glob('*.json'))
++manifest = dict(status='COMPLETE', model_calls_in_packaging=0,
++    final_report_sha256=sha(OUT/'CHAIR_HYBRID_COUPLING_REPORT.md'),
++    frozen_implementation_verified=len(frozen), frozen_implementation=frozen,
++    supplemental_source_sha256={p.relative_to(ROOT).as_posix():sha(p) for p in scripts},
++    artifacts=[dict(path=p.relative_to(OUT).as_posix(), bytes=p.stat().st_size, sha256=sha(p)) for p in sorted(selected)],
++    checkpoint_manifest=read(OUT/'checkpoint_manifest.json'),
++    exclusion_note='Large PT/raw/OT caches are not duplicated; actual PT hashes were independently checked. Raw/query/score hashes remain in per-output and generation manifests. Audit prior versions are retained in their revision directories.',
++    no_extra_archive=True, no_running_experiment=True)
++(OUT/'delivery_manifest.json').write_text(json.dumps(manifest,indent=2,sort_keys=True)+'\n',encoding='utf-8')
++print(json.dumps(dict(status='COMPLETE', artifacts=len(manifest['artifacts']),
++                     frozen_code_files=len(frozen), supplemental_scripts=len(scripts),
++                     report_sha256=manifest['final_report_sha256'])))
+--- /dev/null
++++ b/native_t1/runs/chair_hybrid_coupling_v1/reporting_corrections/render_corrected_report.py
+@@ -0,0 +1,113 @@
++"""Repair UTF-8 report prose only; preserve frozen implementation and statistics.
++
++Run after formal reporting.finalize has produced all real results. The original
++automatic Markdown and its hash are retained before the corrected report replaces
++the user-facing Markdown. This script never imports the experiment package.
++"""
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++from pathlib import Path
++
++
++def sha(path):
++    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
++
++
++def read(path):
++    return json.loads(Path(path).read_text(encoding='utf-8-sig'))
++
++
++def fmt(value):
++    return 'NA' if value is None else f'{value:.7g}' if isinstance(value,(int,float)) else str(value)
++
++
++def render(out):
++    report=out/'CHAIR_HYBRID_COUPLING_REPORT.md'
++    result=read(out/'paired_results/results.json')
++    lines=report.read_text(encoding='utf-8').splitlines()
++    primary=next((r for r in result['primary'] if r['comparison']=='OT_HYBRID-OT_BASE'),None)
++    stages=result['stages'];evaluated=stages['EVALUATED']=='DONE'
++    signal=result['development_geometry_signal'];quality=result['quality_result']
++    tails=result['tail_facts'];diagnostic=result.get('diagnostic_summary',{})
++    accounting=read(out/'accounting.json') if (out/'accounting.json').exists() else result['actual_accounting']
++    counts=accounting.get('summary',accounting)
++    # Same branch predicates as the frozen report; only restore readable text.
++    if not evaluated:
++        priority='先完成或解决实际阻塞阶段；当前不据未完成质量表选择训练干预。'
++    elif quality=='JOINT_POSITIVE_PILOT_SIGNAL':
++        priority='优先在独立配对训练随机流上重复同一固定协议；检验主几何与条件控制信号能否同时复现。当前不自动执行。'
++    elif signal:
++        priority='优先复核已量化的最明显质量或控制退化，检验几何收益是否依赖该代价；保留本轮固定预算，不直接推广HYBRID。'
++    else:
++        priority='优先围绕仍存在的基准自由几何误差做定点诊断，检验主MSE尾部是否集中在同一批父或远端自由区域；本轮未通过预登记耦合干预筛选，不据训练loss追加预算。'
++    new_top=[
++        '实际调用摘要：`'+json.dumps(counts,ensure_ascii=False,sort_keys=True)+'`。', '',
++        f"IMPLEMENTED：{stages['IMPLEMENTED']}；TRAINED：{stages['TRAINED']}；EVALUATED：{stages['EVALUATED']}；QUALITY_RESULT：**{quality}**。缺失父对象不缩小预登记分母。", '',
++    ]
++    # The old automatic opening contains a QUALITY_RESULT paragraph; replace
++    # that paragraph only, without touching any metric tables below it.
++    opening=next(i for i,line in enumerate(lines) if 'QUALITY_RESULT' in line)
++    lines[opening:opening+1]=new_top
++    lines=['## 实际响应诊断汇总' if line=='## ????????' else line for line in lines]
++    six=next(i for i,line in enumerate(lines) if line.startswith('1. HYBRID'))
++    heading=max(i for i in range(six) if lines[i].startswith('## '))
++    geometry='未完成，不能判断。' if not evaluated else '通过预登记开发性几何筛选。' if signal else '未通过预登记开发性几何筛选。'
++    if primary:
++        geometry+=(' 主父均值差='+fmt(primary['delta_mean'])+'，逐父配对差中位数='+fmt(primary['paired_delta_median'])+
++            '，改善父='+str(primary['improved_count'])+'/8。')
++    coverage=tails.get('coverage_fraction');p95=tails.get('fixed_query_p95_L')
++    six_lines=[
++        '## 六个决策问题','',
++        '1. HYBRID是否改善验证alpha=1真实自由几何：'+geometry,
++        '2. 覆盖与尾部：验证A20固定查询覆盖变化='+fmt(coverage['delta_mean'] if coverage else None)+
++        '，p95/L变化='+fmt(p95['delta_mean'] if p95 else None)+'。二者分别报告，不能由宽度推断。',
++        '3. 固定目标列与逐噪声控制：验证控制汇总均未退化且至少一项改善='+str(result['control_improves'])+
++        '；两噪声的宽度绝对误差及列优势方向均未退化='+str(result['control_noise_consistent'])+
++        '；主几何两噪声均值均改善='+str(result['primary_noise_both_improve'])+'。详细逐beta胜率和全部曲线见配对表。',
++        '4. 接口、相交或已观察留出退化：HYBRID−BASE质量守门组均值中发现'+str(len(result['visible_quality_tradeoffs']))+
++        '项方向退化，全部原值和逐父变化见表；这不是容差豁免，也不以一项改善掩盖另一项代价。',
++        '5. 响应分解：'+str(diagnostic.get('interpretation','请结合实际逐曲线及FP32复核读取；当前不作唯一因果解释。')),
++        '6. 优先下一步：'+priority,'',
++        '报告文案编码修正记录：原自动报告及SHA256保留于 reporting_corrections；仅恢复中文文案，不改变指标、分组、判定、协议或训练代码。','',
++    ]
++    return '\n'.join(lines[:heading]+six_lines),dict(
++        stages=stages,quality_result=quality,development_geometry_signal=signal,
++        actual_counts=counts,restored_next_priority=priority,
++        numeric_statistics_changed=False,grouping_changed=False,decision_logic_changed=False,
++        frozen_implementation_changed=False,protocol_changed=False,
++    )
++
++
++def main():
++    p=argparse.ArgumentParser();p.add_argument('--out',type=Path,default=Path(__file__).resolve().parent.parent)
++    p.add_argument('--dry-run',action='store_true');args=p.parse_args();out=args.out.resolve()
++    corrected,audit=render(out)
++    if '????' in corrected:
++        raise ValueError('Unrepaired corrupted prose remains; inspect before publishing')
++    if args.dry_run:
++        print(json.dumps(dict(status='DRY_RUN_PASS',**audit),ensure_ascii=False));return
++    report=out/'CHAIR_HYBRID_COUPLING_REPORT.md';before=sha(report)
++    results=out/'paired_results/results.json';statistics_sha=sha(results)
++    protocol=out/'protocol.json';protocol_sha=sha(protocol) if protocol.exists() else None
++    frozen=out/'registration/implementation_hashes.json';frozen_sha=sha(frozen) if frozen.exists() else None
++    folder=out/'reporting_corrections';folder.mkdir(parents=True,exist_ok=True)
++    original=folder/('CHAIR_HYBRID_COUPLING_REPORT.automatic.'+before[:12]+'.md')
++    if not original.exists():original.write_bytes(report.read_bytes())
++    if sha(original)!=before:raise ValueError('Original report archive mismatch')
++    report.write_text(corrected,encoding='utf-8')
++    assert sha(results)==statistics_sha
++    assert (sha(protocol) if protocol.exists() else None)==protocol_sha
++    assert (sha(frozen) if frozen.exists() else None)==frozen_sha
++    audit.update(status='PASS',original_report_path=str(original),original_report_sha256=before,
++        corrected_report_path=str(report),corrected_report_sha256=sha(report),
++        statistics_json_sha256=statistics_sha,protocol_sha256=protocol_sha,
++        frozen_manifest_sha256=frozen_sha,correction_script_sha256=sha(Path(__file__)))
++    target=folder/('correction_'+before[:12]+'.json')
++    target.write_text(json.dumps(audit,ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
++    print(json.dumps(dict(status='PASS',audit_path=str(target),corrected_report_sha256=audit['corrected_report_sha256']),ensure_ascii=False))
++
++
++if __name__=='__main__':main()

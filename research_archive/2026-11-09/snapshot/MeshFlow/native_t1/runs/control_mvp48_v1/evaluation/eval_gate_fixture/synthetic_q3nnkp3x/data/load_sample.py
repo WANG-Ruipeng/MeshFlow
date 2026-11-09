@@ -1,0 +1,1 @@
+SYNTHETIC_GATE_FIXTURE data/load_sample.py

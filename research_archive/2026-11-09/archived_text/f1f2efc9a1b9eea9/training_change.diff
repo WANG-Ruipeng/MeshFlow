@@ -1,0 +1,119 @@
+--- original_USER_training.py
++++ early_training.py
+@@ -1,4 +1,4 @@
+-"""One frozen Bench data-coverage arm, 1500 updates.
++"""One paired early-time-weighted FM arm, 1500 updates.
+ 
+ Imports the proven IO/checkpoint utilities, never the old experiment state machine.
+ No extra fixed neural probes; original SEAM loss and A0 initialization.
+@@ -28,10 +28,10 @@
+ from meshflow_control.training.context_checkpoint import _cpu_copy, _check_generator
+ from meshflow_control.data.io import digest, append_event
+ from r2.pilots.bench_adaptation_strength_v1 import training as T
+-from . import data as D
+-from .common import OUT, ARMS, ARM, EXPERIMENT, BASELINE_ROOT, resolve
+-
+-SCHEMA = "bench_user_v2_training_training_v1"
++from r2.pilots.bench_user_v2_training_v1 import data as D
++from .common import OUT, ARMS, ARM, EXPERIMENT, BASELINE_ROOT, resolve, time_weight
++
++SCHEMA = "bench_early_fm_training_v1"
+ UPDATES = 1500
+ 
+ 
+@@ -44,6 +44,8 @@
+         raise ValueError("Frozen coverage definition differs")
+     if reg["model_config"] != MODEL_CONFIG or reg["training_seed"] != 20261020:
+         raise ValueError("Same A architecture and initial RNG contract required")
++    if reg['time_weight'] != {'split': .5, 'early': 1.5, 'late': .5, 'per_batch_renormalize': False}:
++        raise ValueError('Frozen time-weight policy differs')
+     if not reg["training_code_hashes"]:
+         raise ValueError("Frozen source hashes required")
+     for path, expected in reg["training_code_hashes"].items():
+@@ -77,10 +79,11 @@
+     train_parents = {r["parent_id"] for r in manifest["train"]}
+     dev_parents = {r["parent_id"] for r in manifest["dev"]}
+     panel = T.read(resolve(reg["eval_manifest"]))
+-    old_panel = T.read(BASELINE_ROOT / "eval_manifest.json")
+-    if panel != old_panel or len(panel["requests"]) != 48:
+-        raise ValueError("Fixed historical A48 evaluation must remain identical")
+-    dev_parents |= {r["parent_id"] for r in panel["requests"] if r["group"] == "DEV"}
++    from .common import CROSS
++    old_panel = T.read(CROSS / 'registration.json')
++    if panel['requests'] != old_panel['requests'] or len(panel["requests"]) != 16:
++        raise ValueError("Fixed crossover16 evaluation must remain identical")
++    dev_parents |= {r["parent_id"] for r in panel["requests"] if r["split"] == "DEV"}
+     if train_parents & dev_parents:
+         raise ValueError("Held-out parent enters training")
+     for row in manifest["rows"]:
+@@ -256,7 +259,7 @@
+                     model_config=copy.deepcopy(MODEL_CONFIG), registration_sha256=reg_sha,
+                     execution=ledger.snapshot(), stream_state=dict(batch_index=step, next_sample_index=8*step),
+                     parameter_drift=T.parameter_drift(g, reference, names), head_calls=0)
+-                immutable = step in (0, 500, 1500)
++                immutable = step in (0, 1500)
+                 dest = out / (f"checkpoint_step{step}.pt" if immutable else "rolling.pt")
+                 if dest.exists() and immutable:
+                     receipt = T.read(dest.with_suffix(".json"))
+@@ -270,7 +273,7 @@
+                 if step == 1500:
+                     export = {k: p[k] for k in ("experiment", "arm", "local_step", "global_step",
+                         "seam_total_step", "generator_state", "generator_state_sha256", "model_config", "EMA")}
+-                    export.update(schema="bench_user_v2_training_generator_v1", state_sha256=p["generator_state_sha256"],
++                    export.update(schema="bench_early_fm_generator_v1", state_sha256=p["generator_state_sha256"],
+                                   training_checkpoint_sha256=state["checkpoint"]["sha256"])
+                     state["inference_export"] = T.save_payload(out / "generator_step1500.pt", export)
+                 T.write(status_path, state)
+@@ -297,7 +300,7 @@
+                     s = D.sample_for_training(cases[row["condition_id"]], row)
+                     if not 128 <= int(s["N"]) <= 256:
+                         raise ValueError("Frozen N128..256 exceeded")
+-                    audit_row = dict(policy="EXPANDED_COVERAGE_ORIGINAL_SEAM_FM",
++                    audit_row = dict(policy="SAME_USER_V2_STREAM_EARLY_FM_WEIGHT_ONLY",
+                         source_owner_count=int(np.asarray(s["occupied_labels"], bool).sum()),
+                         C_boundary_edges=int(len(s["occupied_labels"])),
+                         closed_C=not len(s["occupied_labels"]))
+@@ -308,7 +311,7 @@
+                 batch_start = time.perf_counter()
+                 torch.cuda.reset_peak_memory_stats()
+                 optimizer.zero_grad(set_to_none=True)
+-                total_loss, rows = 0., []
++                total_loss, unweighted_loss, rows = 0., 0., []
+                 for mi, (s, row, audit_row) in enumerate(zip(samples, entry["samples"], audits)):
+                     context = dict(local_step=current, global_step=12000+current,
+                                    microbatch=mi, condition_id=row["condition_id"])
+@@ -317,19 +320,23 @@
+                     with native_execution(model, coordinates=(b["x"], b["t"]), autocast=True):
+                         pred, _ = ledger.call("train_forward", lambda: forward(
+                             model, b["x"], b["t"], b["y"], b["valid"], b["known"], b["fixed"]).float(), context)
+-                        loss = corner_masked_fm_loss(pred, b["target"], b["valid"], b["fixed"], denominator=denominator)
++                        base_loss = corner_masked_fm_loss(pred, b["target"], b["valid"], b["fixed"], denominator=denominator)
++                        weight = time_weight(s["t"])
++                        loss = base_loss * weight
+                         if not bool(torch.isfinite(loss)):
+                             raise FloatingPointError("Nonfinite objective")
+                         ledger.call("train_backward", loss.backward, context)
+                     st = statistics(pred, b, s, arm)
+-                    if not np.isclose(st["all_free_velocity_sse"]/denominator, float(loss.detach()), rtol=4e-6, atol=1e-7):
++                    if not np.isclose(st["all_free_velocity_sse"]/denominator, float(base_loss.detach()), rtol=4e-6, atol=1e-7):
+                         raise ValueError("Loss accounting differs")
+                     total_loss += float(loss.detach())
++                    unweighted_loss += float(base_loss.detach())
+                     append_event(out / "exposure.jsonl", {**row, **context, "t": float(s["t"]),
+                         "N": int(s["N"]), "K": int(s["K"]), "loss_contribution": float(loss.detach()),
++                        "unweighted_loss_contribution": float(base_loss.detach()), "time_weight": weight,
+                         **st, "mechanism": audit_row})
+                     rows.append(st)
+-                    del pred, loss, b
++                    del pred, loss, base_loss, b
+                 if any(p.grad is None for p in model.parameters()):
+                     raise RuntimeError("Unused generator parameter")
+                 gn = float(torch.nn.utils.clip_grad_norm_(model.parameters(), 1., error_if_nonfinite=True))
+@@ -340,6 +347,7 @@
+                     raise FloatingPointError("Nonfinite updated parameter")
+                 sums = {key: sum(r[key] for r in rows) for key in rows[0]}
+                 result = dict(local_step=step, global_step=12000+step, objective=total_loss,
++                    unweighted_objective=unweighted_loss,
+                     free_coordinate_denominator=denominator, **sums, generator_gradient_norm=gn,
+                     input_seconds=input_seconds, update_seconds=time.perf_counter()-batch_start,
+                     peak_allocated_bytes=torch.cuda.max_memory_allocated(),

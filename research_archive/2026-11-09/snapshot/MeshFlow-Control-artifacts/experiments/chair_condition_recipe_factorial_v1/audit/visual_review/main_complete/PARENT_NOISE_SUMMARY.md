@@ -1,0 +1,131 @@
+# Per-parent, across-noise descriptions / 逐父跨噪声描述
+
+Derived only from saved initial notes. Displayed method labels remain unchanged; see README for mapping. No global rank or scalar score.
+
+## 33ec1e64a02ff718faaadcdc0221eb72 — C20
+
+四份噪声都有椅子轮廓，但蓝色基座突出、座面分层和相邻支撑持续存在。Method 5在n6出现明显破碎背板，其n0/n1/n7并非同样坏例；Method 3在n0有清楚扶手框架，但仍有座面分层。
+
+All four noises retain chair silhouettes but show projecting blue base geometry, seat layering and neighboring supports. Method 5 has a conspicuously broken back at n6, unlike its other noises. Method 3 has a clear armchair frame at n0 but still layered seat geometry.
+
+Reviewer: root; noises: n0, n1, n6, n7.
+
+## 33ec1e64a02ff718faaadcdc0221eb72 — C40
+
+n6的背板通常比n0/n1/n7更完整；输入已有的凸起圆板和尖片始终明显。Method 2在n0有座下悬垂三角片，其余噪声的局部裂隙也不能由单张好图代表。
+
+Back surfaces are generally more filled at n6 than n0/n1/n7; the pre-existing raised C plate and spike remain visible. Method 2 has a hanging underside triangle at n0. A single favorable noise does not represent the full condition.
+
+Reviewer: root; noises: n0, n1, n6, n7.
+
+## 341bcae1e7f366a233d93f57729688db — C20
+
+噪声改变整体结构：n0的Method 2/5呈高背椅，但n1不保持该区别。Method 3在n6形成较完整高凳；Method 6在n6/n7缺少大部分长下支撑。蓝条有时低于整体，有时处于下框架，不能据此认证连接。
+
+Noise changes gross organization: Methods 2/5 show tall chairs at n0 but not consistently at n1. Method 3 forms a clear high stool at n6; Method 6 lacks most long lower supports at n6/n7. The blue bar sometimes lies below the body and sometimes within the lower frame; attachment remains uncertain.
+
+Reviewer: schedule40_data; noises: n0, n1, n6, n7.
+
+## 341bcae1e7f366a233d93f57729688db — C40
+
+各噪声中均以盒状围合和暴露的蓝色平台/楔片为共同现象，输入本身已有部分尖楔。n7中Method 1/2有抬高条带，Method 6有上缘尖片，局部差异没有解决共同的围合与C关系问题。
+
+Box-like enclosures and exposed blue platforms/wedges recur across all noises; some angular wedges already exist in C. At n7 Methods 1/2 have raised strips and Method 6 an upper spike. Local differences do not resolve the shared enclosure/C relation.
+
+Reviewer: schedule40_data; noises: n0, n1, n6, n7.
+
+## 534b0e6e2c53a8e1a7cdfd3874ed3723 — C20
+
+显著局部代价随噪声/方法转移：Method 3在n0有大侧鳍，Method 5在n1有座下三角片，Method 2在n6有向下尖片。n7多行背部粗糙；Method 5背部较连续但仍有座下刀片，没有一行全程无缺点。
+
+Local artifact tails move across noise/method: Method 3 has a large side fin at n0, Method 5 an underside triangle at n1, Method 2 a downward spike at n6. Several backs are ragged at n7; Method 5 has a more continuous back but an underside blade. No row is uniformly clean.
+
+Reviewer: schedule40_train; noises: n0, n1, n6, n7.
+
+## 534b0e6e2c53a8e1a7cdfd3874ed3723 — C40
+
+四噪声各方法均能辨认为椅子，差异主要在背板开口、尖片与近距离座面层。Method 6在n0有明显背缝、n6/n7有突出座面；Method 3在n0有下垂细片。近层不自动等于非法重叠。
+
+All methods remain recognizable chairs across the four noises; differences concern back openings, protrusions and close seat layers. Method 6 has back slits at n0 and projecting seat panels at n6/n7; Method 3 has a downward strip at n0. Close layers are not automatically illegal overlaps.
+
+Reviewer: schedule40_train; noises: n0, n1, n6, n7.
+
+## 866e7248434968051cc7750d0afca796 — C20
+
+噪声同时改变环背/条栅背设计及局部碎片，设计差异不按GT误差处罚。n6较整齐不能掩盖n1/n7的代价；Method 5在n7有大三角片向腿部悬垂，其n0/n6较规整。
+
+Noise changes ring versus slatted back design and local fragments; design variation is not judged by source reconstruction. The more orderly n6 cannot conceal artifact tails at n1/n7. Method 5 has a broad triangle hanging toward the legs at n7 despite orderly n0/n6 examples.
+
+Reviewer: review_unified_recipe_code; noises: n0, n1, n6, n7.
+
+## 866e7248434968051cc7750d0afca796 — C40
+
+各噪声保留环形背椅轮廓。Method 5在该子集较规整，但Method 2的n1/n7有座下长针，Method 4在n7有明显下部薄片/碎片。这里只描述该父条件，不能转成全局排名。
+
+Ring-back chair organization persists. Method 5 looks orderly within this subset, while Method 2 has long under-seat needles at n1/n7 and Method 4 shows broad lower sheets/fragments at n7. This condition-specific description is not a global ranking.
+
+Reviewer: review_unified_recipe_code; noises: n0, n1, n6, n7.
+
+## 86ec9c796a6c1789e792598ed58dd1cc — C20
+
+四份噪声普遍形成高椅，差别主要是顶帽/背条样式。n6的Method 6变为梯背并带大座下斜片，Method 4有横向顶端悬片；其余噪声也有细缝/细条，视觉C对齐不认证接合。
+
+Tall chairs recur across all four noises, mainly differing in cap/slat design. At n6 Method 6 becomes a ladder-back variant with broad underside infill; Method 4 has overhanging top fragments. Fine gaps/strips also occur elsewhere; visual C alignment does not certify attachment.
+
+Reviewer: root; noises: n0, n1, n6, n7.
+
+## 86ec9c796a6c1789e792598ed58dd1cc — C40
+
+六种方法都形成较完整高背椅，n6/n7整体差异较小。n0的Method 4有大腿间斜面，n1的Method 3有座下侧填面、Method 6有长悬垂三角片；局部问题随噪声变化。
+
+All methods form tall chairs, with modest gross differences at n6/n7. Method 4 has a large between-leg diagonal panel at n0; Method 3 has under-seat side infill and Method 6 a long hanging triangle at n1. Local artifacts vary with noise.
+
+Reviewer: root; noises: n0, n1, n6, n7.
+
+## bdd29e651e5f6fb2b079317292bdc5d4 — C20
+
+四噪声各方法仍有清楚背/座/腿。Method 3的n7有明显长座下三角条；Method 5的n6为开放条栅背，记录为可能的设计差异，不直接判缺失。蓝色背板处于整体内，接缝仍不确定。
+
+Clear backs, seats and legs persist for every method/noise. Method 3 has a conspicuous long under-seat triangular strip at n7. Method 5 has an open slatted back at n6, recorded as possible design variation rather than automatic missing geometry. The blue back panel lies within the form, but seams remain uncertain.
+
+Reviewer: schedule40_data; noises: n0, n1, n6, n7.
+
+## bdd29e651e5f6fb2b079317292bdc5d4 — C40
+
+各方法四噪声都有完整椅子轮廓，差别是背条、座面层和局部尖片。长座下片出现在Method 1的n6及Method 3的n7，不能据某一噪声建立稳定全局优劣。
+
+All methods retain complete chair outlines across four noises, with back strips, seat layers and local spikes. Long under-seat pieces occur for Method 1 at n6 and Method 3 at n7, so a single noise does not establish a stable global ordering.
+
+Reviewer: schedule40_data; noises: n0, n1, n6, n7.
+
+## c1b8c2f0c4f3cc43aff7c08b060f5ed6 — C20
+
+n0各方法C周围都有拥挤三角片。n1的Method 6有大墙状面与悬片；n6的Method 5有座下刀片；n7的Method 4有大悬垂三角和侧翼。Method 2高凳变化不能仅按高度判坏，Method 3的n1/n7较连贯但近背层仍存在。
+
+At n0 all methods have crowded back triangles around C. Method 6 has a wall-like sheet and hanging pieces at n1; Method 5 an underside blade at n6; Method 4 a large hanging triangle and side flap at n7. Method 2's taller stool variant is not bad solely for height; Method 3 is more coherent at n1/n7 but retains close back surfaces.
+
+Reviewer: schedule40_train; noises: n0, n1, n6, n7.
+
+## c1b8c2f0c4f3cc43aff7c08b060f5ed6 — C40
+
+各输出保持椅子轮廓，但Method 2在n1/n6/n7有分离水平平台，Method 6在n0/n6/n7有大刀片/尖片/悬片。Method 5该四图较规整仍有窄背条和近层不确定性；Method 3在n1也有长刀片。
+
+Chair outlines persist, but Method 2 has separated horizontal platforms at n1/n6/n7 and Method 6 large blade/spike/hanging-sheet artifacts at n0/n6/n7. Method 5 is relatively regular in this subset, with narrow strips and uncertain close surfaces; Method 3 also has a long blade at n1.
+
+Reviewer: schedule40_train; noises: n0, n1, n6, n7.
+
+## f59627a077dcc2566c63b8b48495261a — C20
+
+固定水平蓝板引出直背/拱背/扶手椅多样性，不按来源GT否定。Method 4跨多个噪声有局部碎片，n6有大侧片和近地三角片；Method 6在n1有大浮空三角片，n6/n7更连贯，说明尾部不能由后两张遮盖。
+
+The fixed horizontal blue plate yields straight, arched and armchair forms; source mismatch is not penalized. Method 4 has local fragment tails across several noises, including broad side sheets and a near-ground triangle at n6. Method 6 has a large floating shard at n1 but more coherent n6/n7 examples, which do not erase that tail.
+
+Reviewer: review_unified_recipe_code; noises: n0, n1, n6, n7.
+
+## f59627a077dcc2566c63b8b48495261a — C40
+
+各输出均为可辨高背椅，许多新背面紧邻已有蓝背，图片不能判重复或接合。Method 1在n6/n7有大座下三角片，Method 2在n7有座上旗片；实背/条栅设计随噪声变化。
+
+All outputs are recognizable tall-back chairs; many new back surfaces closely parallel the extensive blue back, without image certification of duplication or joining. Method 1 has broad under-seat flaps at n6/n7 and Method 2 an above-seat flag at n7. Solid versus slatted backs vary with noise.
+
+Reviewer: review_unified_recipe_code; noises: n0, n1, n6, n7.

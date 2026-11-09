@@ -1,0 +1,258 @@
+--- original/worker.py
++++ revised/worker.py
+@@ -3,6 +3,7 @@
+ for _k in ('OMP_NUM_THREADS','MKL_NUM_THREADS','OPENBLAS_NUM_THREADS','NUMEXPR_NUM_THREADS'):os.environ[_k]='2'
+ from native_t1 import runtime as _runtime
+ import argparse
++import csv
+ import time
+ import traceback
+ import torch
+@@ -22,15 +23,103 @@
+     if result['status']!='PASS':raise RuntimeError('Resource headroom unavailable: '+str(result))
+     return result
+ 
+-def run(out,stage,arm=None):
++SAFE_EXIT_CODE=75
++
++
++def training_stage_status(result):
++    status=result.get('status');step=int(result.get('moment_step',-1))
++    if status=='DONE' and step==1000:return 'DONE'
++    if status=='INTERRUPTED_SAFE' and 0<=step<1000:return 'INTERRUPTED_SAFE'
++    raise RuntimeError('Training returned an invalid completion state: '+str((status,step)))
++
++
++def verify_safe_resume(out,arm):
++    """CPU-only proof of a complete checkpoint and covered actual-call ledger."""
++    from .training import validate_recovery
++    from .checkpoint import validate
++    out=Path(out)
++    previous=read_json(out/'stages'/f'train_{arm}.json')
++    training=read_json(out/'training'/f'{arm}_status.json')
++    if previous.get('status')!='INTERRUPTED_SAFE' or training.get('status')!='INTERRUPTED_SAFE':
++        raise RuntimeError('Only an explicitly safe interrupted training stage may resume')
++    step=int(training['moment_step'])
++    if not 0<step<1000 or previous['result']['moment_step']!=step:
++        raise RuntimeError('Safe resume requires a positive checkpoint-covered cursor below1000')
++    pointer=read_json(out/'training'/f'{arm}_pointer.json');path=Path(pointer['path'])
++    if path.resolve().parent!=(out/'checkpoints').resolve():raise ValueError('Recovery pointer escapes current checkpoint directory')
++    if digest(path)!=pointer['checkpoint_sha256']:raise ValueError('Recovery file differs from pointer')
++    side=read_json(path.with_suffix('.json'))
++    if side['checkpoint_sha256']!=pointer['checkpoint_sha256'] or side['metadata']!=pointer['metadata']:
++        raise ValueError('Recovery sidecar and committed pointer differ')
++    payload=torch.load(path,map_location='cpu',weights_only=True,mmap=True)
++    meta=validate(payload)
++    if meta!=pointer['metadata'] or meta['arm']!=arm or meta['moment_step']!=step:
++        raise ValueError('Recovery payload identity/cursor differs')
++    if meta['protocol_sha256']!=json_hash(read_json(out/'protocol.json')):
++        raise ValueError('Recovery protocol differs')
++    del payload
++    validate_recovery(ledger_rows(out/'training'/f'{arm}_events.jsonl'),step)
++    begun={};returned={}
++    kinds=('training_forward','training_backward','optimizer_update')
++    for ledger in sorted((out/'ledger').glob('*.jsonl')):
++        for row in ledger_rows(ledger):
++            if row.get('kind') not in kinds or row.get('context',{}).get('arm')!=arm:continue
++            cid=row['call_id'];event=row.get('event')
++            if event=='CALL_BEGIN':
++                if cid in begun:raise RuntimeError('Duplicate training call reservation')
++                begun[cid]=row
++            elif event=='CALL_RETURN':
++                if cid in returned:raise RuntimeError('Duplicate training call return')
++                returned[cid]=row
++            else:raise RuntimeError('Failed or unknown training-call evidence prevents automatic resume')
++    if set(begun)!=set(returned):raise RuntimeError('Unresolved training call prevents resume')
++    actual={kind:set() for kind in kinds}
++    for cid,row in begun.items():
++        context=row['context'];kind=row['kind'];current=int(context['moment_step'])
++        if not 1<=current<=step:raise RuntimeError('Actual call is not covered by committed checkpoint')
++        key=(current,int(context['microbatch'])) if kind!='optimizer_update' else (current,)
++        if key in actual[kind] or returned[cid]['kind']!=kind or returned[cid]['context']!=context:
++            raise RuntimeError('Training call identity or unique exposure differs')
++        actual[kind].add(key)
++    for kind in kinds:
++        expected={(current,micro) for current in range(1,step+1) for micro in range(8)} if kind!='optimizer_update' else {(current,) for current in range(1,step+1)}
++        if actual[kind]!=expected:raise RuntimeError('Checkpoint does not have exactly covered actual '+kind)
++    with (out/'training'/f'{arm}_training_log.csv').open(newline='',encoding='utf-8') as f:logs=list(csv.DictReader(f))
++    with (out/'training'/f'{arm}_sample_exposure.csv').open(newline='',encoding='utf-8') as f:exposure=list(csv.DictReader(f))
++    if [int(row['moment_step']) for row in logs]!=list(range(1,step+1)):
++        raise RuntimeError('Training log cursor is not complete')
++    if [int(row['sample_index']) for row in exposure]!=list(range(8*step)):
++        raise RuntimeError('Exposure log cursor is not complete')
++    return dict(status='SAFE_RESUME_VERIFIED',arm=arm,moment_step=step,
++        checkpoint_path=str(path),checkpoint_sha256=pointer['checkpoint_sha256'],
++        covered_forward_returns=8*step,covered_backward_returns=8*step,covered_optimizer_returns=step)
++
++
++def run(out,stage,arm=None,resume=False):
+     out=Path(out);key=stage if arm is None else stage+'_'+arm
+     path=out/'stages'/f'{key}.json';protocol=read_json(out/'protocol.json')
+-    if path.exists() and read_json(path)['status']=='DONE':return read_json(path)
++    resume_proof=None
++    if path.exists():
++        previous=read_json(path)
++        if previous['status']=='DONE':
++            if stage=='train' and training_stage_status(previous['result'])!='DONE':
++                raise RuntimeError('Completed stage contains incomplete training')
++            return previous
++        if stage=='train' and resume and previous['status']=='INTERRUPTED_SAFE':
++            resume_proof=verify_safe_resume(out,arm)
++        else:raise RuntimeError('Existing incomplete stage requires explicit verified safe resume or documented engineering recovery')
++    elif resume:
++        raise RuntimeError('No explicit safe-interruption stage exists to resume')
+     if torch.cuda.is_initialized():raise RuntimeError('CUDA initialized before shared lock')
+     torch.set_num_threads(2);torch.set_num_interop_threads(2);_runtime.configure_stable_runtime()
+     before=resource_snapshot();plan=admission(before,protocol)
+     atomic_json(out/'resources'/f'{key}_before.json',dict(resources=before,admission=plan))
+-    state=dict(status='RUNNING',stage=key,started_unix=time.time(),gpu_workers=1);atomic_json(path,state)
++    state=dict(status='RUNNING',stage=key,started_unix=time.time(),gpu_workers=1)
++    if resume_proof is not None:
++        history=out/'recovery'/key/f"resume_from_{resume_proof['moment_step']}.json"
++        freeze_json(history,dict(previous=previous,proof=resume_proof,resumed_unix=time.time()))
++        state['resume_proof']=resume_proof
++    atomic_json(path,state)
+     monitor=None;tick=time.perf_counter()
+     try:
+         with process_gpu_lock(out) as wait:
+@@ -53,11 +142,12 @@
+                     assert read_json(out/'initial_replay/result.json')['status']=='PASS'
+                     from .registration import verify_identity
+                     verify_identity(out,code=True)
+-                    candidates=[p for p in (out/'checkpoints').glob(f'{arm}_moment*_total*.pt')]
+-                    if candidates:
+-                        selected=max(candidates,key=lambda p:read_json(p.with_suffix('.json'))['metadata']['moment_step'])
+-                        model,opt,meta,hashes,stream=load(selected,'cuda',trainable=True,optimizer=True)
+-                    else:model,opt,meta,hashes,stream=load_start(arm,'cuda',optimizer=True)
++                    if resume_proof is not None:
++                        model,opt,meta,hashes,stream=load(resume_proof['checkpoint_path'],'cuda',trainable=True,optimizer=True)
++                    else:
++                        if (out/'training'/f'{arm}_pointer.json').exists() or list((out/'checkpoints').glob(f'{arm}_moment*_total*.pt')):
++                            raise RuntimeError('Existing checkpoint requires explicit verified resume, never inferred latest')
++                        model,opt,meta,hashes,stream=load_start(arm,'cuda',optimizer=True)
+                     result=train_arm(out,arm,protocol,budget,model,opt,meta,stream)
+                 elif stage=='eval':
+                     from .evaluation import run as evaluate
+@@ -67,9 +157,10 @@
+                     set_profile(model,False,collect_stats=False);result=evaluate(out,arm+'_END',model,budget,digest(p))
+                 else:raise ValueError(stage)
+             monitor.stop();monitor=None
+-            state.update(status='DONE',result=result,wall_seconds=time.perf_counter()-tick,lock_wait_seconds=wait,finished_unix=time.time())
++            completed_status=training_stage_status(result) if stage=='train' else 'DONE'
++            state.update(status=completed_status,result=result,wall_seconds=time.perf_counter()-tick,lock_wait_seconds=wait,finished_unix=time.time())
+             Budget(out,key+'_finish').snapshot();atomic_json(out/'resources'/f'{key}_after.json',resource_snapshot());atomic_json(path,state)
+-            print('STAGE_DONE '+key,flush=True);return state
++            print('STAGE_'+state['status']+' '+key,flush=True);return state
+     except BaseException as exc:
+         state.update(status='BLOCKED',error=repr(exc),traceback=traceback.format_exc(),wall_seconds=time.perf_counter()-tick)
+         atomic_json(path,state)
+@@ -82,4 +173,6 @@
+ if __name__=='__main__':
+     ap=argparse.ArgumentParser();ap.add_argument('--out',type=Path,default=OUT)
+     ap.add_argument('--stage',choices=('precheck','initial_replay','train','eval'),required=True);ap.add_argument('--arm',choices=ARMS)
+-    a=ap.parse_args();run(a.out,a.stage,a.arm)
++    ap.add_argument('--resume',action='store_true')
++    a=ap.parse_args();result=run(a.out,a.stage,a.arm,resume=a.resume)
++    raise SystemExit(SAFE_EXIT_CODE if result['status']=='INTERRUPTED_SAFE' else 0)
+--- original/run_all.py
++++ revised/run_all.py
+@@ -2,6 +2,7 @@
+ import argparse
+ import fcntl
+ import os
++import signal
+ from pathlib import Path
+ import subprocess
+ import sys
+@@ -11,21 +12,50 @@
+ 
+ MODULE='experiments.mf_h1_local0.chair_moment_channel_v2'
+ 
+-def execute(out,key,args):
++class SafeInterruption(RuntimeError):
++    pass
++
++
++def execute(out,key,args,resume=False):
+     path=out/'controller'/f'{key}.json'
+     if path.exists():
+         previous=read_json(path)
+-        if previous['status']=='DONE':return previous
+-        raise RuntimeError('Incomplete stage requires documented engineering recovery, not blind replay: '+key)
++        if previous['status']=='DONE':
++            if key.startswith('train_'):
++                from .worker import training_stage_status
++                stage=read_json(out/'stages'/f'{key}.json')
++                if stage['status']!='DONE' or training_stage_status(stage['result'])!='DONE':
++                    raise RuntimeError('Controller DONE conflicts with incomplete worker training')
++            return previous
++        if key.startswith('train_') and resume and previous['status'] in ('INTERRUPTED_SAFE','RUNNING'):
++            from .worker import verify_safe_resume
++            proof=verify_safe_resume(out,key[len('train_'):])
++            freeze_json(out/'controller'/'recovery_history'/f"{key}_from_{proof['moment_step']}.json",dict(previous=previous,proof=proof))
++            args=[*args,'--resume']
++        else:raise RuntimeError('Incomplete stage requires verified --resume or documented engineering recovery, not blind replay: '+key)
+     log=out/'logs'/f'{key}.log';log.parent.mkdir(parents=True,exist_ok=True)
+     state=dict(stage=key,status='RUNNING',started_unix=time.time(),command=[sys.executable,'-B','-m',*args],log=str(log))
+     atomic_json(path,state);env=dict(os.environ,OMP_NUM_THREADS='2',MKL_NUM_THREADS='2',OPENBLAS_NUM_THREADS='2')
+     if key.startswith('score'):env['CUDA_VISIBLE_DEVICES']=''
+     with log.open('a',buffering=1) as f:
+         child=subprocess.Popen(state['command'],cwd=ROOT,stdout=f,stderr=subprocess.STDOUT,env=env)
+-        state['pid']=child.pid;atomic_json(path,state);rc=child.wait()
+-    state.update(status='DONE' if rc==0 else 'BLOCKED',returncode=rc,finished_unix=time.time())
++        state['pid']=child.pid;atomic_json(path,state)
++        def request_stop(signum,frame):
++            state['stop_requested_signal']=int(signum)
++            if child.poll() is None:child.send_signal(signum)
++        handlers={sig:signal.signal(sig,request_stop) for sig in (signal.SIGINT,signal.SIGTERM)}
++        try:rc=child.wait()
++        finally:
++            for sig,handler in handlers.items():signal.signal(sig,handler)
++    safe=False
++    if key.startswith('train_') and (out/'stages'/f'{key}.json').exists():
++        stage_state=read_json(out/'stages'/f'{key}.json')
++        safe=rc==75 and stage_state.get('status')=='INTERRUPTED_SAFE'
++        if rc==0 and (stage_state.get('status')!='DONE' or stage_state.get('result',{}).get('moment_step')!=1000):
++            raise RuntimeError('Successful process exit did not complete 1000 training updates')
++    state.update(status='INTERRUPTED_SAFE' if safe else ('DONE' if rc==0 else 'BLOCKED'),returncode=rc,finished_unix=time.time())
+     atomic_json(path,state)
++    if safe:raise SafeInterruption('Training stopped at a verified checkpoint; resume with --resume: '+key)
+     if rc:raise RuntimeError('Stage stopped; inspect '+str(log))
+     return state
+ 
+@@ -48,7 +78,6 @@
+ def finalize(out):
+     from .ledger import Budget
+     from .reporting import finalize as report
+-    from .report import render
+     endpoints=[]
+     for arm in ARMS:
+         p=out/'checkpoints'/f'{arm}_moment1000_total6000.json'
+@@ -62,7 +91,7 @@
+     atomic_json(out/'accounting.json',counts)
+     verification=verify_identity(out,code=(out/'registration/training_implementation_hashes.json').exists())
+     atomic_json(out/'registration/source_verification_after.json',verification)
+-    results=report(out);render(out,results)
++    results=report(out)
+     source=out/'source_code';source.mkdir(exist_ok=True)
+     import shutil
+     for p in Path(__file__).parent.glob('*.py'):shutil.copyfile(p,source/p.name)
+@@ -100,7 +129,7 @@
+         if a.through=='replay':return
+         if not (out/'registration/training_implementation_hashes.json').exists():freeze_training(out)
+         for arm in ARMS:
+-            execute(out,'train_'+arm,[MODULE+'.worker','--out',str(out),'--stage','train','--arm',arm])
++            execute(out,'train_'+arm,[MODULE+'.worker','--out',str(out),'--stage','train','--arm',arm],resume=a.resume)
+         for arm in ARMS:
+             execute(out,'eval_'+arm,[MODULE+'.worker','--out',str(out),'--stage','eval','--arm',arm])
+         # All raw exists before dependent quality scoring.
+@@ -108,4 +137,8 @@
+             if not (out/'evaluation'/label/'scoring/summary.json').exists():execute(out,'score_'+label,[MODULE+'.scoring','--out',str(out),'--label',label,'--generated',str(out/'evaluation'/label/'generated_rows.json')])
+         finalize(out)
+ 
+-if __name__=='__main__':main()
++if __name__=='__main__':
++    try:main()
++    except SafeInterruption as exc:
++        print(str(exc),flush=True)
++        raise SystemExit(75)

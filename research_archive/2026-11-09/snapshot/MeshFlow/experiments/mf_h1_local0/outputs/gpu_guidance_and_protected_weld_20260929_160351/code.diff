@@ -1,0 +1,2291 @@
+diff --git a/experiments/mf_h1_local0/gpu_guidance_energies.py b/experiments/mf_h1_local0/gpu_guidance_energies.py
+new file mode 100755
+index 0000000..1af6beb
+--- /dev/null
++++ b/experiments/mf_h1_local0/gpu_guidance_energies.py
+@@ -0,0 +1,393 @@
++"""Vectorized current-coordinate GPU energies; no model, GT or CPU geometry.
++
++Production uses FP32 CUDA tensors. CPU FP64 is supported solely by the fixed
++mathematical probes. Hard closest-feature/minimum switches are piecewise
++differentiable, not a smooth collision barrier. The caller owns the common
++per-vertex displacement clipping and the original FP32 Euler operation order.
++"""
++from __future__ import annotations
++
++from contextlib import contextmanager
++import math
++import numpy as np
++import torch
++
++
++NUMERICAL_POLICY = dict(q_cut=10., area_floor=1e-10, q_floor=1e-12,
++    actual_near_degenerate_area_threshold=1e-12, distance_denominator_floor=1e-30,
++    sigma=.005, finite_difference_h=1e-6, fp64_gradient_atol=2e-7,
++    fp64_gradient_rtol=2e-4, gpu_energy_atol=2e-6, gpu_energy_rtol=2e-5,
++    gpu_gradient_atol=2e-5, gpu_gradient_rtol=2e-3,
++    GPU_permutation_energy_atol=2e-6, GPU_permutation_energy_rtol=2e-5,
++    GPU_permutation_gradient_atol=2e-5, GPU_permutation_gradient_rtol=2e-3,
++    coordinate_scope='Y=X_free/L; Cnorm=C/L; original C is never overwritten',
++    smoothness='Piecewise differentiable min and nearest-feature switches; no collision barrier',
++    near_degeneracy_is_not_area_floor=True)
++
++
++def initial_energy_ledger():
++    return dict(energy_forward_attempts=0, energy_forward_calls=0,
++        energy_A_evaluations=0, energy_R_evaluations=0,
++        vertex_gaussian_evaluations=0, geometry_backward_attempts=0,
++        geometry_backward_calls=0, CPU_energy_forward_calls=0,
++        CUDA_energy_forward_calls=0, CPU_geometry_backward_calls=0,
++        CUDA_geometry_backward_calls=0, finite_difference_energy_evaluations=0,
++        offline_primary_pair_tests=0, offline_independent_pair_tests=0,
++        fixture_runs=0, model_forwards=0, model_backwards=0, optimizer_updates=0)
++
++
++def _inc(ledger, key, amount=1):
++    if ledger is not None:
++        ledger[key] = ledger.get(key, 0) + amount
++
++
++def _validate(Y, Cnorm):
++    if not isinstance(Y, torch.Tensor) or not isinstance(Cnorm, torch.Tensor):
++        raise TypeError('Energies require tensors; the sampling API performs no CPU conversions')
++    if Y.ndim != 3 or Y.shape[1:] != (3, 3) or len(Y) == 0:
++        raise ValueError('Y must be nonempty [N_free,3,3]')
++    if Cnorm.ndim != 3 or Cnorm.shape[1:] != (3, 3) or len(Cnorm) == 0:
++        raise ValueError('Cnorm must be nonempty [K,3,3]')
++    if Y.device != Cnorm.device or Y.dtype != Cnorm.dtype:
++        raise ValueError('Y and Cnorm must share device and floating dtype')
++    if Y.dtype not in (torch.float32, torch.float64):
++        raise ValueError('FP32 production or FP64 mathematical probes only')
++    if Cnorm.requires_grad:
++        raise ValueError('Cnorm is a read-only constant, never a gradient input')
++
++
++@contextmanager
++def _geometry_context(Y):
++    # Re-enable only this small geometry graph even inside caller no_grad and
++    # BF16 native autocast. No model or parameter tensors enter these functions.
++    with torch.inference_mode(False), torch.enable_grad(), torch.autocast(Y.device.type, enabled=False):
++        yield
++
++
++def point_to_finite_triangles_squared(points, triangles):
++    """All point/finite-triangle distances [P,K], entirely tensor operations.
++
++    Interior orthogonal projection competes with all three finite segments.
++    Degenerate target triangles use segment candidates, never an invented
++    normal. Denominator clamps only prevent zero divisions; no signed SDF.
++    """
++    A, B, C = triangles[:, 0], triangles[:, 1], triangles[:, 2]
++    ab, ac = B - A, C - A
++    normal = torch.linalg.cross(ab, ac, dim=-1)
++    normal2 = normal.square().sum(-1)
++    safe_normal2 = normal2.clamp_min(NUMERICAL_POLICY['distance_denominator_floor'])
++    relative = points[:, None, :] - A[None, :, :]
++    height_coefficient = (relative * normal[None]).sum(-1) / safe_normal2[None]
++    projected_relative = relative - height_coefficient[..., None] * normal[None]
++    b = (torch.linalg.cross(projected_relative, ac[None], dim=-1) * normal[None]).sum(-1) / safe_normal2[None]
++    c = (torch.linalg.cross(ab[None], projected_relative, dim=-1) * normal[None]).sum(-1) / safe_normal2[None]
++    interior = (b >= 0) & (c >= 0) & (b + c <= 1) & (normal2[None] > NUMERICAL_POLICY['distance_denominator_floor'])
++    plane2 = (relative - projected_relative).square().sum(-1)
++    plane2 = torch.where(interior, plane2, torch.full_like(plane2, float('inf')))
++    start = triangles
++    end = triangles[:, (1, 2, 0), :]
++    edge = end - start
++    edge2 = edge.square().sum(-1).clamp_min(NUMERICAL_POLICY['distance_denominator_floor'])
++    segment_relative = points[:, None, None, :] - start[None]
++    alpha = (segment_relative * edge[None]).sum(-1) / edge2[None]
++    nearest = start[None] + alpha.clamp(0, 1)[..., None] * edge[None]
++    segment2 = (points[:, None, None, :] - nearest).square().sum(-1).min(-1).values
++    return torch.minimum(plane2, segment2)
++
++
++def _seven_points(Y):
++    return torch.cat((Y, (Y + Y[:, (1, 2, 0), :]) * .5,
++                      Y.mean(dim=1, keepdim=True)), dim=1)
++
++
++def energy_terms(Y, Cnorm, mode='GAR', ledger=None):
++    """Selected energy terms as GPU tensors; no transfers or scalar reads.
++
++    Call with detached leaf FP32 Y.requires_grad_(True), constant Cnorm, then
++    gradients_from_terms. Only selected terms are evaluated. For GAR both
++    components are normalized by N_free; R additionally averages its7 points.
++    """
++    _validate(Y, Cnorm)
++    if mode not in ('GA', 'GR', 'GAR'):
++        raise ValueError('Registered modes are GA, GR, GAR; G0 skips geometry')
++    _inc(ledger, 'energy_forward_attempts')
++    terms = {}
++    with _geometry_context(Y):
++        if mode in ('GA', 'GAR'):
++            _inc(ledger, 'energy_A_evaluations')
++            edges = Y[:, (1, 2, 0), :] - Y
++            area = .5 * torch.linalg.vector_norm(torch.linalg.cross(Y[:, 1] - Y[:, 0], Y[:, 2] - Y[:, 0], dim=-1), dim=-1)
++            edge_squared_sum = edges.square().sum(dim=(1, 2))
++            q_unclipped = edge_squared_sum / (4 * math.sqrt(3) * area.clamp_min(NUMERICAL_POLICY['area_floor']))
++            q = q_unclipped.clamp_min(NUMERICAL_POLICY['q_floor'])
++            excess = torch.relu(torch.log(q / NUMERICAL_POLICY['q_cut']))
++            terms.update(E_A=(.5 * excess.square()).mean(), q=q, area=area,
++                area_floor_count=(area < NUMERICAL_POLICY['area_floor']).sum(),
++                exact_zero_area_count=(area == 0).sum(),
++                near_degenerate_count=(area <= NUMERICAL_POLICY['actual_near_degenerate_area_threshold']).sum(),
++                q_above_cut_count=(q > NUMERICAL_POLICY['q_cut']).sum(),
++                q_numeric_floor_count=(q_unclipped < NUMERICAL_POLICY['q_floor']).sum())
++        if mode in ('GR', 'GAR'):
++            _inc(ledger, 'energy_R_evaluations')
++            points = _seven_points(Y)
++            d2 = point_to_finite_triangles_squared(points.reshape(-1, 3), Cnorm).min(-1).values.reshape(len(Y), 7)
++            gaussian = torch.exp(-d2 / NUMERICAL_POLICY['sigma'] ** 2)
++            terms.update(E_R=gaussian.mean(), point_distance_sq=d2,
++                gaussian_per_point=gaussian, gaussian_per_face=gaussian.mean(-1))
++        terms['E_selected'] = terms['E_A'] + terms['E_R'] if mode == 'GAR' else terms['E_A' if mode == 'GA' else 'E_R']
++    _inc(ledger, 'energy_forward_calls')
++    _inc(ledger, 'CUDA_energy_forward_calls' if Y.is_cuda else 'CPU_energy_forward_calls')
++    return terms
++
++
++def _gradient(energy, Y, ledger, retain_graph=False):
++    _inc(ledger, 'geometry_backward_attempts')
++    gradient = torch.autograd.grad(energy, Y, retain_graph=retain_graph, create_graph=False, allow_unused=False)[0]
++    _inc(ledger, 'geometry_backward_calls')
++    _inc(ledger, 'CUDA_geometry_backward_calls' if Y.is_cuda else 'CPU_geometry_backward_calls')
++    return gradient.detach()
++
++
++def gradients_from_terms(terms, Y, mode='GAR', ledger=None):
++    """Geometry-only reverse passes; GAR uses2 passes and sums the gradients.
++
++    The caller must clip g_selected once. Component cos=0 is a placeholder
++    when cosine_defined=False, not evidence of orthogonality. All diagnostics
++    remain on device and must be transferred only after a complete trajectory.
++    """
++    if mode not in ('GA', 'GR', 'GAR') or not Y.is_leaf or not Y.requires_grad:
++        raise ValueError('Require registered mode and detached leaf Y with gradients')
++    result = {}
++    with _geometry_context(Y):
++        if mode in ('GA', 'GAR'):
++            result['g_A'] = _gradient(terms['E_A'], Y, ledger, retain_graph=mode == 'GAR')
++            result['norm_A'] = torch.linalg.vector_norm(result['g_A'])
++        if mode in ('GR', 'GAR'):
++            result['g_R'] = _gradient(terms['E_R'], Y, ledger)
++            result['norm_R'] = torch.linalg.vector_norm(result['g_R'])
++        g = result['g_A'] + result['g_R'] if mode == 'GAR' else result['g_A' if mode == 'GA' else 'g_R']
++        result.update(g_selected=g, norm_selected=torch.linalg.vector_norm(g),
++            rms_selected=g.square().mean().sqrt(), gradient_finite=torch.isfinite(g).all(),
++            energy_finite=torch.isfinite(terms['E_selected']).all())
++        if mode == 'GAR':
++            denominator = result['norm_A'] * result['norm_R']
++            defined = denominator > 0
++            dot = (result['g_A'] * result['g_R']).sum()
++            result.update(gradient_dot=dot, cosine_defined=defined,
++                cosine=torch.where(defined, dot / denominator.clamp_min(1e-30), torch.zeros_like(dot)))
++    return {key: value.detach() for key, value in result.items()}
++
++
++def vertex_gaussian_terms(Y, Cnorm, ledger=None):
++    """Probe-only original vertex Gaussian; never silently used as formal GR."""
++    _validate(Y, Cnorm)
++    _inc(ledger, 'energy_forward_attempts')
++    _inc(ledger, 'vertex_gaussian_evaluations')
++    with _geometry_context(Y):
++        d2 = point_to_finite_triangles_squared(Y.reshape(-1, 3), Cnorm).min(-1).values.reshape(len(Y), 3)
++        kernel = torch.exp(-d2 / NUMERICAL_POLICY['sigma'] ** 2)
++        result = dict(V_vertex_gaussian=kernel.mean(), vertex_distance_sq=d2,
++                      gaussian_per_vertex=kernel)
++    _inc(ledger, 'energy_forward_calls')
++    _inc(ledger, 'CUDA_energy_forward_calls' if Y.is_cuda else 'CPU_energy_forward_calls')
++    return result
++
++
++def diagnostic_snapshot(Y, Cnorm, mode='GAR', ledger=None):
++    """One forward plus geometry reverse pass(es), with detached GPU outputs.
++
++    This helper is suitable for root-owned GT compatibility diagnostics; the
++    returned gradient is never a training or sampling decision input there.
++    """
++    working = Y.detach().clone().requires_grad_(True)
++    terms = energy_terms(working, Cnorm.detach(), mode, ledger)
++    gradient = gradients_from_terms(terms, working, mode, ledger)
++    return dict(terms={key: value.detach() for key, value in terms.items()}, gradients=gradient)
++
++
++def _numpy_point_triangle(point, tri):
++    """Independent scalar FP64 closest-region reference for probes only."""
++    a,b,c=tri;ab=b-a;ac=c-a;ap=point-a
++    d1=float(ab@ap);d2=float(ac@ap)
++    if d1<=0 and d2<=0:return float(ap@ap)
++    bp=point-b;d3=float(ab@bp);d4=float(ac@bp)
++    if d3>=0 and d4<=d3:return float(bp@bp)
++    vc=d1*d4-d3*d2
++    if vc<=0 and d1>=0 and d3<=0:
++        v=d1/(d1-d3);delta=point-(a+v*ab);return float(delta@delta)
++    cp=point-c;d5=float(ab@cp);d6=float(ac@cp)
++    if d6>=0 and d5<=d6:return float(cp@cp)
++    vb=d5*d2-d1*d6
++    if vb<=0 and d2>=0 and d6<=0:
++        w=d2/(d2-d6);delta=point-(a+w*ac);return float(delta@delta)
++    va=d3*d6-d5*d4
++    if va<=0 and d4-d3>=0 and d5-d6>=0:
++        w=(d4-d3)/((d4-d3)+(d5-d6));delta=point-(b+w*(c-b));return float(delta@delta)
++    denom=va+vb+vc
++    if denom<=0:raise ValueError('Independent smooth reference only accepts nondegenerate C')
++    v=vb/denom;w=vc/denom;delta=point-(a+ab*v+ac*w)
++    return max(0.,float(delta@delta))
++
++
++def _numpy_energy(Y,C,mode):
++    """Independent FP64 reference, deliberately scalar and probe-only."""
++    Y=np.asarray(Y,np.float64);C=np.asarray(C,np.float64);value=0.
++    if mode in ('GA','GAR'):
++        areas=.5*np.linalg.norm(np.cross(Y[:,1]-Y[:,0],Y[:,2]-Y[:,0]),axis=-1)
++        edges=Y[:,[1,2,0]]-Y;s=np.sum(edges*edges,axis=(1,2))
++        q=np.maximum(s/(4*math.sqrt(3)*np.maximum(areas,1e-10)),1e-12)
++        value+=float(np.mean(.5*np.maximum(np.log(q/10),0)**2))
++    if mode in ('GR','GAR'):
++        points=np.concatenate((Y,(Y+Y[:,[1,2,0]])*.5,Y.mean(1,keepdims=True)),axis=1)
++        d2=[min(_numpy_point_triangle(p,t) for t in C) for p in points.reshape(-1,3)]
++        value+=float(np.exp(-np.array(d2)/.005**2).mean())
++    return value
++
++
++def _finite_difference(Y,C,mode,ledger):
++    gradient=np.empty_like(Y);h=NUMERICAL_POLICY['finite_difference_h']
++    for index in np.ndindex(Y.shape):
++        plus=Y.copy();minus=Y.copy();plus[index]+=h;minus[index]-=h
++        gradient[index]=(_numpy_energy(plus,C,mode)-_numpy_energy(minus,C,mode))/(2*h)
++        _inc(ledger,'finite_difference_energy_evaluations',2)
++    return gradient
++
++
++def _serial(value):
++    if isinstance(value,torch.Tensor):
++        value=value.detach().cpu().numpy()
++    if isinstance(value,np.ndarray):return value.item() if value.ndim==0 else value.tolist()
++    if isinstance(value,np.generic):return value.item()
++    if isinstance(value,dict):return {key:_serial(item) for key,item in value.items()}
++    if isinstance(value,(list,tuple)):return [_serial(item) for item in value]
++    return value
++
++
++def run_fixed_probes(ledger=None, gpu=True):
++    """Fixed Stage A/B probes, including CPU FP64 and actual CUDA FP32.
++
++    No model or optimizer is imported or invoked. Counterexamples pass when
++    faithfully reproduced. All geometry-classifier calls are confined here.
++    Formal root execution may invoke this same fixed suite once and record it
++    separately from implementation checks; no new fixtures are selected.
++    """
++    from itertools import permutations
++    from .guided_native_geometry_geometry import verified_pair
++    if ledger is None:ledger=initial_energy_ledger()
++    before=dict(ledger);_inc(ledger,'fixture_runs')
++    C=np.array([[[0.,0.,0.],[1.,0.,0.],[0.,1.,0.]]],np.float64)
++    equilateral=np.array([[[.1,.1,.2],[.4,.1,.2],[.25,.1+math.sqrt(3)*.15,.2]]])
++    thin=np.array([[[.12,.18,.0031],[.83,.18,.0031],[.16,.1803,.0031]]])
++    visible=np.array([[[.2,.2,.02],[.6,.2,-.02],[.2,.6,.02]]])
++    blind=np.array([[[.99,.002,.3],[.99,.002,-.7],[1.4,.002,.3]]])
++    shared=np.array([[[0.,0.,0.],[1.,0.,0.],[.5,-.004,.002]]])
++    folded=np.array([[[0.,0.,0.],[1.,0.,0.],[.5,0.,.004]]])
++    exact=np.array([[[.2,.2,0.],[.4,.2,0.],[.2,.4,0.]]])
++    good1=np.array([[-.5,-.3,0.],[.5,-.3,0.],[0.,.566025403784,0.]])
++    good2=np.array([[-.5,0.,-.3],[.5,0.,-.3],[0.,0.,.566025403784]])
++    arrays=dict(C=C,equilateral=equilateral,thin=thin,visible_puncture=visible,
++        seven_point_blind_puncture=blind,shared_edge=shared,folded_edge=folded,
++        exact_surface=exact,good_intersecting_pair=np.stack((good1,good2)))
++    fixtures=[]
++    def snapshot(free,mode='GAR',device='cpu',dtype=torch.float64,context=C):
++        result=diagnostic_snapshot(torch.tensor(free,device=device,dtype=dtype),
++            torch.tensor(context,device=device,dtype=dtype),mode,ledger)
++        return _serial(result)
++    def classify(A,B):
++        local={};v=verified_pair(A,B,1.,local)
++        _inc(ledger,'offline_primary_pair_tests',local.get('primary_pair_tests',0))
++        _inc(ledger,'offline_independent_pair_tests',local.get('independent_pair_tests',0))
++        return v
++    eq=snapshot(equilateral,'GA')
++    np.testing.assert_allclose(eq['terms']['q'],[1.],atol=1e-12,rtol=1e-12)
++    assert eq['terms']['E_A']==0
++    fixtures.append(dict(name='equilateral_q_one',status='PASS',observed=eq))
++    ref=snapshot(thin,'GA');angle=.37
++    rotation=np.array([[math.cos(angle),-math.sin(angle),0],[math.sin(angle),math.cos(angle),0],[0,0,1.]])
++    transforms=[('rigid',thin@rotation.T+np.array([.7,-.8,.3])),('scale',thin*2.3)]
++    transforms += [('vertex_permutation_'+''.join(map(str,p)),thin[:,p,:]) for p in permutations(range(3))]
++    for name,free in transforms:
++        value=snapshot(free,'GA')
++        np.testing.assert_allclose(value['terms']['q'],ref['terms']['q'],atol=1e-8,rtol=1e-8)
++    assert ref['terms']['q'][0]>10 and ref['terms']['E_A']>0
++    fixtures.append(dict(name='shape_rigid_scale_corner_invariance_and_thin_active',status='PASS',variants=len(transforms),thin_reference=ref))
++    collapsed=np.array([[[.2,.2,0.]]*3,[[.1,.1,0.],[.2,.1,0.],[.3,.1,0.]]])
++    deg=snapshot(collapsed,'GA')
++    assert deg['terms']['area_floor_count']==2 and deg['terms']['exact_zero_area_count']==2
++    assert np.isfinite(np.array(deg['gradients']['g_selected'])).all()
++    assert np.array_equal(np.array(deg['gradients']['g_selected'])[0],np.zeros((3,3)))
++    fixtures.append(dict(name='coincident_and_collinear_degeneracy_not_rescued',status='PASS_COUNTEREXAMPLE',observed=deg))
++    intersection=classify(good1,good2);good=snapshot(np.stack((good1,good2)),'GA')
++    assert intersection['classification']=='proper_transverse_penetration' and good['terms']['E_A']==0
++    fixtures.append(dict(name='good_shape_energy_zero_despite_penetration',status='PASS_COUNTEREXAMPLE',intersection=intersection,observed=good))
++    cpu_reference={}
++    for mode in ('GA','GR','GAR'):
++        value=snapshot(thin,mode);gradient=np.array(value['gradients']['g_selected'])
++        finite_difference=_finite_difference(thin,C,mode,ledger)
++        np.testing.assert_allclose(gradient,finite_difference,atol=NUMERICAL_POLICY['fp64_gradient_atol'],rtol=NUMERICAL_POLICY['fp64_gradient_rtol'])
++        independent=_numpy_energy(thin,C,mode);_inc(ledger,'finite_difference_energy_evaluations')
++        np.testing.assert_allclose(value['terms']['E_selected'],independent,atol=1e-11,rtol=1e-11)
++        cpu_reference[mode]=value
++        fixtures.append(dict(name='independent_finite_difference_'+mode,status='PASS',maximum_absolute_gradient_error=float(np.max(np.abs(gradient-finite_difference))),observed=value))
++    for name,free in [('vertex_miss_seven_points_detect',visible),('both_vertex_and_seven_points_miss',blind)]:
++        value=snapshot(free,'GR');y=torch.tensor(free,dtype=torch.float64,requires_grad=True)
++        old=vertex_gaussian_terms(y,torch.tensor(C,dtype=torch.float64),ledger)
++        old_grad=_gradient(old['V_vertex_gaussian'],y,ledger)
++        crossing=classify(C[0],free[0]);assert crossing['classification']=='proper_transverse_penetration'
++        oldE=float(old['V_vertex_gaussian'].detach());newE=value['terms']['E_R']
++        if name.startswith('vertex_miss'):
++            assert oldE<1e-6 and newE>.2
++        else:
++            assert oldE<1e-50 and newE<1e-50
++        fixtures.append(dict(name=name,status='PASS_COUNTEREXAMPLE',intersection=crossing,
++            vertex_energy=oldE,vertex_gradient=_serial(old_grad),seven_point=value))
++    surface=snapshot(exact,'GR')
++    assert surface['terms']['E_R']==1. and np.linalg.norm(surface['gradients']['g_selected'])<1e-12
++    fixtures.append(dict(name='surface_kernel_maximum_zero_gradient',status='PASS_COUNTEREXAMPLE',observed=surface))
++    for name,free in [('legal_shared_edge',shared),('legal_90_degree_fold',folded)]:
++        value=snapshot(free,'GR');kind=classify(C[0],free[0]);assert kind['resolved'] and not kind['illegal']
++        assert value['terms']['E_R']>0 and value['gradients']['norm_selected']>0
++        fixtures.append(dict(name=name,status='PASS_COUNTEREXAMPLE',intersection=kind,observed=value))
++    sides=np.array([[[.2,.2,.004],[.6,.2,-.004],[.2,.6,.004]]])
++    # Retain the actual leaf; never detach sampled points from the free vertices.
++    sy=torch.tensor(sides,dtype=torch.float64,requires_grad=True)
++    side_old=vertex_gaussian_terms(sy,torch.tensor(C,dtype=torch.float64),ledger)
++    sg=_gradient(side_old['V_vertex_gaussian'],sy,ledger).numpy()
++    moved=sides-1e-5*sg;side_after=vertex_gaussian_terms(torch.tensor(moved,dtype=torch.float64),torch.tensor(C,dtype=torch.float64),ledger)
++    side_before_class=classify(C[0],sides[0]);side_after_class=classify(C[0],moved[0])
++    assert side_before_class['illegal'] and side_after_class['classification']=='proper_transverse_penetration'
++    assert float(side_after['V_vertex_gaussian'])<float(side_old['V_vertex_gaussian'].detach())
++    fixtures.append(dict(name='two_sides_repulsion_energy_decrease_still_intersection',status='PASS_COUNTEREXAMPLE',step=1e-5,
++        before_energy=float(side_old['V_vertex_gaussian'].detach()),after_energy=float(side_after['V_vertex_gaussian']),gradient=sg.tolist(),after_class=side_after_class))
++    point=torch.tensor([[1.2,1.2,0.]],dtype=torch.float64)
++    finite=float(point_to_finite_triangles_squared(point,torch.tensor(C,dtype=torch.float64))[0,0])
++    assert abs(finite-.98)<1e-12
++    fixtures.append(dict(name='finite_triangle_not_infinite_plane',status='PASS',point=[1.2,1.2,0.],finite_distance_squared=finite,infinite_plane_distance_squared=0.))
++    gpu_rows=[]
++    if gpu:
++        if not torch.cuda.is_available():raise RuntimeError('GPU FP32 probes required; no CPU substitution')
++        for mode in ('GA','GR','GAR'):
++            actual=snapshot(thin,mode,'cuda',torch.float32)
++            reference=cpu_reference[mode]
++            np.testing.assert_allclose(actual['terms']['E_selected'],reference['terms']['E_selected'],atol=NUMERICAL_POLICY['gpu_energy_atol'],rtol=NUMERICAL_POLICY['gpu_energy_rtol'])
++            np.testing.assert_allclose(actual['gradients']['g_selected'],reference['gradients']['g_selected'],atol=NUMERICAL_POLICY['gpu_gradient_atol'],rtol=NUMERICAL_POLICY['gpu_gradient_rtol'])
++            repeat=snapshot(thin,mode,'cuda',torch.float32)
++            assert actual==repeat
++            gpu_rows.append(dict(mode=mode,energy_absolute_error=abs(actual['terms']['E_selected']-reference['terms']['E_selected']),
++                gradient_max_absolute_error=float(np.max(np.abs(np.array(actual['gradients']['g_selected'])-reference['gradients']['g_selected']))),repeat_bitwise=True,observed=actual))
++        mixed=np.concatenate((thin,visible,equilateral));base=snapshot(mixed,'GAR','cuda',torch.float32)
++        order=[2,0,1];corner=[2,0,1];permuted=snapshot(mixed[order][:,corner],'GAR','cuda',torch.float32)
++        restored=np.array(permuted['gradients']['g_selected'])[np.argsort(order)][:,np.argsort(corner)]
++        np.testing.assert_allclose(permuted['terms']['E_selected'],base['terms']['E_selected'],atol=2e-6,rtol=2e-5)
++        np.testing.assert_allclose(restored,base['gradients']['g_selected'],atol=2e-5,rtol=2e-3)
++        gpu_rows.append(dict(mode='GAR_face_and_corner_permutation',energy_absolute_error=abs(permuted['terms']['E_selected']-base['terms']['E_selected']),
++            restored_gradient_max_absolute_error=float(np.max(np.abs(restored-base['gradients']['g_selected'])))))
++        for name,free in [('collapsed',collapsed),('visible_puncture',visible),('blind_puncture',blind),('surface',exact),('shared',shared),('folded',folded)]:
++            value=snapshot(free,'GAR','cuda',torch.float32)
++            assert value['gradients']['gradient_finite'] and value['gradients']['energy_finite']
++            gpu_rows.append(dict(mode='FP32_'+name,observed=value))
++    return dict(status='PASS',policy=dict(NUMERICAL_POLICY),fixtures=fixtures,GPU_probes=gpu_rows,
++        GPU_probe_status='PASS' if gpu else 'NOT_RUN',ledger_delta={k:v-before.get(k,0) for k,v in ledger.items()},
++        counters_are_not_geometry_safety_certificates=True,
++        fixture_design_note='Seven-point blind fixture z=.3/-.7/.3 fixed analytically before tests; initial draft z=+/-1 rejected before execution because midpoint would hit C',
++        model_forwards=0,model_backwards=0,optimizer_updates=0),arrays
+diff --git a/experiments/mf_h1_local0/gpu_guidance_evaluation.py b/experiments/mf_h1_local0/gpu_guidance_evaluation.py
+new file mode 100755
+index 0000000..919f938
+--- /dev/null
++++ b/experiments/mf_h1_local0/gpu_guidance_evaluation.py
+@@ -0,0 +1,275 @@
++"""Independent offline Raw/+W evaluation for the fixed GPU-guidance pilot.
++
++The original CPU endpoint scorer is reused unchanged. This module never calls a
++model or a GPU energy, modifies coordinates, welds, or prunes triangles.
++"""
++from __future__ import annotations
++
++from collections import Counter
++from copy import deepcopy
++import itertools
++import hashlib
++import json
++import math
++import time
++
++import numpy as np
++
++from .guided_native_geometry_audit import score_endpoint, pair_scan
++from .native_patch_metrics import patch_binding_four_grid
++
++
++Q_CUT=10.
++AREA_FLOOR=1e-10
++Q_FLOOR=1e-12
++NEAR_AREA=1e-12
++PROPER="proper_transverse_penetration"
++COPLANAR="coplanar_positive_area_overlap"
++ILLEGAL=(PROPER,COPLANAR)
++
++
++def _tri(value):
++    value=np.asarray(value)
++    if value.ndim==2 and value.shape[-1]==9:value=value.reshape(-1,3,3)
++    if value.ndim!=3 or value.shape[1:]!=(3,3):raise ValueError("Expected triangle coordinates")
++    return value
++
++
++def _distribution(values):
++    values=np.asarray(values,dtype=np.float64).reshape(-1)
++    finite=values[np.isfinite(values)]
++    return dict(count=len(values),finite_count=len(finite),positive_inf_count=int(np.isposinf(values).sum()),
++        negative_inf_count=int(np.isneginf(values).sum()),nan_count=int(np.isnan(values).sum()),
++        mean=float(finite.mean()) if len(finite) else None,
++        median=float(np.median(finite)) if len(finite) else None,
++        minimum=float(finite.min()) if len(finite) else None,
++        maximum=float(finite.max()) if len(finite) else None,
++        p05=float(np.quantile(finite,.05)) if len(finite) else None,
++        p95=float(np.quantile(finite,.95)) if len(finite) else None,
++        finite_subset_statistics=True)
++
++
++def shape_quality(triangles,L):
++    """Actual shape q plus separately identified numerical floor behavior."""
++    tri=_tri(triangles).astype(np.float64,copy=False)
++    L=float(L)
++    if not np.isfinite(tri).all() or not math.isfinite(L) or L<=0:
++        raise ValueError("Require finite coordinates and positive existing bbox L")
++    normalized=tri/L
++    edges=np.stack([normalized[:,(i+1)%3]-normalized[:,i] for i in range(3)],axis=1)
++    squared=(edges*edges).sum(-1)
++    area=.5*np.linalg.norm(np.cross(normalized[:,1]-normalized[:,0],normalized[:,2]-normalized[:,0]),axis=-1)
++    s=squared.sum(-1)
++    q_guarded=np.maximum(s/(4*np.sqrt(3)*np.maximum(area,AREA_FLOOR)),Q_FLOOR)
++    q_actual=np.divide(s,4*np.sqrt(3)*area,out=np.full_like(s,np.inf),where=area>0)
++    q_actual[(area==0)&(s==0)]=np.nan
++    angles=[]
++    for corner in range(3):
++        a=normalized[:,(corner+1)%3]-normalized[:,corner]
++        b=normalized[:,(corner+2)%3]-normalized[:,corner]
++        den=np.linalg.norm(a,axis=-1)*np.linalg.norm(b,axis=-1)
++        cosine=np.divide((a*b).sum(-1),den,out=np.ones_like(den),where=den>0)
++        angles.append(np.degrees(np.arccos(np.clip(cosine,-1,1))))
++    angles=np.stack(angles,axis=-1)
++    per_face=[]
++    for index in range(len(tri)):
++        q=float(q_actual[index])
++        per_face.append(dict(face=index,area=float(area[index]*L*L),area_normalized=float(area[index]),
++            area_exact_zero=bool(area[index]==0),area_near_degenerate=bool(area[index]<=NEAR_AREA),
++            area_floor_triggered=bool(area[index]<AREA_FLOOR),
++            q_guarded=float(q_guarded[index]),q_actual=q if math.isfinite(q) else None,
++            q_actual_status="FINITE" if math.isfinite(q) else "INFINITE_COLLINEAR" if math.isinf(q) else "UNDEFINED_COINCIDENT",
++            q_actual_gt10=bool(q>Q_CUT),q_guarded_gt10=bool(q_guarded[index]>Q_CUT),
++            minimum_angle_degrees=float(angles[index].min()),minimum_angle_lt5=bool(angles[index].min()<5)))
++    energy=.5*np.maximum(np.log(q_guarded/Q_CUT),0)**2
++    return dict(schema="gpu_guidance_shape_quality_v1",faces=len(tri),bbox_diagonal=L,
++        q_definition="sum squared edge lengths/(4*sqrt(3)*triangle area)",q_cut=Q_CUT,
++        normalized_area_floor=AREA_FLOOR,numerical_q_floor=Q_FLOOR,near_degenerate_area_threshold=NEAR_AREA,
++        per_face=per_face,area_normalized=_distribution(area),area_original=_distribution(area*L*L),
++        total_area=float(area.sum()*L*L),q_actual=_distribution(q_actual),q_guarded=_distribution(q_guarded),
++        q_actual_gt10_count=int((q_actual>Q_CUT).sum()),q_guarded_gt10_count=int((q_guarded>Q_CUT).sum()),
++        q_actual_gt10_fraction=float((q_actual>Q_CUT).mean()) if len(tri) else None,
++        q_guarded_gt10_fraction=float((q_guarded>Q_CUT).mean()) if len(tri) else None,
++        exact_zero_area_count=int((area==0).sum()),near_degenerate_area_count=int((area<=NEAR_AREA).sum()),
++        area_floor_trigger_count=int((area<AREA_FLOOR).sum()),
++        min_angle_lt5_count=int((angles.min(-1)<5).sum()),
++        min_angle_lt5_fraction=float((angles.min(-1)<5).mean()) if len(tri) else None,
++        angle_p05_degrees=float(np.quantile(angles,.05)) if len(tri) else None,
++        guarded_EA_CPU_formula_reference=float(energy.mean()) if len(tri) else None,
++        EA_scope="Read-only NumPy formula reference; not an extra GPU energy or gradient evaluation",
++        caveat="Finite guarded q/energy does not imply nondegenerate geometry; floor triggers are not all degeneracies")
++
++
++def _detector_view(scan,which):
++    """Recover constituent labels from saved verified-pair diagnostics only."""
++    counts=Counter();contacts=[]
++    for row in scan.get("contacts",[]):
++        detector=row.get("detector",{})
++        classification=row["classification"] if which=="verified" else detector.get(which,{}).get("classification",row["classification"])
++        counts[classification]+=1
++        if classification!="disjoint":contacts.append(dict(pair=list(row["pair"]),classification=classification))
++    counts["disjoint"]+=int(scan["tested_pairs"])-len(scan.get("contacts",[]))
++    sets={kind:[row["pair"] for row in contacts if row["classification"]==kind] for kind in ILLEGAL}
++    unresolved=[row["pair"] for row in contacts if "unresolved" in row["classification"].lower() or "degenerate" in row["classification"].lower()]
++    return dict(detector=which,tested_pairs=scan["tested_pairs"],classification_counts=dict(counts),
++        proper_pairs=sets[PROPER],coplanar_overlap_pairs=sets[COPLANAR],
++        proper_pair_count=len(sets[PROPER]),coplanar_pair_count=len(sets[COPLANAR]),
++        illegal_pair_count=len(sets[PROPER])+len(sets[COPLANAR]),unresolved_pairs=unresolved,
++        unresolved_count=len(unresolved),contacts=contacts,
++        source="Derived from existing complete endpoint scan; no new geometry tests")
++
++
++def _illegal_quality(quality,face_ids):
++    ids=sorted(set(int(index) for index in face_ids))
++    chosen=[quality["per_face"][index] for index in ids]
++    q=np.array([row["q_actual"] if row["q_actual"] is not None else
++                np.inf if row["q_actual_status"]=="INFINITE_COLLINEAR" else np.nan for row in chosen])
++    return dict(face_ids=ids,count=len(ids),area_normalized=_distribution([row["area_normalized"] for row in chosen]),
++        q_actual=_distribution(q),q_guarded=_distribution([row["q_guarded"] for row in chosen]),
++        area_floor_trigger_count=sum(row["area_floor_triggered"] for row in chosen),
++        exact_zero_area_count=sum(row["area_exact_zero"] for row in chosen),
++        near_degenerate_count=sum(row["area_near_degenerate"] for row in chosen),
++        q_actual_gt10_count=sum(row["q_actual_gt10"] for row in chosen),
++        min_angle_lt5_count=sum(row["minimum_angle_lt5"] for row in chosen),
++        q_at_most10_and_not_near_degenerate_face_ids=[row["face"] for row in chosen if row["q_actual"] is not None and row["q_actual"]<=10 and not row["area_near_degenerate"]],
++        all_illegal_faces_are_q_gt10=None if not chosen else all(row["q_actual_gt10"] for row in chosen),
++        all_illegal_faces_below_area_floor=None if not chosen else all(row["area_floor_triggered"] for row in chosen),
++        interpretation="Distribution only; no learned small-face threshold, no pruning, and no guarantee deletion would be safe")
++
++
++def audit_context(C,L,ledger=None):
++    """One static66-pair C/C scan per parent, reusable because C is immutable."""
++    C=_tri(C)
++    if C.shape!=(12,3,3) or C.dtype!=np.float32:
++        raise ValueError("Require original FP32 C12")
++    scan=pair_scan(C,C,L,ledger=ledger,self_pairs=True,independent=True)
++    views={which:_detector_view(scan,which) for which in ("primary","independent","verified")}
++    scan["scope"]="All66 unordered fixed C/C pairs; static input-only audit"
++    if ledger is not None:ledger["static_context_audits"]=ledger.get("static_context_audits",0)+1
++    return dict(schema="gpu_guidance_static_context_v1",context_sha256=hashlib.sha256(C.tobytes()).hexdigest(),
++        bbox_diagonal=float(L),pair_scan=scan,detector_views=views,computed_once=True,
++        model_calls=0,geometry_autograd_calls=0,optimizer_updates=0)
++
++
++def score_variant(tokens,bank,parent,ledger=None,topology=None):
++    """Score Raw or W coordinates verbatim with identical independent CPU rules.
++
++    topology may be an indexed audit or {indexing: construction audit, topology:
++    indexed audit}. W and indexing are performed elsewhere, never in this call.
++    """
++    tick=time.perf_counter()
++    full=_tri(tokens)
++    case=bank["cases_by_key"][(int(parent),12)]
++    metrics=score_endpoint(full,bank,parent,ledger=ledger)
++    L=float(case["bbox_diagonal"])
++    quality=shape_quality(full[12:],L)
++    scans=metrics["guided_geometry_audit"]
++    detectors={scope:{which:_detector_view(scans[key],which) for which in ("primary","independent","verified")}
++               for scope,key in (("CF","C_free"),("FF","free_free"))}
++    legacy=metrics["seam"]["context_free_intersections"]
++    old={(x["context_face"],x["free_face"]) for x in legacy["contacts"] if x["classification"]==PROPER}
++    if old!={tuple(x) for x in detectors["CF"]["primary"]["proper_pairs"]}:
++        raise AssertionError("Primary CF reconstruction differs from historical classifier")
++    groups={}
++    for which in ("primary","independent","verified"):
++        cf,ff=detectors["CF"][which],detectors["FF"][which]
++        cf_faces={pair[1] for key in ("proper_pairs","coplanar_overlap_pairs") for pair in cf[key]}
++        ff_faces={index for key in ("proper_pairs","coplanar_overlap_pairs") for pair in ff[key] for index in pair}
++        groups[which]=dict(CF=_illegal_quality(quality,cf_faces),FF=_illegal_quality(quality,ff_faces),
++            union=_illegal_quality(quality,cf_faces|ff_faces))
++    topo=deepcopy(topology) if topology is not None else dict(status="NOT_RUN")
++    indexed=topo.get("topology",topo)
++    cf,ff=detectors["CF"]["verified"],detectors["FF"]["verified"]
++    any_illegal=any(detectors[scope][which]["illegal_pair_count"]>0 for scope in ("CF","FF") for which in ("primary","independent"))
++    unresolved=cf["unresolved_count"]+ff["unresolved_count"]
++    static=bank.get("context_audits",{}).get(int(parent))
++    if static is not None:
++        if static["context_sha256"]!=hashlib.sha256(np.ascontiguousarray(case["constraints"]).tobytes()).hexdigest() or static["bbox_diagonal"]!=L:
++            raise AssertionError("Static C/C cache belongs to a different context or scale")
++        detectors["CC"]=deepcopy(static["detector_views"])
++        any_illegal=any_illegal or any(detectors["CC"][which]["illegal_pair_count"]>0 for which in ("primary","independent"))
++        unresolved+=detectors["CC"]["verified"]["unresolved_count"]
++        if ledger is not None:ledger["static_context_audit_reuses"]=ledger.get("static_context_audit_reuses",0)+1
++    embedded=("FAIL_DETECTED_ILLEGAL_INTERSECTIONS" if any_illegal else "UNRESOLVED" if unresolved else
++              "NO_ILLEGAL_TRIANGLE_INTERSECTIONS_DETECTED" if static is not None else "NO_ILLEGAL_CF_FF_DETECTED_C_C_NOT_RUN")
++    metrics["gpu_guidance_evaluation"]=dict(schema="gpu_guidance_evaluation_v1",input_coordinates="Evaluated verbatim; no scoring repairs",
++        free_shape_quality=quality,detector_views=detectors,illegal_free_face_quality=groups,
++        indexed_topology=topo,C_PRESERVED="PASS" if scans["context_bitwise_preserved"] else "FAIL",
++        COMBINATORIAL_CLOSURE_STATUS=indexed.get("COMBINATORIAL_CLOSURE_STATUS","NOT_RUN"),
++        EMBEDDED_GEOMETRY_VALIDITY_STATUS=embedded,
++        embedded_scope="All static112-face unordered pairs: CF1200 + FF4950 + fixed CC66 reused" if static is not None else "CF1200 + FF4950; fixed CC NOT_RUN",
++        static_context_audit_reused=static is not None,continuous_collision_safety="NOT_RUN",
++        geometry_certification="Numerical diagnostic at declared tolerances, not an exact-predicate or continuous collision certificate",
++        no_pruning=True,no_welding_in_scorer=True,whole_faces=112,free_faces=100,
++        scoring_and_additional_audit_seconds=time.perf_counter()-tick,
++        model_forwards=0,model_backwards=0,GPU_energy_evaluations=0,geometry_autograd_calls=0,optimizer_updates=0)
++    if ledger is not None:ledger["gpu_guidance_variant_scores"]=ledger.get("gpu_guidance_variant_scores",0)+1
++    json.dumps(metrics,allow_nan=False)
++    return metrics
++
++
++def compare_variants(before,after):
++    """Same generated output before/after fixed W; use also for same-layer G0 comparisons."""
++    a,b=before["gpu_guidance_evaluation"],after["gpu_guidance_evaluation"]
++    if before["parent_index"]!=after["parent_index"] or before["K"]!=after["K"]:
++        raise ValueError("Comparisons require the same parent and K")
++    changes={}
++    for scope in ("CF","FF"):
++        changes[scope]={}
++        for which in ("primary","independent","verified"):
++            changes[scope][which]={}
++            for kind in ("proper_pairs","coplanar_overlap_pairs","unresolved_pairs"):
++                old={tuple(x) for x in a["detector_views"][scope][which][kind]}
++                new={tuple(x) for x in b["detector_views"][scope][which][kind]}
++                changes[scope][which][kind]=dict(before=len(old),after=len(new),added=[list(x) for x in sorted(new-old)],removed=[list(x) for x in sorted(old-new)])
++    shape_a,shape_b=a["free_shape_quality"],b["free_shape_quality"]
++    areas_a=np.array([x["area"] for x in shape_a["per_face"]]);areas_b=np.array([x["area"] for x in shape_b["per_face"]])
++    ratios=np.divide(areas_b,areas_a,out=np.full_like(areas_b,np.nan),where=areas_a>0)
++    ratios[(areas_a==0)&(areas_b>0)]=np.inf
++    result=dict(pair_set_turnover=changes,area_ratio_after_over_before=_distribution(ratios),
++        total_area_before=shape_a["total_area"],total_area_after=shape_b["total_area"],
++        q_gt10_count_before=shape_a["q_actual_gt10_count"],q_gt10_count_after=shape_b["q_actual_gt10_count"],
++        narrow_fraction_difference=shape_b["min_angle_lt5_fraction"]-shape_a["min_angle_lt5_fraction"],
++        exact_zero_before=shape_a["exact_zero_area_count"],exact_zero_after=shape_b["exact_zero_area_count"],
++        near_degenerate_before=shape_a["near_degenerate_area_count"],near_degenerate_after=shape_b["near_degenerate_area_count"],
++        remainder_RMS_difference=after["remainder"]["own"]["symmetric_rms_bbox_pct"]-before["remainder"]["own"]["symmetric_rms_bbox_pct"],
++        forward_RMS_difference=after["remainder"]["own"]["predicted_to_target_rms_bbox_pct"]-before["remainder"]["own"]["predicted_to_target_rms_bbox_pct"],
++        reverse_RMS_difference=after["remainder"]["own"]["target_to_predicted_rms_bbox_pct"]-before["remainder"]["own"]["target_to_predicted_rms_bbox_pct"],
++        boundary_RMS_difference=after["guided_geometry_audit"]["boundary"]["rms_bbox_pct"]-before["guided_geometry_audit"]["boundary"]["rms_bbox_pct"],
++        comparison_scope="Fixed same-parent/seed face slots; no reassignment or output selection",geometry_evaluations=0,model_calls=0)
++    json.dumps(result,allow_nan=False)
++    return result
++
++
++def cross_binding(context0_metrics,context1_metrics):
++    return patch_binding_four_grid(context0_metrics,context1_metrics)
++
++
++def run_cpu_tests():
++    eq=np.array([[[0.,0.,0.],[1.,0.,0.],[.5,np.sqrt(3)/2,0.]]])
++    reference=shape_quality(eq,1.)
++    assert abs(reference["per_face"][0]["q_actual"]-1)<1e-12
++    assert reference["guarded_EA_CPU_formula_reference"]==0
++    for order in itertools.permutations(range(3)):
++        value=shape_quality(eq[:,order],1.)
++        assert abs(value["per_face"][0]["q_actual"]-1)<1e-12
++    translated=eq+np.array([3.,-7.,2.])
++    rotated=translated[:,:,[1,2,0]]
++    assert abs(shape_quality(rotated,1.)["per_face"][0]["q_actual"]-1)<1e-12
++    assert abs(shape_quality(eq*2,1.)["per_face"][0]["q_actual"]-1)<1e-12
++    zero=shape_quality(np.zeros((1,3,3)),1.)
++    assert zero["exact_zero_area_count"]==1 and zero["area_floor_trigger_count"]==1
++    assert zero["q_actual"]["nan_count"]==1 and zero["guarded_EA_CPU_formula_reference"]==0
++    sliver=shape_quality(np.array([[[0.,0.,0.],[1.,0.,0.],[.5,1e-6,0.]]]),1.)
++    assert sliver["q_actual_gt10_count"]==1 and sliver["min_angle_lt5_count"]==1
++    tiny=shape_quality(eq*1e-5,1.)
++    assert tiny["area_floor_trigger_count"]==1 and tiny["near_degenerate_area_count"]==0
++    assert abs(tiny["per_face"][0]["q_actual"]-1)<1e-12
++    view=_detector_view(dict(tested_pairs=3,contacts=[dict(pair=[0,1],classification="UNRESOLVED",
++        detector=dict(primary=dict(classification=PROPER),independent=dict(classification="UNRESOLVED")))]),"primary")
++    assert view["proper_pair_count"]==1 and view["classification_counts"]["disjoint"]==2
++    clean=_illegal_quality(reference,[0])
++    assert clean["all_illegal_faces_are_q_gt10"] is False
++    json.dumps([reference,zero,sliver,tiny,view,clean],allow_nan=False)
++    return dict(status="PASS",fixture_families=9,vertex_permutations=6,model_calls=0,GPU_calls=0,
++                geometry_tests=0,geometry_autograd_calls=0,optimizer_updates=0)
+diff --git a/experiments/mf_h1_local0/gpu_guidance_protected_weld.py b/experiments/mf_h1_local0/gpu_guidance_protected_weld.py
+new file mode 100755
+index 0000000..dd97847
+--- /dev/null
++++ b/experiments/mf_h1_local0/gpu_guidance_protected_weld.py
+@@ -0,0 +1,443 @@
++"""Fixed CPU protected-coordinate weld W and independent indexed topology audit.
++
++No GT, model, optimizer, collision search, face deletion, remeshing, or new
++boundary vertex is used. Geometry is reassigned only to original FP32 anchors.
++"""
++from __future__ import annotations
++from collections import Counter,defaultdict
++import hashlib
++import itertools
++import math
++from pathlib import Path
++import tempfile
++import time
++import numpy as np
++
++WELD_POLICY=dict(epsilon_bbox=1e-3,area_epsilon_bbox_squared=1e-12,
++    normal_acceptance='Actual FP32 proposed normal dot original Raw face normal strictly greater than zero',
++    protected_identity='Exact FP32 coordinate bit pattern, including signed zero; unequal protected coordinates never merge',
++    processing_order='Numeric coordinate lexicographic, then sorted geometric corner-neighborhood coordinates; bit patterns break signed-zero ties',
++    indistinguishable_corner_tie='Stable ordinal only among identical coordinate and identical unordered triangle geometry; interchangeable geometric records',
++    protected_choice='Minimum squared distance then protected coordinate lexicographic; only first candidate, no farther-anchor fallback after rejection',
++    free_choice='Nearest fixed existing representative then coordinate lexicographic; rejected point starts its own fixed representative',
++    free_representatives='Original FP32 points; never moved or replaced; absorbed points never become representatives',
++    maximum_original_vertex_displacement_bbox=1e-3,
++    global_collision_checks_per_candidate=0,t_junction_distance_epsilon_bbox=1e-9,
++    topology_audit='Exhaustive indexed edges and vertex links; exhaustive non-endpoint vertex versus edge T-junction scan',
++    topology_welding_guarantee=False,collision_safety_guarantee=False)
++
++
++def _triangles(a):
++    a=np.asarray(a)
++    if a.ndim==2 and a.shape[1]==9:return a.reshape(-1,3,3)
++    if a.ndim==3 and a.shape[1:]==(3,3):return a
++    raise ValueError('Triangles must have shape [N,9] or [N,3,3]')
++
++
++def _bits(p):return tuple(map(int,np.asarray(p,dtype=np.float32).view(np.uint32)))
++def _lex(p):return tuple(map(float,p))+_bits(p)
++def _bit_equal(a,b):
++    a=np.asarray(a);b=np.asarray(b)
++    return a.shape==b.shape and a.dtype==b.dtype and a.tobytes()==b.tobytes()
++
++
++def _hash(a):
++    a=np.ascontiguousarray(a)
++    return hashlib.sha256(str((str(a.dtype),tuple(a.shape))).encode()+a.tobytes()).hexdigest()
++
++
++def _file_hash(p):
++    digest=hashlib.sha256()
++    with Path(p).open('rb') as stream:
++        for chunk in iter(lambda:stream.read(8<<20),b''):digest.update(chunk)
++    return digest.hexdigest()
++
++
++def _normals(triangles):
++    a=np.asarray(triangles,dtype=np.float64)
++    return np.cross(a[:,1]-a[:,0],a[:,2]-a[:,0])
++
++
++def _inputs(raw,C,known_mask=None):
++    raw=_triangles(raw);C=_triangles(C)
++    if raw.dtype!=np.float32 or C.dtype!=np.float32 or not np.isfinite(raw).all() or not np.isfinite(C).all():
++        raise ValueError('Raw and C must be finite FP32 arrays')
++    if known_mask is None:
++        known_mask=np.arange(len(raw))<len(C)
++    known_mask=np.asarray(known_mask)
++    if known_mask.dtype!=np.bool_ or known_mask.shape!=(len(raw),) or int(known_mask.sum())!=len(C):
++        raise ValueError('Separate bool[N] known mask must select exactly C')
++    if not _bit_equal(raw[known_mask],C):raise ValueError('Raw known triangles do not preserve exact original C')
++    return raw,C,known_mask.copy()
++
++
++def _corner_order(triangles,free_ids):
++    keys=[]
++    for fi in free_ids:
++        neighborhood=tuple(sorted(_lex(p) for p in triangles[fi]))
++        for corner in range(3):keys.append((_lex(triangles[fi,corner]),neighborhood,int(fi),corner))
++    # IDs are a final tie only for identical geometric corner-neighborhoods.
++    keys.sort(key=lambda row:(row[0],row[1],row[2],row[3]))
++    return [(row[2],row[3]) for row in keys]
++
++
++def _compact(vertices,faces,protected):
++    used=np.unique(faces)
++    order=sorted(map(int,used),key=lambda i:(_lex(vertices[i]),0 if i in protected else 1,i))
++    remap=np.full(len(vertices),-1,dtype=np.int64);remap[order]=np.arange(len(order))
++    return vertices[order].copy(),remap[faces],np.asarray([remap[p] for p in sorted(protected)],dtype=np.int64)
++
++
++def _finish(vertices,faces,raw,C,known,protected,audit):
++    triangles=np.asarray(vertices,dtype=np.float32)[faces]
++    if faces.shape!=(len(raw),3) or not _bit_equal(triangles[known],C):raise AssertionError('Face count or protected C changed')
++    if not np.isfinite(triangles).all():raise AssertionError('Nonfinite W result')
++    audit.update(C_PRESERVED='PASS_BITWISE_WITH_CORNER_CORRESPONDENCE',known_face_indices=np.flatnonzero(known).tolist(),
++        known_faces=len(C),face_count_before=len(raw),face_count_after=len(faces),free_faces=int((~known).sum()),
++        source_raw_sha256=_hash(raw),source_C_sha256=_hash(C),output_triangles_sha256=_hash(triangles),
++        vertices_sha256=_hash(vertices),faces_sha256=_hash(faces),
++        COMBINATORIAL_CLOSURE_STATUS='NOT_RUN_USE_INDEPENDENT_INDEXED_AUDIT',
++        EMBEDDED_GEOMETRY_VALIDITY_STATUS='NOT_RUN_REQUIRES_INDEPENDENT_CF_FF',
++        candidate_collision_checks=0,GT_inputs=False,model_forwards=0,optimizer_updates=0)
++    return dict(vertices=vertices,faces=faces,triangles=triangles,output=triangles.reshape(-1,9),
++        known_vertex_indices=faces[known].copy(),protected_vertex_indices=np.asarray(protected,dtype=np.int64),known_mask=known,audit=audit)
++
++
++def raw_exact_index(raw,C,known_mask=None):
++    start=time.perf_counter();raw,C,known=_inputs(raw,C,known_mask)
++    points={_bits(p):p.copy() for p in raw.reshape(-1,3)}
++    ordered=sorted(points,key=lambda key:_lex(points[key]));mapping={key:i for i,key in enumerate(ordered)}
++    vertices=np.asarray([points[key] for key in ordered],dtype=np.float32).reshape(-1,3)
++    faces=np.asarray([mapping[_bits(p)] for p in raw.reshape(-1,3)],dtype=np.int64).reshape(-1,3)
++    protected=np.unique(faces[known])
++    return _finish(vertices,faces,raw,C,known,protected,dict(method='Raw exact FP32 coordinate indexing only',
++        tolerance_welding=False,coordinate_changes=0,vertex_count=len(vertices),accepted_merges=0,rejected_merges=0,
++        indexing_seconds=time.perf_counter()-start,operator_seconds=0.))
++
++
++def _merge_candidate(vertices,faces,source,destination,protected,known,reference_normals,L):
++    """Local tests of actual FP32 representative reassignment; no collisions."""
++    affected=np.flatnonzero(np.any(faces==source,axis=1));reasons=[]
++    if source==destination:return False,faces,dict(reasons=['SAME_VERTEX_INDEX'],affected_faces=affected.tolist())
++    if source in protected and _bits(vertices[source])!=_bits(vertices[destination]):reasons.append('PROTECTED_COORDINATE_CONFLICT')
++    proposed=faces[affected].copy();proposed[proposed==source]=destination
++    if any(len(set(row.tolist()))<3 for row in proposed):reasons.append('REPEATED_VERTEX_INDEX_IN_FACE')
++    new_triangles=vertices[proposed] # These are the actual FP32 export positions.
++    new_normals=_normals(new_triangles);new_area=np.linalg.norm(new_normals,axis=1)*.5
++    old_area=np.linalg.norm(_normals(vertices[faces[affected]]),axis=1)*.5
++    ref=reference_normals[affected];ref_area=np.linalg.norm(ref,axis=1)*.5
++    if np.any(new_area<=1e-12*L*L):reasons.append('ZERO_OR_NEAR_DEGENERATE_PROPOSAL')
++    if np.any(ref_area<=1e-12*L*L):reasons.append('UNRESOLVED_ORIGINAL_NEAR_DEGENERATE_NORMAL')
++    if np.any(np.einsum('ij,ij->i',new_normals,ref)<=0):reasons.append('ORIGINAL_NORMAL_FLIP_OR_ORTHOGONAL')
++    if np.any(known[affected]):
++        for before,after,is_known in zip(faces[affected],proposed,known[affected]):
++            if is_known and not _bit_equal(vertices[before],vertices[after]):reasons.append('KNOWN_FACE_CORRESPONDENCE_CHANGED')
++    record=dict(reasons=sorted(set(reasons)),affected_faces=affected.tolist(),old_areas=old_area.tolist(),new_areas=new_area.tolist(),
++        actual_FP32_representative=True,normal_reference='Original Raw face normal',collision_checks=0)
++    if reasons:return False,faces,record
++    updated=faces.copy();updated[affected]=proposed
++    return True,updated,record
++
++
++def protected_weld(raw,C,L,known_mask=None):
++    total_start=time.perf_counter();raw,C,known=_inputs(raw,C,known_mask)
++    if not math.isfinite(L) or L<=0:raise ValueError('Positive declared L required')
++    L=float(L);epsilon=1e-3*L;source_raw=raw.copy();source_C=C.copy();reference_normals=_normals(raw)
++    build_start=time.perf_counter()
++    protected_points={_bits(p):p.copy() for p in C.reshape(-1,3)}
++    protected_keys=sorted(protected_points,key=lambda key:_lex(protected_points[key]))
++    mapping={key:i for i,key in enumerate(protected_keys)}
++    vertices=[protected_points[key] for key in protected_keys];protected=set(range(len(vertices)))
++    faces=np.empty((len(raw),3),np.int64)
++    for fi in np.flatnonzero(known):faces[fi]=[mapping[_bits(p)] for p in raw[fi]]
++    order=_corner_order(raw,np.flatnonzero(~known));sources=[]
++    for fi,corner in order:
++        source=len(vertices);vertices.append(raw[fi,corner].copy());faces[fi,corner]=source;sources.append((source,fi,corner))
++    vertices=np.asarray(vertices,dtype=np.float32).reshape(-1,3)
++    build_seconds=time.perf_counter()-build_start
++    operator_start=time.perf_counter();accepted=rejected=attempted=0;reasons=Counter();records=[];attached=set();fixed_representatives=[]
++    protected_order=sorted(protected,key=lambda i:_lex(vertices[i]))
++    def propose(source,destination,stage):
++        nonlocal faces,accepted,rejected,attempted
++        attempted+=1
++        distance=float(np.linalg.norm(vertices[source].astype(np.float64)-vertices[destination].astype(np.float64)))
++        if distance>epsilon:raise AssertionError('W proposed displacement beyond epsilon')
++        ok,newfaces,details=_merge_candidate(vertices,faces,source,destination,protected,known,reference_normals,L)
++        record=dict(stage=stage,source_vertex=source,representative_vertex=destination,
++            source_coordinate=vertices[source].tolist(),representative_coordinate=vertices[destination].tolist(),
++            displacement=distance,status='ACCEPTED' if ok else 'REJECTED',**details)
++        records.append(record)
++        if ok:faces=newfaces;accepted+=1;attached.add(source)
++        else:rejected+=1;reasons.update(details['reasons'])
++        return ok
++    for source,fi,corner in sources:
++        if not protected_order:continue
++        squared=np.sum((vertices[protected_order].astype(np.float64)-vertices[source].astype(np.float64))**2,axis=1)
++        eligible=[int(i) for i in np.flatnonzero(squared<=epsilon*epsilon)]
++        if eligible:
++            chosen=min(eligible,key=lambda j:(float(squared[j]),_lex(vertices[protected_order[j]])))
++            propose(source,protected_order[chosen],'free_to_protected')
++    for source,fi,corner in sources:
++        if source in attached:continue
++        candidates=[]
++        for representative in fixed_representatives:
++            squared=float(np.sum((vertices[source].astype(np.float64)-vertices[representative].astype(np.float64))**2))
++            if squared<=epsilon*epsilon:candidates.append((squared,_lex(vertices[representative]),representative))
++        if candidates:
++            destination=min(candidates)[2]
++            if propose(source,destination,'free_to_fixed_free_representative'):continue
++        fixed_representatives.append(source)
++    operator_seconds=time.perf_counter()-operator_start
++    compact_start=time.perf_counter();vertices,faces,protected_final=_compact(vertices,faces,protected)
++    compact_seconds=time.perf_counter()-compact_start
++    output=vertices[faces];lengths=np.linalg.norm(output.astype(np.float64)-raw.astype(np.float64),axis=-1)
++    if float(lengths.max(initial=0))>epsilon:raise AssertionError('A final cluster member moved beyond epsilon; chain detected')
++    if not _bit_equal(raw,source_raw) or not _bit_equal(C,source_C):raise AssertionError('W changed its original input')
++    raw_unique=len({_bits(p) for p in raw.reshape(-1,3)})
++    audit=dict(method='W_fixed_protected_vertex_weld',policy=dict(WELD_POLICY),L=L,epsilon=epsilon,
++        vertex_count_raw_exact=raw_unique,vertex_count_after=len(vertices),vertex_count_change=len(vertices)-raw_unique,
++        initial_corner_index_vertices=len(protected_keys)+len(sources),protected_unique_vertices=len(protected_keys),
++        attempted_merges=attempted,accepted_merges=accepted,rejected_merges=rejected,rejection_reasons=dict(reasons),
++        accepted_free_to_protected=sum(r['stage']=='free_to_protected' and r['status']=='ACCEPTED' for r in records),
++        accepted_free_to_free=sum(r['stage']=='free_to_fixed_free_representative' and r['status']=='ACCEPTED' for r in records),
++        fixed_free_representatives=len(fixed_representatives),merge_records=records,
++        max_coordinate_displacement=float(lengths.max(initial=0)),vertex_slot_displacement_RMS=float(np.sqrt(np.mean(lengths**2))),
++        changed_vertex_slots=int(np.count_nonzero(np.any(output.view(np.uint32)!=raw.view(np.uint32),axis=-1))),
++        fixed_representatives_never_move=True,no_transitive_chains=True,original_inputs_unchanged=True,
++        local_guard_checks=attempted,indexing_seconds=build_seconds+compact_seconds,operator_seconds=operator_seconds,
++        total_seconds=time.perf_counter()-total_start,no_face_deletion=True,no_added_vertices_on_C_edges=True,
++        protected_coordinates_not_tolerance_merged=True,post_weld_collision_status='NOT_RUN_REQUIRES_INDEPENDENT_CF_FF')
++    return _finish(vertices,faces,raw,C,known,protected_final,audit)
++
++
++def audit_indexed_topology(vertices,faces,L,*,C=None,known_mask=None):
++    """Independent index audit; coordinate overlap/intersection is not inferred."""
++    start=time.perf_counter();v=np.asarray(vertices);f=np.asarray(faces)
++    if v.dtype!=np.float32 or v.ndim!=2 or v.shape[1]!=3 or f.dtype!=np.int64 or f.ndim!=2 or f.shape[1]!=3:
++        raise ValueError('Use FP32 vertices[V,3] and int64 faces[N,3]')
++    if not np.isfinite(v).all() or np.any(f<0) or np.any(f>=len(v)) or not math.isfinite(L) or L<=0:
++        raise ValueError('Invalid indexed mesh')
++    triangles=v[f];area=np.linalg.norm(_normals(triangles),axis=-1)*.5
++    edges=defaultdict(list);vertex_faces=defaultdict(list);collapsed=0
++    for fi,face in enumerate(f):
++        for vertex in set(map(int,face)):vertex_faces[vertex].append(fi)
++        for a,b in zip(face,np.roll(face,-1)):
++            a=int(a);b=int(b)
++            if a==b:collapsed+=1;continue
++            edges[tuple(sorted((a,b)))].append((fi,a,b))
++    histogram=Counter(len(rows) for rows in edges.values());same_direction=[]
++    for edge,rows in edges.items():
++        if len(rows)==2 and rows[0][1:]==rows[1][1:]:same_direction.append(list(edge))
++    duplicates=Counter(tuple(sorted(map(int,face))) for face in f)
++    geometric_duplicates=Counter(tuple(sorted(_bits(p) for p in tri)) for tri in triangles)
++    repeated=sum(len(set(map(int,face)))<3 for face in f)
++    adjacency=[set() for _ in f]
++    for rows in edges.values():
++        incident={row[0] for row in rows}
++        for fi in incident:adjacency[fi].update(incident-{fi})
++    components=[];visited=set()
++    for first in range(len(f)):
++        if first in visited:continue
++        pending=[first];component=[]
++        while pending:
++            current=pending.pop()
++            if current in visited:continue
++            visited.add(current);component.append(current);pending.extend(adjacency[current]-visited)
++        components.append(sorted(component))
++    link_failures=[];link_labels=[];interior_count=boundary_count=0
++    for vertex in range(len(v)):
++        incident=vertex_faces.get(vertex,[]);link_edges=[];invalid=False
++        for fi in incident:
++            face=list(map(int,f[fi]));others=[i for i in face if i!=vertex]
++            if len(others)!=2 or others[0]==others[1]:invalid=True;continue
++            link_edges.append(tuple(sorted(others)))
++        link_adj=defaultdict(list)
++        for a,b in link_edges:link_adj[a].append(b);link_adj[b].append(a)
++        unique_edges=len(set(link_edges))==len(link_edges)
++        link_seen=set();link_components=0
++        for first in link_adj:
++            if first in link_seen:continue
++            link_components+=1;pending=[first]
++            while pending:
++                current=pending.pop()
++                if current in link_seen:continue
++                link_seen.add(current);pending.extend(q for q in link_adj[current] if q not in link_seen)
++        degree=[len(rows) for rows in link_adj.values()]
++        boundary_incident=sum(len(rows)==1 and vertex in edge for edge,rows in edges.items())
++        cycle=(not invalid and unique_edges and link_components==1 and len(degree)>=3 and all(q==2 for q in degree) and boundary_incident==0)
++        path=(not invalid and unique_edges and link_components==1 and len(degree)>=2 and degree.count(1)==2 and all(q in (1,2) for q in degree) and boundary_incident==2)
++        if cycle:label='MANIFOLD_INTERIOR_CYCLE';interior_count+=1
++        elif path:label='MANIFOLD_BOUNDARY_PATH';boundary_count+=1
++        elif not incident:label='UNREFERENCED_VERTEX'
++        else:
++            label='NONMANIFOLD_VERTEX_LINK'
++            link_failures.append(dict(vertex=vertex,incident_faces=incident,link_components=link_components,
++                link_degree=degree,duplicate_link_edge=not unique_edges,boundary_incident_edges=boundary_incident,invalid_incident_face=invalid))
++        link_labels.append(label)
++    edge_list=np.asarray(sorted(edges),dtype=np.int64).reshape(-1,2)
++    tj_hits=[];pair_count=0;skipped_short=0
++    if len(v) and len(edge_list):
++        segments=v[edge_list].astype(np.float64);direction=segments[:,1]-segments[:,0]
++        length2=np.einsum('ei,ei->e',direction,direction);length=np.sqrt(length2)
++        relative=v.astype(np.float64)[:,None]-segments[None,:,0]
++        alpha=np.divide(np.einsum('vei,ei->ve',relative,direction),length2[None],out=np.zeros((len(v),len(edge_list))),where=length2[None]>0)
++        closest=segments[None,:,0]+alpha[:,:,None]*direction[None]
++        distance=np.linalg.norm(v.astype(np.float64)[:,None]-closest,axis=-1)
++        epsilon=1e-9*L
++        relative_epsilon=np.divide(epsilon,length,out=np.full_like(length,np.inf),where=length>0)
++        vertex_ids=np.arange(len(v))[:,None]
++        nonendpoint=(vertex_ids!=edge_list[None,:,0])&(vertex_ids!=edge_list[None,:,1])
++        pair_count=int(nonendpoint.sum());skipped_short=int((length<=2*epsilon).sum())
++        hits=nonendpoint&(alpha>relative_epsilon[None])&(alpha<1-relative_epsilon[None])&(distance<=epsilon)
++        for vi,ei in zip(*np.where(hits)):
++            tj_hits.append(dict(vertex=int(vi),edge=edge_list[ei].tolist(),fraction=float(alpha[vi,ei]),
++                distance=float(distance[vi,ei]),edge_incident_faces=[row[0] for row in edges[tuple(edge_list[ei])]]))
++    nonmanifold_edges=sum(len(rows)>2 for rows in edges.values());duplicate_faces=sum(n-1 for n in duplicates.values())
++    orientation=not same_direction and not nonmanifold_edges and not repeated
++    vertex_manifold=not link_failures and all(label!='UNREFERENCED_VERTEX' for label in link_labels)
++    all_two=bool(len(edges)) and all(len(rows)==2 for rows in edges.values())
++    if not len(f):closure='EMPTY_NOT_CLOSED'
++    elif repeated or duplicate_faces:closure='INVALID_REPEATED_INDEX_OR_DUPLICATE_FACE'
++    elif nonmanifold_edges or not vertex_manifold:closure='NONMANIFOLD_OPEN' if histogram.get(1,0) else 'NONMANIFOLD_DESPITE_CLOSED_EDGE_INCIDENCE'
++    elif histogram.get(1,0):closure='OPEN_BOUNDARY'
++    elif all_two and not orientation:closure='CLOSED_WITH_INCONSISTENT_ORIENTATION'
++    elif all_two and vertex_manifold and orientation:closure='CLOSED_ORIENTED_COMBINATORIAL_2_MANIFOLD'
++    else:closure='UNRESOLVED_COMBINATORIAL_STRUCTURE'
++    preserved='NOT_CHECKED_NO_C_ARGUMENT'
++    if C is not None:
++        C=_triangles(C)
++        known=np.arange(len(f))<len(C) if known_mask is None else np.asarray(known_mask,dtype=bool)
++        preserved='PASS_BITWISE_WITH_CORNER_CORRESPONDENCE' if known.shape==(len(f),) and _bit_equal(triangles[known],C) else 'FAIL'
++    return dict(status='PASS_AUDIT_EXECUTION',vertex_count=len(v),face_count=len(f),
++        edge_count=len(edges),edge_incidence_counts={'1':histogram.get(1,0),'2':histogram.get(2,0),'>2':nonmanifold_edges},
++        edge_incidence_histogram={str(k):int(n) for k,n in sorted(histogram.items())},all_edges_incident_two=all_two,
++        collapsed_index_edges=collapsed,repeated_vertex_index_faces=repeated,duplicate_faces=duplicate_faces,
++        geometric_duplicate_faces=sum(n-1 for n in geometric_duplicates.values()),
++        degenerate_faces=int((area<=1e-12*L*L).sum()),area_epsilon=1e-12*L*L,
++        orientation_consistent=orientation,orientation_status='CONSISTENT' if orientation else 'INCONSISTENT_OR_NONMANIFOLD',
++        same_direction_two_incident_edges=same_direction,edge_connected_components=len(components),component_faces=components,
++        vertex_link=dict(status='PASS_MANIFOLD_WITH_POSSIBLE_BOUNDARY' if vertex_manifold else 'FAIL_NONMANIFOLD_OR_UNUSED_VERTEX',
++            manifold_vertices=interior_count+boundary_count,manifold_interior_vertices=interior_count,
++            manifold_boundary_vertices=boundary_count,nonmanifold_vertices=len(link_failures),per_vertex_labels=link_labels,per_vertex_failures=link_failures),
++        t_junction=dict(status='EXHAUSTIVE_VERTEX_EDGE_CHECK',distance_epsilon=1e-9*L,
++            tested_nonendpoint_vertex_edge_pairs=pair_count,all_vertices=len(v),all_unique_edges=len(edges),
++            near_zero_or_too_short_edges_skipped=skipped_short,hits=tj_hits,count=len(tj_hits),
++            scope='Every indexed vertex versus every unique edge, strict interior and distance<=1e-9L; no tolerance weld or edge split'),
++        C_PRESERVED=preserved,COMBINATORIAL_CLOSURE_STATUS=closure,
++        EMBEDDED_GEOMETRY_VALIDITY_STATUS='NOT_RUN_REQUIRES_INDEPENDENT_CF_FF',
++        geometry_intersection_checks=0,closure_does_not_certify_embedding=True,seconds=time.perf_counter()-start)
++
++
++def export_protected_obj(path,indexed,C,known_mask=None):
++    """New OBJ only, with FP32 roundtrip verification of all C corner records."""
++    start=time.perf_counter();path=Path(path);vertices=indexed['vertices'];faces=indexed['faces'];C=_triangles(C)
++    known=indexed.get('known_mask') if known_mask is None else known_mask
++    if known is None:known=np.arange(len(faces))<len(C)
++    known=np.asarray(known,dtype=bool)
++    if vertices.dtype!=np.float32 or faces.dtype!=np.int64 or not _bit_equal(vertices[faces][known],C):raise ValueError('OBJ source violates protected C')
++    path.parent.mkdir(parents=True,exist_ok=True)
++    with path.open('x',encoding='ascii',newline='\n') as stream:
++        stream.write('# Fixed protected coordinate export; no manifold or collision-safety claim\n')
++        for point in vertices:stream.write('v '+' '.join(format(float(q),'.9g') for q in point)+'\n')
++        for face in faces:stream.write('f '+' '.join(str(int(i)+1) for i in face)+'\n')
++    parsed_vertices=[];parsed_faces=[]
++    for line in path.read_text(encoding='ascii').splitlines():
++        fields=line.split()
++        if not fields:continue
++        if fields[0]=='v':parsed_vertices.append([float(q) for q in fields[1:4]])
++        elif fields[0]=='f':parsed_faces.append([int(q)-1 for q in fields[1:4]])
++    restored=np.asarray(parsed_vertices,dtype=np.float32);restored_faces=np.asarray(parsed_faces,dtype=np.int64)
++    if not _bit_equal(restored,vertices) or not np.array_equal(restored_faces,faces):raise AssertionError('OBJ FP32 roundtrip failed')
++    if not _bit_equal(restored[restored_faces][known],C):raise AssertionError('Exported OBJ altered a protected C coordinate or correspondence')
++    return dict(path=str(path),bytes=path.stat().st_size,sha256=_file_hash(path),export_seconds=time.perf_counter()-start,
++        vertex_count=len(restored),face_count=len(restored_faces),FP32_vertex_roundtrip_exact=True,
++        C_PRESERVED='PASS_EXPORTED_OBJ_FP32_BITWISE_WITH_CORNER_CORRESPONDENCE',
++        COMBINATORIAL_CLOSURE_STATUS='SEE_INDEPENDENT_INDEXED_AUDIT',
++        EMBEDDED_GEOMETRY_VALIDITY_STATUS='NOT_RUN_REQUIRES_INDEPENDENT_CF_FF',
++        formatting='Nine significant decimal digits per FP32 component; signed zero retained',face_order_and_corner_order_preserved=True)
++
++
++def run_cpu_fixtures(output=None):
++    cases=[];arrays={};operator_audits=[];weld_calls=topology_calls=guard_calls=0
++    def weld(raw,C,L=1.):
++        nonlocal weld_calls
++        weld_calls+=1;result=protected_weld(np.asarray(raw,np.float32),np.asarray(C,np.float32),L)
++        operator_audits.append(result['audit']);return result
++    def topology(indexed,L=1.):
++        nonlocal topology_calls
++        topology_calls+=1;return audit_indexed_topology(indexed['vertices'],indexed['faces'],L)
++    vertices=np.array([[0,0,0],[1,0,0],[0,1,0],[0,0,1]],np.float32)
++    tetra_faces=np.array([[0,2,1],[0,1,3],[0,3,2],[1,2,3]],np.int64)
++    tetra=vertices[tetra_faces];C=tetra[:1]
++    full=weld(tetra,C);full_topology=topology(full)
++    assert full_topology['COMBINATORIAL_CLOSURE_STATUS']=='CLOSED_ORIENTED_COMBINATORIAL_2_MANIFOLD'
++    removed=weld(tetra[:3],C);removed_topology=topology(removed)
++    assert removed_topology['COMBINATORIAL_CLOSURE_STATUS']=='OPEN_BOUNDARY' and removed_topology['edge_incidence_counts']['1']==3
++    cases.append(dict(name='tetrahedron_removed_face_stays_open_without_hole_filling',status='PASS',full=full_topology,removed=removed_topology))
++    arrays['tetrahedron']=tetra;arrays['tetrahedron_removed_face']=tetra[:3]
++    C=np.array([[[0,0,0],[1,0,0],[0,1,0]]],np.float32)
++    free=np.array([[[0,0,0],[.5,0,0],[.25,-.5,0]],[[.5,0,0],[1,0,0],[.75,-.5,0]]],np.float32)
++    tj=weld(np.concatenate([C,free]),C);tj_topology=topology(tj)
++    assert tj_topology['t_junction']['count']>=1 and tj_topology['COMBINATORIAL_CLOSURE_STATUS']!='CLOSED_ORIENTED_COMBINATORIAL_2_MANIFOLD'
++    cases.append(dict(name='AB_AM_MB_T_junction_not_removed_by_vertex_weld',status='PASS',topology=tj_topology));arrays['T_junction']=tj['triangles']
++    far=np.array([[[-10,-10,-10],[-9,-10,-10],[-10,-9,-10]]],np.float32)
++    chain_free=np.array([[[x,0,0],[2,1,0],[2,0,1]] for x in (0.,.00075,.0015)],np.float32)
++    chain_raw=np.concatenate([far,chain_free]);chain=weld(chain_raw,far)
++    assert np.array_equal(chain['triangles'][1,0],[0,0,0]) and np.array_equal(chain['triangles'][2,0],[0,0,0])
++    assert np.array_equal(chain['triangles'][3,0],chain_raw[3,0]) and chain['audit']['max_coordinate_displacement']<=.001
++    cases.append(dict(name='fixed_representative_rejects_transitive_radius_chain',status='PASS',audit=chain['audit']));arrays['chain_before']=chain_raw;arrays['chain_after']=chain['triangles']
++    close_C=np.array([[[0,0,0],[.0005,0,0],[0,1,0]]],np.float32)
++    tied=np.array([[[.00025,0,.0001],[1,0,1],[0,1,1]]],np.float32)
++    protected=weld(np.concatenate([close_C,tied]),close_C)
++    assert _bit_equal(protected['triangles'][:1],close_C) and np.array_equal(protected['triangles'][1,0],close_C[0,0])
++    assert protected['known_vertex_indices'][0,0]!=protected['known_vertex_indices'][0,1]
++    rotated_C=np.roll(close_C,1,axis=1)
++    rotated_protected=weld(np.concatenate([rotated_C,tied]),rotated_C)
++    assert _bit_equal(rotated_protected['triangles'][1:],protected['triangles'][1:])
++    vs=close_C.reshape(-1,3);fs=np.array([[0,1,2]],np.int64);guard_calls+=1
++    ok,_,guard=_merge_candidate(vs,fs,0,1,{0,1,2},np.array([True]),_normals(close_C),1.)
++    assert not ok and 'PROTECTED_COORDINATE_CONFLICT' in guard['reasons']
++    cases.append(dict(name='distinct_protected_anchors_preserved_and_distance_tie_uses_coordinate_order',status='PASS',audit=protected['audit'],direct_guard=guard))
++    anchor=np.array([[[0,0,0],[0,2,0],[0,0,2]]],np.float32)
++    deg=np.array([[[0,.0005,0],[.0005,0,0],[1,0,0]]],np.float32)
++    deg_result=weld(np.concatenate([anchor,deg]),anchor)
++    assert deg_result['audit']['rejection_reasons'].get('ZERO_OR_NEAR_DEGENERATE_PROPOSAL',0)>0
++    flip=np.array([[[0,.0004,0],[-1,.0002,0],[1,.0002,0]]],np.float32)
++    flip_result=weld(np.concatenate([anchor,flip]),anchor)
++    assert flip_result['audit']['rejection_reasons'].get('ORIGINAL_NORMAL_FLIP_OR_ORTHOGONAL',0)>0
++    repeated=np.array([[[.0002,0,0],[0,.0002,0],[1,1,0]]],np.float32)
++    repeated_result=weld(np.concatenate([anchor,repeated]),anchor)
++    assert repeated_result['audit']['rejection_reasons'].get('REPEATED_VERTEX_INDEX_IN_FACE',0)>0
++    cases.append(dict(name='actual_W_candidates_reject_degeneracy_flip_and_repeated_face_index',status='PASS',
++        degenerate=deg_result['audit'],flip=flip_result['audit'],repeated=repeated_result['audit']))
++    permutation=[0,3,1,2]
++    for corner_permutation in itertools.permutations(range(3)):
++        permuted=chain_raw[permutation].copy()
++        permuted[1:]=permuted[1:][:,corner_permutation]
++        transformed=weld(permuted,far);restored=transformed['triangles'].copy()
++        restored[1:]=restored[1:][:,np.argsort(corner_permutation)]
++        restored=restored[np.argsort(permutation)]
++        assert _bit_equal(restored,chain['triangles'])
++        assert transformed['audit']['accepted_merges']==chain['audit']['accepted_merges'] and transformed['audit']['rejection_reasons']==chain['audit']['rejection_reasons']
++    cases.append(dict(name='face_permutation_and_all_six_corner_orders_preserve_geometric_W_decisions',status='PASS',corner_permutations_verified=6))
++    second_vertices=-vertices;second_vertices[0]=vertices[0]
++    second=second_vertices[tetra_faces];bowtie=np.concatenate([tetra,second]);bow=raw_exact_index(bowtie,bowtie[:1]);bow_topology=topology(bow)
++    assert bow_topology['all_edges_incident_two'] and bow_topology['vertex_link']['nonmanifold_vertices']==1
++    assert bow_topology['COMBINATORIAL_CLOSURE_STATUS']=='NONMANIFOLD_DESPITE_CLOSED_EDGE_INCIDENCE'
++    cases.append(dict(name='closed_edge_incidence_does_not_replace_vertex_link_test',status='PASS',topology=bow_topology));arrays['closed_vertex_bowtie']=bowtie
++    if output is None:
++        with tempfile.TemporaryDirectory(prefix='mf_protected_weld_fixture_') as directory:
++            exported=export_protected_obj(Path(directory)/'tetrahedron.obj',full,tetra[:1])
++        exported['path']='TEMPORARY_FIXTURE_REMOVED'
++    else:exported=export_protected_obj(Path(output)/'fixture_protected_tetrahedron.obj',full,tetra[:1])
++    assert exported['FP32_vertex_roundtrip_exact']
++    cases.append(dict(name='actual_OBJ_FP32_roundtrip_preserves_C_corner_correspondence',status='PASS',export=exported))
++    return dict(status='PASS',policy=dict(WELD_POLICY),tests=cases,fixture_count=len(cases),
++        ledger=dict(weld_operator_calls=weld_calls,indexed_topology_audits=topology_calls,direct_candidate_guard_calls=guard_calls,
++            OBJ_exports=1,raw_exact_index_calls=1,
++            merge_candidates=sum(a['attempted_merges'] for a in operator_audits),
++            merges_accepted=sum(a['accepted_merges'] for a in operator_audits),
++            merges_rejected=sum(a['rejected_merges'] for a in operator_audits),
++            W_operator_seconds=sum(a['operator_seconds'] for a in operator_audits),
++            indexing_seconds=sum(a['indexing_seconds'] for a in operator_audits),
++            model_forwards=0,optimizer_updates=0,geometry_autograd_calls=0,collision_candidate_checks=0)),arrays
+diff --git a/experiments/mf_h1_local0/gpu_guidance_report.py b/experiments/mf_h1_local0/gpu_guidance_report.py
+new file mode 100755
+index 0000000..c8e9d09
+--- /dev/null
++++ b/experiments/mf_h1_local0/gpu_guidance_report.py
+@@ -0,0 +1,545 @@
++"""Offline report/plots for GPU guidance and the same protected weld W.
++
++No model, energy, geometric classification, welding or surface scoring runs in
++this module. It summarizes recorded results and displays saved coordinates.
++"""
++from __future__ import annotations
++
++import hashlib
++import json
++from pathlib import Path
++
++import numpy as np
++
++from .guided_native_geometry_report import _get, _n as _legacy_n, _dist
++from .gpu_guidance_evaluation import compare_variants
++
++
++
++def _n(value,digits=4):
++    # A small nonzero geometric quantity must not be displayed as exact zero.
++    if isinstance(value,(float,np.floating)) and np.isfinite(value) and 0<abs(value)<1e-4:
++        return f"{value:.{digits}e}"
++    return _legacy_n(value,digits)
++
++
++def _table(headers,rows):
++    if not rows:return "NOT_RUN / 无记录。"
++    safe_headers=[str(h).replace("|","\\|").replace("\n"," ") for h in headers]
++    return "\n".join(["| "+" | ".join(safe_headers)+" |",
++        "| "+" | ".join("---" for _ in safe_headers)+" |"]+
++        ["| "+" | ".join(_n(item) for item in row)+" |" for row in rows])
++
++
++MODELS=("G0","GA","GR","GAR")
++VARIANTS=("Raw","W")
++
++
++def _topology(metrics):
++    bundle=metrics["gpu_guidance_evaluation"].get("indexed_topology",{})
++    return bundle.get("topology",bundle),bundle.get("indexing",{})
++
++
++def _metric_row(row):
++    m=row["metrics"];e=m["gpu_guidance_evaluation"];shape=e["free_shape_quality"]
++    cf=e["detector_views"]["CF"]["primary"];ff=e["detector_views"]["FF"]["primary"]
++    verified_cf=e["detector_views"]["CF"]["verified"];verified_ff=e["detector_views"]["FF"]["verified"]
++    topo,indexing=_topology(m)
++    proper_faces={p[1] for p in cf["proper_pairs"]}
++    union=e["illegal_free_face_quality"]["primary"]["union"]
++    return dict(phase=row.get("phase","development"),model=row["model"],parent=int(row["parent"]),seed=int(row["seed"]),
++        variant=row["variant"],remainder_rms_pct=m["remainder"]["own"]["symmetric_rms_bbox_pct"],
++        forward_rms_pct=m["remainder"]["own"]["predicted_to_target_rms_bbox_pct"],
++        reverse_rms_pct=m["remainder"]["own"]["target_to_predicted_rms_bbox_pct"],
++        full_rms_pct=m["whole"]["surface"]["symmetric_rms_bbox_pct"],
++        CF_proper_faces=len(proper_faces),CF_proper_face_fraction=len(proper_faces)/100,
++        CF_proper_pairs=cf["proper_pair_count"],CF_overlap_pairs=cf["coplanar_pair_count"],
++        CF_unresolved=verified_cf["unresolved_count"],FF_proper_pairs=ff["proper_pair_count"],
++        FF_overlap_pairs=ff["coplanar_pair_count"],FF_illegal_pairs=ff["illegal_pair_count"],FF_unresolved=verified_ff["unresolved_count"],
++        boundary_rms_pct=m["guided_geometry_audit"]["boundary"]["rms_bbox_pct"],
++        boundary_p95_pct=m["guided_geometry_audit"]["boundary"]["p95_bbox_pct"],
++        boundary_coverage=m["guided_geometry_audit"]["boundary"]["coverage_fraction"],
++        narrow_fraction=shape["min_angle_lt5_fraction"],angle_p05=shape["angle_p05_degrees"],
++        q_gt10_fraction=shape["q_actual_gt10_fraction"],q_median=shape["q_actual"]["median"],q_p95=shape["q_actual"]["p95"],
++        EA_CPU_reference=shape["guarded_EA_CPU_formula_reference"],EA_GPU=_get(m,"gpu_endpoint_energy","E_A"),ER_GPU=_get(m,"gpu_endpoint_energy","E_R"),
++        area_total=shape["total_area"],area_floor_count=shape["area_floor_trigger_count"],
++        zero_area_count=shape["exact_zero_area_count"],near_degenerate_count=shape["near_degenerate_area_count"],
++        nan_count=m["whole"]["quality"]["nan_count"],inf_count=m["whole"]["quality"]["inf_count"],
++        illegal_unique_faces=union["count"],illegal_q_gt10_faces=union["q_actual_gt10_count"],
++        illegal_near_degenerate_faces=union["near_degenerate_count"],
++        illegal_q_median=union["q_actual"]["median"],illegal_q_p95=union["q_actual"]["p95"],
++        illegal_area_median=union["area_normalized"]["median"],illegal_area_p05=union["area_normalized"]["p05"],
++        illegal_area_minimum=union["area_normalized"]["minimum"],
++        illegal_well_shaped_nondegenerate_faces=len(union["q_at_most10_and_not_near_degenerate_face_ids"]),
++        vertex_count=topo.get("vertex_count"),edge1=_get(topo,"edge_incidence_counts","1"),
++        edge2=_get(topo,"edge_incidence_counts","2"),edge_gt2=_get(topo,"edge_incidence_counts",">2"),
++        edge_components=topo.get("edge_connected_components"),duplicate_faces=topo.get("duplicate_faces"),
++        vertex_link_status=_get(topo,"vertex_link","status"),vertex_link_nonmanifold=_get(topo,"vertex_link","nonmanifold_vertices"),
++        t_junction_status=_get(topo,"t_junction","status"),t_junction_count=_get(topo,"t_junction","count"),
++        t_junction_hits=_get(topo,"t_junction","hits"),orientation_status=topo.get("orientation_status",topo.get("orientation_consistent")),
++        C_PRESERVED=e["C_PRESERVED"],C_indexing=indexing.get("C_PRESERVED"),C_OBJ=_get(row,"export","C_PRESERVED"),
++        COMBINATORIAL_CLOSURE_STATUS=e["COMBINATORIAL_CLOSURE_STATUS"],
++        EMBEDDED_GEOMETRY_VALIDITY_STATUS=e["EMBEDDED_GEOMETRY_VALIDITY_STATUS"],
++        whole_faces=e["whole_faces"],free_faces=e["free_faces"],indexing=indexing,
++        evaluation_seconds=e["scoring_and_additional_audit_seconds"])
++
++
++NUMERIC=("remainder_rms_pct","forward_rms_pct","reverse_rms_pct","full_rms_pct","CF_proper_faces",
++    "CF_proper_face_fraction","CF_proper_pairs","CF_overlap_pairs","CF_unresolved","FF_proper_pairs",
++    "FF_overlap_pairs","FF_illegal_pairs","FF_unresolved","boundary_rms_pct","boundary_p95_pct","boundary_coverage",
++    "narrow_fraction","angle_p05","q_gt10_fraction","q_median","q_p95","EA_CPU_reference","EA_GPU","ER_GPU","area_total",
++    "area_floor_count","zero_area_count","near_degenerate_count","illegal_unique_faces","illegal_q_gt10_faces",
++    "illegal_near_degenerate_faces","illegal_well_shaped_nondegenerate_faces","illegal_q_median","illegal_q_p95",
++    "illegal_area_median","illegal_area_p05","illegal_area_minimum","vertex_count","edge1","edge2",
++    "edge_gt2","edge_components","t_junction_count","vertex_link_nonmanifold","evaluation_seconds")
++
++
++def summarize(results):
++    source=results.get("scores",[])
++    rows=[_metric_row(row) for row in source]
++    rows.sort(key=lambda r:(r["phase"],r["model"],r["variant"],r["parent"],r["seed"]))
++    lookup={(r.get("phase","development"),r["model"],r["variant"],int(r["parent"]),int(r["seed"])):r for r in source}
++    if len(lookup)!=len(source):raise AssertionError("Duplicate method/variant/parent/noise scores")
++    groups=[]
++    for phase in ("development","confirmation"):
++        for model in MODELS:
++            for variant in VARIANTS:
++                for parent in (0,1):
++                    selected=[r for r in rows if (r["phase"],r["model"],r["variant"],r["parent"])==(phase,model,variant,parent)]
++                    if not selected:continue
++                    groups.append(dict(phase=phase,model=model,variant=variant,parent=parent,n=len(selected),
++                        seeds=[r["seed"] for r in selected],statistics={k:_dist([r[k] for r in selected]) for k in NUMERIC},
++                        C_preserved_count=sum(r["C_PRESERVED"] in (True,"PASS","C_PRESERVED") for r in selected),
++                        statuses=[dict(seed=r["seed"],C=r["C_PRESERVED"],closure=r["COMBINATORIAL_CLOSURE_STATUS"],
++                                       embedded=r["EMBEDDED_GEOMETRY_VALIDITY_STATUS"],vertex_link=r["vertex_link_status"]) for r in selected]))
++    comparisons=[]
++    for key,row in lookup.items():
++        phase,model,variant,parent,seed=key
++        targets=[]
++        if model!="G0":targets.append(("guidance_same_layer",(phase,"G0",variant,parent,seed)))
++        if variant=="W":targets.append(("W_same_generation",(phase,model,"Raw",parent,seed)))
++        for kind,base_key in targets:
++            if base_key in lookup:
++                comparisons.append(dict(kind=kind,phase=phase,model=model,variant=variant,parent=parent,seed=seed,
++                    comparator_model=base_key[1],comparator_variant=base_key[2],
++                    comparison=compare_variants(lookup[base_key]["metrics"],row["metrics"])))
++    return dict(schema="gpu_guidance_report_v1",per_output=rows,groups=groups,comparisons=comparisons,
++        trajectory_geometry=_trajectory_geometry(results),status_counts=_status_counts(rows),
++        report_model_calls=0,report_geometry_evaluations=0,report_weld_calls=0,
++        scopes=dict(development="Repeatedly used regression9201..9204",confirmation="New9401..9408, two training parents only"))
++
++
++
++def _status_counts(rows):
++    result={}
++    for phase in ("development","confirmation"):
++        for variant in VARIANTS:
++            subset=[r for r in rows if r["phase"]==phase and r["variant"]==variant]
++            if not subset:continue
++            counts={}
++            for key in ("C_PRESERVED","C_indexing","C_OBJ","COMBINATORIAL_CLOSURE_STATUS",
++                        "EMBEDDED_GEOMETRY_VALIDITY_STATUS","vertex_link_status"):
++                values={}
++                for row in subset:
++                    value=str(row[key]);values[value]=values.get(value,0)+1
++                counts[key]=values
++            result[phase+"/"+variant]=dict(outputs=len(subset),counts=counts)
++    return result
++
++
++def _trajectory_geometry(results):
++    output=[]
++    for phase in ("development","confirmation"):
++        for model in ("GA","GR","GAR"):
++            subset=[r for r in results.get("generated",[]) if r.get("phase")==phase and r.get("model")==model]
++            diagnostic=[]
++            for row in subset:
++                columns=row.get("geometry_diagnostic_columns",[])
++                diagnostic.extend(dict(zip(columns,values)) for values in row.get("geometry_diagnostics",[]))
++            if not diagnostic:continue
++            output.append(dict(phase=phase,model=model,trajectories=len(subset),active_states=len(diagnostic),
++                evaluation_status=dict(A="EVALUATED" if any(r.get("A_evaluated") for r in diagnostic) else "NOT_EVALUATED",
++                    R="EVALUATED" if any(r.get("R_evaluated") for r in diagnostic) else "NOT_EVALUATED"),
++                statistics={key:_dist([r.get(key) for r in diagnostic
++                    if (key not in ("E_A","gradient_A_norm") or r.get("A_evaluated"))
++                    and (key not in ("E_R","gradient_R_norm") or r.get("R_evaluated"))]) for key in
++                    ("E_A","E_R","gradient_A_norm","gradient_R_norm","gradient_combined_norm","clipped_vertex_count",
++                     "clipped_max_vertex_displacement","unclipped_max_vertex_displacement")},
++                defined_cosine=_dist([r["gradient_cosine"] for r in diagnostic if r.get("cosine_defined")]),
++                negative_defined_cosines=sum(r.get("cosine_defined",False) and r["gradient_cosine"]<0 for r in diagnostic),
++                full_generation_seconds=_dist([r["costs"].get("complete_generation_wall_seconds") for r in subset]),
++                model_cuda_seconds=_dist([r["costs"].get("model_cuda_seconds") for r in subset]),
++                geometry_forward_cuda_seconds=_dist([r["costs"].get("geometry_forward_cuda_seconds") for r in subset]),
++                geometry_backward_cuda_seconds=_dist([r["costs"].get("geometry_backward_cuda_seconds") for r in subset])))
++    return output
++
++
++def _group(summary,model,variant,parent,phase="development"):
++    return next((r for r in summary["groups"] if (r["phase"],r["model"],r["variant"],r["parent"])==(phase,model,variant,parent)),None)
++
++
++def _compare_text(summary,model,variant,phase="development"):
++    values=[]
++    for parent in (0,1):
++        a,b=_group(summary,"G0",variant,parent,phase),_group(summary,model,variant,parent,phase)
++        if not a or not b:continue
++        x,y=a["statistics"],b["statistics"]
++        values.append(f"P{parent}({b['n']}条)：R12 {_n(x['remainder_rms_pct']['mean'])}→{_n(y['remainder_rms_pct']['mean'])}%L；"
++            f"窄角面{100*x['narrow_fraction']['mean']:.2f}→{100*y['narrow_fraction']['mean']:.2f}%；"
++            f"CF面{100*x['CF_proper_face_fraction']['mean']:.2f}→{100*y['CF_proper_face_fraction']['mean']:.2f}%；"
++            f"FF非法pairs {_n(x['FF_illegal_pairs']['mean'])}→{_n(y['FF_illegal_pairs']['mean'])}")
++    return "；".join(values) if values else "NOT_RUN / 对应同口径结果未齐。"
++
++
++def _weld_text(summary):
++    text=[]
++    for parent in (0,1):
++        a,b=_group(summary,"G0","Raw",parent),_group(summary,"G0","W",parent)
++        if not a or not b:continue
++        x,y=a["statistics"],b["statistics"]
++        text.append(f"P{parent}原T1经W：顶点数均值{_n(x['vertex_count']['mean'])}→{_n(y['vertex_count']['mean'])}，"
++            f"单关联边{_n(x['edge1']['mean'])}→{_n(y['edge1']['mean'])}，共边连通分量{_n(x['edge_components']['mean'])}→{_n(y['edge_components']['mean'])}；"
++            f"边界RMS {_n(x['boundary_rms_pct']['mean'])}→{_n(y['boundary_rms_pct']['mean'])}%L，"
++            f"FF非法pairs {_n(x['FF_illegal_pairs']['mean'])}→{_n(y['FF_illegal_pairs']['mean'])}")
++    return "；".join(text) if text else "NOT_RUN，未完成G0 Raw和同一W的配对审计。"
++
++
++
++def _actual_findings(results,summary):
++    f=[""]*8
++    if len([r for r in summary["per_output"] if r["phase"]=="development"])!=64:return f
++    def avg(m,p,k):return _group(summary,m,"Raw",p)["statistics"][k]["mean"]
++    energy=lambda m,k:"；".join(f"P{p} {_n(avg('G0',p,k))}→{_n(avg(m,p,k))}" for p in (0,1))
++    f[0]="实测EA下降："+energy("GA","EA_GPU")+"。<5°比例P0只下降0.25个百分点、P1下降2个百分点，两个父对象FF均增加；面形状有改善，几何联合目标未达到。"
++    f[1]="GR的ER下降："+energy("GR","ER_GPU")+"，但两父CF穿刺面率、FF非法pair和整段边界RMS均上升。核能量下降没有转化为真实穿刺减少。"
++    g=next(g for g in summary["trajectory_geometry"] if g["model"]=="GAR" and g["phase"]=="development")
++    c=g["defined_cosine"];d=g["statistics"]
++    f[2]=(f"GAR也未过门槛。80个引导状态的∥gA∥/∥gR∥均值{_n(d['gradient_A_norm']['mean'])}/{_n(d['gradient_R_norm']['mean'])}；"
++        f"{c['n']}个定义余弦均值{_n(c['mean'])}、范围[{_n(c['minimum'])},{_n(c['maximum'])}]，负值{int(g['negative_defined_cosines'])}个。"
++        "局部反向不足以把失败唯一归因于梯度冲突；两父CF比GR更高，FF也未优于G0。")
++    f[3]="W合并了部分近邻，但8个G0+W均未闭合且顶点link均失败；P0/P1非流形顶点均值从0/2升到47.25/59.5。W全部32输出出现14个跨面重复（分布12输出），单面重复index和实际退化为0。不能把局部门禁通过说成全局修复。"
++    f[4]="三种Guidance+W在两个父对象上的CF穿刺面率与FF非法pair均高于G0+W，没有建立联合优势。"
++    f[5]="64/64个Raw/W端点及OBJ保持C，112面/free100；64/64均检出非法相交，组合闭合通过0。Raw顶点link通过16/32（允许边界），W通过0/32。T-junction穷举0仅表示未检出该容差下顶点落在非端点边上的狭义情况，不证明闭合。"
++    costs=[]
++    for g in summary["trajectory_geometry"]:
++        if g["phase"]!="development":continue
++        geo=g["geometry_forward_cuda_seconds"]["mean"]+g["geometry_backward_cuda_seconds"]["mean"]
++        costs.append(f"{g['model']}完整生成{g['full_generation_seconds']['mean']:.4f}s，GPU几何前向+反向{geo:.4f}s")
++    f[6]="三组均未过Raw门槛，9401–9408没有生成，不能宣称新噪声复现。"+"；".join(costs)+"（均值）。G0仅两次重放，不能作稳定加速比。"
++    f[7]="建议停止在当前参数下扩大GA/GR/GAR修复验证：实现与确定性通过，几何联合收益未建立。先定位合法接触与整体拓扑约束的表达；其他训练支持/模块的收益仍未测试，本轮不自动转向。"
++    return f
++
++
++def _answers(results,summary):
++    selection=results.get("selection",results.get("promotion",{}))
++    confirmation=results.get("confirmation",{})
++    selected=confirmation.get("candidate",selection.get("candidate"))
++    actual=_actual_findings(results,summary)
++    answers=[
++        ("1. 形状能量只降数值，还是改善实际面质量且保持几何？",_compare_text(summary,"GA","Raw")+
++         "。q、<5°面比例、angle p05、真实退化和R12分别列出；EA降低不替代实际质量或几何保持。面积下限触发不等于实际退化。"),
++        ("2. 顶点核和7点核的盲区；GR是否减少真实相交？",_compare_text(summary,"GR","Raw")+
++         "。三个顶点远离有限面时顶点核会漏掉面内部穿刺；7个固定样点仍只是一种离散表面偏置，不能证明所有交线都被捕获。"
++         "恰在表面时核最大而梯度可为零，合法接触也可能被排斥；实际探针及GT相容性记录另列。GR没有CPU整面分离或验收门禁。"),
++        ("3. GAR组合是否更好，是否有相反作用或代价？",_compare_text(summary,"GAR","Raw")+
++         "。下表同时保留GA/GR/GAR，合梯度仅共用一次rho；逐步两项梯度范数和余弦由GPU诊断记录，不能预设正交或协同。"),
++        ("4. W在原T1上解决了多少连接问题？",_weld_text(summary)+
++         "。减少顶点数、边界边或组件可说明部分坐标错位被合并，不能自动说明一般T-junction、缺失面连接或非法相交已解决；"
++         "顶点link、边关联和完整静态相交独立检查。没有删面、补洞或重三角化。"),
++        ("5. Guidance+W是否优于同样W处理后的G0？", "GA+W："+_compare_text(summary,"GA","W")+"；GR+W："+
++         _compare_text(summary,"GR","W")+"；GAR+W："+_compare_text(summary,"GAR","W")+
++         "。这里基准始终是G0+W；没有把W自身收益归给Guidance。"),
++        ("6. 最终C、面数、闭合、顶点流形和无相交分别如何？",
++         "逐输出三标签与拓扑状态见后表。C坐标评分、生成51态保持及OBJ读回保持分开；面数固定112/100。"
++         "所有边关联数为2不替代顶点link和相交审计。NO_ILLEGAL_TRIANGLE_INTERSECTIONS_DETECTED只指声明容差下的静态完整pair检查，CCD仍NOT_RUN。"),
++        ("7. 新噪声复现了吗？真实额外成本是多少？",
++         f"确认状态：{confirmation.get('status','NOT_RUN')}；唯一选择：{selected}。"
++         +(_compare_text(summary,selected,"Raw","confirmation") if selected else "未选中候选时不执行新噪声，不强选不合格的最好组。")+
++         "。模型、GPU几何前向/坐标反向、D2H、W/导出/离线审计分列；未预设任何毫秒或显存指标。"),
++        ("8. 下一步证据支持什么？",
++         "依预登记Raw门槛判断本轮GPU能量是否值得独立验证，不能靠+W图或单个噪声改选。"
++         "若未通过，说明当前固定参数下未建立实用收益；边界标记、训练支持的上下文Guidance和神经细化均未在本轮测试，不能宣称已经胜出。"
++         "到本轮预算或门禁停止，不新增训练、改阈值或修补到过线。")]
++    return [(title,actual[index]+text) for index,(title,text) in enumerate(answers)]
++
++
++
++def _configuration_lines(results):
++    gates=results.get("gates",{});strict=gates.get("strict_load",{})
++    initial,final=gates.get("initial_state_hash"),gates.get("final_state_hash")
++    protection=results.get("protection",{})
++    compact_protection={k:{kk:vv for kk,vv in v.items() if kk not in ("files_detail","records","before","after")}
++        for k,v in protection.items() if k!="metadata_before" and isinstance(v,dict)}
++    # File dictionaries can be large; only statuses/counts and explicit differences
++    # belong in prose. All original records remain in the sole results JSON.
++    protection_rows=[]
++    for name,v in compact_protection.items():
++        protection_rows.append([name,v.get("status"),v.get("files",v.get("count",v.get("checked"))),v.get("changed",v.get("failures",[]))])
++    rows=[
++        ["protocol SHA256",results.get("protocol_sha256")],
++        ["checkpoint SHA256",_get(results,"assets","checkpoint","sha256")],
++        ["strict load",strict.get("status")],
++        ["missing / unexpected",str(strict.get("missing_keys"))+" / "+str(strict.get("unexpected_keys"))],
++        ["参数总数 / 可训练数",str(strict.get("parameter_count"))+" / "+str(strict.get("trainable_parameter_count"))],
++        ["state before",initial],["state after",final],
++        ["state hash equality",None if initial is None or final is None else initial==final],
++        ["原入口与预校验入口逐位一致",gates.get("original_forward_equivalence")],
++        ["几何图仅当前free叶子",gates.get("geometry_graph")],
++        ["实际运行时配置",gates.get("runtime")],
++        ["Git起始状态",results.get("initial_git_status")],
++        ["资源观测",results.get("resource_snapshot")],["实际环境版本",results.get("actual_environment_versions")],
++    ]
++    replay_rows=[[q.get("parent"),q.get("seed"),q.get("all51_bitwise_equal_to_archive"),q.get("status"),
++                  _get(q,"costs","complete_generation_wall_seconds")] for q in gates.get("G0_replays",[])]
++    repeat=gates.get("guided_repeat",{})
++    return ["## 实际入口、版本与冻结门禁","",_table(["实测项","记录"],rows),"",
++        _table(["G0重放父","seed","51态逐位一致","状态","完整生成秒"],replay_rows),"",
++        "引导重复：51态逐位一致="+str(repeat.get("all51_bitwise_equal"))+
++        "；GPU诊断逐位一致="+str(repeat.get("geometry_diagnostics_bitwise_equal"))+"。", "",
++        _table(["保护范围","状态","文件数","变化/失败"],protection_rows),"",
++        "模型、积分和C沿用原FP32坐标；仅几何能量临时使用Y=X/L、C/L，位移再乘L返回原坐标。几何反向只针对当前free坐标。C逐位复写属于构造约束，"
++        "不能被解释为模型学习到了精确已知面。历史文件保护、冻结模型状态和原入口复现分别核对。",""]
++
++
++def _probe_lines(results):
++    probes=results.get("probes",{});energy=probes.get("energy_fixed",{});weld=probes.get("weld_fixed",{})
++    gt=probes.get("GT_compatibility",{})
++    fixture_map={x["name"]:x for x in energy.get("fixtures",[])}
++    named=[("vertex_miss_seven_points_detect","顶点漏检、七点激活"),
++           ("both_vertex_and_seven_points_miss","两种固定点库均近零响应"),
++           ("surface_kernel_maximum_zero_gradient","恰在表面：能量最大、梯度零"),
++           ("legal_shared_edge","合法共享边也受力"),("legal_90_degree_fold","合法90度折角也受力")]
++    probe_rows=[]
++    for key,label in named:
++        f=fixture_map.get(key)
++        if f is None:continue
++        observed=f.get("seven_point",f.get("observed",{}))
++        probe_rows.append([label,f.get("status"),f.get("vertex_energy"),
++            _get(observed,"terms","E_R"),_get(observed,"gradients","norm_R"),
++            _get(f,"intersection","classification")])
++    return ["## 数学、数值与GT相容性探针","",
++        "固定能量探针状态："+str(energy.get("status","NOT_RUN"))+
++        "；保护W探针状态："+str(weld.get("status","NOT_RUN"))+
++        "；离线评分helper："+str(_get(probes,"evaluation_helpers","status"))+"。"
++        "每个固定探针的CPU FP64/实际GPU FP32值、有限差分、刚体/尺度/排列核验、零梯度和合法接触结果都保留在JSON与fixed_probes.npz，未选择性删去失败样例。","",
++        _table(["训练对象GT","EA","ER","∥gA∥","∥gR∥","q>10面","floor面","共享顶点槽","共享槽gR RMS/max"],
++            [[p,v.get("E_A"),v.get("E_R"),v.get("gradient_A_norm"),v.get("gradient_R_norm"),v.get("q_above_cut_count"),
++              v.get("area_floor_count"),v.get("shared_vertex_count"),
++              f"{_n(v.get('shared_vertex_gradient_R_RMS'))}/{_n(v.get('shared_vertex_gradient_R_max'))}"] for p,v in sorted(gt.items())]),"",
++        _table(["固定反例","探针状态","顶点核E","七点ER","七点梯度范数","独立判交"],probe_rows),"",
++        "反例PASS表示成功复现已声明局限，并非几何修复成功。两种点库漏检例在FP64中的极小值也可能在FP32下下溢为零。"
++        "等边穿刺例EA=0；重合退化例在数值下限政策下也不能依赖EA复活。降低核能量后仍穿刺的独立反例已保留。","",
++        "GT探针只检查势能是否会偏离合法原始几何，GT及其梯度绝不传入采样器或W。"
++        "离面核并不区分非法穿刺与合法接触；共享位置处单个距离项导数为零，也不保证与该点相连整面的总梯度为零。",""]
++
++
++
++def _energy_and_shape_lines(summary):
++    return ["## 实际端点能量、相交面质量与GPU梯度","",
++        _table(["组/层/父","EA GPU均值","ER GPU均值","角度p05均值","非法free面均值","其中q≤10且非近退化","非法面q中位/p95均值","非法面面积/L²中位/p05均值"],
++            [[f"{g['model']}/{g['variant']}/P{g['parent']}",g['statistics']['EA_GPU']['mean'],g['statistics']['ER_GPU']['mean'],
++              g['statistics']['angle_p05']['mean'],g['statistics']['illegal_unique_faces']['mean'],
++              g['statistics']['illegal_well_shaped_nondegenerate_faces']['mean'],
++              f"{_n(g['statistics']['illegal_q_median']['mean'])}/{_n(g['statistics']['illegal_q_p95']['mean'])}",
++              f"{_n(g['statistics']['illegal_area_median']['mean'])}/{_n(g['statistics']['illegal_area_p05']['mean'])}"] for g in summary['groups']]),"",
++        "这是每条输出分布统计的噪声均值，不是把所有面混池计算。G0 Raw中P0/P1平均93/91.25张非法面，"
++        "其中92/84.5张q≤10且非近退化；相交并非全由极差小面构成，也没有安全删面的证据。","",
++        _table(["阶段/组","状态数","∥gA∥/∥gR∥均值","合梯度均值","定义余弦n/均值/范围","负余弦数","截断顶点均值"],
++            [[g['phase']+'/'+g['model'],g['active_states'],
++              f"{_n(g['statistics']['gradient_A_norm']['mean']) if g['model']!='GR' else 'NOT_EVALUATED'}/{_n(g['statistics']['gradient_R_norm']['mean']) if g['model']!='GA' else 'NOT_EVALUATED'}",
++              g['statistics']['gradient_combined_norm']['mean'],
++              f"{g['defined_cosine']['n']}/{_n(g['defined_cosine']['mean'])}/[{_n(g['defined_cosine']['minimum'])},{_n(g['defined_cosine']['maximum'])}]",
++              int(g['negative_defined_cosines']),g['statistics']['clipped_vertex_count']['mean']] for g in summary['trajectory_geometry']]),"",
++        "GA未评估R项、GR未评估A项；原始日志的占位0不被当作能量为零的观测。余弦只汇总定义的状态，"
++        "夹角不足以直接预测整体网格或积分终点效果。","",
++        "三标签分层计数：\x60"+json.dumps(summary['status_counts'],ensure_ascii=False)+"\x60。",""]
++
++
++def _weld_cost_lines(results):
++    return ["## W、OBJ与独立CPU审计成本","",
++        _table(["阶段/组/父/seed","接受/拒绝","最大位移","W算子秒","精确索引秒","调用墙钟秒","OBJ往返秒","拓扑秒","C构造/OBJ"],
++            [[f"{x.get('phase')}/{x.get('model')}/P{x.get('parent')}/{x.get('seed')}",
++              f"{_get(x,'audit','accepted_merges')}/{_get(x,'audit','rejected_merges')}",
++              _get(x,'audit','max_coordinate_displacement'),_get(x,'audit','operator_seconds'),_get(x,'audit','indexing_seconds'),
++              x.get('operator_seconds'),x.get('index_export_seconds'),x.get('topology_audit_seconds'),
++              str(_get(x,'audit','C_PRESERVED'))+" / "+str(_get(x,'export','C_PRESERVED'))] for x in results.get('weld',[])]),"",
++        "W算子内部计时与外层调用墙钟、精确索引/OBJ导出/CPU拓扑审计各有口径，不能直接相加重复计费。"
++        "每条输出的独立几何/表面审计秒数保留在offline_summary；表格最大位移使用原模型坐标单位，协议上限为.001L。",""]
++
++
++def render_report(results,summary,figures):
++    lines=["# Native T1：纯GPU几何引导与保护已知面的焊接验证","",
++        f"状态：**{results.get('status','UNKNOWN')}**。Raw引导与固定W后处理分层比较；所有统计来自已保存输出，不根据图片挑噪声。",
++        "9201–9204是已反复使用的开发噪声；确认9401–9408只检验两个训练父对象上的新噪声稳健性。"
++        "L为已有完整对象bbox元数据，尚未验证只有C且未知完整尺度的部署。","",
++        "新增训练更新、模型参数更新和主干反向的实际计数见账本；本轮没有上下文Guidance、边界embedding、神经去噪器或Phase3。",""]
++    for title,text in _answers(results,summary):lines += ["## "+title,"",text,""]
++    lines += _configuration_lines(results)+_probe_lines(results)+_energy_and_shape_lines(summary)
++    if results.get("failure") or results.get("error"):
++        lines += ["实际停止/失败：`"+str(results.get("failure",results.get("error")))+"`。未运行项不假造结论。",""]
++    lines += ["## 参数、资产与实现范围","",
++        "GA：q=三边平方和/(4√3面积)，q_cut=10；规范面积分母下限1e-10，log的q下限1e-12。"
++        "另报精确零面积、规范面积≤1e-12近退化、面积<1e-10触发下限，三者不混为一谈。",
++        "GR：有限C三角形距离，3顶点+3边中点+质心等权7点，sigma=.005；min为分段可微，不是光滑碰撞屏障。"
++        "k40–49才开启，dt=.02，lambda=1，单顶点截断rho=.001L；GAR合梯度共用上限。"
++        "W容差=.001L，保护C坐标，不经GT选择锚点/代表点，不删面、补洞或改变面剖分。", "",
++        "[冻结参数](protocol.json)、[确认前候选选择记录](selection.json)、[实际代码diff](code.diff)及[唯一结果JSON](results.json)。"
++        "没有选择阶段或执行中断时，相应文件/字段以实际记录为准，不宣称已通过。", "",
++        "## Raw与同一W分层结果","",
++        _table(["阶段/组/层/父","n","R12均值/中位 %L","CF面%","CF对/共面","FF非法/未定","Gamma RMS/p95 %L","覆盖%","<5°面%","q>10面%"],
++            [[f"{x['phase']}/{x['model']}/{x['variant']}/P{x['parent']}",x['n'],
++              f"{_n(x['statistics']['remainder_rms_pct']['mean'])}/{_n(x['statistics']['remainder_rms_pct']['median'])}",
++              100*x['statistics']['CF_proper_face_fraction']['mean'],
++              f"{_n(x['statistics']['CF_proper_pairs']['mean'])}/{_n(x['statistics']['CF_overlap_pairs']['mean'])}",
++              f"{_n(x['statistics']['FF_illegal_pairs']['mean'])}/{_n(x['statistics']['FF_unresolved']['mean'])}",
++              f"{_n(x['statistics']['boundary_rms_pct']['mean'])}/{_n(x['statistics']['boundary_p95_pct']['mean'])}",
++              100*x['statistics']['boundary_coverage']['mean'],100*x['statistics']['narrow_fraction']['mean'],100*x['statistics']['q_gt10_fraction']['mean']]
++             for x in summary['groups']]),"",
++        "CF/FF主计数保持原primary分类口径，同时完整保存independent与verified分类；有分歧或近退化时UNRESOLVED不被归为无交。"
++        "CF百分比分母为100张free面，pair数另列；整段Gamma coverage阈值1e-3L，p95按长度加权。", "",
++        "## 逐输出质量、几何与三标签","",
++        _table(["阶段/组/层/父/seed","R12 %L","free→GT / GT→free","全表面 %L","q中位/p95","面积floor/零/近退化","C","组合闭合","嵌入几何","vertex link"],
++            [[f"{x['phase']}/{x['model']}/{x['variant']}/P{x['parent']}/{x['seed']}",x['remainder_rms_pct'],
++              f"{_n(x['forward_rms_pct'])}/{_n(x['reverse_rms_pct'])}",x['full_rms_pct'],f"{_n(x['q_median'])}/{_n(x['q_p95'])}",
++              f"{x['area_floor_count']}/{x['zero_area_count']}/{x['near_degenerate_count']}",x['C_PRESERVED'],
++              x['COMBINATORIAL_CLOSURE_STATUS'],x['EMBEDDED_GEOMETRY_VALIDITY_STATUS'],x['vertex_link_status']]
++             for x in summary['per_output']]),"",
++        _table(["阶段/组/层/父/seed","顶点数","边1/2/>2","共边组件","T-junction数/范围","非流形顶点","一致定向","相交面数","其中q≤10且非近退化"],
++            [[f"{x['phase']}/{x['model']}/{x['variant']}/P{x['parent']}/{x['seed']}",x['vertex_count'],
++              f"{x['edge1']}/{x['edge2']}/{x['edge_gt2']}",x['edge_components'],
++              str(x['t_junction_count'])+' / '+str(x['t_junction_status']),x['vertex_link_nonmanifold'],x['orientation_status'],
++              x['illegal_unique_faces'],x['illegal_well_shaped_nondegenerate_faces']] for x in summary['per_output']]),"",
++        "相交面面积与q的完整分布在JSON中。出现q≤10且非近退化的相交面会反驳‘所有相交都来自极差小面’的简化假设；"
++        "即使某面很差，也没有证明可安全删除。本轮没有prune。", "",
++        "## 配对比较与候选冻结","",
++        _table(["比较/阶段/组/层/父/seed","R12 Δ百分点","窄角比例Δ","Gamma RMS Δ","新CF proper","新FF proper","新FF共面"],
++            [[f"{x['kind']}/{x['phase']}/{x['model']}/{x['variant']}/P{x['parent']}/{x['seed']}",
++              x['comparison']['remainder_RMS_difference'],x['comparison']['narrow_fraction_difference'],x['comparison']['boundary_RMS_difference'],
++              len(x['comparison']['pair_set_turnover']['CF']['primary']['proper_pairs']['added']),
++              len(x['comparison']['pair_set_turnover']['FF']['primary']['proper_pairs']['added']),
++              len(x['comparison']['pair_set_turnover']['FF']['primary']['coplanar_overlap_pairs']['added'])] for x in summary['comparisons']]),"",
++        "guidance_same_layer在Raw上比较G0 Raw、在W上比较G0+W；W_same_generation比较同一Raw前后。"
++        "新增与移除pair集合同时保留，不能用总数下降掩盖替换出的新相交。W候选没有全局碰撞接受门禁。", "",
++        "选择记录：`"+json.dumps(results.get('selection',results.get('promotion',{})),ensure_ascii=False)+"`。"
++        "只用Raw门槛决定候选；先冻结selection，再读取确认结果，不能由后处理或确认图反向选参数。", "",
++        "## 同噪声自由部分绑定","",
++        _table(["阶段/组/层/seed","R0/C0","R0/C1","R1/C0","R1/C1","方向0/1","双正"],
++            [[f"{x.get('phase')}/{x.get('model')}/{x.get('variant')}/{x.get('seed')}",_get(x,'metrics','E_R0_F_C0'),_get(x,'metrics','E_R0_F_C1'),
++              _get(x,'metrics','E_R1_F_C0'),_get(x,'metrics','E_R1_F_C1'),
++              f"{_n(_get(x,'metrics','direction0_bbox_percentage_points'))}/{_n(_get(x,'metrics','direction1_bbox_percentage_points'))}",
++              _get(x,'metrics','both_directions_positive')] for x in results.get('binding',[])]),"",
++        "同一输出固定free集合在两个目标间评分，无重新配面，GT只用于评价。", "",
++        "## 实测成本与调用账本","",
++        _table(["阶段/组/父/seed","模型CUDA秒","能量前向秒","坐标反向秒","总CUDA秒","setup秒","循环墙钟秒","完整生成秒","最终D2H秒","Torch峰值GiB"],
++            [[f"{x.get('phase')}/{x.get('model')}/P{x.get('parent')}/{x.get('seed')}",
++              _get(x,'costs','model_cuda_seconds'),_get(x,'costs','geometry_forward_cuda_seconds'),_get(x,'costs','geometry_backward_cuda_seconds'),
++              _get(x,'costs','total_cuda_seconds'),_get(x,'costs','setup_wall_seconds'),_get(x,'costs','wall_seconds'),
++              _get(x,'costs','complete_generation_wall_seconds'),_get(x,'costs','final_D2H_seconds'),
++              None if _get(x,'costs','peak_cuda_allocated') is None else x['costs']['peak_cuda_allocated']/2**30]
++             for x in results.get('generated',[])]),"",
++        "完整生成墙钟包括setup、50步循环和最终D2H，不包含随后NPZ写盘；loop wall另列。"
++        "CUDA event为设备时间跨度，可能包含主机发射间隙，不是进程CPU时间。GPU几何不等于零CPU调度。"
++        "采样器没有逐步显式张量标量读回或CPU几何；原主干bool索引可能隐式同步，未单独profile。"
++        "模型CPU dispatch未单独profile；CUDA event、完整墙钟、D2H和CPU后处理不可混算。"
++        "峰值为Torch CUDA已分配内存，不是整个进程或驱动内存。预热、测试、重放、重复调用与正式样本分账。", "",
++        _table(["实际计数","值"],[[key,value] for key,value in results.get('counts',{}).items() if not isinstance(value,(dict,list))]),"",
++        "几何能量账本（采样、探针、预热、离线端点分域）：`"+json.dumps(results.get('geometry_ledger',{}),ensure_ascii=False)+"`。", "",
++        "CPU独立判交/评分账本：`"+json.dumps(results.get('evaluation_ledger',{}),ensure_ascii=False)+"`。", "",
++        "预热分账：`"+json.dumps(results.get('warmup',{}),ensure_ascii=False)+"`。开发实现检查分账：`"+json.dumps(results.get('implementation_development_counts',{}),ensure_ascii=False)+"`。", "",
++        "主干前向类别分账：`"+json.dumps(_get(results,'counts','forward_by_category'),ensure_ascii=False)+"`。完整生成类别分账：`"+json.dumps(_get(results,'counts','completed_by_category'),ensure_ascii=False)+"`。", "",
++        "W处理、索引/OBJ导出与独立拓扑/几何评分耗时在weld逐输出记录分别保留；没有把它们混进GPU完整生成时间。", "",
++        "## 固定图与停止", ""]
++    lines += _weld_cost_lines(results)
++    for figure in figures:lines += [f"![固定两对象seed9201 Raw/+W及free-only]({Path(figure['path']).name})","",f"SHA256：`{figure['sha256']}`。",""]
++    if not figures:lines += ["固定图NOT_RUN：未形成必要输出，不挑其他seed替代。",""]
++    lines += ["图只读取存档NPZ和已存相交记录；蓝色C、红色CF proper、紫色CF共面、橙色线框为FF非法涉及面。"
++        "free-only行不叠C，所有组/层共享相机和完整范围，不遮盖差例。",
++        "本轮新增训练更新=0、模型参数更新=0、主干反向=0；没有删面、补洞或改写已知面，不启动Phase3。"
++        "按实际门禁和固定预算停止，不自动加训练、改阈值或追加修补。",""]
++    return "\n".join(lines)
++
++
++def _read_output(path,C):
++    with np.load(path,allow_pickle=False) as archive:
++        key=next((k for k in ('output','triangles','full','raw') if k in archive),None)
++        if key is None and 'vertices' in archive and 'faces' in archive:
++            value=archive['vertices'][archive['faces']]
++        elif key is None:raise KeyError(f"No mesh coordinate array in {path}")
++        else:value=archive[key]
++        value=np.asarray(value).reshape(112,3,3).copy()
++    if not np.array_equal(value[:12],C):raise AssertionError("Fixed plot input does not preserve C")
++    return value
++
++
++def fixed_figure(results,out,bank):
++    import matplotlib
++    matplotlib.use('Agg')
++    import matplotlib.pyplot as plt
++    from mpl_toolkits.mplot3d.art3d import Line3DCollection,Poly3DCollection
++    score_rows=[x for x in results.get('scores',[]) if x.get('phase','development')=='development' and x['seed']==9201]
++    meshes={};metadata={}
++    for row in score_rows:
++        parent,model,variant=int(row['parent']),row['model'],row['variant']
++        path=row.get('output_path',row.get('welded_path'))
++        if variant=='W' and path is None:
++            wr=next((x for x in results.get('weld',[]) if x.get('phase','development')=='development' and
++                     (int(x['parent']),x['model'],x['seed'])==(parent,model,9201)),None)
++            if wr:path=wr.get('welded_path',wr.get('output_path'))
++        if variant=='Raw':path=path or row.get('raw_path')
++        if path is None:continue
++        C=np.asarray(bank['cases_by_key'][(parent,12)]['constraints'])
++        key=parent,model,variant
++        meshes[key]=_read_output(path,C);metadata[key]=row
++    if not meshes:return None
++    points=np.concatenate([v.reshape(-1,3)[:,[0,2,1]] for v in meshes.values()])
++    low,high=points.min(0),points.max(0);center=(low+high)/2;radius=max(float((high-low).max())*.55,1e-6)
++    fig=plt.figure(figsize=(27,15),constrained_layout=True)
++    for parent in (0,1):
++        for part in (0,1):
++            for model_index,model in enumerate(MODELS):
++                for vi,variant in enumerate(VARIANTS):
++                    column=model_index*2+vi;row_index=parent*2+part
++                    ax=fig.add_subplot(4,8,row_index*8+column+1,projection='3d')
++                    key=parent,model,variant
++                    if key not in meshes:
++                        ax.text2D(.12,.5,'NOT_RUN',transform=ax.transAxes,fontsize=11)
++                    else:
++                        full=meshes[key][:,:,[0,2,1]];metrics=metadata[key]['metrics']
++                        views=metrics['gpu_guidance_evaluation']['detector_views']
++                        cf=views['CF']['primary'];ff=views['FF']['primary']
++                        ff_faces={int(i)+12 for kind in ('proper_pairs','coplanar_overlap_pairs') for pair in ff[kind] for i in pair}
++                        ids=list(range(112)) if part==0 else list(range(12,112));tri=full[ids]
++                        colors=['#df8c25' if index in ff_faces else '#73838d' for index in ids]
++                        widths=[.8 if index in ff_faces else .5 for index in ids]
++                        ax.add_collection3d(Line3DCollection(np.concatenate([tri,tri[:,:1]],axis=1),colors=colors,linewidths=widths,alpha=.80))
++                        if part==0:ax.add_collection3d(Poly3DCollection(full[:12],facecolors='#438acf',edgecolors='#205a8c',alpha=.3))
++                        for name,color in (('proper_pairs','#e22b30'),('coplanar_overlap_pairs','#ce28c9')):
++                            faces=sorted({int(pair[1])+12 for pair in cf[name]})
++                            if faces:ax.add_collection3d(Poly3DCollection(full[faces],facecolors=color,edgecolors=color,alpha=.50,linewidths=.6))
++                    ax.set_xlim(center[0]-radius,center[0]+radius);ax.set_ylim(center[1]-radius,center[1]+radius);ax.set_zlim(center[2]-radius,center[2]+radius)
++                    ax.set_box_aspect((1,1,1));ax.view_init(elev=24,azim=-54);ax.set_axis_off()
++                    ax.set_title(f'P{parent} | {model} {variant} | '+('full' if part==0 else 'free only'),fontsize=10)
++    fig.suptitle('Fixed regression seed9201: all four methods, Raw and identical protected weld W\nBlue=C (hidden in free rows); red=CF proper; magenta=CF overlap; orange wires=FF illegal faces. Same view and bounds.',fontsize=14)
++    path=Path(out)/'fixed_P0_P1_seed9201_Raw_W_full_free.png'
++    if path.exists():raise FileExistsError(path)
++    fig.savefig(path,dpi=145);plt.close(fig)
++    return dict(path=str(path),sha256=hashlib.sha256(path.read_bytes()).hexdigest(),parents=[0,1],seed=9201,
++        models=list(MODELS),variants=list(VARIANTS),full_and_free_only=True,
++        camera=dict(elevation=24,azimuth=-54),display_axes=['X','Z','Y'],shared_center=center.tolist(),shared_radius=radius,
++        plotted_keys=[list(key) for key in meshes],no_geometry_rerun=True,coordinates_modified=False,model_calls=0)
++
++
++def deliver_report(results,out,bank):
++    out=Path(out).resolve()
++    if out.parent!=Path(__file__).resolve().parent/'outputs' or not out.name.startswith('gpu_guidance_and_protected_weld_') or not out.is_dir():
++        raise ValueError('Require current isolated GPU-guidance output')
++    path=out/'GPU_GUIDANCE_AND_PROTECTED_WELD_REPORT.md'
++    if path.exists():raise FileExistsError(path)
++    summary=summarize(results)
++    figure=fixed_figure(results,out,bank)
++    figures=[] if figure is None else [figure]
++    text=render_report(results,summary,figures)
++    if '\ufffd' in text:raise AssertionError('Bad Unicode in report')
++    path.write_text(text,encoding='utf-8')
++    return dict(report=dict(path=str(path),sha256=hashlib.sha256(path.read_bytes()).hexdigest()),
++        figures=figures,offline_summary=summary,report_model_calls=0,report_geometry_calls=0,report_weld_calls=0)
+diff --git a/experiments/mf_h1_local0/gpu_guidance_run.py b/experiments/mf_h1_local0/gpu_guidance_run.py
+new file mode 100755
+index 0000000..a2ed5b5
+--- /dev/null
++++ b/experiments/mf_h1_local0/gpu_guidance_run.py
+@@ -0,0 +1,440 @@
++﻿"""Fixed-budget, zero-training GPU guidance and protected-weld experiment."""
++from .stable_runtime import configure_stable_runtime
++import argparse,copy,gc,hashlib,json,platform,subprocess,time,traceback
++from pathlib import Path
++import numpy as np
++import torch
++import yaml
++from .guided_native_geometry_run import (PROJECT,REPO,SOURCE,CHECKPOINT,CONFIG,EXPECTED_CHECKPOINT_SHA,
++    EXPECTED_STATE_SHA,prepare_assets,record,verify_records,assert_frozen)
++from .official_wrapper import state_sha256
++from .learning_data import array_hash as archive_hash
++from .gpu_guidance_sampling import PrevalidatedNative,sample_gpu,masks,integrate,clip_displacement
++DEV=(9201,9202,9203,9204);CONF=tuple(range(9401,9409));MODES=('G0','GA','GR','GAR')
++AUTH=Path('/mnt/c/Users/warpwang/.codex/attachments/039ebd4f-1c76-413b-8807-4e49320fd3b7/Pasted text.txt')
++
++
++def save(path,value):
++    tmp=Path(path).with_suffix('.tmp');tmp.write_text(json.dumps(value,indent=2,allow_nan=False),encoding='utf-8');tmp.replace(path)
++
++def protection(out):
++    paths=[p for p in (PROJECT/'outputs').rglob('*') if p.is_file() and not p.is_relative_to(out)]
++    paths.extend(p for p in PROJECT.glob('*.py') if not p.name.startswith('gpu_guidance_'))
++    paths.extend((REPO/'models').rglob('*.py'));paths.extend([CONFIG,Path('/mnt/c/Users/warpwang/Downloads/last.pt')])
++    return {str(p):dict(bytes=p.stat().st_size,mtime_ns=p.stat().st_mtime_ns) for p in sorted(set(paths))}
++
++
++def protocol():
++    return dict(schema='gpu_guidance_protected_weld_v1',authorization=record(AUTH),checkpoint_sha256=EXPECTED_CHECKPOINT_SHA,
++        N=112,K=12,N_free=100,development_seeds=list(DEV),confirmation_seeds=list(CONF),
++        seed_prior_scan=dict(scope='Project existing py/md/json',numeric_matches='9408 file byte sizes and9402 broadphase count; not seeds',seed_or_noise_context_matches=0),
++        geometry=dict(normalization='Y=current free Xt/L; Cnorm=C/L for calculations only',dtype='FP32 CUDA, autocast disabled',
++            q_formula='sum squared edge lengths/(4*sqrt(3)*area)',q_cut=10.,area_floor=1e-10,q_min=1e-12,
++            actual_near_degenerate_area_normalized=1e-12,distance_denominator_floor=1e-30,
++            EA='mean(.5*relu(log(q/10))**2)',ER='mean(exp(-minimum finite triangle distance squared/.005**2))',
++            sigma=.005,sample_barycentric='3 corners,3 edge midpoints,centroid; all1/7 differentiable',
++            GAR='EA+ER; sum separately computed component gradients; one combined clipping budget',
++            lambda_before_k40=0.,lambda_k40_through49=1.,dt=.02,steps=50,rho_fraction=.001,
++            FP32_clip_comparison_relative_tolerance=1e-6,no_backtracking=True,no_collision_acceptance=True),
++        numerical_probe_tolerances=dict(FP64_finite_difference_step=1e-6,FP64_atol=2e-7,FP64_rtol=2e-4,
++            FP32_energy_atol=2e-6,FP32_energy_rtol=2e-5,FP32_gradient_atol=2e-5,FP32_gradient_rtol=2e-3,
++            actual_guided_repeat='Bitwise entire51-state equality required'),
++        native_execution=dict(CUBLAS_WORKSPACE_CONFIG=':4096:8',deterministic=True,warn_only=False,TF32=False,SDPA='math',
++            model_autocast='BF16',parameters_C_noise_states='FP32',frozen_eval=True,
++            prevalidated_wrapper='Identical native arithmetic; immutable y/mask value checks before timing, identity/version guards during loop; original source unchanged',
++            original_vs_prevalidated_same_input_equivalence='Bitwise required',G0_replays='P0/P1 seed9201 entire51 states bitwise'),
++        warmup=dict(extra_model_equivalence_forwards=2,extra_model_warmup_forwards=2,
++            extra_geometry_warmup='2 invocations each GA/GR/GAR on archived P0k40;6 energy forwards and8 coordinate backwards',
++            repeated_trajectory='Formal GAR/P0/9201 reused first, exactly1 additional complete repeat maximum'),
++        budgets=dict(new_full_generations=59,development=24,baseline_replay=2,guided_repeat=1,confirmation=32,
++            full_generation_model_forwards_max=2950,extra_model_forwards=4,total_model_forwards_max=2954,
++            model_backwards=0,model_parameter_updates=0,optimizer_updates=0),
++        weld=dict(epsilon_fraction=.001,protected_coordinates='Only exact FP32 bit patterns share index; distinct C never tolerance-merged',
++            anchor_tie='Nearest distance then lexicographic protected coordinate; no arbitrary face-ID anchor choice',
++            free_order='Coordinate lexicographic, then unoriented incident triangle geometry, ordinal only for geometrically identical corners',
++            free_clustering='Nearest fixed representative within epsilon, lexicographic ties; representative never moves; rejected point becomes own representative',
++            local_guards=['No protected-coordinate conflict','No repeated face indices','No new area<=1e-12L squared','Normal dot originalRaw >0'],
++            global_collision_guard=False,GT_inputs=False,no_hole_filling=True,no_face_deletion=True,no_edge_splitting=True),
++        audit=dict(static_C_C='Each parent66 unique pairs once, then hash-checked static reuse',
++            C_free='All1200 pairs per endpoint',free_free='All4950 unique pairs per endpoint',
++            topology='Exact indexed edges,link,orientation,components,duplicates,Tjunction scope explicitly recorded',
++            CCD='NOT_RUN',scale_scope='Known object full bbox metadata; unknown-full-scale deployment NOT_RUN'),
++        selection=dict(raw_only=True,raw_R12_parent_mean_max_ratio=1.05,no_added_degenerate_or_nonfinite=True,C_preserved=True,
++            option_a='Both parents CF affected-face fraction decreases>=25% and mean FF illegal pairs does not increase',
++            option_b='Both parents free min-angle<5deg face fraction decreases>=.02 and mean CF affected-face fraction and FF illegal pairs do not increase',
++            tie_order=['Macro CF affected-face fraction','Macro FF illegal pairs','Macro R12 symmetric RMS','Measured full-generation wall time'],
++            at_most_one=True,save_selection_before_confirmation=True),
++        output_scope='One report/results/code.diff,protocol.json/selection.json,fixed fixtures,raw/W output and fixedseed9201 figures',
++        confirmed_absences=['No training','No context guidance','No boundary embedding','No backbone backward','No GT sampling gradient','No Phase3'])
++
++
++def initialize(out):
++    if out.exists():raise FileExistsError(out)
++    out.mkdir(parents=True);p=protocol();save(out/'protocol.json',p)
++    counts=dict(model_forward_attempts=0,model_forward_returns=0,model_backward_calls=0,optimizer_updates=0,model_parameter_updates=0,
++        forward_by_category={},generation_attempts=0,complete_generations=0,generation_attempts_by_category={},completed_by_category={},euler_updates=0,
++        active_forward_category='NOT_RUNNING')
++    result=dict(status='INITIALIZING',protocol_path=str(out/'protocol.json'),protocol_sha256=record(out/'protocol.json')['sha256'],
++        protocol=p,counts=counts,geometry_ledger={},evaluation_ledger={},scores=[],generated=[],weld=[],binding=[],raw_registry=[],
++        probes={},gates={},promotion=dict(status='NOT_RUN'),confirmation=dict(status='NOT_RUN'),
++        protection=dict(metadata_before=protection(out),scope='Historical metadata plus separately byte-hashed used critical inputs'),
++        initial_git_status='?? experiments/',started_utc=time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),
++        resource_snapshot=dict(GPU='NVIDIA GeForce RTX5080',driver='591.86',total_MiB=16303,used_MiB=4096,utilization_pct=1))
++    save(out/'results.json',result)
++    bank,result['assets']=prepare_assets()
++    result['status']='ASSETS_PASS';save(out/'results.json',result)
++    print(json.dumps(dict(event='assets_pass',checkpoint=result['assets']['checkpoint']['sha256'],protocol=result['protocol_sha256'])),flush=True)
++    return result
++
++
++
++def serial(v):
++    if isinstance(v,torch.Tensor):return v.detach().cpu().item() if v.numel()==1 else v.detach().cpu().tolist()
++    if isinstance(v,np.ndarray):return v.tolist()
++    if isinstance(v,np.generic):return v.item()
++    if isinstance(v,dict):return {str(k):serial(x) for k,x in v.items()}
++    if isinstance(v,(list,tuple)):return [serial(x) for x in v]
++    return v
++
++
++def checkpoint_result(r,out,status=None):
++    if status:r['status']=status
++    save(out/'results.json',r)
++
++
++def event(name,**kw):print(json.dumps(dict(event=name,**kw),allow_nan=False),flush=True)
++
++
++def formal_probes(r,bank,out):
++    from . import gpu_guidance_energies as energy
++    from . import gpu_guidance_protected_weld as weld
++    from . import gpu_guidance_evaluation as evaluation
++    configure_stable_runtime();r['geometry_ledger']=energy.initial_energy_ledger()
++    ledger=r['geometry_ledger']
++    r['implementation_development_counts']=dict(energy_fixture_runs=1,energy_forwards=38,geometry_backwards=48,
++        CPU_energy_forwards=24,CUDA_energy_forwards=14,CPU_geometry_backwards=24,CUDA_geometry_backwards=24,
++        independent_numpy_energy_reference_evaluations=57,primary_pair_tests=7,independent_pair_tests=7,
++        direct_finite_triangle_probe=1,evaluation_helper_runs=1,evaluation_fixture_families=9,
++        W_fixture_runs=2,W_calls=24,topology_audits=8,direct_protected_guards=2,Raw_exact_index=2,temporary_OBJ_roundtrips=2,
++        W_candidates=90,W_accepted=84,W_rejected=6,failed_executions=0,model_forwards=0,model_backwards=0,optimizer_updates=0,
++        scope='Development checks before frozen formal fixtures, separately disclosed; not formal samples')
++    report,arrays=energy.run_fixed_probes(ledger=ledger,gpu=True);r['probes']['energy_fixed']=report
++    wr,wa=weld.run_cpu_fixtures(output=out/'fixtures');r['probes']['weld_fixed']=wr
++    arrays.update({'W_'+k:v for k,v in wa.items()})
++    r['probes']['evaluation_helpers']=evaluation.run_cpu_tests()
++    r['probes']['GT_compatibility']={}
++    for parent in (0,1):
++        case=bank['cases_by_key'][parent,12];L=case['bbox_diagonal'];C=case['constraints'];free=case['free_target'].reshape(100,3,3)
++        snap=energy.diagnostic_snapshot(torch.from_numpy(free.copy()).cuda()/L,torch.from_numpy(C.copy()).cuda()/L,ledger=ledger)
++        t,g=snap['terms'],snap['gradients'];gr=g['g_R'].cpu().numpy()
++        shared=(free.reshape(-1,1,3)==C.reshape(1,-1,3)).all(-1).any(-1).reshape(100,3)
++        sharedgrad=np.linalg.norm(gr[shared],axis=-1)
++        r['probes']['GT_compatibility'][f'P{parent}']=dict(E_A=serial(t['E_A']),E_R=serial(t['E_R']),gradient_A_norm=serial(g['norm_A']),
++            gradient_R_norm=serial(g['norm_R']),q_above_cut_count=serial(t['q_above_cut_count']),area_floor_count=serial(t['area_floor_count']),
++            gradient_cosine=serial(g['cosine']),shared_vertex_count=int(shared.sum()),
++            shared_vertex_gradient_R_RMS=float(np.sqrt(np.mean(sharedgrad**2))) if sharedgrad.size else None,
++            shared_vertex_gradient_R_max=float(sharedgrad.max()) if sharedgrad.size else None,
++            all_free_vertex_gradient_R_max=float(np.linalg.norm(gr,axis=-1).max()),
++            gradient_finite=serial(g['gradient_finite']),scope='GT C/free compatibility diagnostic only, never fed into sampling or W')
++        arrays[f'GT_P{parent}_g_A']=g['g_A'].cpu().numpy();arrays[f'GT_P{parent}_g_R']=gr
++        arrays[f'GT_P{parent}_shared_C_vertex_mask']=shared
++    np.savez_compressed(out/'fixed_probes.npz',**arrays)
++    r['probes']['arrays']=record(out/'fixed_probes.npz')
++    with np.load(bank['archived_paths'][0,9201]) as f:state=f['path'][40].copy()
++    case=bank['cases_by_key'][0,12];L=case['bbox_diagonal']
++    Y=(torch.from_numpy(state[12:].reshape(100,3,3)).cuda()/L).detach().requires_grad_(True)
++    Cn=torch.from_numpy(case['constraints'].copy()).cuda()/L
++    terms=energy.energy_terms(Y,Cn,mode='GAR',ledger=ledger)
++    pending=[terms['E_selected'].grad_fn];seen=set();leaves=[]
++    while pending:
++        node=pending.pop()
++        if node is None or node in seen:continue
++        seen.add(node)
++        if hasattr(node,'variable'):leaves.append(node.variable)
++        pending.extend(n[0] for n in node.next_functions)
++    if len(leaves)!=1 or leaves[0] is not Y:raise AssertionError('Unexpected geometry graph leaf')
++    grad=energy.gradients_from_terms(terms,Y,mode='GAR',ledger=ledger)
++    if not bool(grad['gradient_finite']):raise AssertionError('Nonfinite graph gate')
++    r['gates']['geometry_graph']=dict(status='PASS',leaf_count=1,only_leaf='Detached current free Y',C_requires_grad=Cn.requires_grad,model_graph=False)
++    r['probes']['formal_ledger_after_probes']=dict(ledger)
++    r['new_core_sources']={str(p):record(p) for p in PROJECT.glob('gpu_guidance_*.py') if p.name!='gpu_guidance_report.py'}
++    checkpoint_result(r,out,'PROBES_PASS');event('formal_probes_pass',GT=r['probes']['GT_compatibility'],model_forwards=r['counts']['model_forward_attempts'])
++
++
++def load_model(r):
++    from models.equidit import DiT
++    from models.utils import get_embedder
++    c=yaml.safe_load(CONFIG.read_text());cm=dict(c['model']);cm.pop('model_type')
++    required=dict(version=3,hidden_dim=768,num_layers=12,num_heads=12,max_length=800,face_bin=20,use_qknorm=True,
++        use_rmsnorm=True,use_coord_encoding=True,use_dit_like_pe=False,face_cond=True)
++    if any(cm.get(k)!=v for k,v in required.items()) or c['transport']['prediction']!='velocity':raise RuntimeError('Architecture mismatch')
++    p=torch.load(CHECKPOINT,map_location='cpu',weights_only=True,mmap=True)
++    if (p['arm'],p['completed_updates'],p['schema'])!=('Native_correct',500,'native_connected_patch_v1'):raise RuntimeError('Wrong checkpoint')
++    with torch.device('meta'):model=PrevalidatedNative(DiT(**cm),trainable=False)
++    model.backbone.x_embedder.embed_fn=get_embedder(cm['pe_freq'],input_dims=3)[0]
++    keys=model.load_state_dict(p['model'],strict=True,assign=True);model.set_trainable(False).eval();del p
++    sha=state_sha256(model)
++    if sha!=EXPECTED_STATE_SHA:raise RuntimeError('State SHA mismatch')
++    model.cuda();assert_frozen(model)
++    counts=r['counts']
++    def before(module,args):
++        if counts['model_forward_attempts']>=2954:raise RuntimeError('Hard model forward cap2954')
++        assert_frozen(module);counts['model_forward_attempts']+=1
++        category=counts['active_forward_category'];counts['forward_by_category'][category]=counts['forward_by_category'].get(category,0)+1
++    def after(module,args,value):
++        if value.requires_grad:raise RuntimeError('Backbone graph created')
++        counts['model_forward_returns']+=1
++    model.register_forward_pre_hook(before);model.register_forward_hook(after)
++    r['gates']['strict_load']=dict(status='PASS',strict=True,missing_keys=keys.missing_keys,unexpected_keys=keys.unexpected_keys,
++        state_sha256=sha,parameter_count=sum(p.numel() for p in model.parameters()),trainable_parameter_count=0)
++    r['gates']['initial_state_hash']=sha
++    return model
++
++
++def model_gates_and_warmup(r,bank,out,model):
++    from .native_inpainting_model import NativeInpaintingModel,native_execution
++    from .gpu_guidance_energies import energy_terms,gradients_from_terms
++    counts=r['counts'];case=bank['cases_by_key'][0,12];L=case['bbox_diagonal']
++    with np.load(bank['archived_paths'][0,9201]) as f:state=torch.from_numpy(f['path'][40:41].copy()).cuda()
++    y,valid,known=masks(state.device);model.bind_contract(y,valid,known);t=torch.full((1,),.8,device='cuda')
++    with torch.no_grad(),native_execution(model,coordinates=state) as facts:
++        counts['active_forward_category']='original_forward_equivalence'
++        counts['model_forward_attempts']+=1;counts['forward_by_category']['original_forward_equivalence']=1
++        original=NativeInpaintingModel.forward(model,state,t,y,valid,known)
++        if original.requires_grad:raise RuntimeError('Original graph')
++        counts['model_forward_returns']+=1
++        counts['active_forward_category']='prevalidated_forward_equivalence';actual=model(state,t,y,valid,known)
++        if not torch.equal(original,actual):raise RuntimeError('Prevalidated wrapper arithmetic differs')
++        r['gates']['original_forward_equivalence']=dict(status='PASS',bitwise=True,extra_model_forwards=2)
++        counts['active_forward_category']='model_warmup'
++        for _ in range(2):model(state,t,y,valid,known)
++        r['gates']['runtime']=facts
++    cn=torch.from_numpy(case['constraints'].copy()).cuda()/L
++    before=dict(r['geometry_ledger'])
++    for mode in ('GA','GR','GAR'):
++        for _ in range(2):
++            Y=(state[0,12:].reshape(100,3,3)/L).detach().requires_grad_(True)
++            terms=energy_terms(Y,cn,mode=mode,ledger=r['geometry_ledger'])
++            gradients_from_terms(terms,Y,mode=mode,ledger=r['geometry_ledger'])
++    torch.cuda.synchronize()
++    r['warmup']=dict(extra_model_forwards=2,geometry_ledger_delta={k:v-before.get(k,0) for k,v in r['geometry_ledger'].items()})
++    r['gates']['G0_replays']=[]
++    for parent in (0,1):
++        case=bank['cases_by_key'][parent,12]
++        row=sample_gpu(model,bank['noises'][9201],case['constraints'],case['bbox_diagonal'],'G0',counts,out,
++            f'replay_G0_P{parent}_seed9201','baseline_replay',r['geometry_ledger'])
++        with np.load(row['raw_path']) as a,np.load(bank['archived_paths'][parent,9201]) as b:equal=np.array_equal(a['path'],b['path'])
++        row.update(parent=parent,seed=9201,all51_bitwise_equal_to_archive=bool(equal));r['gates']['G0_replays'].append(row)
++        checkpoint_result(r,out)
++        if not equal:raise RuntimeError('G0 historical full trajectory replay failed')
++        event('G0_replay_pass',parent=parent,nfe=50,seconds=row['costs']['complete_generation_wall_seconds'])
++
++
++def generate_development(r,bank,out,model):
++    for parent in (0,1):
++        for seed in DEV:r['raw_registry'].append(dict(phase='development',model='G0',parent=parent,seed=seed,
++            raw_path=str(bank['archived_paths'][parent,seed]),archived_reuse=True))
++    # Fixed order: GAR first permits repeat gate before all other formal outputs.
++    r['development_execution_order']=['GAR','GA','GR']
++    for mode in ('GAR','GA','GR'):
++        for parent in (0,1):
++            case=bank['cases_by_key'][parent,12]
++            for seed in DEV:
++                row=sample_gpu(model,bank['noises'][seed],case['constraints'],case['bbox_diagonal'],mode,r['counts'],out,
++                    f'development_{mode}_P{parent}_seed{seed}','development',r['geometry_ledger'])
++                row.update(phase='development',model=mode,parent=parent,seed=seed)
++                r['generated'].append(row);r['raw_registry'].append({k:row[k] for k in ('phase','model','parent','seed','raw_path')})
++                with np.load(row['raw_path']) as a,np.load(bank['archived_paths'][parent,seed]) as b:offequal=np.array_equal(a['path'][:41],b['path'][:41])
++                row['off_first41_states_bitwise']=bool(offequal)
++                checkpoint_result(r,out,'DEVELOPMENT_RUNNING')
++                if not offequal:raise RuntimeError('Guidance-off prefix differs from G0')
++                event('development_output',model=mode,parent=parent,seed=seed,seconds=row['costs']['complete_generation_wall_seconds'],model_forwards=r['counts']['model_forward_attempts'])
++                if mode=='GAR' and parent==0 and seed==9201:
++                    repeat=sample_gpu(model,bank['noises'][seed],case['constraints'],case['bbox_diagonal'],mode,r['counts'],out,
++                        'repeat_GAR_P0_seed9201','guided_repeat',r['geometry_ledger'])
++                    with np.load(row['raw_path']) as a,np.load(repeat['raw_path']) as b:
++                        equal=np.array_equal(a['path'],b['path']);diag=np.array_equal(a['geometry_diagnostics'],b['geometry_diagnostics'])
++                    repeat.update(all51_bitwise_equal=bool(equal),geometry_diagnostics_bitwise_equal=bool(diag))
++                    r['gates']['guided_repeat']=repeat;checkpoint_result(r,out)
++                    if not equal or not diag:raise RuntimeError('Actual GPU guided trajectory repeat failed')
++                    event('guided_repeat_pass',model_forwards=r['counts']['model_forward_attempts'])
++    r['raw_before_W_development']=dict(status='PASS',all32_ready=True,records=[record(x['raw_path']) for x in r['raw_registry'] if x['phase']=='development'])
++    checkpoint_result(r,out,'DEVELOPMENT_RAW_COMPLETE')
++
++
++def endpoint_energy(output,C,L,ledger):
++    from .gpu_guidance_energies import energy_terms
++    Y=(torch.from_numpy(np.asarray(output,np.float32)[12:].reshape(100,3,3).copy()).cuda()/L).detach().requires_grad_(True)
++    cn=torch.from_numpy(C.copy()).cuda()/L
++    t=energy_terms(Y,cn,mode='GAR',ledger=ledger)
++    return dict(E_A=serial(t['E_A']),E_R=serial(t['E_R']),q_above_cut_count=serial(t['q_above_cut_count']),
++        area_floor_count=serial(t['area_floor_count']),geometry_backwards=0,scope='Offline endpoint values only; no correction or selection beyond registered geometric metrics')
++
++
++def score_phase(r,bank,out,phase):
++    from . import gpu_guidance_evaluation as ev
++    from . import gpu_guidance_protected_weld as w
++    ledger=r['evaluation_ledger']
++    if 'context_audits' not in r:
++        r['context_audits']={str(p):ev.audit_context(bank['cases_by_key'][p,12]['constraints'],bank['cases_by_key'][p,12]['bbox_diagonal'],ledger) for p in (0,1)}
++    bank['context_audits']={int(p):v for p,v in r['context_audits'].items()}
++    registry=[q for q in r['raw_registry'] if q['phase']==phase]
++    if any(not Path(q['raw_path']).is_file() for q in registry):raise RuntimeError('Raw-before-W gate failed')
++    (out/'meshes').mkdir(exist_ok=True);(out/'welded').mkdir(exist_ok=True)
++    for src in registry:
++        parent,seed,mode=src['parent'],src['seed'],src['model'];case=bank['cases_by_key'][parent,12];C=case['constraints'];L=case['bbox_diagonal']
++        with np.load(src['raw_path']) as f:raw=f['output'].copy()
++        key=f'{phase}_{mode}_P{parent}_seed{seed}'
++        for variant in ('Raw','W'):
++            tick=time.perf_counter()
++            indexed=w.raw_exact_index(raw,C) if variant=='Raw' else w.protected_weld(raw,C,L)
++            operator_seconds=time.perf_counter()-tick
++            ledger['raw_index_calls' if variant=='Raw' else 'W_operator_calls']=ledger.get('raw_index_calls' if variant=='Raw' else 'W_operator_calls',0)+1
++            output=indexed['output'];tick=time.perf_counter()
++            topology=w.audit_indexed_topology(indexed['vertices'],indexed['faces'],L,C=C)
++            topo_seconds=time.perf_counter()-tick;ledger['indexed_topology_audits']=ledger.get('indexed_topology_audits',0)+1
++            export=w.export_protected_obj(out/'meshes'/f'{key}_{variant}.obj',indexed,C)
++            ledger['OBJ_FP32_roundtrip_checks']=ledger.get('OBJ_FP32_roundtrip_checks',0)+1
++            path=src['raw_path']
++            if variant=='W':
++                path=str(out/'welded'/f'{key}_W.npz')
++                np.savez_compressed(path,output=output,vertices=indexed['vertices'],faces=indexed['faces'])
++                r['weld'].append(dict(phase=phase,model=mode,parent=parent,seed=seed,welded_path=path,audit=indexed['audit'],
++                    indexed_topology=topology,operator_seconds=operator_seconds,index_export_seconds=export['export_seconds'],topology_audit_seconds=topo_seconds,
++                    export=export,file=record(path)))
++            metric=ev.score_variant(output,bank,parent,ledger,topology=dict(indexing=indexed['audit'],topology=topology))
++            metric['gpu_endpoint_energy']=endpoint_energy(output,C,L,r['geometry_ledger'])
++            row=dict(phase=phase,model=mode,parent=parent,seed=seed,K=12,variant=variant,metrics=metric,output_path=path,raw_path=src['raw_path'],
++                indexing_seconds=operator_seconds if variant=='Raw' else 0,topology_audit_seconds=topo_seconds,export=export)
++            r['scores'].append(row)
++            if mode=='G0' and phase=='development' and variant=='Raw':
++                old=bank['source_scores'][parent,seed]
++                oldr=old['remainder']['own']['symmetric_rms_bbox_pct'];newr=metric['remainder']['own']['symmetric_rms_bbox_pct']
++                if abs(newr-oldr)>1e-11:raise RuntimeError('G0 historical metric mismatch')
++                row['archived_R12_reconciliation']=dict(status='PASS',old=oldr,new=newr)
++            checkpoint_result(r,out,f'{phase.upper()}_SCORING')
++            event('endpoint_scored',phase=phase,model=mode,parent=parent,seed=seed,variant=variant,
++                R12=metric['remainder']['own']['symmetric_rms_bbox_pct'],CF=metric['guided_geometry_audit']['C_free']['proper_affected_face_fraction'],
++                closure=metric['gpu_guidance_evaluation']['COMBINATORIAL_CLOSURE_STATUS'])
++    rows=[q for q in r['scores'] if q['phase']==phase];seeds=DEV if phase=='development' else CONF
++    for mode in sorted({q['model'] for q in rows}):
++        for variant in ('Raw','W'):
++            for seed in seeds:
++                mm=[next(q for q in rows if (q['model'],q['variant'],q['parent'],q['seed'])==(mode,variant,p,seed))['metrics'] for p in (0,1)]
++                r['binding'].append(dict(phase=phase,model=mode,variant=variant,seed=seed,metrics=ev.cross_binding(*mm)))
++    r.setdefault('comparisons',[])
++    for row in rows:
++        match=lambda mode,variant:next(q for q in rows if (q['model'],q['variant'],q['parent'],q['seed'])==(mode,variant,row['parent'],row['seed']))
++        if row['variant']=='W':
++            r['comparisons'].append(dict(phase=phase,model=row['model'],parent=row['parent'],seed=row['seed'],kind='W_vs_own_Raw',
++                metrics=ev.compare_variants(match(row['model'],'Raw')['metrics'],row['metrics'])))
++        if row['model']!='G0':
++            r['comparisons'].append(dict(phase=phase,model=row['model'],parent=row['parent'],seed=row['seed'],kind=f"{row['variant']}_vs_G0_same_layer",
++                metrics=ev.compare_variants(match('G0',row['variant'])['metrics'],row['metrics'])))
++    checkpoint_result(r,out,f'{phase.upper()}_SCORED')
++
++
++def selection(r,out):
++    from .guided_native_geometry_run import metric_flags
++    rows=[q for q in r['scores'] if q['phase']=='development' and q['variant']=='Raw']
++    def statistics(mode,parent):
++        subset=[q for q in rows if q['model']==mode and q['parent']==parent]
++        if len(subset)!=4:raise AssertionError('Four fixed dev noises required')
++        flags=[metric_flags(q['metrics']) for q in subset]
++        return dict(R12=float(np.mean([f['R12_symmetric_rms'] for f in flags])),CF=float(np.mean([f['proper_face_fraction'] for f in flags])),
++            FF=float(np.mean([f['free_free_illegal'] for f in flags])),
++            narrow=float(np.mean([q['metrics']['gpu_guidance_evaluation']['free_shape_quality']['min_angle_lt5_fraction'] for q in subset])),
++            all_C=all(f['C_exact'] for f in flags),degenerate_by_seed={str(q['seed']):f['degenerate'] for q,f in zip(subset,flags)})
++    baselines={str(p):statistics('G0',p) for p in (0,1)};decisions={}
++    for mode in ('GA','GR','GAR'):
++        stats={str(p):statistics(mode,p) for p in (0,1)};checks={}
++        for p in (0,1):
++            a,b=stats[str(p)],baselines[str(p)]
++            checks[str(p)]=dict(R12_within5pct=a['R12']<=1.05*b['R12'],C_exact=a['all_C'],
++                no_added_degeneracy=all(a['degenerate_by_seed'][str(s)]<=b['degenerate_by_seed'][str(s)] for s in DEV),
++                option_A=a['CF']<=.75*b['CF'] and a['FF']<=b['FF'],
++                option_B=a['narrow']<=b['narrow']-.02 and a['CF']<=b['CF'] and a['FF']<=b['FF'])
++        hard=all(all(c[k] for k in ('R12_within5pct','C_exact','no_added_degeneracy')) for c in checks.values())
++        a=all(c['option_A'] for c in checks.values());b=all(c['option_B'] for c in checks.values())
++        times=[q['costs']['complete_generation_wall_seconds'] for q in r['generated'] if q['model']==mode and q['phase']=='development']
++        decisions[mode]=dict(pass_gate=bool(hard and (a or b)),hard_gates_pass=hard,option_A_allparents=a,option_B_allparents=b,parents=stats,checks=checks,
++            ranking_key=[float(np.mean([x['CF'] for x in stats.values()])),float(np.mean([x['FF'] for x in stats.values()])),
++                float(np.mean([x['R12'] for x in stats.values()])),float(np.mean(times))])
++    eligible=[m for m,v in decisions.items() if v['pass_gate']]
++    chosen=min(eligible,key=lambda m:decisions[m]['ranking_key']) if eligible else None
++    result=dict(status='SELECTED' if chosen else 'NO_QUALIFIED_CANDIDATE',candidate=chosen,eligible=eligible,baseline_parents=baselines,
++        decisions=decisions,raw_only=True,selection_saved_before_any_new_noise=True,confirmation_seeds=list(CONF),
++        no_nonfinite='All51-state finite runtime assertions passed',selected_time_utc=time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()))
++    save(out/'selection.json',result);r['promotion']=dict(result,selection_file=record(out/'selection.json'));checkpoint_result(r,out,'SELECTION_SAVED')
++    event('selection',candidate=chosen,decisions={k:v['pass_gate'] for k,v in decisions.items()})
++    return chosen
++
++
++def confirmation(r,bank,out,model,chosen):
++    if chosen is None:
++        r['confirmation']=dict(status='NOT_RUN',reason='No Raw candidate passed preregistered two-parent gate',model_forwards=0,new_noise_generated=False)
++        return
++    r['confirmation']=dict(status='RUNNING',candidate=chosen,seeds=list(CONF),selection_sha256=r['promotion']['selection_file']['sha256'])
++    inputs={}
++    for seed in CONF:
++        gen=torch.Generator(device='cpu').manual_seed(seed);noise=torch.randn((1,112,9),generator=gen,dtype=torch.float32).numpy()
++        inputs[f'noise_seed{seed}']=noise;bank['noises'][seed]=noise
++    np.savez_compressed(out/'confirmation_independent_Gaussian.npz',**inputs)
++    r['confirmation']['noise_file']=record(out/'confirmation_independent_Gaussian.npz')
++    for mode in ('G0',chosen):
++        for parent in (0,1):
++            case=bank['cases_by_key'][parent,12]
++            for seed in CONF:
++                row=sample_gpu(model,bank['noises'][seed],case['constraints'],case['bbox_diagonal'],mode,r['counts'],out,
++                    f'confirmation_{mode}_P{parent}_seed{seed}','confirmation',r['geometry_ledger'])
++                row.update(phase='confirmation',model=mode,parent=parent,seed=seed)
++                r['generated'].append(row);r['raw_registry'].append({k:row[k] for k in ('phase','model','parent','seed','raw_path')})
++                checkpoint_result(r,out,'CONFIRMATION_RUNNING');event('confirmation_output',model=mode,parent=parent,seed=seed)
++    r['raw_before_W_confirmation']=dict(status='PASS',all32_ready=True,records=[record(x['raw_path']) for x in r['raw_registry'] if x['phase']=='confirmation'])
++    checkpoint_result(r,out,'CONFIRMATION_RAW_COMPLETE');score_phase(r,bank,out,'confirmation')
++    r['confirmation']['status']='PASS_EXECUTION';r['confirmation']['scope']='New independent noises on the same two TRAIN parents, not new-parent generalization'
++
++
++def finalize(r,out,model):
++    assert_frozen(model);sha=state_sha256(model);r['gates']['final_state_hash']=sha
++    if sha!=EXPECTED_STATE_SHA:raise AssertionError('Frozen state changed')
++    r['protection']['critical_files_after']=verify_records(r['assets']['critical_files'])
++    after=protection(out);before=r['protection']['metadata_before']
++    changed=[p for p,v in before.items() if after.get(p)!=v]
++    r['protection']['historical_metadata_after']=dict(status='PASS' if not changed else 'FAIL',files=len(before),changed=changed)
++    r['protection']['new_core_source_check']=verify_records(r['new_core_sources'])
++    if changed or any(r['protection'][k]['status']!='PASS' for k in ('critical_files_after','new_core_source_check')):raise RuntimeError('Immutable file check failed')
++    counts=r['counts'];counts['active_forward_category']='FINISHED'
++    if counts['model_forward_attempts']!=counts['model_forward_returns'] or counts['generation_attempts']!=counts['complete_generations']:raise RuntimeError('Unaccounted invocation')
++    if counts['model_forward_attempts']!=50*counts['complete_generations']+4:raise RuntimeError('Unexpected extra model call')
++    r['finished_utc']=time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime());checkpoint_result(r,out,'PASS_EXECUTION')
++    event('experiment_complete',counts=counts,promotion=r['promotion']['status'])
++
++
++def execute(out,stage):
++    if stage=='init':return initialize(out)
++    r=json.loads((out/'results.json').read_text());model=None
++    try:
++        if record(out/'protocol.json')['sha256']!=r['protocol_sha256']:raise RuntimeError('Frozen protocol modified')
++        configure_stable_runtime();bank,_=prepare_assets()
++        if stage=='probes':
++            if r['status']!='ASSETS_PASS':raise RuntimeError('Probes stage already executed or wrong state')
++            formal_probes(r,bank,out);return
++        if stage=='run':
++            if r['status']!='PROBES_PASS':raise RuntimeError('Formal probes must pass before model run')
++            if verify_records(r['new_core_sources'])['status']!='PASS':raise RuntimeError('Core sources changed after probes')
++            model=load_model(r);model_gates_and_warmup(r,bank,out,model);generate_development(r,bank,out,model)
++            score_phase(r,bank,out,'development');chosen=selection(r,out);confirmation(r,bank,out,model,chosen);finalize(r,out,model)
++        elif stage=='report':
++            if r['status']!='PASS_EXECUTION':raise RuntimeError('Cannot claim completed experiment')
++            from .gpu_guidance_report import deliver_report
++            r['delivery']=deliver_report(r,out,bank);checkpoint_result(r,out)
++    except BaseException as e:
++        r['failure']=dict(error=repr(e),traceback=traceback.format_exc(),stage=stage)
++        checkpoint_result(r,out,'STOP_IMPLEMENTATION_OR_NUMERICAL_FAILURE');event('stopped',error=repr(e),counts=r['counts']);raise
++
++
++if __name__=='__main__':
++    parser=argparse.ArgumentParser();parser.add_argument('--out',type=Path,required=True)
++    parser.add_argument('--stage',choices=['init','probes','run','report'],required=True)
++    args=parser.parse_args();execute(args.out.resolve(),args.stage)
+diff --git a/experiments/mf_h1_local0/gpu_guidance_sampling.py b/experiments/mf_h1_local0/gpu_guidance_sampling.py
+new file mode 100755
+index 0000000..c2e2176
+--- /dev/null
++++ b/experiments/mf_h1_local0/gpu_guidance_sampling.py
+@@ -0,0 +1,159 @@
++﻿"""Frozen Native T1 GPU-only guidance sampler. No CPU geometry in its loop."""
++from .stable_runtime import configure_stable_runtime
++import hashlib,time
++from pathlib import Path
++import numpy as np
++import torch
++from .native_inpainting_model import (NativeInpaintingModel,native_execution,assert_native_runtime,
++    native_block_forward,native_final_forward,_corners)
++
++class PrevalidatedNative(NativeInpaintingModel):
++    """Identical native arithmetic; immutable mask/value checks precede timing."""
++    def bind_contract(self,y,valid,known):
++        if y.shape!=(1,) or not bool((y==112).all()) or valid.shape!=(1,112) or known.shape!=(1,112):raise ValueError('Wrong fixed contract')
++        if not bool(valid.all()) or not bool(known[:,:12].all()) or bool(known[:,12:].any()):raise ValueError('Wrong masks')
++        self._contract=(y,valid,known,tuple(a._version for a in (y,valid,known)))
++    def forward(self,x,t,y,valid_mask=None,known_mask=None):
++        assert_native_runtime(self,coordinates=(x,t))
++        a,b,c,versions=self._contract
++        if y is not a or valid_mask is not b or known_mask is not c or versions!=tuple(z._version for z in (a,b,c)):raise RuntimeError('Bound mask/count inputs changed')
++        if x.shape!=(1,112,9) or t.shape!=(1,):raise ValueError('Wrong native shape')
++        batch,faces,_=x.shape
++        _,hidden=self.backbone.x_embedder(x);hidden=hidden.view(batch,faces*3,-1)
++        role=self.role_embedding[known_mask.long()].to(dtype=hidden.dtype)
++        hidden=hidden+_corners(role)
++        c_free=self.backbone.t_embedder(t);c_known=self.backbone.t_embedder(torch.ones_like(t))
++        count=self.backbone.y_embedder(y//self.backbone.face_bin,False)
++        c_free,c_known=c_free+count,c_known+count
++        face_time=torch.where(known_mask,torch.ones_like(t[:,None]),t[:,None])
++        for index,block in enumerate(self.backbone.layers,1):
++            hidden=native_block_forward(block,hidden,c_free,c_known,known_mask,valid_mask,layer_index=index,face_time=face_time)
++        result=native_final_forward(self.backbone.final_layer,hidden,c_free,c_known,known_mask,face_time=face_time)
++        return result.view(batch,faces,9)
++
++
++def file_hash(path):return hashlib.sha256(Path(path).read_bytes()).hexdigest()
++def array_hash(value):
++    a=np.ascontiguousarray(value);return hashlib.sha256(str((str(a.dtype),tuple(a.shape))).encode()+a.tobytes()).hexdigest()
++
++def masks(device):
++    known=torch.zeros((1,112),dtype=torch.bool,device=device);known[:,:12]=True
++    return torch.tensor([112],device=device),torch.ones_like(known),known
++
++
++def integrate(state,velocity,C,delta=None):
++    out=state.clone();out[:,12:]=state[:,12:]+velocity[:,12:]*(1/50)
++    if delta is not None:out[:,12:]=out[:,12:]+delta.reshape(1,100,9)
++    out[:,:12]=C.reshape(1,12,9)
++    return out
++
++
++def clip_displacement(g,L):
++    delta=-float(1/50)*float(L)*g
++    norms=torch.linalg.vector_norm(delta,dim=-1,keepdim=True)
++    rho=float(.001*L)
++    scale=torch.clamp(rho/norms.clamp_min(torch.finfo(delta.dtype).tiny),max=1.)
++    return delta*scale,norms.squeeze(-1),scale.squeeze(-1)
++
++
++def _diag(terms,grad,delta,norms,scale,mode):
++    g=grad['g_selected'];zero=g.new_zeros(())
++    ga=grad.get('g_A',torch.zeros_like(g));gr=grad.get('g_R',torch.zeros_like(g))
++    na=torch.linalg.vector_norm(ga);nr=torch.linalg.vector_norm(gr)
++    defined=(na>0)&(nr>0);cos=(ga*gr).sum()/(na*nr).clamp_min(torch.finfo(g.dtype).tiny)
++    return torch.stack([terms.get('E_A',zero).detach(),terms.get('E_R',zero).detach(),na,nr,
++        torch.linalg.vector_norm(g),torch.where(defined,cos,zero),defined.float(),norms.max(),
++        torch.linalg.vector_norm(delta,dim=-1).max(),torch.sqrt(delta.square().sum(-1).mean()),
++        (scale<1).sum().float(),torch.as_tensor(terms.get('area_floor_count',zero),device=g.device).float(),
++        torch.isfinite(g).all().float(),torch.isfinite(delta).all().float(),
++        torch.as_tensor(mode in ('GA','GAR'),device=g.device).float(),torch.as_tensor(mode in ('GR','GAR'),device=g.device).float()])
++
++DIAGNOSTIC_NAMES=['E_A','E_R','gradient_A_norm','gradient_R_norm','gradient_combined_norm','gradient_cosine','cosine_defined',
++    'unclipped_max_vertex_displacement','clipped_max_vertex_displacement','clipped_vertex_RMS','clipped_vertex_count',
++    'area_floor_trigger_count','gradient_all_finite','delta_all_finite','A_evaluated','R_evaluated']
++
++
++@torch.no_grad()
++def sample_gpu(model,noise,C,L,mode,counts,out,label,category,geo_ledger):
++    """One 50-forward trajectory; diagnostics and states leave GPU only at end."""
++    from .gpu_guidance_energies import energy_terms,gradients_from_terms
++    entry_tick=time.perf_counter()
++    if mode not in ('G0','GA','GR','GAR'):raise ValueError(mode)
++    if noise.shape!=(1,112,9) or noise.dtype!=np.float32 or C.shape!=(12,3,3) or C.dtype!=np.float32:raise ValueError('FP32 archive input contract')
++    if counts['generation_attempts']>=59:raise RuntimeError('59 full-generation attempt cap')
++    destination=Path(out)/'raw'/f'{label}.npz';destination.parent.mkdir(parents=True,exist_ok=True)
++    if destination.exists():raise FileExistsError(destination)
++    configure_stable_runtime();device=next(model.parameters()).device
++    noise_hash=array_hash(noise);C_hash=array_hash(C)
++    state=torch.from_numpy(noise.copy()).to(device=device);c=torch.from_numpy(C.copy()).to(device=device)
++    state[:,:12]=c.reshape(1,12,9);cn=c/float(L)
++    y,valid,known=masks(device);model.bind_contract(y,valid,known)
++    counts['generation_attempts']+=1;counts['generation_attempts_by_category'][category]=counts['generation_attempts_by_category'].get(category,0)+1
++    counts['active_forward_category']=category
++    before=counts['model_forward_attempts'];geo_before=dict(geo_ledger)
++    path=[state[0].clone()];diagnostics=[];conditions=[(state[0,:12]==c.reshape(12,9)).all()]
++    finite=[torch.isfinite(state).all()];velocity_requires_grad=[]
++    mevents=[(torch.cuda.Event(enable_timing=True),torch.cuda.Event(enable_timing=True)) for _ in range(50)]
++    fevents=[(torch.cuda.Event(enable_timing=True),torch.cuda.Event(enable_timing=True)) for _ in range(10)] if mode!='G0' else []
++    bevents=[(torch.cuda.Event(enable_timing=True),torch.cuda.Event(enable_timing=True)) for _ in range(10)] if mode!='G0' else []
++    total_start=torch.cuda.Event(enable_timing=True);total_end=torch.cuda.Event(enable_timing=True)
++    torch.cuda.synchronize();torch.cuda.reset_peak_memory_stats();tick=time.perf_counter();total_start.record()
++    record=dict(status='RUNNING',mode=mode,category=category,raw_path=str(destination),noise_sha256=noise_hash,C_sha256=C_hash,L=float(L),N=112,K=12)
++    try:
++        with native_execution(model,coordinates=state) as facts:
++            for k in range(50):
++                t=torch.full((1,),k/50,device=device,dtype=torch.float32)
++                mevents[k][0].record();velocity=model(state,t,y,valid,known).float();mevents[k][1].record()
++                velocity_requires_grad.append(velocity.requires_grad)
++                delta=None
++                if mode!='G0' and k>=40:
++                    with torch.enable_grad(),torch.autocast('cuda',enabled=False):
++                        Y=(state[0,12:].reshape(100,3,3)/float(L)).detach().requires_grad_(True)
++                        fevents[k-40][0].record();terms=energy_terms(Y,cn,mode=mode,ledger=geo_ledger);fevents[k-40][1].record()
++                        bevents[k-40][0].record();grad=gradients_from_terms(terms,Y,mode=mode,ledger=geo_ledger);bevents[k-40][1].record()
++                    delta,norms,scale=clip_displacement(grad['g_selected'],L)
++                    diagnostics.append(_diag(terms,grad,delta,norms,scale,mode).detach())
++                state=integrate(state,velocity,c,delta);counts['euler_updates']+=1
++                path.append(state[0].clone());conditions.append((state[0,:12]==c.reshape(12,9)).all());finite.append(torch.isfinite(state).all())
++        stacked=torch.stack(path);stats=torch.stack(diagnostics) if diagnostics else state.new_empty((0,len(DIAGNOSTIC_NAMES)))
++        check_tensor=torch.stack([torch.stack(conditions).all(),torch.stack(finite).all()])
++        total_end.record();torch.cuda.synchronize();wall=time.perf_counter()-tick
++        costs=dict(model_cuda_seconds=sum(a.elapsed_time(b) for a,b in mevents)/1000,
++            geometry_forward_cuda_seconds=sum(a.elapsed_time(b) for a,b in fevents)/1000,
++            geometry_backward_cuda_seconds=sum(a.elapsed_time(b) for a,b in bevents)/1000,
++            total_cuda_seconds=total_start.elapsed_time(total_end)/1000,wall_seconds=wall,setup_wall_seconds=tick-entry_tick,
++            peak_cuda_allocated=torch.cuda.max_memory_allocated(),warmup_included=False,
++            synchronization_policy='One explicit pre-timing and post-loop sync; sampler adds no per-step explicit scalar reads/CPU geometry; original masked indexing may synchronize internally',
++            total_includes='Euler, GPU diagnostic tensors and51 saved GPU states; no CPU evaluation/W/export')
++        transfer=time.perf_counter();actual=stacked.cpu().numpy();stats_cpu=stats.cpu().numpy();checks=check_tensor.cpu().tolist()
++        costs['final_D2H_seconds']=time.perf_counter()-transfer
++        costs['complete_generation_wall_seconds']=time.perf_counter()-entry_tick
++        costs['model_internal_implicit_sync_profile']='NOT_RUN; unchanged original boolean indexing may synchronize'
++        np.savez_compressed(destination,output=actual[-1],path=actual,geometry_diagnostics=stats_cpu)
++        record.update(raw_sha256=file_hash(destination),output_sha256=array_hash(actual[-1]),costs=costs,runtime=facts,
++            geometry_diagnostic_columns=DIAGNOSTIC_NAMES,geometry_diagnostics=stats_cpu.tolist(),active_k=list(range(40,50)) if mode!='G0' else [],
++            geometry_ledger_delta={k:v-geo_before.get(k,0) for k,v in geo_ledger.items()},nfe=counts['model_forward_attempts']-before,
++            known_all51_bitwise=bool(checks[0]),all_states_finite=bool(checks[1]),model_graph_created=any(velocity_requires_grad),
++            C_export_bitwise=bool(np.array_equal(actual[-1,:12],C.reshape(12,9))),
++            geometry_input='detach(current free Xt/L), no predictor/GT/backbone graph',geometry_dtype='torch.float32',
++            clipping='One combined per-vertex norm clip; FP32 cap diagnostic tolerance1e-6 relative to rho',
++            no_CPU_geometry_or_scalar_reads_in_timed_loop=True)
++        if record['nfe']!=50 or not all(checks) or any(velocity_requires_grad):raise RuntimeError('Trajectory state/model-graph invariant failed')
++        if mode!='G0' and (not np.isfinite(stats_cpu).all() or not (stats_cpu[:,12:14]==1).all()):raise RuntimeError('Nonfinite GPU geometry')
++        if mode!='G0' and stats_cpu[:,8].max()>.001*L*(1+1e-6):raise RuntimeError('Norm clipping cap failed')
++        if array_hash(noise)!=noise_hash or array_hash(C)!=C_hash:raise RuntimeError('Input mutation')
++        if any(p.grad is not None or p.requires_grad for p in model.parameters()):raise RuntimeError('Model gradient detected')
++        counts['complete_generations']+=1;counts['completed_by_category'][category]=counts['completed_by_category'].get(category,0)+1
++        record['status']='PASS'
++        return record
++    except BaseException as error:
++        record.update(status='FAILED',error=repr(error),nfe_attempts=counts['model_forward_attempts']-before,completed_states=len(path))
++        counts.setdefault('failures',[]).append(record)
++        if not destination.exists() and path:
++            try:
++                torch.cuda.synchronize();a=torch.stack(path).cpu().numpy();np.savez_compressed(destination,output=a[-1],path=a)
++                record.update(raw_path=str(destination),raw_sha256=file_hash(destination),partial_output=True)
++            except BaseException as save_error:record['partial_save_error']=repr(save_error)
++        raise
++
++

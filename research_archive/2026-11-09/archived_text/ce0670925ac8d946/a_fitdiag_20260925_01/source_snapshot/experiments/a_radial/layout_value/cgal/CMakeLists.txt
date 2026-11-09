@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.20)
+project(a_layout_guarded_qem LANGUAGES CXX)
+find_package(CGAL REQUIRED)
+find_package(Eigen3 3.3 REQUIRED NO_MODULE)
+add_executable(guarded_qem guarded_qem.cpp)
+target_compile_features(guarded_qem PRIVATE cxx_std_17)
+target_link_libraries(guarded_qem PRIVATE CGAL::CGAL Eigen3::Eigen)

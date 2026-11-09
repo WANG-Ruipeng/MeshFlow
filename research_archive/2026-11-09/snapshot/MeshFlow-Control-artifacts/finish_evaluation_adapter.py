@@ -1,0 +1,11 @@
+from pathlib import Path
+p=Path('/mnt/e/MeshFlow-Control/src/meshflow_control/evaluation/evaluate.py')
+s=p.read_text()
+s=s.replace("row['metrics']={k:v for k,v in m.items() if isinstance(v,(int,float,bool)) or v is None}","exclude={'K','N','L0','candidate','noise_seed','model_calls','generation_seconds','adapter_seconds','scoring_seconds','context_level','attempted','known_area_ratio','known_face_ratio','known_span_L0'}\n        row['metrics']={k:v for k,v in m.items() if k not in exclude and (isinstance(v,(int,float,bool)) or v is None)}\n        for name in ('SeamCov','ConflictCov_C','ExposedRetain'):row['metric_status'][name]=m.get(name+'_status','PASS')")
+s=s.replace("m.update(quality.pr_metrics(dy,df,L));m.update(quality.angle_reference(c['GT_free'],L))","m.update(quality.pr_metrics(dy,df,L));m.update(quality.angle_reference(c['GT_free'],L))\n            m.update({k.replace('GT_free','predicted_free'):v for k,v in quality.angle_reference(F,L).items()})")
+s=s.replace("flat=[dict(**{k:r[k] for k in ('request_id','label','panel','cohort','condition_id','parent_id','candidate','N','K','status')},**r['metrics']) for r in good]","flat=[{**{k:r[k] for k in ('request_id','label','panel','cohort','condition_id','parent_id','candidate','N','K','status')},**r['metrics']} for r in good]")
+s=s.replace("aggregation=aggregate(results,out)","aggregation=aggregate(results,out)\n    from .diversity import diversity\n    diversity(good,out)")
+p.write_text(s)
+p=Path('/mnt/e/MeshFlow-Control/src/meshflow_control/evaluation/registry.py')
+s=p.read_text().replace("or 'minus_GT' in name","or 'minus_GT' in name or name.startswith('ConflictCov_C_GT') or name.startswith('reference_')")
+p.write_text(s)

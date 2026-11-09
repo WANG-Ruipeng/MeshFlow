@@ -1,0 +1,1554 @@
+diff --git a/experiments/mf_h1_local0/t1_interface_run.py b/experiments/mf_h1_local0/t1_interface_run.py
+new file mode 100755
+index 0000000..a38132d
+--- /dev/null
++++ b/experiments/mf_h1_local0/t1_interface_run.py
+@@ -0,0 +1,218 @@
++"""Fixed three-arm Native T1 branch training; no guidance or repair."""
++from native_t1.runtime import configure_stable_runtime
++import argparse,contextlib,copy,gc,hashlib,json,platform,random,subprocess,time,traceback
++from pathlib import Path
++import numpy as np
++import torch
++from native_t1.artifacts import atomic_json,file_sha256,state_sha256,array_hash
++from native_t1.checkpoint import load_t1,T1_FILE_SHA256,T1_STATE_SHA256,DEFAULT_CHECKPOINT,DEFAULT_CONFIG
++from native_t1.data import load_archive,NativeTrainingStream,native_collate,model_inputs
++from native_t1.model import native_execution
++from native_t1.sampling import clamped_sample,make_noise,new_counts
++from .guided_native_geometry_run import prepare_assets,record,verify_records
++
++PROJECT=Path(__file__).resolve().parent
++REPO=PROJECT.parents[1]
++SOURCE=PROJECT/'outputs/native_patch_20260929_010000'
++SEEDS=tuple(range(9501,9509));ARMS=('A','B','C');DIAGNOSTIC_STEPS=(1,100,250,500)
++INPUT_SHA='e80d52e0906bc762475f35a2526cb99ff5b52858c9d2e6a38d09018e5d5aea73'
++
++
++def seal(v):return hashlib.sha256(json.dumps(v,sort_keys=True,separators=(',',':')).encode()).hexdigest()
++def write(r,out):atomic_json(out/'results.json',r)
++def event(name,**kw):print(json.dumps(dict(event=name,**kw),allow_nan=False),flush=True)
++def release():gc.collect();torch.cuda.empty_cache()
++def cpu(v):
++    if torch.is_tensor(v):return v.detach().cpu()
++    if isinstance(v,dict):return {k:cpu(x) for k,x in v.items()}
++    if isinstance(v,list):return [cpu(x) for x in v]
++    if isinstance(v,tuple):return tuple(cpu(x) for x in v)
++    return v
++
++def metadata(out):
++    files=[x for x in (PROJECT/'outputs').rglob('*') if x.is_file() and not x.is_relative_to(out)]
++    files += [x for x in PROJECT.glob('*.py') if not x.name.startswith('t1_interface_')]
++    files += list((REPO/'native_t1').glob('*.py'))+list((REPO/'models').glob('*.py'))+[DEFAULT_CONFIG,Path('/mnt/c/Users/warpwang/Downloads/last.pt')]
++    files += [x for x in (PROJECT/'assets').rglob('*.npz')]
++    return {str(x):dict(bytes=x.stat().st_size,mtime_ns=x.stat().st_mtime_ns) for x in sorted(set(files))}
++
++
++def protocol():
++    return dict(schema='t1_interface_3arm_v1',initial=dict(path=str(DEFAULT_CHECKPOINT),file_sha256=T1_FILE_SHA256,state_sha256=T1_STATE_SHA256,old_updates=500),
++      arms=dict(A='Continue original Native/FM',B='Known-only boundary Linear(2,768,bias=False),zero weight1536; original FM',C='Original Native; FM+0.1FC+0.1FF, endpoint shared-source-vertex losses'),
++      training=dict(seed=10,additional_updates_each=500,total_update_cap=1500,effective_batch=8,microbatch=1,K=[4,8,12],parents=2,
++          stream='Unchanged NativeTrainingStream Native_correct; independent RandomState streams reset identically',
++          OT='Original free-only optimal_sum_numpy reorders noise Z only; target Y ordering and labels follow source_face_ids/corner_permutations',
++          time='original logit-normal',optimizer='fresh AdamW each arm',lr=1e-5,betas=[.9,.95],weight_decay=0,clip=1,
++          scheduler=False,EMA=False,dropout=False,eval_modules=True,all_parameters_trainable=True,
++          FC_weight=.1,FF_weight=.1,aux_scale='original coordinates and per-coordinate MSE; no bbox normalization',
++          auxiliary_accumulation='Sum group losses across all8 microbatches / total valid groups across those8; FC/FF separately',
++          checkpoint_additional_steps=[250,500],checkpoint_cumulative_steps=[750,1000],diagnostic_steps=list(DIAGNOSTIC_STEPS),
++          save_optimizer=True,continue_old_optimizer=False,no_training_cache=True),
++      runtime=dict(CUBLAS_WORKSPACE_CONFIG=':4096:8',deterministic=True,warn_only=False,TF32=False,SDPA='math',parameters='FP32',forward='BF16',integration='FP32'),
++      new_seeds=list(SEEDS),seed_audit='No semantic seed or seed filename9501..9508 prior use found; numeric metric/byte-count matches excluded',
++      evaluation=dict(models=['T1','A','B','C'],N=112,K=12,free=100,y=112,steps=50,formal_rollouts=64,formal_forwards=3200,
++        known_time=1,free_time='FP32 k/50',dt=1/50,noise='CPU torch.Generator FP32[1,112,9], shared free arrays, no GT/OT',
++        stages='Only additionalstep500 full generation; no step250 generation',evaluator='Unchanged complete independent T1 confirmation evaluator',
++        comparisons=['A-T1 continued training','B-A interface increment','C-A relation increment']),
++      gates=dict(expected_actual_model_forwards=2,expected_actual_model_backwards=2,optimizer_updates=0,
++        A_B_zero_output='bitwise equal',u_endpoint_relation_MSE_atol=1e-10),
++      forbidden=dict(guidance=0,extra_CFG=0,CPU_geometry_sampling=0,postprocessing=0,B_plus_C=0,fourth_training_arm=0),
++      stop='500 new updates per arm and64 endpoint samples; no extension, no Phase3')
++
++
++class Ledger:
++    def __init__(self,r):self.r=r
++    def attach(self,model):
++        def pre(module,args):
++            c=self.r['counts'];stage=self.r['active_stage']
++            if c['model_forward_attempts']>=15202:raise RuntimeError('Hard total model-forward budget')
++            c['model_forward_attempts']+=1;c['forward_by_stage'][stage]=c['forward_by_stage'].get(stage,0)+1
++        def post(module,args,value):self.r['counts']['model_forward_returns']+=1
++        model.register_forward_pre_hook(pre);model.register_forward_hook(post)
++
++
++def initialize(out):
++    if out.exists():raise FileExistsError(out)
++    out.mkdir(parents=True);(out/'raw').mkdir()
++    p=protocol();r=dict(status='INITIALIZING',started_utc=time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),protocol=p,protocol_sha256=seal(p),
++      counts=dict(model_forward_attempts=0,model_forward_returns=0,forward_by_stage={},backward_attempts=0,backward_completed=0,
++          optimizer_step_attempts=0,optimizer_updates=0,gate_backward_calls=0,training_backward_calls=0,rollout_attempts=0,complete_rollouts=0,
++          euler_updates=0,geometry_guidance_calls=0,postprocessing_repairs=0,training_OT_calls=0,gate_OT_calls=0),
++      arms={},generated=[],scores=[],bindings=[],gates={},evaluation_ledger={},active_stage='INITIALIZING',
++      protection=dict(before=metadata(out)),AGENTS='No applicable AGENTS.md found by repository and ancestor checks',
++      git_status=subprocess.run(['git','status','--short'],cwd=REPO,capture_output=True,text=True).stdout,
++      environment=dict(python=platform.python_version(),torch=torch.__version__,cuda=torch.version.cuda,numpy=np.__version__))
++    r['environment']['GPU']=subprocess.run(['nvidia-smi','--query-gpu=name,driver_version,memory.total,memory.used,utilization.gpu','--format=csv,noheader'],capture_output=True,text=True).stdout.strip()
++    write(r,out)
++    bank,assets=prepare_assets();r['assets']=assets
++    if assets['checkpoint']['sha256']!=T1_FILE_SHA256 or file_sha256(SOURCE/'inputs.npz')!=INPUT_SHA:raise RuntimeError('Wrong T1 assets')
++    r['assets']['official_EMA_protection']=record('/mnt/c/Users/warpwang/Downloads/last.pt')
++    r['assets']['critical_files'][r['assets']['official_EMA_protection']['path']]=r['assets']['official_EMA_protection']
++    r['assets']['native_t1_core']={str(x):record(x) for x in (REPO/'native_t1').glob('*.py')}
++    archive=load_archive(SOURCE/'inputs.npz',INPUT_SHA)
++    r['assets']['training_cases']=[dict(parent=p,K=k,N=c.N,L=c.bbox_diagonal,source_face_ids=c.source_face_ids.tolist(),condition_sha256=array_hash(c.constraints)) for (p,k),c in archive.cases.items()]
++    from .t1_native_confirmation_topology import run_input_audit
++    from .t1_native_confirmation_evaluation import audit_context
++    r['input_topology']=run_input_audit(bank)
++    r['assets']['context_audits']={str(p):audit_context(bank['cases_by_key'][p,12]['constraints'],bank['cases_by_key'][p,12]['bbox_diagonal'],r['evaluation_ledger']) for p in (0,1)}
++    arrays={};r['noise_ledger']={}
++    for s in SEEDS:
++        a=make_noise(s).numpy();arrays[f'noise_seed{s}']=a
++        r['noise_ledger'][str(s)]=dict(shape=list(a.shape),dtype=str(a.dtype),sha256=array_hash(a),free_sha256=array_hash(a[:,12:]))
++    np.savez_compressed(out/'fixed_noise.npz',**arrays);r['noise_file']=record(out/'fixed_noise.npz')
++    r['seed_usage_audit']=dict(seeds=list(SEEDS),semantic_record_matches=0,output_filename_matches=0,
++        broad_false_hits='Scalar metrics, extraction byte counts, or broadphase counts; not seed use',fixed_before_any_model_call=True)
++    r['status']='ASSETS_PASS';write(r,out);event('assets_pass',out=str(out),counts=r['counts'])
++    return r
++
++
++def load_model(r,name,checkpoint=None,trainable=False):
++    model,audit=load_t1()
++    if name=='B':
++        from .t1_interface_model import add_boundary_model
++        model=add_boundary_model(model)
++    if checkpoint is not None:
++        if file_sha256(checkpoint['path'])!=checkpoint['sha256']:raise RuntimeError('New checkpoint bytes differ')
++        payload=torch.load(checkpoint['path'],map_location='cpu',weights_only=True,mmap=True)
++        if payload['arm']!=name or payload['additional_updates']!=500:raise RuntimeError('Wrong branch endpoint')
++        keys=model.load_state_dict(payload['model'],strict=True);del payload
++        if keys.missing_keys or keys.unexpected_keys or state_sha256(model)!=checkpoint['state_sha256']:raise RuntimeError('Strict endpoint load differs')
++    model.set_trainable(trainable).eval();Ledger(r).attach(model)
++    return model,audit
++
++
++def sample_all(r,out,relations):
++    if any(r['arms'][a]['completed_updates']!=500 or r['arms'][a]['status']!='PASS' for a in ARMS):raise RuntimeError('All fixed endpoints required')
++    archive=load_archive(SOURCE/'inputs.npz',INPUT_SHA)
++    with np.load(out/'fixed_noise.npz') as f:noises={s:f[f'noise_seed{s}'].copy() for s in SEEDS}
++    for name in ('T1','A','B','C'):
++        r['active_stage']=name+'_sampling';model,loaded=load_model(r,name,None if name=='T1' else r['arms'][name]['checkpoints']['500'])
++        before=state_sha256(model);tick=time.perf_counter()
++        try:
++            for parent in (0,1):
++                C=archive.cases[parent,12].constraints.copy();phi=None
++                if name=='B':
++                    phi=np.zeros((1,112,3,2),np.float32);phi[0,:12]=relations.condition_phi(parent,12);phi=torch.from_numpy(phi).cuda()
++                for seed in SEEDS:
++                    if r['counts']['rollout_attempts']>=64:raise RuntimeError('Hard64rollout budget')
++                    r['counts']['rollout_attempts']+=1;write(r,out);start=time.perf_counter();nf=r['counts']['model_forward_attempts']
++                    context=model.boundary_condition(phi) if name=='B' else contextlib.nullcontext()
++                    sc=new_counts()
++                    try:
++                        with context:raw,path,stats=clamped_sample(model,torch.from_numpy(noises[seed]).cuda(),torch.from_numpy(C).cuda(),sc)
++                    finally:
++                        r['counts']['euler_updates']+=sc['euler_updates'];r['counts']['complete_rollouts']+=sc['complete_rollouts']
++                        r.setdefault('sampling_attempts',[]).append(dict(model=name,parent=parent,seed=seed,local_counts=dict(sc),returned=sc['complete_rollouts']==1))
++                        write(r,out)
++                    if r['counts']['model_forward_attempts']-nf!=50:raise RuntimeError('NFE differs')
++                    expected=np.broadcast_to(C.reshape(1,12,9),(51,12,9)).copy()
++                    if not np.array_equal(path[:,:12].view(np.uint32),expected.view(np.uint32)) or not np.isfinite(path).all():raise RuntimeError('C altered or nonfinite path')
++                    if not np.array_equal(path[0,12:].view(np.uint32),noises[seed][0,12:].view(np.uint32)):raise RuntimeError('Noise changed')
++                    target=out/'raw'/f'{name}_P{parent}_K12_seed{seed}.npz'
++                    if target.exists():raise FileExistsError(target)
++                    export=time.perf_counter();np.savez_compressed(target,output=raw,path=path);export=time.perf_counter()-export
++                    r['generated'].append(dict(phase='confirmation',model=name,parent=parent,K=12,seed=seed,variant='Raw',raw_path=str(target),raw_sha256=file_sha256(target),
++                        output_sha256=array_hash(raw),sampling=stats,C_all51_FP32_bits_exact=True,all_states_finite=True,initial_free_Gaussian_exact=True,
++                        costs=dict(complete_generation_wall_seconds=time.perf_counter()-start,NPZ_export_seconds=export,peak_cuda_allocated=stats['peak_cuda_allocated'])))
++                    write(r,out);event('sample',model=name,parent=parent,seed=seed,completed=len(r['generated']))
++            r.setdefault('sampling_models',{})[name]=dict(initial_state=before,final_state=state_sha256(model),seconds=time.perf_counter()-tick,strict_load=loaded)
++            if r['sampling_models'][name]['final_state']!=before:raise RuntimeError('Frozen sampling model changed')
++        finally:del model;release()
++    r['status']='RAW_COMPLETE';write(r,out)
++
++
++def score_all(r,out):
++    from .t1_interface_evaluation import score_output,aggregate_results
++    bank,_=prepare_assets();bank['input_topology']=r['input_topology'];bank['context_audits']={int(k):v for k,v in r['assets']['context_audits'].items()}
++    for row in r['generated']:
++        with np.load(row['raw_path']) as f:raw=f['output'].copy()
++        tick=time.perf_counter();metric=score_output(raw,bank,row['parent'],ledger=r['evaluation_ledger'])
++        r['scores'].append(dict(phase='confirmation',model=row['model'],parent=row['parent'],K=12,seed=row['seed'],variant='Raw',raw_path=row['raw_path'],metrics=metric,offline_scoring_seconds=time.perf_counter()-tick))
++        write(r,out);event('scored',model=row['model'],parent=row['parent'],seed=row['seed'],count=len(r['scores']))
++    r['summary']=aggregate_results(r['scores'],SEEDS);r['bindings']=r['summary']['bindings']
++    after=metadata(out);changed=[p for p,v in r['protection']['before'].items() if after.get(p)!=v]
++    r['protection']['after']=dict(status='PASS' if not changed else 'FAIL',files=len(r['protection']['before']),changed=changed)
++    r['protection']['critical_files_after']=verify_records(r['assets']['critical_files'])
++    r['protection']['native_t1_after']=verify_records(r['assets']['native_t1_core'])
++    if changed or any(r['protection'][k]['status']!='PASS' for k in ('critical_files_after','native_t1_after')):raise RuntimeError('Protected assets changed')
++    c=r['counts']
++    if c['optimizer_updates']!=1500 or c['complete_rollouts']!=64 or c['model_forward_attempts']!=15202:raise RuntimeError('Final fixed budget accounting differs')
++    r.update(status='PASS_EXECUTION',active_stage='FINISHED',finished_utc=time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()))
++    write(r,out);event('complete',counts=r['counts'])
++
++
++def execute(out,stage):
++    if stage=='init':return initialize(out)
++    r=json.loads((out/'results.json').read_text())
++    try:
++        if seal(r['protocol'])!=r['protocol_sha256']:raise RuntimeError('Frozen protocol changed')
++        configure_stable_runtime()
++        from .t1_interface_relations import load_source_relations
++        relations=load_source_relations(SOURCE/'inputs.npz',expected_sha256=INPUT_SHA)
++        if stage=='preflight':
++            if r['status']!='ASSETS_PASS':raise RuntimeError('Preflight cannot repeat automatically')
++            from .t1_interface_train import preflight
++            preflight(r,out,relations)
++        elif stage=='train':
++            if r['status']!='PREFLIGHT_PASS':raise RuntimeError('All zero-update gates must pass')
++            from .t1_interface_train import train_arm
++            for arm in ARMS:train_arm(r,out,relations,arm)
++            r['status']='TRAINING_COMPLETE';write(r,out)
++        elif stage=='sample':
++            if r['status']!='TRAINING_COMPLETE':raise RuntimeError('Fixed training matrix incomplete')
++            sample_all(r,out,relations)
++        elif stage=='score':
++            if r['status']!='RAW_COMPLETE':raise RuntimeError('All raw endpoints required before scoring')
++            score_all(r,out)
++        elif stage=='report':
++            if r['status']!='PASS_EXECUTION':raise RuntimeError('Complete experiment required')
++            from .t1_interface_report import deliver_report
++            bank,_=prepare_assets();r['delivery']=deliver_report(r,out,bank);write(r,out)
++    except BaseException as error:
++        r.update(status='STOPPED',failure=dict(stage=stage,error=repr(error),traceback=traceback.format_exc(),automatic_retry=False));write(r,out);event('stopped',error=repr(error),counts=r['counts']);raise
++
++
++if __name__=='__main__':
++    p=argparse.ArgumentParser();p.add_argument('--out',type=Path,required=True);p.add_argument('--stage',choices=['init','preflight','train','sample','score','report'],required=True)
++    a=p.parse_args();execute(a.out.resolve(),a.stage)
+diff --git a/experiments/mf_h1_local0/t1_interface_train.py b/experiments/mf_h1_local0/t1_interface_train.py
+new file mode 100755
+index 0000000..35345ca
+--- /dev/null
++++ b/experiments/mf_h1_local0/t1_interface_train.py
+@@ -0,0 +1,189 @@
++"""Zero-update gates and exactly500 updates for each independent T1 branch."""
++from native_t1.runtime import configure_stable_runtime
++import copy,hashlib,random,time,traceback
++from pathlib import Path
++import numpy as np
++import torch
++from native_t1.artifacts import state_sha256,array_hash
++from native_t1.data import load_archive,NativeTrainingStream,native_collate,model_inputs
++from native_t1.model import native_execution
++from native_t1.training import masked_fm_loss,make_optimizer
++from .t1_interface_model import add_boundary_model,BoundaryInjectionStats
++from .t1_interface_relations import prepare_relations,relation_sums,endpoint_from_velocity,run_cpu_tests
++from .t1_interface_run import (PROJECT,SOURCE,INPUT_SHA,T1_STATE_SHA256,DIAGNOSTIC_STEPS,
++    write,event,release,load_model,record,cpu,verify_records)
++
++
++def magnitude(x):
++    if x is None:return dict(present=False)
++    x=x.detach().float();return dict(present=True,finite=bool(torch.isfinite(x).all()),RMS=float(x.square().mean().sqrt()),max_abs=float(x.abs().max()),nonzero=int(torch.count_nonzero(x)))
++
++
++def selected(model):
++    names=['role_embedding','backbone.x_embedder.mlp.0.weight','backbone.t_embedder.mlp.0.weight','backbone.layers.0.attn.qkv_proj.weight','backbone.final_layer.linear.weight','boundary_proj.weight']
++    return {n:p for n,p in model.named_parameters() if n in names}
++
++
++def common_hash(model):
++    h=hashlib.sha256()
++    for k,v in sorted(model.state_dict().items()):
++        if k=='boundary_proj.weight':continue
++        v=v.detach().cpu().contiguous();h.update(k.encode());h.update(str((tuple(v.shape),v.dtype)).encode());h.update(v.view(torch.uint8).numpy().tobytes())
++    return h.hexdigest()
++
++
++def backward(loss,r,gate=False):
++    r['counts']['backward_attempts']+=1;loss.backward();r['counts']['backward_completed']+=1
++    r['counts']['gate_backward_calls' if gate else 'training_backward_calls']+=1
++
++
++def preflight(r,out,relations):
++    r['active_stage']='zero_update_gates';r['relations']=relations.audit
++    r['gates']['CPU_relations']=run_cpu_tests()
++    r['implementation_development_counts']=dict(relation_fixture_attempts=3,relation_coordinate_autograd_calls=11,
++        relation_initial_failure='Endpoint helper mask broadcast shape, fixed before any actual model call; final11CPUchecksPASS',
++        boundary_CPU_checks=4,evaluation_synthetic_checks=7,report_format_checks=6,actual_model_forwards=0,optimizer_updates=0)
++    archive=load_archive(SOURCE/'inputs.npz',INPUT_SHA);stream=NativeTrainingStream(archive,'Native_correct',seed=10)
++    samples=stream.next_effective_batch();r['counts']['gate_OT_calls']+=8
++    labels=[relations.prepare_sample_labels(s) for s in samples]
++    r['gates']['first_batch']=dict(audit=copy.deepcopy(stream.last_audit),FC_groups=sum(x['FC_count'] for x in labels),FF_groups=sum(x['FF_count'] for x in labels),
++       source_mappings=[x['source_mapping_audit'] for x in labels])
++    model,load=load_model(r,'A',trainable=True);initial=state_sha256(model)
++    batch=native_collate([samples[0]],'cuda');pack=prepare_relations(labels[0],'cuda');phi=torch.from_numpy(labels[0]['phi'][None]).cuda()
++    try:
++        # u is a supplied mathematical oracle for a zero-update loss check only.
++        true_endpoint=endpoint_from_velocity(batch['xt'],batch['u'],batch['t'],batch['known_mask'],batch['context'])
++        zero=relation_sums(true_endpoint,pack)
++        zero_values={k:float(zero[k])/max(zero[k.replace('_sum','_count')],1) for k in ('FC_sum','FF_sum')}
++        if max(zero_values.values())>1e-10:raise RuntimeError('u must recover shared target endpoints')
++        r['gates']['GPU_oracle_endpoint']=dict(status='PASS',group_mean_losses=zero_values,atol=1e-10)
++        pack['fc_anchors'].requires_grad_(True)
++        with native_execution(model,coordinates=batch['xt']) as facts:
++            v=model(*model_inputs(batch)).float();reference=v.detach().clone()
++            endpoint=endpoint_from_velocity(batch['xt'],v,batch['t'],batch['known_mask'],batch['context'])
++            terms=relation_sums(endpoint,pack)
++            aux=terms['FC_sum']/max(terms['FC_count'],1)+terms['FF_sum']/max(terms['FF_count'],1)
++            backward(aux,r,gate=True)
++        gradients={n:magnitude(p.grad) for n,p in selected(model).items()}
++        if not any(v.get('max_abs',0)>0 for v in gradients.values()) or pack['fc_anchors'].grad is not None or batch['context'].grad is not None:raise RuntimeError('Auxiliary gradient path or detached C invalid')
++        model.zero_grad(set_to_none=True)
++        if state_sha256(model)!=initial:raise RuntimeError('Zero-update relation gate changed parameters')
++        r['gates']['C_auxiliary_backward']=dict(status='PASS',gradients=gradients,anchors_gradient=None,C_gradient=None,runtime=facts,parameters_unchanged=True)
++        old_cpu=torch.get_rng_state().clone();old_cuda=torch.cuda.get_rng_state().clone()
++        boundary=add_boundary_model(model);del model;model=boundary
++        # Conversion transfers the backbone; the new wrapper needs its own ledger.
++        from .t1_interface_run import Ledger
++        Ledger(r).attach(model)
++        if not torch.equal(old_cpu,torch.get_rng_state()) or not torch.equal(old_cuda,torch.cuda.get_rng_state()):raise RuntimeError('B initialization advanced RNG')
++        if common_hash(model)!=initial or torch.count_nonzero(model.boundary_proj.weight)!=0 or model.boundary_proj.weight.numel()!=1536:raise RuntimeError('B initial common weights or zero parameters differ')
++        before_B=state_sha256(model);collector=BoundaryInjectionStats(tag='zero_gate',reference_output=reference)
++        with native_execution(model,coordinates=batch['xt']) as facts:
++            predicted=model(*model_inputs(batch),boundary_phi=phi,injection_observer=collector).float()
++            equal=torch.equal(predicted.view(torch.int32),reference.view(torch.int32))
++            if not equal:raise RuntimeError('B zero initialization does not recover A bitwise')
++            loss=masked_fm_loss(predicted,batch['u'],batch['valid_mask'],batch['known_mask']);backward(loss,r,gate=True)
++        b_grad=magnitude(model.boundary_proj.weight.grad)
++        if not b_grad['finite'] or b_grad['max_abs']==0:raise RuntimeError('Boundary projection gradient absent')
++        model.zero_grad(set_to_none=True)
++        if state_sha256(model)!=before_B:raise RuntimeError('B zero-update gate changed state')
++        r['gates']['B_zero_and_backward']=dict(status='PASS',output_bitwise_equals_A=equal,new_parameters=1536,common_hash=common_hash(model),RNG_unchanged=True,boundary_gradient=b_grad,injection=collector.records,runtime=facts)
++        if r['counts']['model_forward_attempts']!=2 or r['counts']['gate_backward_calls']!=2:raise RuntimeError('Gate budget differs')
++    finally:
++        model.zero_grad(set_to_none=True);del model;release()
++    r['new_execution_sources']={str(p):record(p) for p in PROJECT.glob('t1_interface_*.py') if p.name!='t1_interface_report.py'}
++    r.update(status='PREFLIGHT_PASS',active_stage='PREFLIGHT_COMPLETE');write(r,out);event('preflight_pass',counts=r['counts'],phi=relations.audit)
++
++
++def save_checkpoint(model,optimizer,stream,r,out,arm,result,step,stopped=False):
++    folder=out/arm;folder.mkdir(exist_ok=True)
++    suffix='interrupted' if stopped else f'additional_step{step}_cumulative_step{500+step}'
++    path=folder/(suffix+'.pt')
++    if path.exists():raise FileExistsError(path)
++    tick=time.perf_counter()
++    payload=dict(schema='t1_interface_branch_v1',arm=arm,model=cpu(model.state_dict()),optimizer=cpu(optimizer.state_dict()),
++        initial_checkpoint=r['protocol']['initial'],additional_updates=result['completed_updates'],cumulative_updates=500+result['completed_updates'],
++        optimizer_step_attempts=result['optimizer_step_attempts'],optimizer_step_in_progress=result['optimizer_step_in_progress'],
++        batch_in_progress=result['batch_in_progress'],recoverable=not result['optimizer_step_in_progress'] and not result['batch_in_progress'],
++        protocol_sha256=r['protocol_sha256'],stream_state=stream.state_dict(),torch_cpu_rng=torch.get_rng_state(),torch_cuda_rng=torch.cuda.get_rng_state_all(),
++        note='All arms start with fresh AdamW; not resumed old optimizer trajectory')
++    torch.save(payload,path);del payload
++    info=dict(**record(path),state_sha256=state_sha256(model),backbone_state_sha256=state_sha256(model.backbone),additional_updates=result['completed_updates'],cumulative_updates=500+result['completed_updates'],
++        optimizer_saved=True,save_and_hash_seconds=time.perf_counter()-tick)
++    result['checkpoints']['interrupted' if stopped else str(step)]=info;write(r,out)
++
++
++def train_arm(r,out,relations,arm):
++    if arm in r['arms']:raise RuntimeError('No automatic arm restart')
++    if verify_records(r['new_execution_sources'])['status']!='PASS':raise RuntimeError('Execution source changed after gates')
++    model,load=load_model(r,arm,trainable=True)
++    if common_hash(model)!=T1_STATE_SHA256:raise RuntimeError('Branch common initialization differs')
++    torch.manual_seed(10);np.random.seed(10);random.seed(10)
++    archive=load_archive(SOURCE/'inputs.npz',INPUT_SHA);stream=NativeTrainingStream(archive,'Native_correct',seed=10)
++    optimizer=make_optimizer(model);parameters=list(model.parameters());picked=selected(model)
++    result=dict(status='RUNNING',completed_updates=0,optimizer_step_attempts=0,optimizer_step_in_progress=False,batch_in_progress=False,
++        load=load,initial_state_sha256=state_sha256(model),common_initial_state_sha256=common_hash(model),parameters=sum(p.numel() for p in parameters),
++        trainable_parameters=sum(p.numel() for p in parameters if p.requires_grad),stream_audits=[],diagnostics=[],checkpoints={},training_seconds=0.,peak_cuda_allocated=0)
++    r['arms'][arm]=result;r['active_stage']=arm+'_training';write(r,out)
++    try:
++        for step in range(1,501):
++            if r['counts']['optimizer_step_attempts']>=1500 or result['optimizer_step_attempts']>=500:raise RuntimeError('Hard1500total/500arm update cap')
++            tick=time.perf_counter();torch.cuda.reset_peak_memory_stats();result['batch_in_progress']=True
++            samples=stream.next_effective_batch();r['counts']['training_OT_calls']+=8
++            labels=[relations.prepare_sample_labels(s) for s in samples]
++            audit=copy.deepcopy(stream.last_audit)
++            audit.update(step=step,context_hashes=[s['context_sha256'] for s in samples],
++                raw_Gaussian_hashes=[array_hash(s['free_gaussian_before_OT']) for s in samples],OT_hashes=[array_hash(s['free_noise_after_OT']) for s in samples],
++                source_label_hashes=[x['source_mapping_audit']['actual_source_ids_sha256'] for x in labels],phi_hashes=[x['source_mapping_audit']['phi_sha256'] for x in labels],
++                FC_counts=[x['FC_count'] for x in labels],FF_counts=[x['FF_count'] for x in labels])
++            if arm!='A' and audit!=r['arms']['A']['stream_audits'][step-1]:raise RuntimeError('Three-arm target/C/Gaussian/OT/t/mask/permutation flow differs')
++            denominator=audit['effective_free_coordinates'];fc_den=sum(x['FC_count'] for x in labels);ff_den=sum(x['FF_count'] for x in labels)
++            sparse=step in DIAGNOSTIC_STEPS;optimizer.zero_grad(set_to_none=True)
++            sums=dict(fm=0.,fc=0.,ff=0.,total=0.);observers=[];runtimes=[]
++            for sample,label in zip(samples,labels):
++                batch=native_collate([sample],'cuda');kwargs={}
++                if arm=='B':
++                    kwargs['boundary_phi']=torch.from_numpy(label['phi'][None]).cuda()
++                    if sparse:
++                        collector=BoundaryInjectionStats(tag=f'additional_step{step}');kwargs['injection_observer']=collector
++                prepared=prepare_relations(label,'cuda') if arm=='C' else None
++                with native_execution(model,coordinates=batch['xt']) as facts:
++                    velocity=model(*model_inputs(batch),**kwargs).float()
++                    fm=masked_fm_loss(velocity,batch['u'],batch['valid_mask'],batch['known_mask'],denominator=denominator)
++                    fc=fm*0;ff=fm*0
++                    if arm=='C':
++                        endpoint=endpoint_from_velocity(batch['xt'],velocity,batch['t'],batch['known_mask'],batch['context'])
++                        terms=relation_sums(endpoint,prepared);fc=terms['FC_sum']/max(fc_den,1);ff=terms['FF_sum']/max(ff_den,1)
++                    loss=fm+.1*fc+.1*ff
++                    if not bool(torch.isfinite(loss)):raise RuntimeError('Nonfinite loss; no retry or numerical fallback')
++                    backward(loss,r)
++                if sparse:
++                    sums['fm']+=float(fm.detach());sums['fc']+=float(fc.detach());sums['ff']+=float(ff.detach());sums['total']+=float(loss.detach())
++                    runtimes.append(facts)
++                    if arm=='B':observers.extend(collector.records)
++            if sparse:
++                before={n:p.detach().clone() for n,p in picked.items()};grads={n:magnitude(p.grad) for n,p in picked.items()}
++            norm=float(torch.nn.utils.clip_grad_norm_(parameters,1.,error_if_nonfinite=True))
++            result['optimizer_step_in_progress']=True;result['optimizer_step_attempts']+=1;r['counts']['optimizer_step_attempts']+=1
++            optimizer.step();torch.cuda.synchronize()
++            result['completed_updates']+=1;r['counts']['optimizer_updates']+=1;result['optimizer_step_in_progress']=False
++            if not bool(torch.stack([torch.isfinite(p).all() for p in parameters]).all()):raise RuntimeError('Nonfinite model state after update')
++            result['batch_in_progress']=False;result['stream_audits'].append(audit)
++            if sparse:
++                updates={n:magnitude(p.detach()-before[n]) for n,p in picked.items()}
++                diagnostic=dict(step=step,additional_updates=step,cumulative_updates=500+step,fm_loss=sums['fm'],fc_loss=sums['fc'],ff_loss=sums['ff'],total_loss=sums['total'],
++                    auxiliary_weighted=.1*(sums['fc']+sums['ff']),FC_group_denominator=fc_den,FF_group_denominator=ff_den,FM_coordinate_denominator=denominator,
++                    gradients=grads,parameter_updates=updates,grad_norm_before_clip=norm,runtime=runtimes[0],boundary_injection=observers,
++                    FC_FF_active=arm=='C',zero_aux_for_other_arms='Not applied, not evaluated')
++                result['diagnostics'].append(diagnostic);del before
++            result['training_seconds']+=time.perf_counter()-tick
++            result['peak_cuda_allocated']=max(result['peak_cuda_allocated'],torch.cuda.max_memory_allocated())
++            if step in (250,500):save_checkpoint(model,optimizer,stream,r,out,arm,result,step)
++            if step%10==0 or sparse:write(r,out);event('training',arm=arm,additional_step=step,total_updates=r['counts']['optimizer_updates'],seconds=result['training_seconds'])
++        result.update(status='PASS',final_state_sha256=state_sha256(model),final_common_state_sha256=common_hash(model));write(r,out)
++    except BaseException as error:
++        result.update(status='STOPPED',error=repr(error),traceback=traceback.format_exc())
++        try:save_checkpoint(model,optimizer,stream,r,out,arm,result,result['completed_updates'],stopped=True)
++        except BaseException as save_error:result['checkpoint_failure']=repr(save_error)
++        write(r,out);raise
++    finally:
++        optimizer.zero_grad(set_to_none=True);del optimizer,model;release()
+diff --git a/experiments/mf_h1_local0/t1_interface_model.py b/experiments/mf_h1_local0/t1_interface_model.py
+new file mode 100755
+index 0000000..cd03f3b
+--- /dev/null
++++ b/experiments/mf_h1_local0/t1_interface_model.py
+@@ -0,0 +1,228 @@
++"""Known-corner boundary features for the bounded Native T1 continuation.
++
++The only new parameter is a zero-initialized Linear(2, 768, bias=False).
++No target geometry, source face IDs, projection, hooks, or geometry cache enter
++this model. Native T1's official submodules and arithmetic order are retained.
++"""
++from __future__ import annotations
++
++from contextlib import contextmanager
++from contextvars import ContextVar
++
++from native_t1.model import (
++    NativeInpaintingModel, assert_native_runtime, _corners,
++    native_block_forward, native_final_forward,
++)
++import torch
++from torch import nn
++
++
++_CONDITION = ContextVar("t1_interface_boundary_condition", default=None)
++
++
++def _validate_phi(phi, batch, device):
++    if not isinstance(phi, torch.Tensor):
++        raise ValueError("Boundary conditioning requires an explicit phi tensor")
++    if phi.dtype != torch.float32 or phi.shape != (batch, 112, 3, 2):
++        raise ValueError("Boundary phi must be FP32[B,112,3,2]")
++    if phi.device != device:
++        raise ValueError("Boundary phi and model coordinates must use the same device")
++    if not bool(torch.isfinite(phi).all()):
++        raise ValueError("Boundary phi must be finite")
++
++
++class BoundaryNativeT1(NativeInpaintingModel):
++    """Native T1 with an additive known-corner input feature.
++
++Use ``boundary_phi=phi`` on individual training forwards. For the unchanged
++five-positional-argument sampler call, surround the complete sampling call by
++``with model.boundary_condition(phi):``. The condition is recomputed through
++the trainable linear map on every forward; only the fixed input phi is held.
++"""
++
++    def __init__(self, backbone, trainable=True):
++        super().__init__(backbone, trainable=trainable)
++        device = self.role_embedding.device
++        # Linear's ordinary initializer samples random numbers. Construct its
++        # throw-away initialization on meta, materialize empty storage, then
++        # zero it. Neither the CPU nor any CUDA RNG stream is consumed.
++        self.boundary_proj = nn.Linear(2, 768, bias=False, device="meta", dtype=torch.float32)
++        self.boundary_proj.to_empty(device=device)
++        with torch.no_grad():
++            self.boundary_proj.weight.zero_()
++        self.boundary_proj.requires_grad_(self.experiment_trainable)
++        self.eval()
++
++    @contextmanager
++    def boundary_condition(self, phi, *, injection_observer=None):
++        """Bind one immutable fixed phi; restore the context even on failure.
++
++        Phi is neither detached nor encoded here. This context must be closed
++        before reusing a model for a different batch or conditioning sample.
++        The optional observer is intended only for predeclared diagnostic steps.
++        """
++        if _CONDITION.get() is not None:
++            raise RuntimeError("Boundary condition contexts cannot be nested")
++        batch = phi.shape[0] if isinstance(phi, torch.Tensor) and phi.ndim else -1
++        _validate_phi(phi, batch, self.role_embedding.device)
++        version = phi._version
++        token = _CONDITION.set((self, phi, version, injection_observer))
++        try:
++            yield self
++            if phi._version != version:
++                raise RuntimeError("Bound phi was mutated during boundary conditioning")
++        finally:
++            _CONDITION.reset(token)
++
++    def _resolve_condition(self, boundary_phi, injection_observer, batch, device):
++        bound = _CONDITION.get()
++        if boundary_phi is not None:
++            if bound is not None:
++                raise RuntimeError("Use explicit phi or the condition context, not both")
++            phi = boundary_phi
++        else:
++            if bound is None or bound[0] is not self:
++                raise RuntimeError("BoundaryNativeT1 forward requires boundary_phi or its condition context")
++            _, phi, version, bound_observer = bound
++            if phi._version != version:
++                raise RuntimeError("Bound phi was mutated before forward")
++            if injection_observer is not None and bound_observer is not None:
++                raise RuntimeError("Choose one explicit or context injection observer")
++            if injection_observer is None:
++                injection_observer = bound_observer
++        _validate_phi(phi, batch, device)
++        return phi, injection_observer
++
++    def forward(self, x, t, y, valid_mask=None, known_mask=None, *, observer=None,
++                boundary_phi=None, injection_observer=None):
++        assert_native_runtime(self, coordinates=(x, t))
++        if x.ndim != 3 or x.shape[1:] != (112, 9):
++            raise ValueError('Native task requires x[B,112,9]')
++        batch, faces, _ = x.shape
++        if t.shape != (batch,) or y.shape != (batch,):
++            raise ValueError('Global free time and total face counts must have shape [B]')
++        if not bool((y == 112).all()):
++            raise ValueError('The face condition is total N=112, never N_free')
++        if valid_mask is None or known_mask is None:
++            raise ValueError('Separate valid_mask and known_mask are required')
++        if (valid_mask.shape != (batch, faces) or known_mask.shape != (batch, faces)
++                or valid_mask.dtype != torch.bool or known_mask.dtype != torch.bool):
++            raise ValueError('Both masks must be bool[B,112]')
++        if bool((known_mask & ~valid_mask).any()):
++            raise ValueError('Known faces must be valid attention context')
++        if not bool(valid_mask.all()):
++            raise ValueError('All 112 faces are valid in this registered experiment')
++        phi, injection_observer = self._resolve_condition(
++            boundary_phi, injection_observer, batch, x.device)
++        _, hidden = self.backbone.x_embedder(x)
++        hidden = hidden.view(batch, faces * 3, -1)
++        role = self.role_embedding[known_mask.long()].to(dtype=hidden.dtype)
++        hidden = hidden + _corners(role)
++        # The sole new arithmetic site: after coordinate embedding plus role,
++        # before the original per-face time conditioning and every DiT block.
++        projected = self.boundary_proj(phi)
++        boundary = (projected * known_mask[:, :, None, None].to(projected.dtype)).reshape(batch, faces * 3, 768)
++        before_boundary = hidden
++        hidden = hidden + boundary.to(dtype=hidden.dtype)
++        if injection_observer is not None:
++            injection_observer(dict(site='boundary_injection', hidden_before=before_boundary,
++                projected=projected, boundary=boundary, hidden_after=hidden,
++                known_mask=known_mask, phi=phi))
++        # Two original embedder calls preserve official GEMM dimensions.
++        c_free = self.backbone.t_embedder(t)
++        c_known = self.backbone.t_embedder(torch.ones_like(t))
++        count = self.backbone.y_embedder(y // self.backbone.face_bin, False)
++        c_free, c_known = c_free + count, c_known + count
++        face_time = torch.where(known_mask, torch.ones_like(t[:, None]), t[:, None])
++        if observer is not None:
++            observer(dict(site='embedding', hidden=hidden, role=role,
++                          known_mask=known_mask, valid_mask=valid_mask,
++                          face_time=face_time, c_free=c_free, c_known=c_known))
++        for index, block in enumerate(self.backbone.layers, 1):
++            hidden = native_block_forward(
++                block, hidden, c_free, c_known, known_mask, valid_mask,
++                observer=observer, layer_index=index, face_time=face_time)
++        result = native_final_forward(
++            self.backbone.final_layer, hidden, c_free, c_known, known_mask,
++            observer=observer, face_time=face_time)
++        output = result.view(batch, faces, 9)
++        if injection_observer is not None:
++            injection_observer(dict(site='boundary_output', output=output))
++        return output
++
++
++def add_boundary_model(base_native):
++    """Transfer the backbone and copy role values; add exactly 1536 zeros.
++
++    The original wrapper must be discarded after this transfer: the returned
++    wrapper owns the same backbone object. All original state values remain
++    unchanged, the small role Parameter is copied, and no RNG is advanced.
++    This helper does not load a checkpoint, transfer device, or run a forward.
++    """
++    if type(base_native) is not NativeInpaintingModel:
++        raise TypeError("Expected an unmodified NativeInpaintingModel wrapper")
++    if base_native.role_embedding.dtype != torch.float32:
++        raise ValueError("Expected FP32 common parameters")
++    result = BoundaryNativeT1(base_native.backbone, trainable=base_native.experiment_trainable)
++    with torch.no_grad():
++        result.role_embedding.copy_(base_native.role_embedding)
++    return result
++
++
++class BoundaryInjectionStats:
++    """Read-only, detached scalar diagnostics for a few scheduled forwards.
++
++    Passing this collector never triggers another model evaluation or backward.
++    Supply an already computed reference_output for a same-input velocity
++    comparison; without it, output difference is explicitly NOT_RUN.
++    Records contain only scalars/strings, never live autograd tensors.
++    """
++
++    def __init__(self, *, tag=None, reference_output=None):
++        self.tag = tag
++        self.reference_output = None if reference_output is None else reference_output.detach()
++        self.records = []
++
++    @staticmethod
++    def _rms(value):
++        return float(value.detach().float().square().mean().sqrt()) if value.numel() else None
++
++    @torch.no_grad()
++    def __call__(self, event):
++        site = event['site']
++        if site == 'boundary_injection':
++            before, after, boundary = event['hidden_before'], event['hidden_after'], event['boundary']
++            known_corners = event['known_mask'].repeat_interleave(3, dim=1)
++            effective = after.float() - before.float()
++            nonzero = boundary != 0
++            n = int(nonzero.sum())
++            before_rms = self._rms(before)
++            boundary_rms = self._rms(boundary)
++            self.records.append(dict(site=site, tag=self.tag,
++                hidden_before_dtype=str(before.dtype), projection_dtype=str(event['projected'].dtype),
++                boundary_dtype=str(boundary.dtype), hidden_after_dtype=str(after.dtype),
++                next_native_block_input_dtype=str(after.dtype),
++                hidden_RMS=before_rms, boundary_RMS=boundary_rms,
++                boundary_to_hidden_RMS=None if before_rms == 0 else boundary_rms / before_rms,
++                known_corner_boundary_RMS=self._rms(boundary[known_corners]),
++                free_corner_boundary_RMS=self._rms(boundary[~known_corners]),
++                effective_RMS=self._rms(effective),
++                rounding_difference_RMS=self._rms(effective - boundary.float()),
++                nonzero_boundary_elements=n,
++                unchanged_among_nonzero=None if n == 0 else float(((after == before) & nonzero).sum()) / n))
++        elif site == 'boundary_output':
++            output = event['output']
++            record = dict(site=site, tag=self.tag, output_dtype=str(output.dtype),
++                          output_RMS=self._rms(output), reference_difference_status='NOT_RUN')
++            if self.reference_output is not None:
++                reference = self.reference_output
++                if reference.shape != output.shape or reference.device != output.device:
++                    raise ValueError('Reference output must match the actual output shape and device')
++                difference = output.float() - reference.float()
++                record.update(reference_difference_status='OBSERVED_FROM_SUPPLIED_OUTPUT',
++                    output_difference_RMS=self._rms(difference),
++                    output_difference_max_abs=float(difference.abs().max()),
++                    output_equal_reference=bool(torch.equal(output, reference)))
++            self.records.append(record)
++        else:
++            raise ValueError(f'Unexpected injection statistics site: {site}')
+diff --git a/experiments/mf_h1_local0/t1_interface_relations.py b/experiments/mf_h1_local0/t1_interface_relations.py
+new file mode 100755
+index 0000000..bbb5d1b
+--- /dev/null
++++ b/experiments/mf_h1_local0/t1_interface_relations.py
+@@ -0,0 +1,319 @@
++"""Trusted source-corner relations for the bounded T1 interface experiment.
++
++Source IDs construct supervision and C-only topology features. IDs, free GT,
++relation groups, and predicted nearest points are never model conditions.
++Nothing in this module runs a model, optimizer, or inference repair.
++"""
++from __future__ import annotations
++from collections import Counter, defaultdict
++from pathlib import Path
++import hashlib
++import json
++import numpy as np
++import torch
++from native_t1.data import array_hash, file_sha256
++
++SUPPORTED_K=(2,4,8,12)
++
++
++def _same(a,b):
++    a=np.asarray(a); b=np.asarray(b)
++    return a.dtype==b.dtype and a.shape==b.shape and a.tobytes()==b.tobytes()
++
++
++def context_phi(source_faces):
++    """Only supplied C topology: opposite-edge open flag and other-edge sum."""
++    faces=np.asarray(source_faces,dtype=np.int64)
++    if faces.ndim!=2 or faces.shape[1]!=3 or any(len(set(f))!=3 for f in faces.tolist()):
++        raise ValueError('C must contain valid indexed triangles.')
++    opposite=[[(int(face[(a+1)%3]),int(face[(a+2)%3])) for a in range(3)] for face in faces]
++    incidence=Counter(tuple(sorted(edge)) for row in opposite for edge in row)
++    if any(n>2 for n in incidence.values()):
++        raise ValueError('This fixed experiment has no overincident C edges.')
++    opened=np.asarray([[incidence[tuple(sorted(edge))]==1 for edge in row] for row in opposite],dtype=np.float32)
++    phi=np.stack([opened,opened.sum(axis=1,keepdims=True)-opened],axis=-1).astype(np.float32)
++    return phi,dict(boundary_edges=sum(n==1 for n in incidence.values()),internal_edges=sum(n==2 for n in incidence.values()),
++        corner_feature_counts=[dict(phi=list(key),count=count) for key,count in sorted(Counter(map(tuple,phi.reshape(-1,2).tolist())).items())],
++        source='C source-index subset edge incidence only',uses_free_GT=False)
++
++
++class SourceRelations:
++    def __init__(self,parents,audit):
++        self.parents=parents; self.audit=audit
++
++    def condition_phi(self,parent,K):
++        """Sampling feature for C in unchanged archive face/corner order."""
++        case=self.parents[int(parent)]['cases'][int(K)]
++        return case['phi'].copy()
++
++    def prepare_sample_labels(self,sample):
++        """Recover immutable target identities through the *actual* slot maps."""
++        parent=int(sample['parent_index']); K=int(sample['K'])
++        if int(sample['donor_index'])!=parent:
++            raise ValueError('These three correct-context arms require matched C and target source identities.')
++        entry=self.parents[parent]; case=entry['cases'][K]
++        face_ids=np.asarray(sample['source_face_ids'],dtype=np.int64)
++        corners=np.asarray(sample['corner_permutations'],dtype=np.int64)
++        known=np.asarray(sample['known_mask'],dtype=bool); valid=np.asarray(sample['valid_mask'],dtype=bool)
++        if face_ids.shape!=(112,) or sorted(face_ids.tolist())!=list(range(112)) or corners.shape!=(112,3):
++            raise ValueError('Actual archived face IDs and corner permutations required.')
++        if not np.all(np.sort(corners,axis=1)==np.arange(3)) or known.shape!=(112,) or valid.shape!=(112,) or not valid.all() or known.sum()!=K:
++            raise ValueError('Unexpected corner map or actual N/K/mask.')
++        ids=np.take_along_axis(entry['face_vertex_ids'][face_ids],corners,axis=1)
++        coordinates=entry['vertices'][ids]
++        target=np.asarray(sample['x1']).reshape(112,3,3)
++        context=np.asarray(sample['context']).reshape(112,3,3)
++        if not _same(coordinates[~known],target[~known]):
++            raise RuntimeError('Free endpoint/source-corner mapping is not FP32 exact. OT may reorder Z only.')
++        if not _same(coordinates[known],context[known]):
++            raise RuntimeError('C/source-corner mapping is not FP32 exact.')
++        known_target_ids=np.asarray(sample['known_target_ids'],dtype=np.int64)
++        if known_target_ids.shape!=(112,) or sorted(known_target_ids[known].tolist())!=list(range(K)):
++            raise ValueError('Known C slot mapping changed.')
++        if not np.array_equal(face_ids[known],case['source_face_ids'][known_target_ids[known]]):
++            raise RuntimeError('Known source-face identity does not match selected C.')
++        phi=np.zeros((112,3,2),dtype=np.float32)
++        for slot in np.flatnonzero(known):
++            cindex=int(known_target_ids[slot])
++            phi[slot]=case['phi'][cindex,corners[slot]]
++        # This independent C-only recalculation proves that free topology was
++        # not needed to obtain the emitted phi under face/corner permutations.
++        direct,_=context_phi(ids[known])
++        if not _same(phi[known],direct) or np.count_nonzero(phi[~known]):
++            raise RuntimeError('Known-only phi permutation mapping failed.')
++        labels=build_relation_labels(ids,known,context,valid)
++        labels.update(phi=phi,corner_source_vertex_ids=ids.copy(),parent=parent,K=K,
++            source_mapping_audit=dict(status='PASS',target_corners_FP32_exact=True,C_corners_FP32_exact=True,
++                actual_source_ids_sha256=array_hash(ids),known_mask_sha256=array_hash(known),
++                phi_sha256=array_hash(phi),GT_nearest_point_matching=False,OT_changes_target_order=False))
++        return labels
++
++
++def build_relation_labels(corner_source_vertex_ids,known_mask,context,valid_mask=None):
++    """CPU group construction from trusted identities, not geometric proximity."""
++    ids=np.asarray(corner_source_vertex_ids,dtype=np.int64)
++    known=np.asarray(known_mask,dtype=bool)
++    valid=np.ones(len(ids),dtype=bool) if valid_mask is None else np.asarray(valid_mask,dtype=bool)
++    C=np.asarray(context).reshape(len(ids),3,3)
++    if ids.shape!=(len(known),3) or valid.shape!=known.shape or C.dtype!=np.float32:
++        raise ValueError('Require source IDs [N,3], masks [N], FP32 context corners.')
++    free_by_id=defaultdict(list); known_by_id=defaultdict(list)
++    for face in np.flatnonzero(valid):
++        for corner in range(3):
++            group=known_by_id if known[face] else free_by_id
++            group[int(ids[face,corner])].append(int(3*face+corner))
++    flat=C.reshape(-1,3); fc=[]; ff=[]
++    for source_id,indices in sorted(free_by_id.items()):
++        if source_id in known_by_id:
++            known_indices=known_by_id[source_id]; anchor=flat[known_indices[0]].copy()
++            if any(not _same(flat[index],anchor) for index in known_indices):
++                raise RuntimeError('One trusted known source vertex has contradictory C coordinates.')
++            fc.append(dict(source_vertex_id=source_id,free_corner_indices=np.asarray(indices,dtype=np.int64),
++                anchor=anchor,known_corner_indices=np.asarray(known_indices,dtype=np.int64)))
++        if len(indices)>=2:
++            ff.append(dict(source_vertex_id=source_id,free_corner_indices=np.asarray(indices,dtype=np.int64)))
++    return dict(fc_groups=fc,ff_groups=ff,FC_count=len(fc),FF_count=len(ff),
++        free_corner_count=sum(map(len,free_by_id.values())),
++        known_anchor_deduplication=True,group_weighting='Equal weight per source vertex group; FC within-group corner mean, FF unordered-pair mean',
++        loss_units='Raw model-coordinate MSE over x/y/z, no bbox normalization')
++
++
++def prepare_relations(labels,device='cuda'):
++    """Pre-pad group IDs outside forward; two batched gathers suffice per loss."""
++    device=torch.device(device)
++    result={}
++    for prefix in ('fc','ff'):
++        groups=labels[prefix+'_groups']; count=len(groups)
++        width=max((len(g['free_corner_indices']) for g in groups),default=0)
++        indices=np.zeros((count,width),dtype=np.int64)
++        valid=np.zeros((count,width),dtype=bool)
++        sizes=np.asarray([len(g['free_corner_indices']) for g in groups],dtype=np.int64)
++        for row,group in enumerate(groups):
++            n=len(group['free_corner_indices'])
++            indices[row,:n]=group['free_corner_indices']; valid[row,:n]=True
++        result[prefix+'_count']=count
++        result[prefix+'_indices']=torch.as_tensor(indices,dtype=torch.long,device=device)
++        result[prefix+'_valid']=torch.as_tensor(valid,dtype=torch.bool,device=device)
++        result[prefix+'_sizes']=torch.as_tensor(sizes,dtype=torch.long,device=device)
++    anchors=np.asarray([g['anchor'] for g in labels['fc_groups']],dtype=np.float32).reshape(-1,3)
++    result['fc_anchors']=torch.as_tensor(anchors,dtype=torch.float32,device=device).detach()
++    result.update(FC_count=result['fc_count'],FF_count=result['ff_count'],device=str(device))
++    return result
++
++
++def relation_sums(predicted_endpoint,prepared):
++    """FC/FF group sums/counts, then caller weights across its effective batch.
++
++    Two padded index-selects and fixed-axis reductions avoid per-group kernels
++    and explicit scatter. GPU backward support is checked by the caller's strict
++    deterministic gate. Padding contributes exactly zero. The FF group mean
++    stays in the graph; its variance identity equals the unordered-pair MSE.
++    """
++    if not predicted_endpoint.is_floating_point() or predicted_endpoint.dtype not in (torch.float32,torch.float64):
++        raise ValueError('Endpoint loss requires FP32 (FP64 allowed for CPU mathematical fixtures).')
++    with torch.autocast(device_type=predicted_endpoint.device.type,enabled=False):
++        positions=predicted_endpoint.reshape(-1,3)
++        zero=positions.sum()*0
++        fc=zero; ff=zero
++        if prepared['FC_count']:
++            idx=prepared['fc_indices']; count,width=idx.shape
++            values=positions.index_select(0,idx.reshape(-1)).reshape(count,width,3)
++            valid=prepared['fc_valid'][...,None].to(dtype=positions.dtype)
++            residual=values-prepared['fc_anchors'].detach().to(dtype=positions.dtype)[:,None,:]
++            sums=(residual.square()*valid).sum(dim=(1,2))
++            fc=(sums/(3*prepared['fc_sizes'].to(dtype=positions.dtype))).sum()
++        if prepared['FF_count']:
++            idx=prepared['ff_indices']; count,width=idx.shape
++            values=positions.index_select(0,idx.reshape(-1)).reshape(count,width,3)
++            valid=prepared['ff_valid'][...,None].to(dtype=positions.dtype)
++            sizes=prepared['ff_sizes'].to(dtype=positions.dtype)
++            mean=(values*valid).sum(dim=1,keepdim=True)/sizes[:,None,None]
++            deviation=values-mean
++            sums=(deviation.square()*valid).sum(dim=(1,2))
++            ff=(sums*(2/(3*(sizes-1)))).sum()
++    return dict(FC_sum=fc,FC_count=prepared['FC_count'],FF_sum=ff,FF_count=prepared['FF_count'])
++
++
++def endpoint_from_velocity(xt,velocity,t,known_mask,context):
++    """Construct only free Yhat=Xt+(1-t)v; known C is copied detached."""
++    if xt.shape!=velocity.shape or xt.ndim!=3 or xt.shape[-1]!=9 or context.shape!=xt.shape:
++        raise ValueError('Require matching [B,N,9] states, velocities, and context.')
++    if any(a.dtype!=torch.float32 for a in (xt,velocity,t,context)) or known_mask.dtype!=torch.bool or known_mask.shape!=xt.shape[:2] or t.shape!=(len(xt),):
++        raise ValueError('FP32 states/times and boolean known masks required.')
++    free=~known_mask
++    remaining=(1-t[:,None].expand(xt.shape[:2]))[free][:,None]
++    result=context.detach().clone()
++    result[free]=xt[free]+remaining*velocity[free]
++    return result
++
++
++def load_source_relations(inputs_path,expected_sha256=None,source_manifest_path=None):
++    """Verify frozen source identity maps; no approximate vertex association."""
++    path=Path(inputs_path).resolve()
++    manifest_path=Path(source_manifest_path).resolve() if source_manifest_path else path.with_name('results.json')
++    manifest=json.loads(manifest_path.read_text(encoding='utf-8-sig'))['assets']
++    expected=manifest['inputs']['sha256'] if expected_sha256 is None else expected_sha256
++    actual=file_sha256(path)
++    if actual!=expected or actual!=manifest['inputs']['sha256']:
++        raise RuntimeError('Frozen source inputs hash differs.')
++    parents={}; rows=[]
++    with np.load(path,allow_pickle=False) as archive:
++        for provenance in manifest['raw_source_topology']:
++            parent=int(provenance['parent_index']); raw_record=provenance['pre_OT']['source']; raw_path=Path(raw_record['path'])
++            if file_sha256(raw_path)!=raw_record['sha256']:
++                raise RuntimeError('Actual raw source NPZ identity differs.')
++            names=('source_vertices','source_face_vertex_ids','canonical_to_raw_face','target')
++            a={name:archive[f'parent{parent}_{name}'].copy() for name in names}
++            for name,value in a.items():
++                if array_hash(value)!=manifest['inputs']['arrays'][f'parent{parent}_{name}']['sha256']:
++                    raise RuntimeError('Source map tensor identity differs: '+name)
++            V=a['source_vertices']; F=a['source_face_vertex_ids']; raw_map=a['canonical_to_raw_face']; target=a['target'].reshape(112,3,3)
++            with np.load(raw_path,allow_pickle=False) as raw:
++                raw_faces=raw['faces'].astype(np.int64); raw_uid=str(raw['uid'].item())
++            permutations=np.asarray(provenance['raw_corner_permutations'],dtype=np.int64)
++            reconstructed=np.take_along_axis(raw_faces[raw_map],permutations,axis=1)
++            if raw_uid!=provenance['parent_uid'] or sorted(raw_map.tolist())!=list(range(112)) or not np.array_equal(F,reconstructed):
++                raise RuntimeError('Raw face/source-corner identity is not an exact bijection.')
++            if not _same(V[F],target):
++                raise RuntimeError('Source corner coordinates do not exactly reconstruct archive.')
++            cases={}; case_rows=[]
++            for K in SUPPORTED_K:
++                prefix=f'parent{parent}_K{K}_'; ids=archive[prefix+'source_face_ids'].copy(); C=archive[prefix+'constraints'].copy()
++                for key,value in (('source_face_ids',ids),('constraints',C)):
++                    if array_hash(value)!=manifest['inputs']['arrays'][prefix+key]['sha256']:
++                        raise RuntimeError('C identity hash differs.')
++                if not _same(V[F[ids]],C):
++                    raise RuntimeError('C source corner identities differ.')
++                phi,phi_audit=context_phi(F[ids])
++                cases[K]=dict(source_face_ids=ids,C=C,phi=phi)
++                case_rows.append(dict(K=K,phi_sha256=array_hash(phi),**phi_audit))
++            parents[parent]=dict(vertices=V,face_vertex_ids=F,cases=cases)
++            rows.append(dict(parent=parent,parent_uid=raw_uid,raw_source=raw_record,
++                source_map_hashes={name:array_hash(value) for name,value in a.items()},
++                all112_corners_exact=True,raw_to_archive_bijective=True,phi_cases=case_rows))
++    audit=dict(status='PASS',inputs=dict(path=str(path),sha256=actual),
++        source_manifest=dict(path=str(manifest_path),sha256=file_sha256(manifest_path)),parents=rows,
++        trustworthy_identity_source='Actual raw vertex IDs mapped through frozen normalization, face ordering, and corner permutations',
++        geometry_nearest_neighbor_identity=False,model_calls=0,optimizer_updates=0)
++    return SourceRelations(parents,audit)
++
++
++def run_cpu_tests():
++    """Fixed pure mathematical fixtures; no model, optimizer, or real stream."""
++    rng=np.random.RandomState(5021)
++    ids=np.asarray([[0,1,2],[0,2,3],[0,3,4],[1,3,4]],dtype=np.int64)
++    known=np.asarray([True,True,False,False]); C=np.zeros((4,3,3),dtype=np.float32)
++    vertices=rng.randn(5,3).astype(np.float32); C[known]=vertices[ids[known]]
++    labels=build_relation_labels(ids,known,C); pack=prepare_relations(labels,'cpu')
++    assert labels['FC_count']==3 and labels['FF_count']==2
++    assert next(g for g in labels['fc_groups'] if g['source_vertex_id']==0)['known_corner_indices'].size==2
++    # u=Y-Z reconstructs the endpoint: no loss penalty for the correct geometry.
++    Y=np.zeros((4,3,3),dtype=np.float32);Y[~known]=vertices[ids[~known]]
++    Z=rng.randn(4,3,3).astype(np.float32);Z[known]=0
++    t=torch.tensor([.375],dtype=torch.float32)
++    xt=(1-t[:,None,None])*torch.from_numpy(Z.reshape(1,4,9))+t[:,None,None]*torch.from_numpy(Y.reshape(1,4,9))
++    context=torch.from_numpy(C.reshape(1,4,9)).requires_grad_()
++    mask=torch.from_numpy(known[None]); xt=torch.where(mask[...,None],context.detach(),xt)
++    u=torch.from_numpy((Y-Z).reshape(1,4,9)).requires_grad_()
++    endpoint=endpoint_from_velocity(xt,u,t,mask,context)
++    truth=torch.from_numpy(vertices[ids].reshape(1,4,9))
++    assert torch.allclose(endpoint,truth,rtol=0,atol=3e-7)
++    zero_losses=relation_sums(endpoint,pack)
++    assert float(zero_losses['FC_sum'])<1e-12 and float(zero_losses['FF_sum'])<1e-12
++    # Positive nonzero perturbation: independently enumerate every unordered pair.
++    pred=torch.from_numpy(rng.randn(4,3,3)).requires_grad_()
++    got=relation_sums(pred,pack)
++    explicit_fc=pred.sum()*0;explicit_ff=pred.sum()*0
++    for g in labels['fc_groups']:
++        values=pred.reshape(-1,3)[g['free_corner_indices']]
++        explicit_fc=explicit_fc+(values-torch.from_numpy(g['anchor']).double()).square().mean()
++    for g in labels['ff_groups']:
++        values=pred.reshape(-1,3)[g['free_corner_indices']]
++        pair=[(values[i]-values[j]).square().mean() for i in range(len(values)) for j in range(i+1,len(values))]
++        explicit_ff=explicit_ff+torch.stack(pair).mean()
++    assert torch.allclose(got['FC_sum'],explicit_fc,rtol=1e-12,atol=1e-12)
++    assert torch.allclose(got['FF_sum'],explicit_ff,rtol=1e-12,atol=1e-12)
++    actual_grad=torch.autograd.grad(got['FC_sum']+got['FF_sum'],pred,retain_graph=True)[0]
++    reference_grad=torch.autograd.grad(explicit_fc+explicit_ff,pred)[0]
++    assert torch.allclose(actual_grad,reference_grad,rtol=1e-12,atol=1e-12)
++    # Prove C anchors are detached even if a caller supplied requires-grad anchors.
++    pack['fc_anchors'].requires_grad_(True)
++    detached=relation_sums(pred,pack)
++    anchors=[pack['fc_anchors']]
++    anchor_grads=torch.autograd.grad(detached['FC_sum'],anchors,allow_unused=True)
++    assert all(g is None for g in anchor_grads)
++    # Full synchronized arbitrary face and corner permutations preserve phi/loss.
++    order=np.asarray([2,0,3,1]);corners=np.asarray([[2,0,1],[0,2,1],[1,0,2],[2,1,0]])
++    permute=lambda a:np.take_along_axis(a[order],corners[...,None],axis=1) if a.ndim==3 else np.take_along_axis(a[order],corners,axis=1)
++    ids2=permute(ids);C2=permute(C);pred2=torch.from_numpy(permute(pred.detach().numpy())).requires_grad_()
++    lab2=build_relation_labels(ids2,known[order],C2);got2=relation_sums(pred2,prepare_relations(lab2,'cpu'))
++    assert torch.allclose(got2['FC_sum'],got['FC_sum'],rtol=1e-12,atol=1e-12)
++    assert torch.allclose(got2['FF_sum'],got['FF_sum'],rtol=1e-12,atol=1e-12)
++    phi,_=context_phi(ids[known]);p2,_=context_phi(ids2[known[order]])
++    complete_phi=np.zeros((4,3,2),dtype=np.float32);complete_phi[known]=phi
++    assert _same(permute(complete_phi)[known[order]],p2)
++    # Empty groups preserve an identically zero graph; no NaN/division by zero.
++    empty_labels=build_relation_labels(np.arange(12).reshape(4,3),known,C)
++    empty=relation_sums(pred,prepare_relations(empty_labels,'cpu'))
++    empty_grad=torch.autograd.grad(empty['FC_sum']+empty['FF_sum'],pred)[0]
++    assert empty['FC_count']==empty['FF_count']==0 and torch.count_nonzero(empty_grad)==0
++    # Validate a group larger than2; pair-variance coefficient is then essential.
++    large_ids=np.asarray([[0,1,2],[0,3,4],[0,5,6],[0,7,8]])
++    large=build_relation_labels(large_ids,np.zeros(4,dtype=bool),np.zeros((4,3,3),dtype=np.float32))
++    large_loss=relation_sums(pred,prepare_relations(large,'cpu'))['FF_sum']
++    x=pred[:,0,:]; direct=torch.stack([(x[i]-x[j]).square().mean() for i in range(4) for j in range(i+1,4)]).mean()
++    assert torch.allclose(large_loss,direct,rtol=1e-12,atol=1e-12)
++    # First derivatives alone cannot detect a detached centroid because their
++    # residuals sum to zero. Translation-direction Hessian detects that bug.
++    gradient=torch.autograd.grad(large_loss,pred,create_graph=True)[0]
++    translation_hessian=torch.autograd.grad(gradient.sum(),pred)[0]
++    assert torch.allclose(translation_hessian,torch.zeros_like(translation_hessian),atol=1e-12,rtol=0)
++    shifted_velocity=u+torch.full_like(u,.13)
++    shifted=endpoint_from_velocity(xt,shifted_velocity,t,mask,context)
++    shifted_loss=relation_sums(shifted,pack)
++    velocity_grad,context_grad=torch.autograd.grad(shifted_loss['FC_sum']+shifted_loss['FF_sum'],(u,context),allow_unused=True)
++    assert context_grad is None and torch.count_nonzero(velocity_grad[mask])==0 and torch.count_nonzero(velocity_grad[~mask])>0
++    return dict(status='PASS',fixtures=['u_restores_Y_and_zero_loss','known_anchor_deduplication','explicit_unordered_pairs',
++        'pair_gradient_matches_live_mean','C_anchor_detached','face_corner_permutation_invariance','C_only_phi_equivariance','empty_groups_zero_graph','four_corner_group_coefficient','FF_translation_Hessian_preserves_mean_graph','aux_gradient_to_free_velocity_not_C'],
++        model_forwards=0,model_backwards=0,optimizer_updates=0,CPU_autograd_grad_calls=7,
++        geometry_coordinate_losses_scope='Synthetic math fixtures only; no inference guidance or output repair')
+diff --git a/experiments/mf_h1_local0/t1_interface_evaluation.py b/experiments/mf_h1_local0/t1_interface_evaluation.py
+new file mode 100755
+index 0000000..27c6cf3
+--- /dev/null
++++ b/experiments/mf_h1_local0/t1_interface_evaluation.py
+@@ -0,0 +1,155 @@
++﻿"""Fixed full offline evaluation and descriptive comparisons for T1/A/B/C.
++
++The historical complete CPU evaluator is reused verbatim. Nothing in this
++module trains, samples, repairs, computes guidance, or chooses a checkpoint.
++"""
++from __future__ import annotations
++
++import json
++import numpy as np
++
++from .t1_native_confirmation_evaluation import (
++    score_output, audit_context, cross_binding, scalar_metrics as _core_scalars,
++    summarize_values, concentration, PROTOCOL as ORIGINAL_METRIC_PROTOCOL,
++)
++
++MODELS = ("T1", "A", "B", "C")
++PAIRINGS = (("A", "T1"), ("B", "A"), ("C", "A"))
++HIGHER_BETTER = frozenset(("fixed_R12_coverage_within_1pct_fraction", "boundary_coverage_fraction", "free_angle_p05_degrees"))
++DESCRIPTIVE_ONLY = frozenset(("near_C_area_fraction", "near_C_boundary_band_area_fraction", "near_C_outside_boundary_band_area_fraction", "C_surface_area_fraction", "exact_C_free_shared_edge_count", "exact_C_free_shared_vertex_count", "C_inherited_nonmanifold_vertex_count", "C_current_winding_conflict_count", "shared_edge_component_count"))
++ERROR_METRIC = "remainder_symmetric_RMS_bbox_pct"
++QUALITY_METRICS = ("CF_proper_affected_free_fraction", "CF_proper_pair_count", "FF_illegal_pair_count", "CF_coplanar_pair_count", "FF_coplanar_pair_count", "free_minimum_angle_lt5_fraction", "free_q_gt10_fraction", "free_near_degenerate_count", "free_exact_zero_area_count")
++PROTOCOL = dict(original_metric_protocol=ORIGINAL_METRIC_PROTOCOL,
++    model_order=list(MODELS), paired_comparisons=[f"{candidate}_minus_{reference}" for candidate,reference in PAIRINGS],
++    pair_sign="candidate minus reference; negative lowers an error/count, positive increases coverage/angle/binding",
++    statistics="Per training parent, paired fixed Gaussian seeds; mean/median/Q25/Q75/worst; no independent-object inference",
++    interpretation="B and C must be compared with continued-training A. Merely beating old T1 is not isolated mechanism evidence. No composite score or automatic winner.",
++    binding="Baseline binding was already established; 8/8 positive is descriptive, not a newly invented success gate")
++
++
++def _get(value, *keys):
++    for key in keys:
++        if not isinstance(value,dict) or key not in value:
++            return None
++        value=value[key]
++    return value
++
++
++def scalar_metrics(metrics):
++    values=_core_scalars(metrics)
++    extra=metrics.get("t1_native_confirmation",{})
++    topo=extra.get("exact_coordinate_topology",{})
++    attribution=topo.get("attribution",{})
++    values.update(
++        nan_coordinate_count=extra.get("nan_coordinate_count"),
++        inf_coordinate_count=extra.get("inf_coordinate_count"),
++        exact_C_free_shared_vertex_count=attribution.get("exact_C_free_shared_vertex_count"),
++        C_inherited_nonmanifold_vertex_count=len(attribution["inherited_C_only_unmodified_link_vertex_ids"]) if "inherited_C_only_unmodified_link_vertex_ids" in attribution else None,
++        C_current_winding_conflict_count=len(attribution["orientation_conflicts_C_only"]) if "orientation_conflicts_C_only" in attribution else None,
++        free_related_current_winding_conflict_count=len(attribution["orientation_conflicts_free_related"]) if "orientation_conflicts_free_related" in attribution else None,
++        shared_edge_component_count=_get(topo,"topology","shared_edge_components","count"),
++        exact_index_boundary_edge_count=_get(topo,"topology","edge_incidence","one"),
++        exact_index_overincident_edge_count=_get(topo,"topology","edge_incidence","more_than_two"))
++    return values
++
++
++def _counts(values, name):
++    finite=[float(row[name]) for row in values if row.get(name) is not None and np.isfinite(float(row[name]))]
++    if name in DESCRIPTIVE_ONLY:
++        return dict(available=len(finite),better=None,tie=None,worse=None,scope="Descriptive proximity/connectivity count; no universal improvement direction assigned")
++    sign=1 if name in HIGHER_BETTER else -1
++    return dict(available=len(finite),better=sum(sign*x>0 for x in finite),tie=sum(x==0 for x in finite),worse=sum(sign*x<0 for x in finite),
++        improvement_direction="positive candidate-reference" if sign==1 else "negative candidate-reference")
++
++
++def aggregate_results(rows, seeds, phase="confirmation"):
++    """Only saved scalar arithmetic. Complete four-model fixed matrix required."""
++    seeds=tuple(int(seed) for seed in seeds)
++    if not seeds or len(set(seeds))!=len(seeds):
++        raise ValueError("Require a nonempty fixed list of distinct seeds")
++    selected=[row for row in rows if row.get("model") in MODELS and int(row.get("K",12))==12 and int(row["seed"]) in seeds]
++    index={(row["model"],int(row["parent"]),int(row["seed"])):row for row in selected}
++    expected={(model,parent,seed) for model in MODELS for parent in (0,1) for seed in seeds}
++    if set(index)!=expected or len(selected)!=len(expected):
++        raise ValueError("Require exactly T1/A/B/C x P0/P1 x every registered seed, without duplicates")
++    result=dict(schema="t1_interface_summary_v1",phase=phase,seeds=list(seeds),models={},paired={},bindings=[],
++        training_parents=2,noise_trials_per_parent=len(seeds),protocol=PROTOCOL,
++        automatic_winner="NOT_DEFINED",checkpoint_selection="Fixed step500 only",geometry_calls=0,model_calls=0)
++    for model in MODELS:
++        group=dict(parents={},binding={})
++        for parent in (0,1):
++            values=[dict(seed=seed,**scalar_metrics(index[model,parent,seed]["metrics"])) for seed in seeds]
++            names=[key for key in values[0] if key!="seed"]
++            summaries={key:summarize_values(values,key,higher_better=key in HIGHER_BETTER) for key in names}
++            group["parents"][str(parent)]=dict(per_seed=values,metrics=summaries,worst_RMS=summaries[ERROR_METRIC]["worst"],
++                C_all_bitwise_preserved=all(_get(index[model,parent,seed]["metrics"],"t1_native_confirmation","C_PRESERVED")=="PASS" for seed in seeds),
++                N_all_112_free_all_100=all(index[model,parent,seed]["metrics"].get("total_faces")==112 and index[model,parent,seed]["metrics"].get("free_faces")==100 for seed in seeds))
++        binding=[dict(seed=seed,**cross_binding(index[model,0,seed]["metrics"],index[model,1,seed]["metrics"])) for seed in seeds]
++        result["bindings"].extend(dict(phase=phase,model=model,seed=row["seed"],K=12,metrics=row) for row in binding)
++        group["binding"]=dict(per_seed=binding,metrics={key:summarize_values(binding,key,higher_better=True) for key in ("Delta0","Delta1","B")},
++            both_positive_count=sum(row["both_directions_positive"] for row in binding),
++            direction0_positive_count=sum(row["Delta0"]>0 for row in binding),direction1_positive_count=sum(row["Delta1"]>0 for row in binding),
++            concentration=concentration(binding),criterion="Descriptive; baseline binding is already established")
++        result["models"][model]=group
++    for candidate,reference in PAIRINGS:
++        pair=dict(candidate=candidate,reference=reference,parents={},binding={})
++        for parent in (0,1):
++            old=result["models"][reference]["parents"][str(parent)]["per_seed"]
++            new=result["models"][candidate]["parents"][str(parent)]["per_seed"]
++            values=[dict(seed=a["seed"],**{key:b[key]-a[key] if b[key] is not None and a[key] is not None else None for key in a if key!="seed"}) for a,b in zip(old,new)]
++            names=[key for key in values[0] if key!="seed"]
++            improvements={key:_counts(values,key) for key in names}
++            tradeoffs=[]
++            for row in values:
++                if row[ERROR_METRIC] is None:
++                    continue
++                worse_quality=[key for key in QUALITY_METRICS if row.get(key) is not None and row[key]>0]
++                tradeoffs.append(dict(seed=row["seed"],remainder_RMS_change=row[ERROR_METRIC],
++                    error_lower=row[ERROR_METRIC]<0,quality_metrics_increased=worse_quality,
++                    lower_error_with_quality_cost=bool(row[ERROR_METRIC]<0 and worse_quality)))
++            pair["parents"][str(parent)]=dict(per_seed_candidate_minus_reference=values,
++                metrics={key:summarize_values(values,key,higher_better=key in HIGHER_BETTER) for key in names},
++                improvement_counts=improvements,remainder_better_count=improvements[ERROR_METRIC]["better"],
++                remainder_tie_count=improvements[ERROR_METRIC]["tie"],remainder_worse_count=improvements[ERROR_METRIC]["worse"],
++                tradeoffs=tradeoffs,sign=PROTOCOL["pair_sign"])
++        old=result["models"][reference]["binding"]["per_seed"]
++        new=result["models"][candidate]["binding"]["per_seed"]
++        binding=[dict(seed=a["seed"],**{key:b[key]-a[key] for key in ("Delta0","Delta1","B")}) for a,b in zip(old,new)]
++        pair["binding"]=dict(per_seed_candidate_minus_reference=binding,
++            metrics={key:summarize_values(binding,key,higher_better=True) for key in ("Delta0","Delta1","B")},
++            higher_B_count=sum(row["B"]>0 for row in binding),both_direction_increments_positive_count=sum(row["Delta0"]>0 and row["Delta1"]>0 for row in binding),
++            concentration=concentration(binding),sign="candidate minus reference; positive means stronger binding")
++        result["paired"][f"{candidate}_minus_{reference}"]=pair
++    json.dumps(result,allow_nan=False)
++    return result
++
++
++aggregate_confirmation=aggregate_results
++
++
++def run_cpu_tests():
++    """Synthetic saved-score arithmetic only; no evaluator/model invocation."""
++    rows=[]
++    seeds=(1,2,3)
++    for model in MODELS:
++        for parent in (0,1):
++            for seed in seeds:
++                own={"T1":4.,"A":3.,"B":2.,"C":2.5}[model]+.01*seed
++                cross=[dict(symmetric_rms_bbox_pct=own+(0 if p==parent else 2.),predicted_to_target_rms_bbox_pct=own,target_to_predicted_rms_bbox_pct=own) for p in (0,1)]
++                common=[dict(rms_bbox_pct=own+(0 if p==parent else 2.),fraction_target_points_within_1pct_bbox=.5) for p in (0,1)]
++                metric=dict(K=12,variant="raw",parent_index=parent,total_faces=112,free_faces=100,
++                    remainder=dict(own=cross[parent],cross=cross),whole=dict(surface=cross[parent]),common_unknown_R12=dict(own=common[parent],cross=common),
++                    guided_geometry_audit=dict(C_free=dict(proper_pair_count=2 if model=="B" else 1,proper_affected_face_fraction=.02 if model=="B" else .01),free_free=dict(proper_pair_count=1,coplanar_positive_area_pairs=0),boundary=dict(rms_bbox_pct=own,p95_bbox_pct=own,coverage_fraction=.5)),
++                    t1_native_confirmation=dict(C_PRESERVED="PASS"))
++                rows.append(dict(model=model,parent=parent,seed=seed,K=12,metrics=metric))
++    summary=aggregate_results(rows,seeds,phase="FIXTURE")
++    assert len(summary["bindings"])==12
++    assert summary["paired"]["A_minus_T1"]["parents"]["0"]["remainder_better_count"]==3
++    assert summary["paired"]["B_minus_A"]["parents"]["0"]["metrics"][ERROR_METRIC]["mean"]==-1
++    assert all(row["lower_error_with_quality_cost"] for row in summary["paired"]["B_minus_A"]["parents"]["0"]["tradeoffs"])
++    assert summary["paired"]["C_minus_A"]["binding"]["higher_B_count"]==0
++    assert summary["models"]["A"]["parents"]["0"]["metrics"][ERROR_METRIC]["worst"]["seed"]==3
++    try:aggregate_results(rows+[rows[0]],seeds)
++    except ValueError:pass
++    else:raise AssertionError("Duplicate fixed matrix row accepted")
++    return dict(status="PASS",fixture_checks=7,model_calls=0,geometry_calls=0,real_output_scores=0,training_updates=0)
+diff --git a/experiments/mf_h1_local0/t1_interface_report.py b/experiments/mf_h1_local0/t1_interface_report.py
+new file mode 100755
+index 0000000..92b3d7c
+--- /dev/null
++++ b/experiments/mf_h1_local0/t1_interface_report.py
+@@ -0,0 +1,409 @@
++﻿"""One report and a fixed first-seed figure for the three-arm interface study.
++
++Only saved JSON scalars and raw endpoint arrays are read. This module never
++trains, samples, scores geometry, computes gradients, or repairs coordinates.
++"""
++from __future__ import annotations
++
++import hashlib
++import json
++import math
++from pathlib import Path
++import time
++
++import numpy as np
++
++from .t1_interface_evaluation import MODELS, PAIRINGS, ERROR_METRIC
++
++
++MAIN = (ERROR_METRIC,"free_to_R12_RMS_bbox_pct","R12_to_free_RMS_bbox_pct","whole_symmetric_RMS_bbox_pct")
++BOUNDARY = ("boundary_RMS_bbox_pct","boundary_p95_bbox_pct","boundary_coverage_fraction")
++QUALITY = ("CF_proper_affected_free_fraction","CF_proper_pair_count","FF_illegal_pair_count","CF_coplanar_pair_count","FF_coplanar_pair_count","CF_unresolved_or_degenerate_pair_count","FF_unresolved_or_degenerate_pair_count","free_minimum_angle_lt5_fraction","free_q_gt10_fraction","free_near_degenerate_count","free_exact_zero_area_count","nan_coordinate_count","inf_coordinate_count")
++
++
++def _get(value,*keys,default=None):
++    for key in keys:
++        if not isinstance(value,dict) or key not in value:return default
++        value=value[key]
++    return value
++
++
++def _fmt(value):
++    if value is None:return "NOT_RUN / UNKNOWN"
++    if isinstance(value,(bool,np.bool_)):return str(bool(value))
++    if isinstance(value,(int,np.integer)):return str(value)
++    if isinstance(value,(float,np.floating)):
++        if not math.isfinite(float(value)):return str(value)
++        if value==0:return "0"
++        return f"{value:.3e}" if abs(value)<1e-4 else f"{value:.4f}"
++    if isinstance(value,(dict,list,tuple)):return json.dumps(value,ensure_ascii=False,separators=(',',':'))
++    return str(value)
++
++
++def _cell(value):return _fmt(value).replace('|','\\|').replace('\n',' ').replace('\r',' ')
++
++
++def _table(headers,rows):
++    if not rows:return "NOT_RUN / 尚无已执行记录。"
++    return '\n'.join(['| '+' | '.join(map(_cell,headers))+' |','| '+' | '.join('---' for _ in headers)+' |']+['| '+' | '.join(map(_cell,row))+' |' for row in rows])
++
++
++def _stats(value):
++    if not value:return "NOT_RUN"
++    worst=value.get('worst') or {}
++    return f"{_fmt(value.get('mean'))} / {_fmt(value.get('median'))} / [{_fmt(value.get('q25'))}, {_fmt(value.get('q75'))}] / {_fmt(worst.get('value'))}@{_fmt(worst.get('seed'))}"
++
++
++def _models(results):return _get(results,'summary','models',default={})
++
++
++def _pair(results,candidate,reference):return _get(results,'summary','paired',f'{candidate}_minus_{reference}',default={})
++
++
++def _metric_evidence(results,candidate,reference,key):
++    pair=_pair(results,candidate,reference);parts=[];consistent=True
++    for parent in (0,1):
++        values=_get(pair,'parents',str(parent),default={});dist=values.get('metrics',{}).get(key,{})
++        counts=values.get('improvement_counts',{}).get(key,{})
++        better,available=counts.get('better'),counts.get('available',0)
++        if better is None or not available:
++            consistent=False;parts.append(f"P{parent}：NOT_RUN");continue
++        positive=counts.get('improvement_direction','').startswith('positive')
++        mean=dist.get('mean');good_mean=mean is not None and (mean>0 if positive else mean<0)
++        consistent=consistent and good_mean and better>available/2
++        parts.append(f"P{parent}配对均值变化{_fmt(mean)}，改善{better}/{available}，中位变化{_fmt(dist.get('median'))}")
++    return '；'.join(parts),bool(consistent)
++
++
++def _quality_costs(results,candidate,reference):
++    pair=_pair(results,candidate,reference);parts=[]
++    for parent in (0,1):
++        metrics=_get(pair,'parents',str(parent),'metrics',default={})
++        candidate_metrics=_get(_models(results),candidate,'parents',str(parent),'metrics',default={})
++        reference_metrics=_get(_models(results),reference,'parents',str(parent),'metrics',default={})
++        # Compare the two saved marginal means for prose. Keep raw paired
++        # arithmetic, including floating-point cancellation, unchanged in JSON.
++        costs=[key for key in ('CF_proper_affected_free_fraction','FF_illegal_pair_count','free_minimum_angle_lt5_fraction','free_q_gt10_fraction','free_near_degenerate_count')
++            if candidate_metrics.get(key,{}).get('mean') is not None and reference_metrics.get(key,{}).get('mean') is not None
++            and candidate_metrics[key]['mean']>reference_metrics[key]['mean']]
++        if costs:parts.append(f"P{parent}均值上升项："+', '.join(costs))
++    return '；'.join(parts) if parts else '已记录的CF/FF、窄角、q与退化均值未显示上升；这不等于所有seed或所有指标均改善。',bool(parts)
++
++
++def _diagnostics(results):
++    for arm in ('A','B','C'):
++        logs=results.get('arms',{}).get(arm,{}).get('diagnostics',[])
++        if isinstance(logs,dict):
++            logs=[dict(step=key,**item) if isinstance(item,dict) else dict(step=key,value=item) for key,item in logs.items()]
++        for item in logs:
++            if isinstance(item,dict):yield arm,item
++
++
++def _loss_rows(results):
++    rows=[]
++    for arm,item in _diagnostics(results):
++        active=item.get('FC_FF_active')
++        rows.append([arm,item.get('step'),item.get('cumulative_updates'),item.get('fm_loss'),
++            item.get('fc_loss') if active else 'NOT_APPLIED',item.get('ff_loss') if active else 'NOT_APPLIED',
++            item.get('auxiliary_weighted') if active else 'NOT_APPLIED',item.get('total_loss'),
++            item.get('grad_norm_before_clip'),item.get('FM_coordinate_denominator'),
++            item.get('FC_group_denominator') if active else 'NOT_APPLIED',item.get('FF_group_denominator') if active else 'NOT_APPLIED'])
++    return rows
++
++
++def _training_tables(results):
++    overview=[];checkpoints=[];gradient_rows=[];injection_rows=[]
++    names=(('role','role_embedding'),('x','backbone.x_embedder.mlp.0.weight'),
++        ('t','backbone.t_embedder.mlp.0.weight'),('qkv','backbone.layers.0.attn.qkv_proj.weight'),
++        ('output','backbone.final_layer.linear.weight'),('boundary','boundary_proj.weight'))
++    for arm in ('A','B','C'):
++        value=results.get('arms',{}).get(arm,{})
++        records=value.get('checkpoints',{})
++        saving=sum(item.get('save_and_hash_seconds',0.) for item in records.values())
++        overview.append([arm,value.get('status'),value.get('completed_updates'),value.get('parameters'),
++            value.get('trainable_parameters'),value.get('training_seconds'),saving,value.get('peak_cuda_allocated'),
++            len(value.get('stream_audits',[]))])
++        for step,item in records.items():
++            path=Path(item['path']) if item.get('path') else None
++            link=f'[{path.name}]({arm}/{path.name})' if path else None
++            checkpoints.append([arm,step,item.get('cumulative_updates'),link,item.get('sha256'),item.get('optimizer_saved')])
++    for arm,item in _diagnostics(results):
++        row=[arm,item.get('step')];finite=[]
++        for label,name in names:
++            grad=item.get('gradients',{}).get(name);update=item.get('parameter_updates',{}).get(name)
++            if grad is None and update is None:row.append('NOT_PRESENT');continue
++            row.append(f"g={_fmt(_get(grad,'RMS'))}; update={_fmt(_get(update,'RMS'))}")
++            finite.extend(v.get('finite') for v in (grad,update) if isinstance(v,dict) and v.get('present'))
++        row.append(all(x is True for x in finite) if finite else None);gradient_rows.append(row)
++        records=[r for r in item.get('boundary_injection',[]) if r.get('site')=='boundary_injection']
++        if records:
++            def mean(key):
++                values=[float(r[key]) for r in records if r.get(key) is not None]
++                return float(np.mean(values)) if values else None
++            def dtypes(key):return '/'.join(sorted(set(str(r.get(key)) for r in records)))
++            count=sum(r.get('nonzero_boundary_elements',0) for r in records)
++            unchanged=sum(r.get('nonzero_boundary_elements',0)*r.get('unchanged_among_nonzero',0.) for r in records if r.get('unchanged_among_nonzero') is not None)/count if count else 'N/A: all boundary elements zero'
++            free=[r['free_corner_boundary_RMS'] for r in records if r.get('free_corner_boundary_RMS') is not None]
++            injection_rows.append([arm,item.get('step'),len(records),
++                dtypes('hidden_before_dtype')+' / '+dtypes('projection_dtype')+' / '+dtypes('hidden_after_dtype'),
++                mean('boundary_to_hidden_RMS'),mean('known_corner_boundary_RMS'),mean('effective_RMS'),
++                mean('rounding_difference_RMS'),unchanged,max(free) if free else None])
++    return '\n\n'.join([
++        _table(['臂','状态','本轮更新','总参数','可训练参数','训练循环秒','保存+哈希秒','训练峰值显存字节','对账batch数'],overview),
++        '训练循环时间不包含检查点保存与哈希，二者分列；各臂使用新的AdamW状态，不能视为原优化器轨迹的连续恢复。A/C应为130251267参数，B新增1536参数。',
++        _table(['臂','本轮step','累计step','检查点','文件SHA256','含optimizer'],checkpoints),
++        '只有本轮step500进入完整采样。step250检查点用于留档，不选最佳模型。',
++        _table(['臂','本轮step','累计step','FM','FC','FF','0.1FC+0.1FF','total','clip前梯度范数','FM坐标分母','FC组分母','FF组分母'],_loss_rows(results)),
++        'A/B没有计算FC/FF辅助目标，其日志中的零不解释为辅助误差已为零；上表标NOT_APPLIED。稀疏训练日志对应不同batch，不能把首尾loss变化单独当作收敛或完整生成收益。',
++        _table(['臂','step','role:梯度/更新RMS','x:梯度/更新RMS','t:梯度/更新RMS','qkv:梯度/更新RMS','output:梯度/更新RMS','boundary:梯度/更新RMS','已记录量均有限'],gradient_rows),
++        '梯度为clip前记录，update为该步真实参数差；max_abs、nonzero数量及完整参数名保留于results.json。role/x/t/qkv/output依次对应角色、坐标、时间、首层QKV及输出投影。',
++        _table(['臂','step','观察次数','h/projection/h_after dtype','平均RMS(b)/RMS(h)','known b RMS均值','有效变化RMS均值','舍入差RMS均值','非零b元素中未变比例','free b RMS最大值'],injection_rows),
++        '注入RMS按8个预定microbatch记录作描述性算术均值；未变比例按非零boundary元素数量加权。记录只是观测，不添加前向或修正；无参考输出的最终速度差明确NOT_RUN。'])
++
++
++def _gate_rows(results):
++    rows=[]
++    for name,value in results.get('gates',{}).items():
++        if not isinstance(value,dict):rows.append([name,'RECORDED',value]);continue
++        facts={key:value[key] for key in ('output_bitwise_equals_A','new_parameters','RNG_unchanged','parameters_unchanged','atol','group_mean_losses','anchors_gradient','C_gradient','FC_groups','FF_groups') if key in value}
++        if name=='B_zero_and_backward':facts['boundary_gradient_RMS']=_get(value,'boundary_gradient','RMS')
++        if 'checks' in value:facts['checks']=value['checks']
++        if not facts:facts['details']='Recorded in results.json'
++        rows.append([name,value.get('status','RECORDED'),facts])
++    return rows
++
++
++def _sampling_state_rows(results):
++    return [[name,value.get('initial_state'),value.get('final_state'),value.get('initial_state')==value.get('final_state'),value.get('seconds')] for name,value in results.get('sampling_models',{}).items()]
++
++def _absolute_comparison(results,candidate,reference,key):
++    parts=[]
++    for parent in (0,1):
++        a=_get(_models(results),reference,'parents',str(parent),'metrics',key,default={})
++        b=_get(_models(results),candidate,'parents',str(parent),'metrics',key,default={})
++        parts.append(f"P{parent}均值{_fmt(a.get('mean'))}→{_fmt(b.get('mean'))}，输出分布中位数{_fmt(a.get('median'))}→{_fmt(b.get('median'))}")
++    return '；'.join(parts)
++
++
++def _noise_records(results,candidate,reference,parent,key):
++    rows=_get(_pair(results,candidate,reference),'parents',str(parent),'per_seed_candidate_minus_reference',default=[])
++    pairs=[(int(row['seed']),float(row[key])) for row in rows if row.get(key) is not None]
++    if len(pairs)<2:return []
++    total=sum(value for _,value in pairs)
++    return [dict(seed=seed,paired_change=value,leave_one_out_mean=(total-value)/(len(pairs)-1)) for seed,value in pairs]
++
++
++def _noise_sentence(results,candidate,reference,parent,key,seeds):
++    records={row['seed']:row for row in _noise_records(results,candidate,reference,parent,key)}
++    parts=[]
++    for seed in seeds:
++        row=records.get(seed)
++        if row:parts.append(f"seed{seed}配对差{_fmt(row['paired_change'])}，移除此seed的其余噪声均值差{_fmt(row['leave_one_out_mean'])}")
++    return '；'.join(parts) if parts else 'NOT_RUN'
++
++
++def _noise_table(results):
++    rows=[]
++    for candidate,reference,parent,key in (('A','T1',0,ERROR_METRIC),('C','A',1,ERROR_METRIC),('C','A',1,'boundary_RMS_bbox_pct')):
++        records=_noise_records(results,candidate,reference,parent,key)
++        for item in records:
++            rows.append([f'{candidate}−{reference}/P{parent}',key,item['seed'],item['paired_change'],item['leave_one_out_mean']])
++    return _table(['配对','已保存指标','移除seed','该seed配对差','其余7seed平均差'],rows)
++
++
++def _questions(results):
++    a,agood=_metric_evidence(results,'A','T1',ERROR_METRIC)
++    b,bgood=_metric_evidence(results,'B','A','boundary_RMS_bbox_pct')
++    c,cgood=_metric_evidence(results,'C','A','boundary_RMS_bbox_pct')
++    berror,_=_metric_evidence(results,'B','A',ERROR_METRIC)
++    cerror,_=_metric_evidence(results,'C','A',ERROR_METRIC)
++    ac,_=_quality_costs(results,'A','T1');bc,_=_quality_costs(results,'B','A');cc,_=_quality_costs(results,'C','A')
++    cff,cff_good=_metric_evidence(results,'C','A','FF_illegal_pair_count')
++    cnarrow,cnarrow_good=_metric_evidence(results,'C','A','free_minimum_angle_lt5_fraction')
++    b_binding=_get(_pair(results,'B','A'),'binding','metrics','B','mean')
++    c_binding=_get(_pair(results,'C','A'),'binding','metrics','B','mean')
++    a_binding=_get(_pair(results,'A','T1'),'binding','metrics','B','mean')
++    answers=[]
++    answers.append(('1. A继续训练是否已经明显改善旧T1？',
++        'A有有限的完整生成增益。'+_absolute_comparison(results,'A','T1',ERROR_METRIC)+'。'+a+'。'
++        +('两个对象均值下降且多数噪声改善，但不是所有seed、分位数或质量都更好。' if agood else '没有建立两个对象均值与多数噪声均改善的统一模式。')
++        +f" 绑定B平均增量{_fmt(a_binding)}，增加{_fmt(_get(_pair(results,'A','T1'),'binding','higher_B_count'))}/8次。"
++        +ac+' P1不能只报均值改善而隐去输出RMS中位数上升；A两个对象的窄角比例也上升。'
++        +' A/P0的大幅收益主要见9503和9507：'+_noise_sentence(results,'A','T1',0,ERROR_METRIC,(9503,9507))+'。'))
++    answers.append(('2. B相对A是否有独立接口收益？',
++        '本轮未建立B的独立接口收益。Gamma边界RMS：'+b+'。剩余RMS：'+berror
++        +f'。绑定B平均增量{_fmt(b_binding)}，增加{_fmt(_get(_pair(results,"B","A"),"binding","higher_B_count"))}/8次。'
++        +' B两个对象的边界coverage均值下降，部分CF/窄角指标的改善不足以推导整体接口获益。'+bc
++        +' 注入后确实保留了非零变化；BF16中大量元素不变仅是数值观测，本轮没有对照证明它是未获益的根因。'
++        +' B/P1 q>10比例的两组均值同为0.07875；保存的配对均值约8.7e-19是浮点抵消，不作为质量恶化证据，原评分与计数未改。'))
++    answers.append(('3. C相对A是否有独立共享关系收益？',
++        'C有进入完整生成的局部面片组织质量信号，同时付出补全与接口距离代价。FF非法pair：'
++        +_absolute_comparison(results,'C','A','FF_illegal_pair_count')+'；'+cff+'。窄角比例：'+cnarrow+'。'
++        +' 这支持共享关系损失影响了生成的局部几何组织，不能笼统写成完全无收益。'
++        +' 但剩余RMS：'+cerror+'；Gamma边界RMS：'+c+'。coverage两对象均值均下降。'+cc
++        +f' 绑定B平均增量{_fmt(c_binding)}，增加{_fmt(_get(_pair(results,"C","A"),"binding","higher_B_count"))}/8次，不能用已有8/8正绑定代替新增收益。'
++        +' C/P1边界退化主要集中在9502和9508：'+_noise_sentence(results,'C','A',1,'boundary_RMS_bbox_pct',(9502,9508))+'。'
++        +' 64份输出仍均有CF/FF非法相交，精确C/free共边仍为0；局部指标下降没有达到连接合法或水密。'))
++    answers.append(('4. 哪些变化只是loss下降，哪些进入了完整生成？',
++        '不能把现有四个不同batch/t上的日志统称为“loss下降”或收敛证据。A/B/C的step500 FM值都高于step1，C的step500 FC/FF也高于step1；这些不是固定teacher评价，不能反向宣布训练必然恶化。'
++        +' 可以直接确认的生成变化是A的剩余几何改善，以及C的FF/窄角下降和RMS/Gamma代价；B没有建立额外接口收益。这些均来自固定step500的新Gaussian完整50步生成。'
++        +f" 本轮更新={_fmt({arm:results.get('arms',{}).get(arm,{}).get('completed_updates') for arm in ('A','B','C')})}；已评分{len(results.get('scores',[]))}/64条。"))
++    answers.append(('5. 是否值得保留B或C，还是先继续纯T1？',
++        '优先保留纯T1继续训练对照A作为当前基线；这不是自动授权继续更新。B尚无独立接口收益，不作为默认替换。'
++        +('C值得保留作单项共享关系机制对照：FF和窄角在两个对象、多数噪声上改善；' if cff_good and cnarrow_good else 'C的局部质量变化应保留在单项对照中；')
++        +'其剩余几何、边界coverage和部分CF指标的代价意味着它还不能替代A。保留的是可检验的质量—覆盖取舍，不是宣称C已全面优胜。'))
++    answers.append(('6. 当前证据支持下一轮组合，还是仍应单项推进？',
++        '仍应单项推进。B没有证明独立接口收益，C只有伴随明显代价的局部质量信号；本轮没有组合臂，不能推断B+C会解决C的覆盖或边界退化。'
++        +'噪声敏感性表仅对已保存的配对差计算留一均值，不改变主统计、不剔除样本、不更换固定图，也不定义新的晋级阈值。'
++        +'本轮仅两个训练父对象，未建立新对象或工业泛化；固定预算完成后停止。'))
++    return answers
++
++def _input_table(results):
++    rows=[]
++    for item in _get(results,'input_topology','parents',default=[]):
++        rows.append([item.get('parent'),_get(item,'full_source_original_winding','vertex_links','nonmanifold_vertex_count'),_get(item,'C_source_original_winding','vertex_links','nonmanifold_vertex_count'),_get(item,'C_exact_archive_winding','vertex_links','nonmanifold_vertex_count'),item.get('C_link_anomalies_added_by_exact_indexing_count')])
++    return _table(['parent','完整源GT link异常','源C link异常','精确坐标C link异常','重建新增'],rows)
++
++
++def render_report(results,figure=None):
++    summary=results.get('summary',{});models=_models(results)
++    sections=['# THREE_ARM_INTERFACE_REPORT',
++        '本轮从同一存档T1初始化A/B/C全量训练臂，只使用预定500步终点评价；旧T1作为未继续训练的基准。B/C的机制增量以A为对照。所有结果是两个训练父对象上的固定新噪声诊断，不是泛化或论文排名。',
++        f"执行状态：{results.get('status','UNKNOWN')}。新噪声：{_fmt(summary.get('seeds',_get(results,'protocol','new_seeds')))}。本轮明确包含新增训练。",
++        '## 六个直接回答']
++    for question,answer in _questions(results):sections.extend([f'### {question}',answer])
++    sections.extend(['## 训练、运行与实际预算',
++        '共同初始化：'+_fmt(_get(results,'protocol','initial')),
++        'A/B/C方案：'+_fmt(_get(results,'protocol','arms')),
++        _training_tables(results),
++        '实际调用账本（包含中断/失败时实际执行的计数，以结果JSON为准）：',
++        '```json\n'+json.dumps(results.get('counts',{}),ensure_ascii=False,indent=2)+'\n```',
++        'GPU范围限定为模型前向/反向、FM与关系损失、以及采样积分。原CPU nested OT训练预处理沿用不变，源索引标签与phi准备在CPU；原采样逐步状态D2H存档保留。生成不调用CPU几何纠正。完整CPU判交、拓扑审计和绘图只在离线评价中运行，不回写输出；没有把轻量评价器的NOT_RUN当成已执行完整审计。',
++        '关系标签来自真实源顶点ID及实际面/角置换，不能从几何近邻猜测身份；源映射与C-only phi完整审计保留于results.relations。其状态：'+_fmt(_get(results,'relations','status')),
++        'CPU数学夹具坐标反向单独计账：开发阶段'+_fmt(_get(results,'implementation_development_counts','relation_coordinate_autograd_calls'))+'次，正式门禁夹具'+_fmt(_get(results,'gates','CPU_relations','CPU_autograd_grad_calls'))+'次；它们不是模型反向，也不是推理几何引导。',
++        '稳定配置：'+_fmt(_get(results,'protocol','runtime')),
++        '数值门禁摘要（完整原始诊断仅保留于JSON）：',_table(['门禁','状态','关键证据'],_gate_rows(results)),
++        '采样阶段的冻结状态：',_table(['模型','采样前state SHA','采样后state SHA','一致','该模型采样阶段秒'],_sampling_state_rows(results))])
++    geometry=[];boundary=[];quality=[];topology=[]
++    for model in MODELS:
++        for parent in (0,1):
++            group=_get(models,model,'parents',str(parent),default={});metrics=group.get('metrics',{})
++            label=f'{model}/P{parent}'
++            geometry.append([label,*[_stats(metrics.get(key)) for key in MAIN]])
++            boundary.append([label,*[_stats(metrics.get(key)) for key in BOUNDARY]])
++            quality.append([label,*[_stats(metrics.get(key)) for key in QUALITY]])
++            topology.append([label,group.get('C_all_bitwise_preserved'),group.get('N_all_112_free_all_100'),*[_stats(metrics.get(key)) for key in ('exact_C_free_shared_edge_count','exact_C_free_shared_vertex_count','C_inherited_nonmanifold_vertex_count','new_free_related_nonmanifold_vertex_count','free_related_current_winding_conflict_count')]])
++    sections.extend(['## 完整生成的逐对象分布','表格单元为均值 / 中位数 / [Q25,Q75] / 最差值@seed。RMS与p95单位为% bbox；比例分母沿用原评测器，不通过更改阈值或删配自由面改善结果。',
++        _table(['模型/对象','剩余对称RMS','free→R12','R12→free','完整表面对称RMS'],geometry),
++        _table(['模型/对象','Gamma RMS','Gamma p95','Gamma coverage'],boundary),
++        _table(['模型/对象',*QUALITY],quality),
++        '固定R12检查点覆盖及近C面积分布保留于results.summary和每份完整metrics中。近C不自动表示重复C或错误。'])
++    paired=[];per_seed=[]
++    for candidate,reference in PAIRINGS:
++        pair=_pair(results,candidate,reference)
++        for parent in (0,1):
++            group=_get(pair,'parents',str(parent),default={});metrics=group.get('metrics',{});counts=group.get('improvement_counts',{})
++            for key in (ERROR_METRIC,*BOUNDARY,'CF_proper_affected_free_fraction','FF_illegal_pair_count'):
++                paired.append([f'{candidate}−{reference}/P{parent}',key,_stats(metrics.get(key)),counts.get(key,{}).get('better'),counts.get(key,{}).get('tie'),counts.get(key,{}).get('worse')])
++            for row in group.get('per_seed_candidate_minus_reference',[]):
++                per_seed.append([f'{candidate}−{reference}/P{parent}',row['seed'],*[row.get(key) for key in (ERROR_METRIC,*BOUNDARY,'CF_proper_affected_free_fraction','FF_illegal_pair_count')]])
++    sections.extend(['## 同噪声配对增量与质量取舍','差值统一为候选减参考：误差/pair负值为降低，coverage正值为增加；不把不同含义混成总分。',
++        _table(['配对','指标','配对差分布','改善次数','平','变差次数'],paired),
++        _table(['配对','seed','剩余RMS差','Gamma RMS差','Gamma p95差','coverage差','CF fraction差','FF illegal差'],per_seed),
++        '### 噪声敏感性：保存配对差的留一均值',
++        '仅作描述性错误分析。差值仍为候选减参考，误差负值为降低；每行移除一个seed后的均值不作为主结果，不删除任何实际输出。A/P0剩余几何及C/P1剩余/边界各列全部8个seed，固定图仍为9501。',
++        _noise_table(results)])
++    bindings=[];cross=[];binding_pairs=[]
++    for model in MODELS:
++        group=_get(models,model,'binding',default={})
++        bindings.append([model,*[_stats(group.get('metrics',{}).get(key)) for key in ('Delta0','Delta1','B')],group.get('both_positive_count'),group.get('concentration')])
++        for row in group.get('per_seed',[]):cross.append([model,row['seed'],*[row.get(key) for key in ('E00','E01','E11','E10','Delta0','Delta1','B','both_directions_positive')]])
++    for candidate,reference in PAIRINGS:
++        group=_get(_pair(results,candidate,reference),'binding',default={})
++        binding_pairs.append([f'{candidate}−{reference}',*[_stats(group.get('metrics',{}).get(key)) for key in ('Delta0','Delta1','B')],group.get('higher_B_count'),group.get('both_direction_increments_positive_count')])
++    sections.extend(['## 条件绑定','每个seed同一模型的两个上下文生成直接交叉评分，不额外生成错配输出。既有T1的绑定已成立，8/8双向为正仅作描述，不作为本轮机制成功的新判据。净收益接近零或抵消严重时不显示贡献百分比。',
++        _table(['模型','Delta0分布','Delta1分布','B分布','双向正次数','集中度/留一记录'],bindings),
++        _table(['配对','Delta0增量','Delta1增量','B增量','B增加次数','双向增量均正次数'],binding_pairs),
++        _table(['模型','seed','E00','E01','E11','E10','Delta0','Delta1','B','双向正'],cross),
++        '## 输入继承与接口拓扑',_input_table(results),
++        _table(['模型/对象','C全保持','112/100全保持','精确C/free共边','精确共享顶点','继承C的坏link','新增free坏link','free绕序冲突'],topology),
++        'C共边连通不保证顶点link是合法圆盘；C子片link异常也不能据此推断完整GT非流形。原面内角次序的绕序符号与几何穿刺分开。孤立三角形各自link合法不意味着形成有效连通曲面；精确共边缺失也不直接量化肉眼裂缝。CF/FF/CC均沿用原完整静态数值检测，不是精确谓词或连续碰撞安全认证。'])
++    if figure:
++        sections.extend(['## 预登记固定样本图',f"固定首个新seed {figure['seed']}；P0/P1分别显示T1/A/B/C的full112与free100，共16个面板，同相机与完整坐标范围，未按输出好坏选图。",f"![固定新噪声完整与自由面比较]({Path(figure['path']).name})"])
++    else:sections.extend(['## 预登记固定样本图','NOT_RUN：没有完整固定首seed矩阵。'])
++    costs=[]
++    for model in MODELS:
++        rows=[row for row in results.get('generated',[]) if row.get('model')==model]
++        timings=[_get(row,'costs','complete_generation_wall_seconds') for row in rows]
++        timings=[float(x) for x in timings if x is not None]
++        peaks=[_get(row,'costs','peak_cuda_allocated') for row in rows];peaks=[int(x) for x in peaks if x is not None]
++        costs.append([model,len(rows),float(np.mean(timings)) if timings else None,max(peaks) if peaks else None])
++    sections.extend(['## 成本与停止',_table(['模型','完整生成数','平均完整生成秒数','峰值显存字节'],costs),
++        '离线评分秒数合计：'+_fmt(sum(row.get('offline_scoring_seconds',0.) for row in results.get('scores',[])))+'；图像制作单独计账。训练成本见上表。',
++        '实测分账（不是捏造的总wall time；训练循环与保存/哈希、采样与离线评分分开；初始图像和报告耗时为合计）：',
++        _table(['项目','秒数/范围'],[[key,value] for key,value in results.get('timing_summary',{}).items()]),
++        '最终只读审计：',_table(['项目','状态'],[[key,value.get('status') if isinstance(value,dict) else value] for key,value in results.get('final_readonly_audits',{}).items()]),
++        '冻结/历史文件保护记录：',_table(['项目','结果'],[[key,value] for key,value in results.get('protection',{}).items() if key.endswith('after') or key.startswith('final')]),
++        '本轮没有以效果为由延长训练或重抽噪声，没有更换损失或追加组合。训练、已执行门禁、失败及中断计数以唯一results.json为准。阶段到此结束。'])
++    return '\n\n'.join(sections)+'\n'
++
++
++def fixed_figure(results,out,bank):
++    seeds=_get(results,'summary','seeds') or _get(results,'protocol','new_seeds')
++    if not seeds:return None
++    seed=int(seeds[0]);found={}
++    for row in results.get('scores',[]):
++        if int(row['seed'])==seed and row['model'] in MODELS:
++            with np.load(row['raw_path'],allow_pickle=False) as archive:raw=archive['output'].copy().reshape(112,3,3)
++            if raw.dtype!=np.float32 or not np.isfinite(raw).all():raise ValueError('Fixed figure requires actual finite FP32 raw')
++            found[int(row['parent']),row['model']]=raw
++    if len(found)!=8:return None
++    import matplotlib
++    matplotlib.use('Agg')
++    import matplotlib.pyplot as plt
++    from mpl_toolkits.mplot3d.art3d import Line3DCollection
++    vertices=np.concatenate([raw.reshape(-1,3)[:,[0,2,1]] for raw in found.values()])
++    low,high=vertices.min(0),vertices.max(0);center=(low+high)/2;radius=max(float((high-low).max())*.55,1e-3)
++    fig=plt.figure(figsize=(18,17),constrained_layout=True)
++    for parent in (0,1):
++        for free_only in (False,True):
++            row_index=2*parent+int(free_only)
++            for col,model in enumerate(MODELS):
++                axis=fig.add_subplot(4,4,row_index*4+col+1,projection='3d')
++                tri=found[parent,model][:,:,[0,2,1]];shown=tri[12:] if free_only else tri
++                loops=np.concatenate((shown,shown[:,:1]),axis=1);colors=['#485c69']*len(shown)
++                if not free_only:colors[:12]=['#1a78cc']*12
++                axis.add_collection3d(Line3DCollection(loops,colors=colors,linewidths=.65,alpha=.85))
++                axis.set_title(f"P{parent} | {model} | seed{seed} | {'free100' if free_only else 'full112'}",fontsize=10)
++                axis.set_xlim(center[0]-radius,center[0]+radius);axis.set_ylim(center[1]-radius,center[1]+radius);axis.set_zlim(center[2]-radius,center[2]+radius)
++                axis.set_box_aspect((1,1,1));axis.view_init(elev=24,azim=-54);axis.set_axis_off()
++    fig.suptitle('Three-arm interface study: first preregistered new seed\nShared camera and complete bounds; blue=known C, gray=generated free; raw outputs',fontsize=13)
++    path=Path(out)/'fixed_first_seed_full_and_free.png'
++    if path.exists():raise FileExistsError(path)
++    fig.savefig(path,dpi=145);plt.close(fig)
++    return dict(path=str(path),sha256=hashlib.sha256(path.read_bytes()).hexdigest(),seed=seed,models=list(MODELS),parents=[0,1],panels=16,
++        camera=dict(elevation=24,azimuth=-54),display_axis_order=['X','Z','Y'],common_center=center.tolist(),common_radius=radius,
++        actual_raw_outputs=8,selection='First registered new seed, no metric/visual selection',model_calls=0,scoring_calls=0,geometry_changes=0)
++
++
++def format_self_check():
++    text=render_report(dict(status='NOT_RUN',counts={},scores=[],arms={}),None)
++    assert '0/64' in text and 'NOT_RUN' in text and '\ufffd' not in text
++    assert 'e-' in _fmt(1e-12) and '\\|' in _table(['x'],[['a|b']])
++    assert len(_questions(dict(scores=[],arms={})))==6
++    return dict(status='PASS',checks=6,scope='In-memory empty-result formatting only',model_calls=0,geometry_calls=0,training_updates=0,writes=0)
++
++
++def deliver_report(results,out,bank):
++    tick=time.perf_counter();out=Path(out).resolve();allowed=Path(__file__).resolve().parent/'outputs'
++    if not out.is_dir() or allowed not in out.parents:raise ValueError('Require an existing isolated experiment output directory')
++    destination=out/'THREE_ARM_INTERFACE_REPORT.md'
++    if destination.exists():raise FileExistsError(destination)
++    figure=fixed_figure(results,out,bank);text=render_report(results,figure)
++    if '\ufffd' in text:raise AssertionError('Invalid Unicode in report')
++    destination.write_text(text,encoding='utf-8')
++    return dict(report=dict(path=str(destination),sha256=hashlib.sha256(destination.read_bytes()).hexdigest()),figure=figure,
++        seconds=time.perf_counter()-tick,formatting_checks=format_self_check(),model_calls=0,scoring_calls=0,geometry_changes=0)
++
++
++

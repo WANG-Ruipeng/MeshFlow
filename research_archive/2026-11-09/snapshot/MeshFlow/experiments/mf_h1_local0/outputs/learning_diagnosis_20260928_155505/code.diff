@@ -1,0 +1,2129 @@
+diff --git a/experiments/mf_h1_local0/stable_runtime.py b/experiments/mf_h1_local0/stable_runtime.py
+new file mode 100644
+--- /dev/null
++++ b/experiments/mf_h1_local0/stable_runtime.py
+@@ -0,0 +1,122 @@
++"""Shared strict execution policy for new training, teacher and sampling entrypoints.
++
++Import this module BEFORE importing torch or model modules in an entrypoint.
++Use ``with stable_execution(backbone, adapter):`` around actual computation;
++the context preserves the caller's gradient mode and never casts parameters.
++No exception is caught to retry an unsupported deterministic operation.
++"""
++from __future__ import annotations
++
++import os
++import sys
++
++_CUBLAS_CONFIG = ":4096:8"
++_existing_torch = sys.modules.get("torch")
++_existing_config = os.environ.get("CUBLAS_WORKSPACE_CONFIG")
++if _existing_config not in (None, _CUBLAS_CONFIG):
++    raise RuntimeError("Stable execution requires CUBLAS_WORKSPACE_CONFIG=:4096:8; conflicting value found")
++if (_existing_config is None and _existing_torch is not None
++        and _existing_torch.cuda.is_initialized()):
++    raise RuntimeError("Import stable_runtime before CUDA initialization; CUBLAS configuration was absent")
++os.environ["CUBLAS_WORKSPACE_CONFIG"] = _CUBLAS_CONFIG
++
++from contextlib import contextmanager
++from contextvars import ContextVar
++import torch
++from torch.nn.attention import SDPBackend, sdpa_kernel
++
++_ACTIVE_DEPTH = ContextVar("meshflow_stable_execution_depth", default=0)
++
++
++def _parameter_summary(modules):
++    count = 0
++    seen = set()
++    for module in modules:
++        if module is None:
++            continue
++        for name, parameter in module.named_parameters():
++            if id(parameter) in seen:
++                continue
++            seen.add(id(parameter))
++            if parameter.is_floating_point() and parameter.dtype != torch.float32:
++                raise RuntimeError(f"Stable execution requires FP32 parameters: {name} is {parameter.dtype}")
++            count += parameter.numel()
++    return count
++
++
++def configure_stable_runtime():
++    """Set the process policy explicitly; this does not initialize CUDA."""
++    if os.environ.get("CUBLAS_WORKSPACE_CONFIG") != _CUBLAS_CONFIG:
++        raise RuntimeError("CUBLAS_WORKSPACE_CONFIG changed after stable_runtime import")
++    if os.environ.get("NVIDIA_TF32_OVERRIDE") == "1":
++        raise RuntimeError("NVIDIA_TF32_OVERRIDE=1 conflicts with the stable TF32-off policy")
++    torch.use_deterministic_algorithms(True, warn_only=False)
++    torch.backends.cuda.matmul.allow_tf32 = False
++    torch.backends.cudnn.allow_tf32 = False
++    torch.backends.cudnn.benchmark = False
++    from models import attention
++    if attention.FLASH_ATTN_AVAILABLE:
++        raise RuntimeError("External FlashAttention is available; the audited SDPA-only environment is required")
++    return assert_stable_runtime(require_context=False)
++
++
++def assert_stable_runtime(*modules, require_context=True, coordinates=None):
++    """Fail closed and return JSON-safe facts; call inside actual execution paths."""
++    from models import attention
++    coordinate_tensors = () if coordinates is None else (
++        (coordinates,) if isinstance(coordinates, torch.Tensor) else tuple(coordinates))
++    for coordinate in coordinate_tensors:
++        if not isinstance(coordinate, torch.Tensor) or coordinate.dtype != torch.float32:
++            raise RuntimeError("Stable execution requires FP32 integration coordinates")
++    facts = dict(
++        cublas_workspace_config=os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
++        deterministic_algorithms=torch.are_deterministic_algorithms_enabled(),
++        deterministic_warn_only=torch.is_deterministic_algorithms_warn_only_enabled(),
++        tf32_matmul=torch.backends.cuda.matmul.allow_tf32,
++        tf32_cudnn=torch.backends.cudnn.allow_tf32,
++        cudnn_benchmark=torch.backends.cudnn.benchmark,
++        external_flash_available=attention.FLASH_ATTN_AVAILABLE,
++        sdpa_math_enabled=torch.backends.cuda.math_sdp_enabled(),
++        sdpa_flash_enabled=torch.backends.cuda.flash_sdp_enabled(),
++        sdpa_mem_efficient_enabled=torch.backends.cuda.mem_efficient_sdp_enabled(),
++        sdpa_cudnn_enabled=torch.backends.cuda.cudnn_sdp_enabled(),
++        cuda_autocast_enabled=torch.is_autocast_enabled("cuda"),
++        cuda_autocast_dtype=str(torch.get_autocast_dtype("cuda")),
++        gradient_enabled=torch.is_grad_enabled(),
++        parameter_dtype="torch.float32",
++        parameter_elements_checked=_parameter_summary(modules),
++        coordinate_tensors_checked=len(coordinate_tensors),
++        active_context_depth=_ACTIVE_DEPTH.get(),
++    )
++    required = (facts["cublas_workspace_config"] == _CUBLAS_CONFIG
++                and facts["deterministic_algorithms"] and not facts["deterministic_warn_only"]
++                and not facts["tf32_matmul"] and not facts["tf32_cudnn"]
++                and not facts["cudnn_benchmark"] and not facts["external_flash_available"])
++    if require_context:
++        required = (required and facts["active_context_depth"] > 0
++                    and facts["sdpa_math_enabled"] and not facts["sdpa_flash_enabled"]
++                    and not facts["sdpa_mem_efficient_enabled"] and not facts["sdpa_cudnn_enabled"]
++                    and facts["cuda_autocast_enabled"]
++                    and torch.get_autocast_dtype("cuda") == torch.bfloat16)
++    if not required:
++        raise RuntimeError(f"Stable runtime assertion failed: {facts}")
++    return facts
++
++
++@contextmanager
++def stable_execution(*modules):
++    """Strict deterministic CUDA BF16/SDPA-math execution; grad mode is unchanged.
++
++    Deterministic/TF32 settings remain strict after exit. Autocast and backend
++    contexts unwind normally, including on exceptions. Parameters are checked,
++    never converted. Use for a training forward/backward, teacher, or sampler.
++    """
++    configure_stable_runtime()
++    with sdpa_kernel(SDPBackend.MATH), torch.autocast("cuda", dtype=torch.bfloat16):
++        token = _ACTIVE_DEPTH.set(_ACTIVE_DEPTH.get() + 1)
++        try:
++            facts = assert_stable_runtime(*modules)
++            yield facts
++            assert_stable_runtime(*modules)
++        finally:
++            _ACTIVE_DEPTH.reset(token)
+diff --git a/experiments/mf_h1_local0/learning_residuals.py b/experiments/mf_h1_local0/learning_residuals.py
+new file mode 100644
+--- /dev/null
++++ b/experiments/mf_h1_local0/learning_residuals.py
+@@ -0,0 +1,250 @@
++"""Read-only observation of the actual residual addition in OfficialWrapper.
++
++Install AFTER constructing the wrapper. Each capture surrounds exactly one
++forward and takes its face mask. Hooks return None and retain only detached CPU
++values; they never recompute or substitute a model activation. Layer 12's next
++module is final_layer. Others are the following backbone transformer layer.
++
++Example::
++
++    with ResidualObserver(wrapper) as observer:
++        with observer.capture("correct", face_mask):
++            correct = wrapper(...)
++        with observer.capture("mismatch", face_mask):
++            mismatch = wrapper(...)
++        rows = observer.report()
++        comparison = observer.compare_effective("correct", "mismatch")
++
++Keep each observer bounded to one microbatch if retaining effective residuals;
++release_effective() frees those arrays without removing the scalar report.
++"""
++from __future__ import annotations
++
++from contextlib import contextmanager
++import copy
++import math
++import torch
++
++LAYERS = (3, 6, 9, 12)
++
++
++def _cpu(tensor):
++    if not isinstance(tensor, torch.Tensor):
++        raise TypeError("Residual observation requires a tensor activation")
++    return tensor.detach().cpu().clone()
++
++
++def _moments(values):
++    values = values.double()
++    count = values.numel()
++    if not count:
++        return dict(elements=0, square_sum=0., rms=None, max_abs=None)
++    if not torch.isfinite(values).all():
++        raise RuntimeError("Nonfinite activation in residual observation")
++    square_sum = float(values.square().sum())
++    return dict(elements=count, square_sum=square_sum,
++                rms=math.sqrt(square_sum/count), max_abs=float(values.abs().max()))
++
++
++def _ratio(numerator, denominator):
++    return numerator/denominator if numerator is not None and denominator else None
++
++
++class ResidualObserver:
++    """Observe pre-add h, actual r, post-add h_after and next-module input.
++
++    The wrapper's insertion hook must already exist. A prepended backbone hook
++    sees h before that hook; an appended hook sees its actual returned h_after.
++    Adapter hooks capture r as actually returned, without dtype conversion until
++    the explicitly defined CPU FP32 diagnostic subtraction.
++    """
++    def __init__(self, wrapper, retain_effective=True):
++        self.wrapper = wrapper
++        self.retain_effective = retain_effective
++        self.records = []
++        self._effective = {}
++        self._handles = []
++        self._active = None
++        self._pending = {}
++        self._installed = False
++
++    def __enter__(self):
++        if self._installed:
++            raise RuntimeError("ResidualObserver cannot be installed twice")
++        if len(self.wrapper.adapter.layers) != 4 or len(self.wrapper.backbone.layers) != 12:
++            raise ValueError("ResidualObserver requires the audited four-injection 12-layer wrapper")
++        if not self.wrapper._handles:
++            raise RuntimeError("Install ResidualObserver on a live wrapper with its insertion hooks")
++        try:
++            for index, number in enumerate(LAYERS):
++                block = self.wrapper.backbone.layers[number-1]
++                following = (self.wrapper.backbone.layers[number] if number < 12
++                             else self.wrapper.backbone.final_layer)
++                self._handles.append(block.register_forward_hook(self._before(index), prepend=True))
++                self._handles.append(self.wrapper.adapter.layers[index].register_forward_hook(self._residual(index)))
++                self._handles.append(block.register_forward_hook(self._after(index)))
++                self._handles.append(following.register_forward_pre_hook(self._next(index)))
++        except BaseException:
++            self.close()
++            raise
++        self._installed = True
++        return self
++
++    def __exit__(self, exception_type, exception, traceback):
++        self.close()
++        return False
++
++    @contextmanager
++    def capture(self, label, face_mask):
++        """Capture one forward; face_mask is the actual [B,N] valid-face mask."""
++        if not self._installed or self._active is not None:
++            raise RuntimeError("Capture requires an installed, inactive observer")
++        if any(row["label"] == label for row in self.records):
++            raise ValueError("Capture labels must be unique within an observer")
++        if face_mask.ndim != 2 or face_mask.dtype != torch.bool:
++            raise ValueError("face_mask must be a boolean [batch, faces] tensor")
++        record = dict(label=label, status="RUNNING", layers=[], event_order=[])
++        self.records.append(record)
++        self._active = dict(record=record, mask=_cpu(face_mask).repeat_interleave(3, dim=1))
++        self._pending = {}
++        try:
++            yield self
++            if [row["layer_one_based"] for row in record["layers"]] != list(LAYERS):
++                raise RuntimeError("Capture did not observe exactly one forward through all four injection sites")
++            record["status"] = "PASS"
++        except BaseException as error:
++            record.update(status="FAIL", error=repr(error))
++            raise
++        finally:
++            self._active = None
++            self._pending.clear()
++
++    def _event(self, index, name):
++        self._active["record"]["event_order"].append(dict(layer_one_based=LAYERS[index], event=name))
++
++    def _before(self, index):
++        def hook(module, args, output):
++            if self._active is None:
++                return None
++            if index in self._pending:
++                raise RuntimeError("Repeated injection site in one residual capture")
++            context = self.wrapper._context
++            scale = 0. if context is None else float(context[4])
++            if scale not in (0., 1.):
++                raise RuntimeError("Learning diagnosis only permits original control scale 0 or 1")
++            h = _cpu(output)
++            if h.ndim != 3 or h.shape[:2] != self._active["mask"].shape:
++                raise RuntimeError("Actual hidden shape does not match the captured face mask")
++            self._pending[index] = dict(h=h, scale=scale, r=None)
++            self._event(index, "h_before_insertion")
++            return None
++        return hook
++
++    def _residual(self, index):
++        def hook(module, args, output):
++            if self._active is None:
++                return None
++            pending = self._pending[index]
++            if pending["r"] is not None:
++                raise RuntimeError("Repeated adapter execution in one residual capture")
++            if not torch.equal(_cpu(args[0]), pending["h"]):
++                raise RuntimeError("Observed adapter input differs from pre-insertion hidden feature")
++            pending["r"] = _cpu(output)
++            self._event(index, "actual_adapter_residual")
++            return None
++        return hook
++
++    def _after(self, index):
++        def hook(module, args, output):
++            if self._active is None:
++                return None
++            self._pending[index]["after"] = _cpu(output)
++            self._event(index, "actual_h_after_insertion")
++            return None
++        return hook
++
++    def _next(self, index):
++        def hook(module, args):
++            if self._active is None:
++                return None
++            pending = self._pending[index]
++            following = _cpu(args[0])
++            self._event(index, "actual_next_module_input")
++            self._summarize(index, pending, following)
++            return None
++        return hook
++
++    def _summarize(self, index, pending, following):
++        h, after, residual = pending["h"], pending["after"], pending["r"]
++        mask = self._active["mask"]
++        if after.shape != h.shape or following.shape != h.shape:
++            raise RuntimeError("Residual boundary shape changed")
++        if residual is None and pending["scale"] != 0.:
++            raise RuntimeError("Enabled branch did not execute its adapter")
++        if residual is not None and residual.shape != h.shape:
++            raise RuntimeError("Residual shape does not match hidden feature")
++        raw = torch.zeros_like(h, dtype=torch.float32) if residual is None else residual.float()
++        effective = after.float()-h.float()
++        requested = raw*pending["scale"]
++        error = effective-requested
++        h_stats = _moments(h[mask])
++        r_stats = _moments(raw[mask])
++        eff_stats = _moments(effective[mask])
++        error_stats = _moments(error[mask])
++        nonzero = raw[mask] != 0
++        unchanged = after[mask].float() == h[mask].float()
++        nonzero_count = int(nonzero.sum())
++        lost_count = int((nonzero & unchanged).sum())
++        row = dict(
++            layer_one_based=LAYERS[index], control_scale=pending["scale"],
++            shape=list(h.shape), valid_hidden_elements=h_stats["elements"],
++            actual_dtypes=dict(h=str(h.dtype), r=None if residual is None else str(residual.dtype),
++                               h_after=str(after.dtype), next_module_input=str(following.dtype)),
++            next_module=(f"layers.{LAYERS[index]}" if LAYERS[index] < 12 else "final_layer"),
++            next_input_equals_h_after=(following.dtype == after.dtype and torch.equal(following, after)),
++            residual_observed=residual is not None,
++            h=h_stats, r=r_stats, r_eff=eff_stats, quantization_error=error_stats,
++            residual_to_feature_rms=_ratio(r_stats["rms"], h_stats["rms"]),
++            effective_to_raw_residual_rms=_ratio(eff_stats["rms"], r_stats["rms"]),
++            quantization_error_to_raw_residual_rms=_ratio(error_stats["rms"], r_stats["rms"]),
++            nonzero_r_elements=nonzero_count, nonzero_r_addition_unchanged_elements=lost_count,
++            nonzero_r_addition_unchanged_fraction=lost_count/nonzero_count if nonzero_count else None,
++            effective_nonzero_elements=int((effective[mask] != 0).sum()),
++        )
++        self._active["record"]["layers"].append(row)
++        if self.retain_effective:
++            key = (self._active["record"]["label"], index)
++            self._effective[key] = (effective[mask].clone(), mask.clone())
++        # Release detached boundary snapshots as soon as the next module sees them.
++        pending.clear()
++
++    def compare_effective(self, correct_label, mismatch_label):
++        """Elementwise correct-minus-mismatch r_eff under identical valid masks."""
++        rows = []
++        for index, number in enumerate(LAYERS):
++            a, mask_a = self._effective[(correct_label, index)]
++            b, mask_b = self._effective[(mismatch_label, index)]
++            if a.shape != b.shape or not torch.equal(mask_a, mask_b):
++                raise RuntimeError("Effective residual comparison requires identical shapes and masks")
++            rows.append(dict(layer_one_based=number, difference=_moments(a-b),
++                             bitwise_equal=torch.equal(a, b)))
++        return dict(correct_label=correct_label, mismatch_label=mismatch_label,
++                    definition="r_eff(correct) - r_eff(mismatch), identical valid hidden elements", layers=rows)
++
++    def report(self):
++        return dict(captures=copy.deepcopy(self.records), hooks_return_values=False,
++                    statistics_device="cpu", diagnostic_subtraction_dtype="torch.float32",
++                    effective_definition="h_after.float() - h.float()",
++                    quantization_error_definition="r_eff - control_scale * r.float()",
++                    off_residual_note="No adapter residual is observed when control is off; zero is used for diagnostics")
++
++    def release_effective(self):
++        self._effective.clear()
++
++    def close(self):
++        for handle in self._handles:
++            handle.remove()
++        self._handles.clear()
++        self._active = None
++        self._pending.clear()
++        self._installed = False
+diff --git a/experiments/mf_h1_local0/learning_data.py b/experiments/mf_h1_local0/learning_data.py
+new file mode 100644
+--- /dev/null
++++ b/experiments/mf_h1_local0/learning_data.py
+@@ -0,0 +1,328 @@
++﻿"""CPU-only fixed geometry bank and matched real-data streams for Q learning.
++
++Targets/noise/OT/t/N remain the upstream RealChairStream path. Only prompts are
++replaced. Formal sampling noises are independent CPU Gaussian draws, never OT
++coupled to targets. No model, optimizer, CUDA operation or training is provided.
++"""
++from __future__ import annotations
++import argparse
++import copy
++import hashlib
++import json
++from pathlib import Path
++import numpy as np
++import torch
++from .prompt_dataset import (RealChairStream, PROMPT_TYPES, make_prompt,
++    sample_surface_primitive, file_sha256, collate_samples)
++
++PROJECT = Path(__file__).resolve().parent
++OLD_SPLIT = PROJECT/'outputs/run_20260928_01/split_manifest.json'
++PROMPT_KEYS = ('vertices','arity','primitive_mask','points','point_primitive','point_mask')
++EVALUATION_SEEDS = (6101,6102)
++TEACHER_SEED = 19010
++MANIFEST_NAME = 'learning_bank_manifest.json'
++
++
++def array_hash(value):
++    value = np.ascontiguousarray(value)
++    digest = hashlib.sha256()
++    digest.update(str((value.dtype, value.shape)).encode())
++    digest.update(value.tobytes())
++    return digest.hexdigest()
++
++
++def _update_array(digest, name, value):
++    value = np.ascontiguousarray(value)
++    digest.update(name.encode())
++    digest.update(str((value.dtype,value.shape)).encode())
++    digest.update(value.tobytes())
++
++
++def base_tensor_hash(batch):
++    """Actual FP32/padded official input tensors, excluding all prompt fields."""
++    digest = hashlib.sha256()
++    for key in ('tokens','noise','num_faces','masks','t'):
++        value = batch[key].detach().cpu().contiguous()
++        _update_array(digest,key,value.numpy())
++    return digest.hexdigest()
++
++
++def base_sample_hash(samples):
++    """Original data values, including masks implied by each real face count."""
++    digest = hashlib.sha256()
++    for sample in samples:
++        digest.update(sample['parent_uid'].encode())
++        for key in ('coords','noise','num_faces','len','t'):
++            _update_array(digest,key,sample[key])
++        _update_array(digest,'mask',np.ones(int(sample['num_faces']),dtype=bool))
++    return digest.hexdigest()
++
++
++def base_audit(samples, microbatch=2):
++    if len(samples) % microbatch:
++        raise ValueError('The fixed microbatch must divide this batch')
++    return dict(base_input_hash=base_sample_hash(samples),
++        padded_batch_base_hash=base_tensor_hash(collate_samples(samples,'cpu')),
++        microbatch_base_hashes=[base_tensor_hash(collate_samples(samples[i:i+microbatch],'cpu'))
++                               for i in range(0,len(samples),microbatch)],
++        target_parent_uids=[sample['parent_uid'] for sample in samples],
++        num_faces=[int(sample['num_faces']) for sample in samples],
++        times=[float(sample['t']) for sample in samples],
++        valid_coordinates=sum(int(sample['num_faces'])*9 for sample in samples),
++        mask_policy='Original collate_samples true N, zero padding, microbatch2; no truncation')
++
++
++def _write_json_new(path, value):
++    with Path(path).open('x',encoding='utf-8') as stream:
++        json.dump(value,stream,indent=2)
++
++
++def _save_npz_new(path, **arrays):
++    with Path(path).open('xb') as stream:
++        np.savez_compressed(stream,**arrays)
++
++
++def _selected_parents():
++    source = json.loads(OLD_SPLIT.read_text(encoding='utf-8-sig'))
++    parents,seen = [],set()
++    for parent in source['train']:
++        uid = str(parent.get('parent_uid',parent['uid']))
++        if uid not in seen:
++            if str(parent['uid']) != uid:
++                raise ValueError('Ambiguous author parent UID')
++            parents.append(copy.deepcopy(parent));seen.add(uid)
++        if len(parents)==4:
++            break
++    excluded = {str(p.get('parent_uid',p['uid'])) for p in source['diagnostic']}
++    if len(parents)!=4 or seen & excluded:
++        raise ValueError('Require first four unique old training parents; old diagnostics are excluded')
++    return parents,source
++
++
++def _teacher_first_per_parent(parents):
++    stream = RealChairStream(parents,seed=TEACHER_SEED)
++    selected,seen_at = {},{}
++    consumed = 0
++    for _ in range(64):
++        samples = stream.next_effective_batch(8)
++        for sample in samples:
++            uid = sample['parent_uid']
++            if uid not in selected:
++                selected[uid] = copy.deepcopy(sample)
++                seen_at[uid] = consumed
++            consumed += 1
++        if len(selected)==4:
++            break
++    if len(selected)!=4:
++        raise RuntimeError('Fixed teacher stream did not cover the preselected four parents')
++    return [selected[p['uid']] for p in parents],dict(seed=TEACHER_SEED,
++        data_rng_seed=TEACHER_SEED+10000,prompt_rng_seed=TEACHER_SEED+20000,
++        time_rng_seed=TEACHER_SEED+30000,stream_samples_consumed=consumed,
++        selected_zero_based_stream_indices=[seen_at[p['uid']] for p in parents],
++        rule='First occurrence of each preselected parent in the unchanged seed19010 RealChairStream; no model scores inspected')
++
++
++def prepare_bank(output):
++    """Create once; reuse only through full artifact/source hash validation.
++
++    Returns load_bank(output). The output directory may already contain the task
++    and runtime configuration. A partial bank is never overwritten or repaired.
++    """
++    output = Path(output).resolve()
++    if not output.is_relative_to((PROJECT/'outputs').resolve()):
++        raise ValueError('Bank output must be under this experiment outputs directory')
++    if (output/MANIFEST_NAME).exists():
++        return load_bank(output)
++    output.mkdir(parents=True,exist_ok=True)
++    fixed = output/'learning_bank'
++    fixed.mkdir(exist_ok=False)
++    parents,source = _selected_parents()
++    teacher,teacher_selection = _teacher_first_per_parent(parents)
++    from datasets.mesh_dataset import sort_triangle_soup
++    from .evaluate import surface_distance_squared
++    records = []
++    for index,(parent,sample) in enumerate(zip(parents,teacher)):
++        # Reorder only an already-normalized official target. The saved teacher
++        # retains its original target/OT-noise pairing and ordering unchanged.
++        target = sort_triangle_soup(np.asarray(sample['coords'])).astype(np.float32)
++        n = int(sample['num_faces'])
++        if target.shape!=(n,9) or not 20<n<800:
++            raise ValueError('Source target shape/count changed; no truncation is allowed')
++        with np.load(parent['path'],allow_pickle=False) as raw:
++            vertices = raw['vertices']
++            bounds = np.array([vertices.min(0),vertices.max(0)])
++        transform = dict(source_bbox_center=((bounds[0]+bounds[1])/2).tolist(),
++            source_bbox_max_extent=float((bounds[1]-bounds[0]).max()),
++            final_target_multiplier=2/.3762,
++            transform='Original ObjaverseDataset.__getitem__ normalization; target coords * (1/0.5)',
++            canonicalization='Official sort_triangle_soup reorders target faces/corners only')
++        diagonal = float(np.linalg.norm(np.ptp(target.reshape(-1,3),axis=0)))
++        for kind_index,kind in enumerate(PROMPT_TYPES):
++            context_seed = 17100+index*10+kind_index
++            check_seed = 18100+index*10+kind_index
++            prompt = make_prompt(target,kind_index,np.random.RandomState(context_seed))
++            check_rng = np.random.RandomState(check_seed)
++            checks = np.stack([sample_surface_primitive(v,int(a),128,check_rng,False)
++                               for v,a in zip(prompt['vertices'],prompt['arity'])])
++            points = np.concatenate([prompt['points'],checks.reshape(-1,3)])
++            max_distance = float(np.sqrt(surface_distance_squared(points,target.reshape(-1,3,3)).max()))
++            if max_distance>1e-5:
++                raise ValueError('Prompt/check coordinate frame failed the true target surface check')
++            path = fixed/f'parent{index}_{kind}.npz'
++            _save_npz_new(path,target=target,check_points=checks,**prompt)
++            records.append(dict(parent_index=index,parent_uid=parent['uid'],kind=kind,
++                path=str(path.resolve()),sha256=file_sha256(path),target_array_sha256=array_hash(target),
++                bbox_diagonal=diagonal,num_faces=n,transform=transform,context_seed=context_seed,
++                check_seed=check_seed,prompt_points=32,checks_per_primitive=128,
++                prompt_surface_max_distance=max_distance,prompt_surface_threshold=1e-5))
++    teacher_path = fixed/'teacher_inputs.npz'
++    arrays = {}
++    for index,sample in enumerate(teacher):
++        for key in ('coords','noise','num_faces','len','t'):
++            arrays[f'parent{index}_{key}'] = np.asarray(sample[key])
++    _save_npz_new(teacher_path,**arrays)
++    noise_path = fixed/'evaluation_noises.npz'
++    noises = {f'seed{seed}':torch.randn((1,512,9),generator=torch.Generator(device='cpu').manual_seed(seed),
++              device='cpu',dtype=torch.float32).numpy() for seed in EVALUATION_SEEDS}
++    _save_npz_new(noise_path,**noises)
++    manifest = dict(schema=1,status='PASS',source_split_path=str(OLD_SPLIT.resolve()),
++        source_split_sha256=file_sha256(OLD_SPLIT),author_split=source['author_split'],
++        selection='First four unique parent UIDs in the old 16-parent train manifest order',
++        parents=parents,parent_uids=[p['uid'] for p in parents],records=records,
++        old_diagnostic_parent_uids_excluded=[p['uid'] for p in source['diagnostic']],
++        prompt_selection='Fixed geometry-only seeds; no generated outputs or evaluation scores used',
++        static_target_noise_pairing='NONE: canonical targets are geometry/oracle only; formal noises are independent Gaussian samples',
++        teacher=dict(path=str(teacher_path.resolve()),sha256=file_sha256(teacher_path),
++            selection=teacher_selection,base_audit=base_audit(teacher),default_prompt_type='mixed_2edges_1face',
++            prescribed_evaluation_times=[.05,.2,.5,.8,.95],training_time_distribution_changed=False),
++        evaluation_noise=dict(path=str(noise_path.resolve()),sha256=file_sha256(noise_path),
++            seeds=list(EVALUATION_SEEDS),shape=[1,512,9],dtype='float32',device='cpu',
++            distribution='Independent torch.Generator CPU standard Gaussian; no target OT or pairing',
++            array_sha256={str(seed):array_hash(noises[f'seed{seed}']) for seed in EVALUATION_SEEDS}),
++        training_stream=dict(base='Unchanged RealChairStream(parents,seed10)',
++            type_rng_seed=40010,donor_rng_seed=50010,type_sampling='Independent uniform among three prompt kinds',
++            independent_donor_sampling='Independent uniform four parents, with replacement every sample, including correct parent with probability 1/4',
++            microbatch=2,effective_batch=8,targets_or_noise_in_prompt=False),
++        generalization_claim=False,phase3=False,model_forwards=0,optimizer_updates=0)
++    _write_json_new(output/MANIFEST_NAME,manifest)
++    return load_bank(output)
++
++
++def load_bank(output):
++    output = Path(output).resolve()
++    manifest_path = output/MANIFEST_NAME
++    manifest = json.loads(manifest_path.read_text(encoding='utf-8-sig'))
++    if manifest.get('status')!='PASS' or manifest.get('schema')!=1:
++        raise ValueError('A completed, supported learning bank is required')
++    if file_sha256(OLD_SPLIT)!=manifest['source_split_sha256']:
++        raise ValueError('Old split manifest changed')
++    parents = manifest['parents']
++    expected,_ = _selected_parents()
++    if parents!=expected or len(manifest['records'])!=12:
++        raise ValueError('Fixed parent selection or bank record count changed')
++    for parent in parents:
++        if file_sha256(parent['path'])!=parent['sha256']:
++            raise ValueError('Original real parent asset changed')
++    prompts,targets,checks,by_key = {},{},{},{}
++    for record in manifest['records']:
++        path = Path(record['path']).resolve()
++        if not path.is_relative_to(output/'learning_bank') or file_sha256(path)!=record['sha256']:
++            raise ValueError('Fixed prompt path/hash changed')
++        with np.load(path,allow_pickle=False) as saved:
++            uid,kind = record['parent_uid'],record['kind']
++            prompts[(uid,kind)] = {key:saved[key].copy() for key in PROMPT_KEYS}
++            target = saved['target'].copy()
++            if uid in targets and not np.array_equal(targets[uid],target):
++                raise ValueError('One parent has inconsistent target coordinates')
++            targets[uid]=target;checks[(uid,kind)]=saved['check_points'].copy()
++            by_key[(record['parent_index'],kind)] = record
++    if len(prompts)!=12 or len(by_key)!=12:
++        raise ValueError('Duplicate fixed prompt records')
++    teacher_record,noise_record = manifest['teacher'],manifest['evaluation_noise']
++    for record in (teacher_record,noise_record):
++        path = Path(record['path']).resolve()
++        if not path.is_relative_to(output/'learning_bank') or file_sha256(path)!=record['sha256']:
++            raise ValueError('Teacher/evaluation-noise asset changed')
++    teacher=[]
++    with np.load(teacher_record['path'],allow_pickle=False) as saved:
++        for index,parent in enumerate(parents):
++            sample={key:saved[f'parent{index}_{key}'].copy() for key in ('coords','noise','num_faces','len','t')}
++            sample['t']=float(sample['t']);sample['parent_uid']=parent['uid'];sample['uid']=parent['uid']
++            sample['prompt']=copy.deepcopy(prompts[(parent['uid'],'mixed_2edges_1face')])
++            teacher.append(sample)
++    if base_audit(teacher)!=teacher_record['base_audit']:
++        raise ValueError('Saved teacher data/masks differ from the original stream')
++    with np.load(noise_record['path'],allow_pickle=False) as saved:
++        eval_noises={seed:torch.from_numpy(saved[f'seed{seed}'].copy()) for seed in EVALUATION_SEEDS}
++    for seed,noise in eval_noises.items():
++        if tuple(noise.shape)!=(1,512,9) or noise.dtype!=torch.float32 or array_hash(noise.numpy())!=noise_record['array_sha256'][str(seed)]:
++            raise ValueError('Independent formal Gaussian noise identity changed')
++    return dict(output=output,manifest=manifest,manifest_path=manifest_path,
++        manifest_sha256=file_sha256(manifest_path),parents=parents,parent_uids=manifest['parent_uids'],
++        records=manifest['records'],records_by_key=by_key,prompts=prompts,targets=targets,
++        checks=checks,eval_noises=eval_noises,teacher_samples=teacher)
++
++
++class PairedLearningStream:
++    """Preserve upstream target/noise/time RNG; replace only the prompt payload."""
++    def __init__(self,parents,bank,arm='Q_correct',seed=10):
++        if arm not in ('Q_correct','Q_independent') or seed!=10:
++            raise ValueError('Only the two newly authorized Q arms with seed10 are allowed')
++        self.parents=copy.deepcopy(parents)
++        self.bank=bank
++        if self.parents!=bank['parents'] or len(self.parents)!=4:
++            raise ValueError('Training must use exactly the four predeclared bank parents')
++        self.arm=arm;self.seed=seed
++        self.base=RealChairStream(self.parents,seed=seed)
++        self.type_rng=np.random.RandomState(seed+40000)
++        self.donor_rng=np.random.RandomState(seed+50000)
++        self.parent_indices={p['uid']:i for i,p in enumerate(self.parents)}
++        self.batch_index=0;self.last_audit=None
++
++    def next_effective_batch(self,size=8):
++        if size!=8:
++            raise ValueError('The authorized effective training batch is exactly 8')
++        samples=self.base.next_effective_batch(size)
++        original=base_audit(samples)
++        types=self.type_rng.randint(0,len(PROMPT_TYPES),size=size)
++        if self.arm=='Q_independent':
++            donors=self.donor_rng.randint(0,len(self.parents),size=size)
++        else:
++            donors=np.asarray([self.parent_indices[s['parent_uid']] for s in samples])
++        for sample,kind_index,donor in zip(samples,types,donors):
++            kind=PROMPT_TYPES[int(kind_index)];uid=self.parents[int(donor)]['uid']
++            sample['prompt']=copy.deepcopy(self.bank['prompts'][(uid,kind)])
++        if base_sample_hash(samples)!=original['base_input_hash']:
++            raise RuntimeError('Replacing a prompt changed original target/noise/t/N/mask data')
++        self.batch_index+=1
++        self.last_audit=dict(batch_index=self.batch_index,arm=self.arm,**original,
++            prompt_types=[PROMPT_TYPES[int(k)] for k in types],prompt_type_indices=types.tolist(),
++            donor_indices=donors.tolist(),donor_parent_uids=[self.parents[int(i)]['uid'] for i in donors],
++            donor_matches_target=[self.parents[int(i)]['uid']==s['parent_uid'] for i,s in zip(donors,samples)])
++        return samples
++
++    def state_dict(self):
++        return dict(**self.base.state_dict(),type_rng=self.type_rng.get_state(),donor_rng=self.donor_rng.get_state())
++
++    def load_state_dict(self,state,batch_index=0):
++        expected={'data_rng','prompt_rng','time_rng','type_rng','donor_rng'}
++        if set(state)!=expected:
++            raise ValueError('Paired stream must restore all five independent RNG states')
++        self.base.load_state_dict({k:state[k] for k in ('data_rng','prompt_rng','time_rng')})
++        self.type_rng.set_state(state['type_rng']);self.donor_rng.set_state(state['donor_rng'])
++        self.batch_index=int(batch_index);self.last_audit=None
++
++
++def main():
++    parser=argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('--output',required=True)
++    args=parser.parse_args()
++    bank=prepare_bank(args.output)
++    print(json.dumps(dict(status='PASS',manifest=str(bank['manifest_path']),
++        manifest_sha256=bank['manifest_sha256'],parent_uids=bank['parent_uids'],
++        prompts=len(bank['records']),teacher_samples=len(bank['teacher_samples']),
++        evaluation_noise_seeds=list(bank['eval_noises']),model_forwards=0,optimizer_updates=0)),flush=True)
++
++
++if __name__=='__main__':
++    main()
+diff --git a/experiments/mf_h1_local0/learning_evaluation.py b/experiments/mf_h1_local0/learning_evaluation.py
+new file mode 100644
+--- /dev/null
++++ b/experiments/mf_h1_local0/learning_evaluation.py
+@@ -0,0 +1,514 @@
++"""Bounded, paired evaluation of the new Q learnability checkpoints.
++
++No model is loaded and no optimizer is created here. The caller owns the one
++official backbone and serializes evaluation with training. Import the shared
++runtime policy before importing torch in every executable entrypoint.
++"""
++from __future__ import annotations
++
++from .stable_runtime import stable_execution, assert_stable_runtime
++
++import hashlib
++import itertools
++import json
++import math
++import traceback
++from pathlib import Path
++
++import numpy as np
++import torch
++
++from .evaluate import guidance_metrics, raw_quality, completion_rms
++from .official_wrapper import state_sha256
++from .prompt_dataset import collate_samples, collate_prompts, PROMPT_TYPES
++from .sample import euler_sample
++
++ARMS = ("Q_correct", "Q_independent")
++CHECKPOINT_STEPS = (0, 200, 500, 1000)
++EVAL_SEEDS = (6101, 6102)
++TEACHER_TIMES = (.05, .2, .5, .8, .95)
++MODES = ("off", "correct", "cyclic_mismatch")
++
++
++def array_hash(value):
++    """Hash numerical content, dtype and shape, independently of its location."""
++    if torch.is_tensor(value):
++        value = value.detach().cpu().contiguous().numpy()
++    value = np.ascontiguousarray(value)
++    return hashlib.sha256(str((value.shape, str(value.dtype))).encode()
++                          + value.tobytes()).hexdigest()
++
++
++def _safe_json(value):
++    if isinstance(value, dict):
++        return {str(k): _safe_json(v) for k, v in value.items()}
++    if isinstance(value, (list, tuple)):
++        return [_safe_json(v) for v in value]
++    if isinstance(value, (np.integer, np.floating)):
++        value = value.item()
++    if isinstance(value, float) and not math.isfinite(value):
++        return None
++    if isinstance(value, Path):
++        return str(value)
++    return value
++
++
++def _write_json(path, value):
++    Path(path).write_text(json.dumps(_safe_json(value), indent=2, allow_nan=False), encoding="utf-8")
++
++
++def _count_delta(before, after):
++    return {key: int(after.get(key, 0) - before.get(key, 0)) for key in set(before) | set(after)}
++
++
++def _mean(rows, fn):
++    values = [fn(row) for row in rows]
++    values = [float(value) for value in values if value is not None and np.isfinite(value)]
++    return float(np.mean(values)) if values else None
++
++
++def _rng_snapshot():
++    # Evaluation has supplied noise and local scoring RNGs, so it must not
++    # advance the training RNG. Compare states instead of silently restoring it.
++    import random
++    return dict(python=random.getstate(), numpy=np.random.get_state(),
++                torch=torch.get_rng_state().clone(),
++                cuda=[state.clone() for state in torch.cuda.get_rng_state_all()])
++
++
++def _rng_equal(a, b):
++    return (a["python"] == b["python"]
++            and a["numpy"][0] == b["numpy"][0]
++            and np.array_equal(a["numpy"][1], b["numpy"][1])
++            and a["numpy"][2:] == b["numpy"][2:]
++            and torch.equal(a["torch"], b["torch"])
++            and len(a["cuda"]) == len(b["cuda"])
++            and all(torch.equal(x, y) for x, y in zip(a["cuda"], b["cuda"])))
++
++
++class EvaluationRunner:
++    """One runner per experiment, sharing two Base draws and exact step-0 results.
++
++    ``evaluate_checkpoint(wrapper, arm, step)`` is the training callback.
++    ``counters`` is optional; only names prefixed ``evaluation_`` are updated.
++    The caller's global official-backbone hook remains the authoritative total.
++    Reports also contain actual wrapper deltas, including any failed attempt.
++    """
++    def __init__(self, base, bank, output, counters=None):
++        self.base, self.bank = base, bank
++        self.output = Path(output).resolve()
++        self.output.mkdir(parents=True, exist_ok=True)
++        self.results = self.output / "results"
++        self.raw = self.output / "raw_evaluation"
++        self.results.mkdir(exist_ok=True)
++        self.raw.mkdir(exist_ok=True)
++        self.counters = counters if counters is not None else {}
++        self.parent_uids = list(bank["parent_uids"])
++        if len(self.parent_uids) != 4 or len(set(self.parent_uids)) != 4:
++            raise ValueError("Exactly four distinct training parents are required")
++        if len(bank["teacher_samples"]) != 4:
++            raise ValueError("Exactly four fixed real teacher target/noise pairs are required")
++        if [sample["parent_uid"] for sample in bank["teacher_samples"]] != self.parent_uids:
++            raise ValueError("Fixed teacher targets must follow the four training-parent order")
++        if set(bank["eval_noises"]) != set(EVAL_SEEDS):
++            raise ValueError("Evaluation uses exactly independent seeds 6101 and 6102")
++        self.cases = {}
++        for parent, uid in enumerate(self.parent_uids):
++            for kind in PROMPT_TYPES:
++                record = bank["records_by_key"][(parent, kind)]
++                if record["parent_uid"] != uid:
++                    raise ValueError("Prompt record parent order mismatch")
++                with np.load(record["path"], allow_pickle=False) as stored:
++                    checks = stored["check_points"].copy()
++                    target = stored["target"].copy()
++                prompt = bank["prompts"][(uid, kind)]
++                if not np.array_equal(target, np.asarray(bank["targets"][uid])):
++                    raise ValueError("Prompt evaluation target differs from the frozen parent target")
++                self.cases[(parent, kind)] = dict(record=record, prompt=prompt,
++                                                 check_points=checks, target=target)
++        for noise in bank["eval_noises"].values():
++            if noise.shape != (1, 512, 9) or noise.dtype != torch.float32 or noise.device.type != "cpu":
++                raise ValueError("Evaluation noise must be fixed CPU FP32 [1,512,9]")
++        self.bank_hash = self._bank_hash()
++        self.base_report = None
++        self.base_arrays = {}
++        self.zero_report = None
++
++    def _bank_hash(self):
++        records = dict(parents=self.parent_uids,
++            noise={str(seed): array_hash(self.bank["eval_noises"][seed]) for seed in EVAL_SEEDS},
++            prompts={f"{parent}:{kind}": {key: array_hash(value) for key, value in case["prompt"].items()}
++                     for (parent, kind), case in self.cases.items()},
++            checks={f"{parent}:{kind}": array_hash(case["check_points"])
++                    for (parent, kind), case in self.cases.items()},
++            targets={uid: array_hash(self.bank["targets"][uid]) for uid in self.parent_uids},
++            teacher=[dict(parent_uid=item["parent_uid"],
++                coords=array_hash(item["coords"]), noise=array_hash(item["noise"]),
++                num_faces=int(item["num_faces"])) for item in self.bank["teacher_samples"]])
++        return hashlib.sha256(json.dumps(records, sort_keys=True).encode()).hexdigest()
++
++    def _increment(self, report, key, value=1):
++        report["actual_counts"][key] = report["actual_counts"].get(key, 0) + int(value)
++
++    def _sample(self, wrapper, seed, prompt, report):
++        assert_stable_runtime(wrapper.backbone, wrapper.adapter)
++        device = next(wrapper.backbone.parameters()).device
++        noise = self.bank["eval_noises"][seed].to(device)
++        y = torch.tensor([512], device=device, dtype=torch.long)
++        mask = torch.ones((1, 512), device=device, dtype=torch.bool)
++        assert_stable_runtime(wrapper.backbone, wrapper.adapter, coordinates=noise)
++        before_hash = array_hash(noise)
++        prompts = None if prompt is None else collate_prompts([prompt], device)
++        self._increment(report, "sampler_calls")
++        generated, stats = euler_sample(wrapper, noise, y, mask, prompts=prompts, precision="bf16")
++        if stats["status"] != "PASS" or not torch.isfinite(generated).all():
++            raise RuntimeError("Nonfinite complete generation; no repairs or resampling are allowed")
++        if array_hash(noise) != before_hash:
++            raise RuntimeError("Sampling modified its independent initial noise")
++        if stats["call_delta"]["backbone_forward"] != 50:
++            raise RuntimeError("The sampler did not execute the specified 50 official forwards")
++        expected_encodes = int(prompts is not None)
++        if stats["call_delta"]["condition_encoding"] != expected_encodes:
++            raise RuntimeError("Sampling condition encoding count changed")
++        if stats["call_delta"]["cache_hits"]:
++            raise RuntimeError("Q evaluation must not enable geometry caching")
++        self._increment(report, "complete_rollouts")
++        self._increment(report, "base_rollouts" if prompts is None else "adapted_rollouts")
++        return generated[0].detach().float().cpu().numpy(), stats
++
++    def _base(self, wrapper, report, base_hash):
++        path = self.results / "evaluation_base.json"
++        raw_path = self.raw / "evaluation_base.npz"
++        if self.base_report is None and path.exists():
++            saved = json.loads(path.read_text(encoding="utf-8"))
++            if (saved.get("status") != "PASS" or saved["bank_hash"] != self.bank_hash
++                    or saved["base_state_hash"] != base_hash):
++                raise RuntimeError("Existing Base cache is incomplete or belongs to different assets")
++            with np.load(raw_path, allow_pickle=False) as stored:
++                self.base_arrays = {key: stored[key].copy() for key in stored.files}
++            if {key: array_hash(value) for key, value in self.base_arrays.items()} != saved["array_hashes"]:
++                raise RuntimeError("Persisted shared Base output hashes differ")
++            self.base_report = saved
++        if self.base_report is not None:
++            if self.base_report["base_state_hash"] != base_hash or self.base_report["bank_hash"] != self.bank_hash:
++                raise RuntimeError("Shared Base results no longer match the frozen base/input state")
++            self._increment(report, "base_rollouts_reused", 2)
++            return
++        if raw_path.exists():
++            raise FileExistsError("Incomplete prior Base artifact is preserved: " + str(raw_path))
++        before = dict(wrapper.counts)
++        base = dict(status="RUNNING", bank_hash=self.bank_hash, base_state_hash=base_hash,
++                    independent_base_draws=2, noise_seeds=list(EVAL_SEEDS), rows=[], actual_rollouts=[],
++                    interpretation="Two unconditional generated meshes are shared across parents, types, arms and checkpoints; repeated scores are not independent generated samples.")
++        for seed in EVAL_SEEDS:
++            tokens, stats = self._sample(wrapper, seed, None, report)
++            self.base_arrays[f"seed{seed}"] = tokens
++            base["actual_rollouts"].append(dict(seed=seed, stats=stats))
++            quality = raw_quality(tokens)
++            self._increment(report, "quality_scores")
++            for parent, kind in itertools.product(range(4), PROMPT_TYPES):
++                case = self.cases[(parent, kind)]
++                guide = guidance_metrics(tokens, case["check_points"], case["record"]["bbox_diagonal"])
++                completion = completion_rms(tokens, case["target"], case["record"]["bbox_diagonal"])
++                self._increment(report, "guide_scores")
++                self._increment(report, "completion_scores")
++                base["rows"].append(dict(parent_index=parent, parent_uid=self.parent_uids[parent],
++                    kind=kind, noise_seed=seed, guide=guide, quality=quality,
++                    completion_symmetric_rms_bbox_pct=completion, output_reference=f"seed{seed}"))
++        base.update(status="PASS", wrapper_count_delta=_count_delta(before, wrapper.counts),
++                    raw_path=str(raw_path), array_hashes={key: array_hash(value) for key, value in self.base_arrays.items()})
++        np.savez_compressed(raw_path, **self.base_arrays)
++        _write_json(path, base)
++        self.base_report = base
++
++    def _teacher(self, wrapper, report):
++        from .learning_residuals import ResidualObserver
++
++        device = next(wrapper.backbone.parameters()).device
++        samples = self.bank["teacher_samples"]
++        teacher = dict(time_points=list(TEACHER_TIMES), effective_samples=4, microbatch=2,
++            parent_uids=self.parent_uids, prompt_kind="mixed_2edges_1face",
++            mismatch_rule="Teacher target j gets the same-type prompt of parent (j+1) modulo 4; target, OT-paired noise, mask and time are unchanged.",
++            target_noise_source="Fixed real teacher pairs in learning_data bank; distinct from independent evaluation noise.",
++            time_distribution_changed_for_training=False, rows=[], microbatches=[], residuals={})
++        report["teacher"] = teacher
++        for time in TEACHER_TIMES:
++            sums = dict(denominator=0, d2=0., two_ed=0., correct_minus_off=0.,
++                        correct_minus_off_identity=0., correct_minus_off_mse_subtraction=0.,
++                        mse={mode: 0. for mode in MODES}, samples=[])
++            for start in (0, 2):
++                selected = []
++                for j in range(start, start + 2):
++                    item = dict(samples[j])
++                    item["t"] = time
++                    item["prompt"] = self.bank["prompts"][(self.parent_uids[j], "mixed_2edges_1face")]
++                    selected.append(item)
++                batch = collate_samples(selected, device)
++                x0, x1, mask, t = batch["noise"], batch["tokens"], batch["masks"], batch["t"]
++                if x0.dtype != torch.float32 or x1.dtype != torch.float32:
++                    raise RuntimeError("Teacher integration state must remain FP32")
++                xt = t[:, None, None] * x1 + (1 - t[:, None, None]) * x0
++                target = x1 - x0
++                mismatch = collate_prompts([self.bank["prompts"][(self.parent_uids[(j + 1) % 4], "mixed_2edges_1face")]
++                                           for j in range(start, start + 2)], device)
++                inputs = dict(xt=array_hash(xt), velocity_target=array_hash(target), mask=array_hash(mask),
++                              target=array_hash(x1), noise=array_hash(x0), t=array_hash(t), N=array_hash(batch["num_faces"]))
++                predictions = {}
++                observer = ResidualObserver(wrapper, retain_effective=True) if time == .5 else None
++                try:
++                    if observer is not None:
++                        observer.__enter__()
++                    for mode in MODES:
++                        assert_stable_runtime(wrapper.backbone, wrapper.adapter, coordinates=xt)
++                        prompt = None if mode == "off" else batch["prompts"] if mode == "correct" else mismatch
++                        self._increment(report, "teacher_forwards")
++                        kwargs = dict(y=batch["num_faces"], mask=mask, prompts=prompt,
++                                      control_scale=0. if mode == "off" else 1.)
++                        if observer is not None and mode != "off":
++                            with observer.capture(mode, mask):
++                                prediction = wrapper(xt, t, **kwargs)
++                        else:
++                            prediction = wrapper(xt, t, **kwargs)
++                        if not torch.isfinite(prediction).all():
++                            raise RuntimeError("Nonfinite fixed teacher velocity")
++                        predictions[mode] = prediction.detach().double()
++                    if observer is not None:
++                        teacher["residuals"][f"micro{start//2}"] = dict(
++                            at_time=.5, parent_indices=[start, start+1], observations=observer.report(),
++                            correct_vs_mismatch=observer.compare_effective("correct", "cyclic_mismatch"))
++                finally:
++                    if observer is not None:
++                        observer.__exit__(None, None, None)
++                target64 = target.double()
++                errors = {mode: target64 - pred for mode, pred in predictions.items()}
++                e = errors["off"]
++                d = predictions["correct"] - predictions["off"]
++                for j in range(2):
++                    valid = mask[j]
++                    denominator = int(valid.sum().item()) * 9
++                    loss_sums = {mode: float(value[j][valid].square().sum().item()) for mode, value in errors.items()}
++                    d2 = float(d[j][valid].square().sum().item())
++                    two_ed = float((2 * e[j][valid] * d[j][valid]).sum().item())
++                    # Both expressions are evaluated in FP64 from the same FP32
++                    # model outputs, reducing cancellation in the identity test.
++                    loss_delta = float((errors["correct"][j][valid].square() - e[j][valid].square()).sum().item())
++                    identity = d2 - two_ed
++                    sums["denominator"] += denominator
++                    sums["d2"] += d2
++                    sums["two_ed"] += two_ed
++                    sums["correct_minus_off"] += loss_delta
++                    sums["correct_minus_off_identity"] += identity
++                    sums["correct_minus_off_mse_subtraction"] += loss_sums["correct"] - loss_sums["off"]
++                    for mode in MODES:
++                        sums["mse"][mode] += loss_sums[mode]
++                    sums["samples"].append(dict(parent_index=start+j, parent_uid=self.parent_uids[start+j],
++                        true_faces=int(batch["num_faces"][j]), valid_coordinate_denominator=denominator,
++                        mse={mode: value/denominator for mode, value in loss_sums.items()},
++                        mean_d2=d2/denominator, two_mean_ed=two_ed/denominator,
++                        Lcorrect_minus_Loff=loss_delta/denominator,
++                        algebra_absolute_error=abs(loss_delta-identity)/denominator))
++                if inputs != dict(xt=array_hash(xt), velocity_target=array_hash(target), mask=array_hash(mask),
++                                   target=array_hash(x1), noise=array_hash(x0), t=array_hash(t), N=array_hash(batch["num_faces"])):
++                    raise RuntimeError("Teacher input tensors were modified in place")
++                teacher["microbatches"].append(dict(t=time, parent_indices=[start,start+1], input_hashes=inputs))
++            denom = sums["denominator"]
++            row = dict(t=time, valid_coordinate_denominator=denom,
++                       mse={mode: value/denom for mode, value in sums["mse"].items()},
++                       mean_d2=sums["d2"]/denom, two_mean_ed=sums["two_ed"]/denom,
++                       Lcorrect_minus_Loff=sums["correct_minus_off"]/denom,
++                       d2_minus_two_ed=sums["correct_minus_off_identity"]/denom,
++                       Lcorrect_minus_Loff_from_separate_sums=sums["correct_minus_off_mse_subtraction"]/denom,
++                       algebra_absolute_error=abs(sums["correct_minus_off"]-sums["correct_minus_off_identity"])/denom,
++                       per_parent=sums["samples"])
++            if row["algebra_absolute_error"] > 1e-10:
++                raise RuntimeError("The fixed-mask teacher d2 - 2ed loss identity failed")
++            teacher["rows"].append(row)
++        teacher["identity_normalization"] = "All terms sum over the identical valid true-N coordinates and divide by their full shared count; no time reweighting."
++
++    def _score(self, outputs, report):
++        cache, quality, own_rows, cross_rows = {}, {}, [], []
++
++        def metric(mesh_parent, target_parent, kind, seed):
++            key = mesh_parent, target_parent, kind, seed
++            if key not in cache:
++                case = self.cases[(target_parent, kind)]
++                tokens = outputs[(mesh_parent, kind, seed)]
++                cache[key] = dict(guide=guidance_metrics(tokens, case["check_points"], case["record"]["bbox_diagonal"]),
++                    completion=completion_rms(tokens, case["target"], case["record"]["bbox_diagonal"]))
++                self._increment(report, "guide_scores")
++                self._increment(report, "completion_scores")
++            return cache[key]
++
++        for key, tokens in outputs.items():
++            quality[key] = raw_quality(tokens)
++            self._increment(report, "quality_scores")
++        for parent, kind, seed in itertools.product(range(4), PROMPT_TYPES, EVAL_SEEDS):
++            value = metric(parent, parent, kind, seed)
++            own_rows.append(dict(parent_index=parent, parent_uid=self.parent_uids[parent], kind=kind,
++                noise_seed=seed, guide=value["guide"], quality=quality[(parent, kind, seed)],
++                completion_symmetric_rms_bbox_pct=value["completion"]))
++        for kind, seed, a in itertools.product(PROMPT_TYPES, EVAL_SEEDS, range(4)):
++            b = (a + 1) % 4
++            aa, ab = metric(a, a, kind, seed), metric(b, a, kind, seed)
++            bb, ba = metric(b, b, kind, seed), metric(a, b, kind, seed)
++            guide = [row["guide"]["guide_rms_bbox_pct"] for row in (aa, ab, bb, ba)]
++            completion = [row["completion"] for row in (aa, ab, bb, ba)]
++            ma, mb = outputs[(a, kind, seed)], outputs[(b, kind, seed)]
++            difference = ma.astype(np.float64) - mb.astype(np.float64)
++            cross_rows.append(dict(parent_a=a, parent_b=b, parent_uid_a=self.parent_uids[a],
++                parent_uid_b=self.parent_uids[b], kind=kind, noise_seed=seed,
++                guide=dict(zip(("E_Ca_Ma", "E_Ca_Mb", "E_Cb_Mb", "E_Cb_Ma"), guide)),
++                guide_a_binding_improvement=guide[1]-guide[0],
++                guide_b_binding_improvement=guide[3]-guide[2],
++                guide_mean_binding_improvement=((guide[1]-guide[0])+(guide[3]-guide[2]))/2,
++                full_surface_completion=dict(zip(("E_Ta_Ma", "E_Ta_Mb", "E_Tb_Mb", "E_Tb_Ma"), completion)),
++                completion_mean_binding_improvement=None if any(v is None for v in completion) else
++                    ((completion[1]-completion[0])+(completion[3]-completion[2]))/2,
++                same_noise_verified=True, noise_sha256=array_hash(self.bank["eval_noises"][seed]),
++                output_change=dict(bitwise_equal=bool(np.array_equal(ma, mb)),
++                    rms=float(np.sqrt(np.mean(difference*difference))), max_abs=float(np.max(np.abs(difference))))))
++        summary = {}
++        for kind in (*PROMPT_TYPES, "all"):
++            own = [r for r in own_rows if kind == "all" or r["kind"] == kind]
++            base = [r for r in self.base_report["rows"] if kind == "all" or r["kind"] == kind]
++            cross = [r for r in cross_rows if kind == "all" or r["kind"] == kind]
++            summary[kind] = dict(conditional_scores=len(own), independent_noise_seeds=2, distinct_parents=4,
++                own_guide_mean=_mean(own, lambda r:r["guide"]["guide_rms_bbox_pct"]),
++                base_guide_mean=_mean(base, lambda r:r["guide"]["guide_rms_bbox_pct"]),
++                own_completion_mean=_mean(own, lambda r:r["completion_symmetric_rms_bbox_pct"]),
++                base_completion_mean=_mean(base, lambda r:r["completion_symmetric_rms_bbox_pct"]),
++                guide_mean_binding_improvement=_mean(cross, lambda r:r["guide_mean_binding_improvement"]),
++                completion_mean_binding_improvement=_mean(cross, lambda r:r["completion_mean_binding_improvement"]),
++                both_guide_bindings_improve_pairs=sum(r["guide_a_binding_improvement"] > 0 and r["guide_b_binding_improvement"] > 0 for r in cross),
++                cyclic_pairs=len(cross), narrow_face_fraction_mean=_mean(own, lambda r:r["quality"]["min_angle_lt5_fraction"]),
++                degenerate_fraction_mean=_mean(own, lambda r:r["quality"]["degenerate_fraction"]))
++        report["scores"] = dict(own_condition_rows=own_rows, same_noise_cross_four_grid=cross_rows, summary=summary,
++            shared_base_reference=str(self.results/"evaluation_base.json"),
++            topology=dict(self_intersection="NOT_RUN", watertight="NOT_RUN", manifold="NOT_RUN"),
++            interpretation="Training-parent learnability only. Paired scores reuse the same two independent noise draws; parent/type/cyclic rows are not independent experiments. Coordinate changes alone do not establish useful control.")
++
++    def evaluate_checkpoint(self, wrapper, arm, step):
++        if arm not in ARMS or step not in CHECKPOINT_STEPS:
++            raise ValueError("Only the two authorized Q arms and four fixed checkpoints are evaluated")
++        if wrapper.backbone is not self.base or wrapper.adapter.arm != "Q_center":
++            raise ValueError("Evaluation must use the caller's sole official backbone and Q adapter")
++        if any(parameter.requires_grad for parameter in self.base.parameters()):
++            raise RuntimeError("The official backbone must remain frozen")
++        if self._bank_hash() != self.bank_hash:
++            raise RuntimeError("Frozen evaluation bank changed")
++        name = f"evaluation_{arm}_step{step:04d}"
++        destination = self.results/(name+".json")
++        raw_path = self.raw/(name+".npz")
++        if destination.exists() or raw_path.exists():
++            raise FileExistsError("Preserve prior evaluation evidence: " + str(destination))
++        adapter_hash, base_hash = state_sha256(wrapper.adapter), state_sha256(self.base)
++        if step == 0 and self.zero_report is None:
++            candidates = [self.results/f"evaluation_{other}_step0000.json" for other in ARMS if other != arm]
++            for candidate in candidates:
++                if candidate.exists():
++                    self.zero_report = json.loads(candidate.read_text(encoding="utf-8"))
++        if step == 0 and self.zero_report is not None:
++            source = self.zero_report
++            if (source.get("status") != "PASS" or source["adapter_state_hash"] != adapter_hash
++                    or source["base_state_hash"] != base_hash or source["bank_hash"] != self.bank_hash):
++                raise RuntimeError("Step-0 reuse requires complete state and input hash equality")
++            with np.load(source["raw_path"], allow_pickle=False) as arrays:
++                hashes = {key: array_hash(arrays[key]) for key in arrays.files}
++            if hashes != source["array_hashes"]:
++                raise RuntimeError("Step-0 raw outputs changed before cross-arm reuse")
++            reused = dict(source, arm=arm, step=0, result_path=str(destination),
++                status="PASS_REUSED_IDENTICAL_INITIAL_STATE",
++                reused_from=source["result_path"], actual_counts=dict(official_forwards=0,
++                    condition_encodes=0, complete_rollouts=0, teacher_forwards=0,
++                    optimizer_updates=0, backbone_updates=0, phase3_updates=0),
++                wrapper_count_delta={}, reuse=dict(adapted_rollouts=24, teacher_forwards=30,
++                                                  note="Exact same Q initialization, base and all evaluation inputs; no independent sample added."))
++            _write_json(destination, reused)
++            self.counters["evaluation_checkpoint_reuses"] = self.counters.get("evaluation_checkpoint_reuses", 0) + 1
++            return reused
++        before = dict(wrapper.counts)
++        modes_before = wrapper.training, wrapper.adapter.training, self.base.training
++        rng_before = _rng_snapshot()
++        arrays = {}
++        report = dict(status="RUNNING", arm=arm, step=step, bank_hash=self.bank_hash,
++            adapter_state_hash=adapter_hash, base_state_hash=base_hash,
++            result_path=str(destination), raw_path=str(raw_path), actual_rollouts=[],
++            policy=dict(training_updates_here=0, geometric_cache=False, raw_face_slots=512,
++                euler_updates=50, eval_noise_seeds=list(EVAL_SEEDS), face_cfg=1., geometry_cfg=1.,
++                parameter_and_integrator_dtype="float32", precision="bf16",
++                true_N_training_and_teacher="Teacher and training retain original real N and masks; only complete-generation face condition is 512.",
++                target_access="Targets and independent primitive checks are used only by teacher or CPU scoring; the free sampler receives independent noise, 512, masks and prompts."),
++            actual_counts=dict(official_forwards=0, condition_encodes=0, complete_rollouts=0,
++                base_rollouts=0, adapted_rollouts=0, teacher_forwards=0, sampler_calls=0,
++                quality_scores=0, guide_scores=0, completion_scores=0,
++                optimizer_updates=0, backbone_updates=0, phase3_updates=0))
++        try:
++            wrapper.eval()
++            with torch.inference_mode(), stable_execution(self.base, wrapper.adapter) as facts:
++                report["stable_runtime"] = facts
++                self._base(wrapper, report, base_hash)
++                report["base_reference"] = dict(path=str(self.results/"evaluation_base.json"),
++                    total_independent_draws=2, reused_score_rows=24,
++                    actual_base_rollouts_this_call=report["actual_counts"]["base_rollouts"])
++                self._teacher(wrapper, report)
++                outputs = {}
++                for parent, kind, seed in itertools.product(range(4), PROMPT_TYPES, EVAL_SEEDS):
++                    case = self.cases[(parent, kind)]
++                    tokens, stats = self._sample(wrapper, seed, case["prompt"], report)
++                    key = f"parent{parent}_{kind}_seed{seed}"
++                    outputs[(parent, kind, seed)] = tokens
++                    arrays[key] = tokens
++                    report["actual_rollouts"].append(dict(parent_index=parent,
++                        parent_uid=self.parent_uids[parent], kind=kind, noise_seed=seed,
++                        initial_noise_sha256=array_hash(self.bank["eval_noises"][seed]),
++                        prompt_hashes={k:array_hash(v) for k,v in case["prompt"].items()},
++                        array_key=key, stats=stats))
++                    print(json.dumps(dict(stage="learning_evaluation", arm=arm, step=step,
++                        complete=len(outputs), planned=24)), flush=True)
++                assert_stable_runtime(self.base, wrapper.adapter)
++            np.savez_compressed(raw_path, **arrays)
++            report["array_hashes"] = {key: array_hash(value) for key, value in arrays.items()}
++            self._score(outputs, report)
++            report["adapter_state_hash_after"] = state_sha256(wrapper.adapter)
++            report["base_state_hash_after"] = state_sha256(self.base)
++            report["rng_unchanged"] = _rng_equal(rng_before, _rng_snapshot())
++            report["bank_unchanged"] = self._bank_hash() == self.bank_hash
++            if (report["adapter_state_hash_after"] != adapter_hash or report["base_state_hash_after"] != base_hash
++                    or not report["rng_unchanged"] or not report["bank_unchanged"]):
++                raise RuntimeError("Evaluation mutated model, input-bank or training RNG state")
++            expected = 30 + 50 * (24 + report["actual_counts"]["base_rollouts"])
++            if wrapper.counts["backbone_forward"] - before["backbone_forward"] != expected:
++                raise RuntimeError("Checkpoint official forward count differs from the bounded evaluation plan")
++            if wrapper.counts["condition_encoding"] - before["condition_encoding"] != 44:
++                raise RuntimeError("Checkpoint condition encode count differs from 20 teacher plus 24 sampler encodes")
++            report["status"] = "PASS"
++        except BaseException as error:
++            report.update(status="FAIL", error=repr(error), traceback=traceback.format_exc())
++            if self.base_arrays and not (self.raw/"evaluation_base.npz").exists():
++                np.savez_compressed(self.raw/(name+"_partial_base.npz"), **self.base_arrays)
++            if arrays and not raw_path.exists():
++                np.savez_compressed(self.raw/(name+"_partial.npz"), **arrays)
++            raise
++        finally:
++            wrapper.train(modes_before[0])
++            wrapper.adapter.train(modes_before[1])
++            self.base.train(modes_before[2])
++            report["wrapper_count_delta"] = _count_delta(before, wrapper.counts)
++            report["actual_counts"]["official_forwards"] = report["wrapper_count_delta"]["backbone_forward"]
++            report["actual_counts"]["condition_encodes"] = report["wrapper_count_delta"]["condition_encoding"]
++            for key, value in report["actual_counts"].items():
++                counter_key = "evaluation_" + key
++                self.counters[counter_key] = self.counters.get(counter_key, 0) + value
++            _write_json(destination, report)
++        if step == 0:
++            self.zero_report = report
++        return report
++
++
++def evaluate_checkpoint(wrapper, arm, step, bank, output, counters=None):
++    """Convenience callback; prefer one persistent EvaluationRunner in the driver.
++
++    Base and initial-state reuse can also be recovered from verified new-run
++    files, so a newly constructed callback does not rerun these cached outputs.
++    """
++    return EvaluationRunner(wrapper.backbone, bank, output, counters).evaluate_checkpoint(wrapper, arm, step)
+diff --git a/experiments/mf_h1_local0/learning_diagnosis.py b/experiments/mf_h1_local0/learning_diagnosis.py
+new file mode 100644
+--- /dev/null
++++ b/experiments/mf_h1_local0/learning_diagnosis.py
+@@ -0,0 +1,378 @@
++"""Strict, bounded Q condition-learning diagnosis; distinct from Phase 2.
++
++Fresh Q_correct/Q_independent, 1000 updates each. No deterministic fallback,
++architecture search, changed loss, training geometry cache, or automatic resume.
++"""
++from .stable_runtime import stable_execution, assert_stable_runtime, configure_stable_runtime
++import argparse
++import copy
++import hashlib
++import json
++import math
++import os
++import platform
++import random
++import subprocess
++import time
++import traceback
++from collections import Counter
++from pathlib import Path
++import numpy as np
++import torch
++from .adapters import ControlAdapter
++from .official_wrapper import OfficialWrapper, load_official, state_sha256
++from .learning_residuals import ResidualObserver
++from .learning_data import load_bank, PairedLearningStream, base_tensor_hash
++from .prompt_dataset import RealChairStream, collate_samples, collate_prompts, sample_input_hash, file_sha256
++from .train_adapter import rng_state, state_sha256_from_state
++
++PROJECT = Path(__file__).resolve().parent
++REPO = PROJECT.parents[1]
++OLD = PROJECT/'outputs/run_20260928_01'
++CHECKPOINT = Path('/mnt/c/Users/warpwang/Downloads/last.pt')
++EXPECTED_BASE = 'b32197096ecf8d662bfee18bbc4abf16cc4b4690cd28e5c47d14850729d2c222'
++EXPECTED_FILE = 'bda891a0f046ca6015f70f745fa24a8036c64dda12175b246d853c957f63b92d'
++SAVE_STEPS = (0,200,500,1000)
++SPARSE_STEPS = (1,2,10,50,200,500,1000)
++PROMPT_KEYS = ('vertices','arity','primitive_mask','points','point_primitive','point_mask')
++
++
++def atomic_json(path, value):
++    temporary = path.with_suffix('.tmp')
++    temporary.write_text(json.dumps(value,indent=2,allow_nan=False),encoding='utf-8')
++    temporary.replace(path)
++
++
++def frozen_check(base, expected, hash_state=False):
++    if base.training or any(p.requires_grad or p.grad is not None for p in base.parameters()):
++        raise RuntimeError('Official backbone frozen/eval/gradient invariant failed')
++    if hash_state:
++        value = state_sha256(base)
++        if value != expected:
++            raise RuntimeError('Official backbone state hash changed')
++        return value
++    return expected
++
++
++def difference(a,b):
++    a,b=a.detach().float().cpu(),b.detach().float().cpu()
++    d=a.double()-b.double()
++    return dict(bitwise_equal=torch.equal(a,b),max_abs=float(d.abs().max()),rms=float(d.square().mean().sqrt()))
++
++
++def old_cases():
++    split=json.loads((OLD/'split_manifest.json').read_text())
++    samples=RealChairStream(split['train'],seed=9010).next_effective_batch(8)
++    digest=sample_input_hash(samples)
++    if digest!='294bb081c6bc6a206a5febbcf7a8cda53cc9bdd6d0b5cccf25c317d03290bdc8':
++        raise RuntimeError('Historical fixed teacher input identity changed')
++    batch=collate_samples(samples[:2],'cuda')
++    t=batch['t'];xt=t[:,None,None]*batch['tokens']+(1-t[:,None,None])*batch['noise']
++    teacher=dict(name='historical_teacher_mb0',x=xt,t=t,y=batch['num_faces'],mask=batch['masks'],
++        correct=batch['prompts'],mismatch=collate_prompts([samples[j]['prompt'] for j in (1,2)],'cuda'),
++        source=dict(input_hash=digest,seed=9010,scope='first original microbatch2 of effective batch8'))
++    pm=json.loads((OLD/'prompt_manifest.json').read_text())
++    prompts=[]
++    for parent in (0,1):
++        rec=next(r for r in pm['records'] if r['parent_index']==parent and r['kind']=='mixed_2edges_1face')
++        with np.load(rec['path'],allow_pickle=False) as saved:
++            prompts.append({k:saved[k].copy() for k in PROMPT_KEYS})
++    raw=OLD/'raw/Q_center_parent0_mixed_2edges_1face_seed4101_correct.npz'
++    with np.load(raw,allow_pickle=False) as saved:
++        z=torch.from_numpy(saved['initial_noise'].copy()).unsqueeze(0).cuda()
++    sample=dict(name='historical_sampling_initial_state',x=z,t=torch.zeros(1,device='cuda'),
++        y=torch.tensor([512],device='cuda'),mask=torch.ones(1,512,dtype=torch.bool,device='cuda'),
++        correct=collate_prompts([prompts[0]],'cuda'),mismatch=collate_prompts([prompts[1]],'cuda'),
++        source=dict(path=str(raw),sha256=file_sha256(raw),seed=4101,step=0))
++    return (teacher,sample)
++
++
++def residual_preflight(base, report, write):
++    results=dict(status='RUNNING',optimizer_updates=0,cases=[],explicit_numeric_path_error=False)
++    report['residual_preflight']=results
++    cases=old_cases()
++    for arm in ('Q_center','G_closest'):
++        saved=torch.load(OLD/arm/'checkpoints/adapter_step0200.pt',map_location='cpu',weights_only=True)
++        adapter=ControlAdapter(arm)
++        adapter.load_state_dict(saved['adapter'],strict=True)
++        adapter=adapter.cuda().requires_grad_(False).eval()
++        before=state_sha256(adapter)
++        wrapper=OfficialWrapper(base,adapter).eval()
++        try:
++            for case in cases:
++                outputs={};row=dict(arm=arm,state=case['name'],source=case['source'],adapter_hash=before)
++                def call(mode):
++                    with torch.no_grad(),stable_execution(base,adapter):
++                        row['runtime']=assert_stable_runtime(base,adapter,coordinates=case['x'])
++                        value=wrapper(case['x'],case['t'],case['y'],mask=case['mask'],prompts=case[mode])
++                    if not torch.isfinite(value).all():raise RuntimeError('Nonfinite old step200 output')
++                    return value.detach().cpu()
++                for mode in ('correct','mismatch'):outputs[mode]=call(mode)
++                with ResidualObserver(wrapper) as observer:
++                    for mode in ('correct','mismatch'):
++                        with observer.capture(mode,case['mask']):outputs[mode+'_observed']=call(mode)
++                    row['observation']=observer.report()
++                    row['effective_correct_minus_mismatch']=observer.compare_effective('correct','mismatch')
++                row['hook_output_checks']={}
++                for mode in ('correct','mismatch'):
++                    removed=call(mode)
++                    checks=dict(installed=difference(outputs[mode],outputs[mode+'_observed']),removed=difference(outputs[mode],removed))
++                    row['hook_output_checks'][mode]=checks
++                    if not all(v['bitwise_equal'] for v in checks.values()):
++                        raise RuntimeError('Residual hooks changed actual output or strict repetition failed')
++                for capture in row['observation']['captures']:
++                    if not all(r['next_input_equals_h_after'] for r in capture['layers']):
++                        raise RuntimeError('Residual output differs from next-module input')
++                results['cases'].append(row);write()
++                print(json.dumps(dict(stage='residual_preflight',arm=arm,state=case['name'],status='PASS')),flush=True)
++            if state_sha256(adapter)!=before:raise RuntimeError('Old adapter changed during read-only observation')
++        finally:wrapper.close()
++    results.update(status='PASS',gate='No observed boundary/dtype/nonfinite/hook path error; quantization statistics alone do not identify a learning-failure cause')
++    write()
++
++
++def group_names(adapter):
++    groups=dict(condition_encoder=[],dynamic_mlp=[],output_projection=[],other_attention=[])
++    for name,p in adapter.named_parameters():
++        key=('condition_encoder' if name.startswith('condition_encoder.') else
++             'dynamic_mlp' if '.dynamic_mlp.' in name else
++             'output_projection' if '.output_projection.' in name else 'other_attention')
++        groups[key].append((name,p))
++    return groups
++
++
++def magnitude(values):
++    elements=sum(v.numel() for v in values)
++    if not elements:return dict(elements=0,rms=0.,max_abs=0.,nonzero=0)
++    square=sum(float(v.detach().double().square().sum()) for v in values)
++    return dict(elements=elements,rms=math.sqrt(square/elements),
++        max_abs=max(float(v.detach().abs().max()) for v in values),
++        nonzero=sum(int(torch.count_nonzero(v.detach())) for v in values))
++
++
++def grad_report(adapter):
++    return {key:dict(**magnitude([p.grad for n,p in values if p.grad is not None]),
++        tensors_with_grad=sum(p.grad is not None for n,p in values),parameter_tensors=len(values))
++        for key,values in group_names(adapter).items()}
++
++
++def update_report(adapter,before):
++    return {key:magnitude([p.detach().cpu()-before[n] for n,p in values]) for key,values in group_names(adapter).items()}
++
++
++def forward_loss(wrapper,batch):
++    x1,x0,t=batch['tokens'],batch['noise'],batch['t']
++    xt=t[:,None,None]*x1+(1-t[:,None,None])*x0
++    assert_stable_runtime(wrapper.backbone,wrapper.adapter,coordinates=xt)
++    prediction=wrapper(xt,t,batch['num_faces'],mask=batch['masks'],prompts=batch['prompts'],inference_geometry_cache=False)
++    return ((prediction.float()-(x1-x0)).square()*batch['masks'].unsqueeze(-1)).sum()
++
++
++def backward_gate(base,initial,bank,report,write):
++    adapter=ControlAdapter('Q_center');adapter.load_state_dict(initial,strict=True);adapter=adapter.cuda()
++    wrapper=OfficialWrapper(base,adapter).train()
++    before=state_sha256(adapter)
++    try:
++        samples=PairedLearningStream(bank['parents'],bank).next_effective_batch(8)
++        batch=collate_samples(samples[:2],'cuda')
++        with stable_execution(base,adapter):
++            runtime=assert_stable_runtime(base,adapter,coordinates=batch['tokens'])
++            loss=forward_loss(wrapper,batch)/(int(batch['num_faces'].sum())*9)
++            if not torch.isfinite(loss):raise RuntimeError('Nonfinite deterministic backward probe loss')
++            report['counts']['backward_attempts']+=1
++            loss.backward()
++            report['counts']['backward_completed']+=1
++        grads=grad_report(adapter)
++        if not grads['output_projection']['nonzero']:raise RuntimeError('No gradient reached the zero-initialized exit')
++        if any(p.grad is not None and not torch.isfinite(p.grad).all() for p in adapter.parameters()):
++            raise RuntimeError('Nonfinite deterministic backward probe gradient')
++        if state_sha256(adapter)!=before:raise RuntimeError('Zero-update backward probe changed parameters')
++        frozen_check(base,EXPECTED_BASE,True)
++        report['strict_backward_gate']=dict(status='PASS',optimizer_updates=0,actual_forwards=1,
++            actual_backwards=1,loss=float(loss),runtime=runtime,gradient_groups=grads,
++            parameters_unchanged=True,base_frozen=True,training_geometry_cache=False)
++        write()
++    finally:
++        adapter.zero_grad(set_to_none=True);wrapper.close()
++
++
++def train_arm(base,initial,bank,arm,out,report,write,evaluator,reference=None):
++    path=out/arm;path.mkdir(exist_ok=False);checkpoints=path/'checkpoints';checkpoints.mkdir()
++    torch.manual_seed(10);np.random.seed(10);random.seed(10)
++    adapter=ControlAdapter('Q_center');adapter.load_state_dict(initial,strict=True);adapter=adapter.cuda()
++    wrapper=OfficialWrapper(base,adapter).train()
++    stream=PairedLearningStream(bank['parents'],bank,arm=arm,seed=10)
++    optimizer=torch.optim.AdamW(adapter.parameters(),lr=1e-4,betas=(.9,.95),weight_decay=0)
++    result=dict(status='RUNNING',completed_updates=0,optimizer_step_attempts=0,
++        optimizer_step_in_progress=False,input_audits=[],sparse_diagnostics=[],evaluations=[],checkpoints=[],
++        initial_state_sha256=state_sha256(adapter),initial_shared_state_sha256=state_sha256_from_state(initial),
++        frozen_hashes=[dict(step=0,sha256=frozen_check(base,EXPECTED_BASE,True))],
++        independent_donor_counts=np.zeros((3,4,4),dtype=np.int64).tolist())
++    report['arms'][arm]=result
++    started=time.perf_counter()
++    boundary_rng=None
++    def save(step,label=None,recoverable=True):
++        target=checkpoints/(label or f'adapter_step{step:04d}.pt')
++        if target.exists():raise FileExistsError(target)
++        torch.save(dict(checkpoint_schema='learning_diagnosis_v1',arm=arm,step=step,
++            adapter=adapter.state_dict(),optimizer=optimizer.state_dict(),rng=rng_state(stream),
++            config=report['protocol'],base_state_sha256=EXPECTED_BASE,
++            initial_state_sha256=result['initial_state_sha256'],bank_sha256=bank['manifest_sha256'],
++            completed_updates=result['completed_updates'],optimizer_step_attempts=result['optimizer_step_attempts'],
++            recoverable=recoverable,optimizer_step_in_progress=result['optimizer_step_in_progress'],
++            input_audits=result['input_audits'],wrapper_counts=dict(wrapper.counts)),target)
++        record=dict(step=step,path=str(target),sha256=file_sha256(target),adapter_sha256=state_sha256(adapter),recoverable=recoverable)
++        result['checkpoints'].append(record);write()
++    def evaluate(step):
++        report['active_stage']=arm+f'_evaluation_step{step:04d}';write()
++        result['evaluations'].append(evaluator.evaluate_checkpoint(wrapper,arm,step));write()
++        wrapper.train()
++    try:
++        if result['initial_state_sha256']!=state_sha256_from_state(initial):raise RuntimeError('Fresh arm initialization differs')
++        save(0);evaluate(0)
++        with (path/'train.jsonl').open('x',encoding='utf-8') as log:
++            for step in range(1,1001):
++                report['active_stage']=arm+'_training'
++                if report['counts']['optimizer_updates']>=2000:raise RuntimeError('Hard global 2000-update limit')
++                tick=time.perf_counter();boundary_rng=rng_state(stream)
++                samples=stream.next_effective_batch(8);audit=copy.deepcopy(stream.last_audit)
++                if reference is not None:
++                    expected=reference[step-1]
++                    for key in ('base_input_hash','microbatch_base_hashes','padded_batch_base_hash','prompt_types','target_parent_uids','times','num_faces'):
++                        if audit[key]!=expected[key]:raise RuntimeError(f'Paired arm input mismatch step {step}: {key}')
++                optimizer.zero_grad(set_to_none=True)
++                denominator=audit['valid_coordinates'];total_loss=0.
++                for micro in range(4):
++                    batch=collate_samples(samples[2*micro:2*micro+2],'cuda')
++                    if base_tensor_hash(batch)!=audit['microbatch_base_hashes'][micro]:
++                        raise RuntimeError('Actual CUDA microbatch differs from paired input audit')
++                    with stable_execution(base,adapter):
++                        if step==1 and micro==0:result['actual_training_runtime']=assert_stable_runtime(base,adapter,coordinates=batch['tokens'])
++                        loss=forward_loss(wrapper,batch)/denominator
++                        if not torch.isfinite(loss):raise RuntimeError('Nonfinite masked FM velocity loss')
++                        report['counts']['backward_attempts']+=1
++                        loss.backward()
++                        report['counts']['backward_completed']+=1
++                    total_loss+=float(loss.detach())
++                diagnostic=None
++                if step in SPARSE_STEPS:
++                    snapshot={n:p.detach().cpu().clone() for n,p in adapter.named_parameters()}
++                    diagnostic=dict(step=step,gradients_before_clip=grad_report(adapter))
++                norm=float(torch.nn.utils.clip_grad_norm_(adapter.parameters(),1.,error_if_nonfinite=True))
++                if diagnostic is not None:diagnostic['gradients_after_clip']=grad_report(adapter)
++                frozen_check(base,EXPECTED_BASE)
++                result['optimizer_step_attempts']+=1;report['counts']['optimizer_step_attempts']+=1
++                result['optimizer_step_in_progress']=True
++                optimizer.step();torch.cuda.synchronize()
++                result['completed_updates']=step;report['counts']['optimizer_updates']+=1
++                result['optimizer_step_in_progress']=False;boundary_rng=None
++                result['input_audits'].append(audit)
++                if not all(torch.isfinite(p).all() for p in adapter.parameters()):raise RuntimeError('Nonfinite adapter parameter after optimizer update')
++                if diagnostic is not None:
++                    diagnostic['actual_parameter_updates']=update_report(adapter,snapshot)
++                    result['sparse_diagnostics'].append(diagnostic)
++                    del snapshot
++                if arm=='Q_independent':
++                    for typ,target,donor in zip(audit['prompt_type_indices'],audit['target_parent_uids'],audit['donor_indices']):
++                        result['independent_donor_counts'][typ][bank['parent_uids'].index(target)][donor]+=1
++                row=dict(step=step,loss=total_loss,grad_norm_before_clip=norm,input_audit=audit,
++                    diagnostic=diagnostic,seconds=time.perf_counter()-tick)
++                log.write(json.dumps(row,allow_nan=False)+'\n');log.flush()
++                if step in (1,2) or step%10==0:
++                    print(json.dumps(dict(stage='learning_diagnosis_training',arm=arm,step=step,loss=total_loss,
++                        grad_norm=norm,seconds=row['seconds'],total_actual_updates=report['counts']['optimizer_updates'])),flush=True)
++                if step%50==0 or step in SPARSE_STEPS:write()
++                if step in SAVE_STEPS:
++                    result['frozen_hashes'].append(dict(step=step,sha256=frozen_check(base,EXPECTED_BASE,True)))
++                    save(step);evaluate(step)
++        result.update(status='PASS_EXECUTION',seconds=time.perf_counter()-started,
++            wrapper_counts=dict(wrapper.counts),backbone_after=frozen_check(base,EXPECTED_BASE,True))
++        if arm=='Q_independent':
++            counts=np.asarray(result['independent_donor_counts'])
++            result['independent_prompt_correct_fraction']=float(sum(np.trace(v) for v in counts)/counts.sum())
++        write();return result['input_audits']
++    except BaseException as error:
++        result.update(status='STOPPED',error=repr(error),traceback=traceback.format_exc(),
++            wrapper_counts=dict(wrapper.counts),failed_optimizer_may_be_partial=result['optimizer_step_in_progress'])
++        try:save(result['completed_updates'],f'stopped_completed{result["completed_updates"]:04d}.pt',recoverable=False)
++        except BaseException as save_error:result['failure_checkpoint_error']=repr(save_error)
++        write();raise
++    finally:wrapper.close()
++
++
++def run(out):
++    out=Path(out).resolve()
++    if not out.is_relative_to(PROJECT/'outputs') or not out.name.startswith('learning_diagnosis_'):
++        raise ValueError('Require a separate learning_diagnosis output directory')
++    result_path=out/'learning_diagnosis_results.json'
++    if result_path.exists():raise FileExistsError('This entrypoint never overwrites/replays an earlier run')
++    torch.set_num_threads(8)
++    config=configure_stable_runtime()
++    report=dict(status='RUNNING',new_training_authorized=True,zero_training=False,phase3=False,
++        active_stage='initialization',counts=dict(official_forward_attempts=0,official_forward_returns=0,
++            official_by_stage={},optimizer_step_attempts=0,optimizer_updates=0,
++            backward_attempts=0,backward_completed=0,base_updates=0,phase3_updates=0),arms={},
++        protocol=dict(arms=['Q_correct','Q_independent'],adapter='Q_center',seed=10,updates_per_arm=1000,
++            total_updates_cap=2000,effective_batch=8,microbatch=2,checkpoint_steps=list(SAVE_STEPS),
++            gradient_diagnostic_steps=list(SPARSE_STEPS),optimizer='AdamW',lr=1e-4,betas=[.9,.95],weight_decay=0.,
++            grad_clip=1.,loss='Original masked FM velocity MSE, sum over valid face coordinates / valid coordinates of effective batch8',
++            scheduler=None,new_ema=None,geometry_cache=False,training_condition_encoding='Fresh autograd-connected encoding each microbatch; never retained across updates',
++            precision='BF16 autocast; FP32 parameters and Euler integration',time_sampling='Original logistic-normal; unchanged',
++            generation=dict(steps=50,dt=1/50,grid='FP32 k/50 for k=0..49',face_condition=512,face_cfg=1.,geometry_cfg=1.,
++                seeds=[6101,6102],noise='Independent Gaussian, no target coupling'),
++            teacher_times=[.05,.2,.5,.8,.95],final_endpoint=1000,model_selection=False),
++        initial_runtime=config,environment=dict(python=platform.python_version(),torch=torch.__version__,numpy=np.__version__,
++            cuda=torch.version.cuda,platform=platform.platform(),cublas_set_before_cuda=True))
++    def write():atomic_json(result_path,report)
++    write();base=None;started=time.perf_counter()
++    protected=[CHECKPOINT,OLD/'Q_center/checkpoints/adapter_step0200.pt',OLD/'G_closest/checkpoints/adapter_step0200.pt',
++        OLD/'split_manifest.json',OLD/'prompt_manifest.json',PROJECT/'outputs/debug_repeatability_20260928_150208/DEBUG_REPORT.md']
++    try:
++        report['protected_assets_before']={str(p):dict(bytes=p.stat().st_size,sha256=file_sha256(p)) for p in protected}
++        if report['protected_assets_before'][str(CHECKPOINT)]['sha256']!=EXPECTED_FILE:raise RuntimeError('Official checkpoint bytes changed')
++        bank=load_bank(out);report['data_bank']=bank['manifest']
++        report['data_bank_sha256']=bank['manifest_sha256']
++        base,audit=load_official(CHECKPOINT,REPO/'configs/snet/base-120m-ot-v-chair.yaml','cuda')
++        report['strict_load']=audit;report['backbone_before']=state_sha256(base)
++        if report['backbone_before']!=EXPECTED_BASE:raise RuntimeError('Official EMA state identity changed')
++        report['environment'].update(gpu=torch.cuda.get_device_name(),gpu_memory_bytes=torch.cuda.get_device_properties(0).total_memory,
++            git_head=subprocess.check_output(['git','rev-parse','HEAD'],cwd=REPO,text=True).strip())
++        def count_pre(module,args):
++            c=report['counts'];c['official_forward_attempts']+=1
++            stage=report['active_stage'];c['official_by_stage'][stage]=c['official_by_stage'].get(stage,0)+1
++        def count_post(module,args,value):report['counts']['official_forward_returns']+=1
++        base.register_forward_pre_hook(count_pre);base.register_forward_hook(count_post)
++        report['active_stage']='old_step200_residual_preflight';write()
++        residual_preflight(base,report,write)
++        torch.manual_seed(10);np.random.seed(10);random.seed(10)
++        fresh=ControlAdapter('Q_center');initial={k:v.detach().cpu().clone() for k,v in fresh.state_dict().items()}
++        report['fresh_initialization']=dict(seed=10,sha256=state_sha256_from_state(initial),
++            parameters=sum(p.numel() for p in fresh.parameters()),zero_exit=all(not torch.count_nonzero(v) for k,v in initial.items() if '.output_projection.' in k))
++        if not report['fresh_initialization']['zero_exit']:raise RuntimeError('Fresh adapter exit is not zero-initialized')
++        del fresh
++        report['active_stage']='strict_backward_zero_update_probe';write()
++        backward_gate(base,initial,bank,report,write)
++        from .learning_evaluation import EvaluationRunner
++        evaluator=EvaluationRunner(base,bank,out,counters=report['counts'])
++        reference=train_arm(base,initial,bank,'Q_correct',out,report,write,evaluator)
++        train_arm(base,initial,bank,'Q_independent',out,report,write,evaluator,reference=reference)
++        if report['counts']['optimizer_updates']!=2000:raise RuntimeError('Completed training does not match authorized exact budget')
++        report['backbone_after']=frozen_check(base,EXPECTED_BASE,True)
++        report['protected_assets_after']={str(p):dict(bytes=p.stat().st_size,sha256=file_sha256(p)) for p in protected}
++        report['protected_assets_unchanged']=report['protected_assets_before']==report['protected_assets_after']
++        if not report['protected_assets_unchanged']:raise RuntimeError('Protected history/weight files changed')
++        report['paired_input_streams_all_1000_updates_equal']=True
++        report.update(status='PASS_EXECUTION',active_stage='complete',elapsed_seconds=time.perf_counter()-started)
++        write();print(json.dumps(dict(status=report['status'],counts=report['counts'],result=str(result_path))),flush=True)
++    except BaseException as error:
++        report.update(status='STOPPED',error=repr(error),traceback=traceback.format_exc(),elapsed_seconds=time.perf_counter()-started)
++        if base is not None:
++            try:report['backbone_at_stop']=state_sha256(base)
++            except BaseException as hash_error:report['backbone_hash_error']=repr(hash_error)
++        write();raise
++
++
++if __name__=='__main__':
++    parser=argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('--output',required=True)
++    args=parser.parse_args();run(args.output)
+diff --git a/experiments/mf_h1_local0/learning_finalize.py b/experiments/mf_h1_local0/learning_finalize.py
+new file mode 100644
+--- /dev/null
++++ b/experiments/mf_h1_local0/learning_finalize.py
+@@ -0,0 +1,507 @@
++"""CPU-only final reporting after both authorized Q-learning arms finish.
++
++Reads existing JSON evidence, performs arithmetic only, and writes the one
++Chinese Markdown report plus derived_summary in the existing main result JSON.
++No torch/model imports, checkpoint loading, new geometric scores or training.
++"""
++from __future__ import annotations
++import argparse
++import hashlib
++import json
++import math
++import statistics
++from pathlib import Path
++
++ARMS = ('Q_correct','Q_independent')
++STEPS = (0,200,500,1000)
++KINDS = ('single_edge','single_face','mixed_2edges_1face')
++GROUPS = ('condition_encoder','dynamic_mlp','output_projection')
++LABELS = dict(Q_correct='A：正确提示',Q_independent='B：独立提示',base='Base',
++    single_edge='单边',single_face='单面',mixed_2edges_1face='混合',all='全部')
++REPORT_NAME = 'LEARNING_DIAGNOSIS_REPORT.md'
++RESULT_NAME = 'learning_diagnosis_results.json'
++
++
++def sha256(path):
++    digest=hashlib.sha256()
++    with Path(path).open('rb') as stream:
++        for block in iter(lambda:stream.read(8<<20),b''):
++            digest.update(block)
++    return digest.hexdigest()
++
++
++def read_json(path):
++    return json.loads(Path(path).read_text(encoding='utf-8-sig'))
++
++
++def avg(values):
++    values=list(values)
++    if not values or any(v is None or not math.isfinite(float(v)) for v in values):
++        return None
++    return statistics.fmean(float(v) for v in values)
++
++
++def f(value,digits=6):
++    if value is None:return 'NA'
++    if isinstance(value,bool):return '是' if value else '否'
++    return f'{value:.{digits}g}' if isinstance(value,(float,int)) else str(value)
++
++
++def pct(value):
++    return 'NA' if value is None else f'{100*value:.5f}%'
++
++
++def positive(values):
++    values=list(values)
++    return dict(positive=sum(v>0 for v in values),zero=sum(v==0 for v in values),
++                negative=sum(v<0 for v in values),count=len(values),mean=avg(values))
++
++
++def table(headers,rows):
++    lines=['| '+' | '.join(headers)+' |','| '+' | '.join('---' for _ in headers)+' |']
++    for row in rows:
++        lines.append('| '+' | '.join(str(v).replace('|','/') for v in row)+' |')
++    return '\n'.join(lines)
++
++
++def path_in_output(path,output):
++    path=Path(path).resolve()
++    if not path.is_relative_to(output) or not path.is_file():
++        raise ValueError('Missing/outside new output artifact: '+str(path))
++    return path
++
++
++def runtime_ok(facts):
++    return (facts.get('cublas_workspace_config')==':4096:8'
++        and facts.get('deterministic_algorithms') is True and facts.get('deterministic_warn_only') is False
++        and facts.get('tf32_matmul') is False and facts.get('tf32_cudnn') is False
++        and facts.get('sdpa_math_enabled') is True
++        and all(facts.get(key) is False for key in ('sdpa_flash_enabled','sdpa_mem_efficient_enabled','sdpa_cudnn_enabled','external_flash_available'))
++        and facts.get('cuda_autocast_enabled') is True and facts.get('cuda_autocast_dtype')=='torch.bfloat16'
++        and facts.get('parameter_dtype')=='torch.float32' and facts.get('active_context_depth',0)>0)
++
++
++def parent_summary(evaluation,parent):
++    own=[r for r in evaluation['scores']['own_condition_rows'] if r['parent_index']==parent]
++    cross=evaluation['scores']['same_noise_cross_four_grid']
++    binding=[r['guide_a_binding_improvement'] for r in cross if r['parent_a']==parent]
++    binding += [r['guide_b_binding_improvement'] for r in cross if r['parent_b']==parent]
++    completion=[]
++    for row in cross:
++        grid=row['full_surface_completion']
++        if any(v is None for v in grid.values()):continue
++        if row['parent_a']==parent:completion.append(grid['E_Ta_Mb']-grid['E_Ta_Ma'])
++        if row['parent_b']==parent:completion.append(grid['E_Tb_Ma']-grid['E_Tb_Mb'])
++    return dict(parent_index=parent,guide=avg(r['guide']['guide_rms_bbox_pct'] for r in own),
++        completion=avg(r['completion_symmetric_rms_bbox_pct'] for r in own),
++        binding_two_neighbors=positive(binding),completion_binding_two_neighbors=positive(completion))
++
++
++def residual_row(rows):
++    """Pool square sums/counts; never average RMS values across microbatches."""
++    result={}
++    for key in ('h','r','r_eff','quantization_error'):
++        count=sum(row[key]['elements'] for row in rows)
++        result[key+'_rms']=math.sqrt(sum(row[key]['square_sum'] for row in rows)/count) if count else None
++    raw=result['r_rms'];feature=result['h_rms']
++    result.update(residual_to_feature_rms=raw/feature if feature else None,
++        effective_to_raw_rms=result['r_eff_rms']/raw if raw else None,
++        error_to_raw_rms=result['quantization_error_rms']/raw if raw else None)
++    nonzero=sum(row['nonzero_r_elements'] for row in rows)
++    lost=sum(row['nonzero_r_addition_unchanged_elements'] for row in rows)
++    result.update(nonzero_r_elements=nonzero,unchanged_nonzero_elements=lost,
++        unchanged_nonzero_fraction=lost/nonzero if nonzero else None,
++        dtype_chains=sorted(set('/'.join(row['actual_dtypes'][key].replace('torch.','')
++            for key in ('h','r','h_after','next_module_input')) for row in rows)),
++        next_input_matches=all(row['next_input_equals_h_after'] for row in rows))
++    return result
++
++
++def residual_summaries(main,evaluations):
++    old=[]
++    for case in main['residual_preflight']['cases']:
++        differences={row['layer_one_based']:row['difference']['rms']
++            for row in case['effective_correct_minus_mismatch']['layers']}
++        for capture in case['observation']['captures']:
++            for row in capture['layers']:
++                old.append(dict(arm=case['arm'],state=case['state'],mode=capture['label'],
++                    layer=row['layer_one_based'],**residual_row([row]),
++                    correct_minus_mismatch_effective_rms=differences[row['layer_one_based']]))
++    new=[]
++    for arm in ARMS:
++        micros=evaluations[(arm,1000)]['teacher']['residuals'].values()
++        for mode in ('correct','cyclic_mismatch'):
++            for layer in (3,6,9,12):
++                rows=[];delta=[]
++                for micro in micros:
++                    capture=next(c for c in micro['observations']['captures'] if c['label']==mode)
++                    rows.append(next(r for r in capture['layers'] if r['layer_one_based']==layer))
++                    delta.append(next(r['difference'] for r in micro['correct_vs_mismatch']['layers'] if r['layer_one_based']==layer))
++                delta_rms=math.sqrt(sum(d['square_sum'] for d in delta)/sum(d['elements'] for d in delta))
++                new.append(dict(arm=arm,mode=mode,layer=layer,t=.5,**residual_row(rows),
++                    correct_minus_mismatch_effective_rms=delta_rms))
++    return dict(old_step200=old,new_step1000_teacher_t05=new,
++        scope='Old teacher uses its original first microbatch2 and sampling initial state; new teacher pools the four fixed training parents at t=0.5.',
++        hook_identity=all(v['bitwise_equal'] for c in main['residual_preflight']['cases']
++            for mode in c['hook_output_checks'].values() for v in mode.values()))
++
++
++def gradient_summaries(main):
++    result={}
++    for arm in ARMS:
++        records=main['arms'][arm]['sparse_diagnostics']
++        result[arm]={}
++        for group in GROUPS:
++            rows=[dict(step=r['step'],gradient_rms=r['gradients_before_clip'][group]['rms'],
++                clipped_gradient_rms=r['gradients_after_clip'][group]['rms'],
++                gradient_nonzero=r['gradients_before_clip'][group]['nonzero'],
++                update_rms=r['actual_parameter_updates'][group]['rms'],
++                update_nonzero=r['actual_parameter_updates'][group]['nonzero']) for r in records]
++            later=[r for r in rows if r['step']>1]
++            result[arm][group]=dict(rows=rows,
++                observed_later_steps=[r['step'] for r in later],
++                later_zero_gradient_steps=[r['step'] for r in later if r['gradient_nonzero']==0],
++                later_zero_update_steps=[r['step'] for r in later if r['update_nonzero']==0],
++                all_later_observed_gradients_zero=bool(later) and all(r['gradient_nonzero']==0 for r in later),
++                all_later_observed_updates_zero=bool(later) and all(r['update_nonzero']==0 for r in later))
++    return result
++
++
++def quality_summary(rows,base=False):
++    if base:
++        rows=list({r['output_reference']:r for r in rows}.values())
++    return dict(actual_mesh_records=len(rows),independent_noise_seeds=2,
++        narrow_face_fraction=avg(r['quality']['min_angle_lt5_fraction'] for r in rows),
++        degenerate_fraction=avg(r['quality']['degenerate_fraction'] for r in rows),
++        angle_p05_degrees_mean=avg(r['quality']['angles_p05'] for r in rows),
++        nan_count=sum(r['quality']['nan_count'] for r in rows),
++        inf_count=sum(r['quality']['inf_count'] for r in rows),
++        self_intersection='NOT_RUN',watertight='NOT_RUN',manifold='NOT_RUN')
++
++
++def derive(main,evaluations,base):
++    checkpoints=[]
++    for step in STEPS:
++        for arm in ARMS:
++            ev=evaluations[(arm,step)]
++            for kind in (*KINDS,'all'):
++                checkpoints.append(dict(step=step,arm=arm,kind=kind,**ev['scores']['summary'][kind]))
++    parents=[]
++    for parent in range(4):
++        base_rows=[r for r in base['rows'] if r['parent_index']==parent]
++        parents.append(dict(parent_index=parent,parent_uid=main['data_bank']['parent_uids'][parent],
++            base=dict(guide=avg(r['guide']['guide_rms_bbox_pct'] for r in base_rows),
++                      completion=avg(r['completion_symmetric_rms_bbox_pct'] for r in base_rows)),
++            **{arm:parent_summary(evaluations[(arm,1000)],parent) for arm in ARMS}))
++    end={arm:evaluations[(arm,1000)]['scores']['summary']['all'] for arm in ARMS}
++    a,b=end['Q_correct'],end['Q_independent']
++    comparisons=dict(final_step=1000,
++        guide_B_minus_A=b['own_guide_mean']-a['own_guide_mean'],
++        guide_Base_minus_A=a['base_guide_mean']-a['own_guide_mean'],
++        completion_B_minus_A=b['own_completion_mean']-a['own_completion_mean'],
++        completion_Base_minus_A=a['base_completion_mean']-a['own_completion_mean'],
++        binding_A_minus_B=a['guide_mean_binding_improvement']-b['guide_mean_binding_improvement'],
++        parent_guide_A_better_than_B=sum(p['Q_correct']['guide']<p['Q_independent']['guide'] for p in parents),
++        parent_guide_A_better_than_Base=sum(p['Q_correct']['guide']<p['base']['guide'] for p in parents),
++        count_parents=4,
++        description_only=True,preregistered_significance_test=False,bootstrap_run=False,
++        best_checkpoint_selection=False,generalization_claim=False,H1_advantage_claim=False)
++    for other in ('Base','B'):
++        key='base' if other=='Base' else 'Q_independent'
++        comparisons['parent_completion_A_better_than_'+other]=sum(p['Q_correct']['completion']<p[key]['completion'] for p in parents)
++    counts={}
++    for evaluation in evaluations.values():
++        for key,value in evaluation['actual_counts'].items():counts[key]=counts.get(key,0)+value
++    reconciliation={key:dict(sum_of_checkpoint_actual_counts=value,
++        main_counter=main['counts'].get('evaluation_'+key,0),
++        equal=value==main['counts'].get('evaluation_'+key,0)) for key,value in counts.items()}
++    train_forwards=sum(v for k,v in main['counts']['official_by_stage'].items() if k.endswith('_training'))
++    preflight=main['counts']['official_by_stage'].get('old_step200_residual_preflight',0)
++    probe=main['strict_backward_gate']['actual_forwards']
++    counts['training_official_forwards']=train_forwards
++    counts['residual_preflight_official_forwards']=preflight
++    counts['zero_update_backward_probe_official_forwards']=probe
++    counts['reconciled_all_official_forwards']=counts['official_forwards']+train_forwards+preflight+probe
++    counts['arm_wrapper_condition_encodes']=sum(main['arms'][arm]['wrapper_counts']['condition_encoding'] for arm in ARMS)
++    counts['evaluation_condition_encodes']=counts['condition_encodes']
++    counts['training_condition_encodes']=counts['arm_wrapper_condition_encodes']-counts['evaluation_condition_encodes']
++    counts['gate_condition_encodes']=preflight+probe
++    counts['total_condition_encodes']=counts['arm_wrapper_condition_encodes']+counts['gate_condition_encodes']
++    checks=dict(encoder_training_count_equal=counts['training_condition_encodes']==train_forwards,
++        evaluation_counters_equal=all(v['equal'] for v in reconciliation.values()),
++        global_forwards_equal=counts['reconciled_all_official_forwards']==main['counts']['official_forward_attempts']==main['counts']['official_forward_returns'],
++        global_optimizer_updates_equal=main['counts']['optimizer_updates']==sum(main['arms'][arm]['completed_updates'] for arm in ARMS)==2000)
++    if not all(checks.values()):raise RuntimeError('Final count reconciliation failed: '+str(checks))
++    runtime=[main['strict_backward_gate']['runtime']]
++    runtime += [v['runtime'] for v in main['residual_preflight']['cases']]
++    runtime += [main['arms'][arm]['actual_training_runtime'] for arm in ARMS]
++    runtime += [ev['stable_runtime'] for ev in evaluations.values()]
++    residual=residual_summaries(main,evaluations)
++    gradients=gradient_summaries(main)
++    quality=dict(base=quality_summary(base['rows'],True),
++        **{arm:quality_summary(evaluations[(arm,1000)]['scores']['own_condition_rows']) for arm in ARMS})
++    teacher={arm:evaluations[(arm,1000)]['teacher']['rows'] for arm in ARMS}
++    mean_directions=(comparisons['guide_B_minus_A']>0 and comparisons['guide_Base_minus_A']>0
++        and comparisons['completion_B_minus_A']>0 and comparisons['completion_Base_minus_A']>0
++        and comparisons['binding_A_minus_B']>0 and a['guide_mean_binding_improvement']>0)
++    four_parent_consistency=(comparisons['parent_guide_A_better_than_B']==4
++        and comparisons['parent_guide_A_better_than_Base']==4)
++    condition_response={}
++    for arm in ARMS:
++        pairs=evaluations[(arm,1000)]['scores']['same_noise_cross_four_grid']
++        rms=[row['output_change']['rms'] for row in pairs]
++        condition_response[arm]=dict(final_step=1000,recorded_cyclic_pairs=len(pairs),
++            bitwise_identical_pairs=sum(row['output_change']['bitwise_equal'] for row in pairs),
++            nonzero_response_pairs=sum(not row['output_change']['bitwise_equal'] for row in pairs),
++            rms_mean=avg(rms),rms_min=min(rms),rms_max=max(rms),
++            comparison='Existing same-kind, same-noise neighboring-parent cyclic comparisons only; no new scoring or pair creation',
++            independent_parents=4,independent_noise_seeds=2)
++    a_free_generation_not_improved=(comparisons['guide_Base_minus_A']<=0
++        and comparisons['completion_Base_minus_A']<=0
++        and a['guide_mean_binding_improvement']<=0)
++    mapping_status=('NOT_ESTABLISHED_IN_BUDGET' if a_free_generation_not_improved else
++        'DESCRIPTIVE_TRAINING_PARENT_SUPPORT' if mean_directions and four_parent_consistency else
++        'MIXED_EVIDENCE_NOT_ESTABLISHED')
++    mapping_text=('在当前预定1000步预算内未建立有效条件控制：A 的自由生成 guide 和完整表面误差均未改善 Base，平均绑定改善非正；即使存在非零条件响应，也不能解释为正确提示已学会控制对应目标。'
++        if a_free_generation_not_improved else
++        '固定终点显示训练父对象上的描述性条件学习支持；仍须结合效应幅度、质量与负对照，不能外推泛化或H1优势。'
++        if mean_directions and four_parent_consistency else
++        '最终证据未一致建立有用条件映射；必须区分非零响应、teacher改善和独立噪声自由生成的正确绑定。')
++    gates=dict(strict_loading=main['strict_load'].get('status')=='PASS',
++        numerical_preflight=main['residual_preflight'].get('status')=='PASS',
++        deterministic_backward=main['strict_backward_gate'].get('status')=='PASS',
++        stable_actual_paths=all(runtime_ok(row) for row in runtime))
++    evidence_levels=dict(execution_and_gradient_gates=gates,
++        all_execution_and_gradient_gates_passed=all(gates.values()),
++        condition_response=condition_response,
++        useful_condition_mapping=dict(status=mapping_status,assessment=mapping_text,final_step=1000,
++            H1_evaluated=False,generalization_evaluated=False,nonzero_response_is_not_useful_control=True))
++    next_step=('可考虑另行授权后扩大真实父对象，检验已观察学习收益能否重复；本轮不执行扩数据。'
++        if mean_directions and four_parent_consistency else
++        '先定位正确条件的学习与生成收益为何不足或不一致；当前证据不支持据此直接扩大数据，本轮不追加实验。')
++    return dict(schema=1,final_endpoint=1000,checkpoint_summary=checkpoints,final_parent_summary=parents,
++        final_comparison=comparisons,evidence_levels=evidence_levels,condition_response=condition_response,
++        residuals=residual,gradient_update_diagnostics=gradients,
++        final_quality=quality,final_teacher=teacher,
++        actual_counts=dict(main=main['counts'],reconciled=counts,checks=checks,evaluation_reconciliation=reconciliation),
++        stable_runtime_in_actual_paths=all(runtime_ok(row) for row in runtime),
++        teacher_algebra_max_absolute_error=max(row['algebra_absolute_error'] for rows in teacher.values() for row in rows),
++        interpretation=dict(all_requested_final_mean_directions_favorable=mean_directions,
++            guide_direction_consistent_on_all_four_training_parents=four_parent_consistency,
++            recommendation=next_step,
++            recommendation_basis='Descriptive direction checks at fixed step1000, not a preregistered effect-size threshold or statistical test',
++            no_significance_or_clear_superiority_claim=True))
++
++
++def render(main,summary,evaluations,base,output):
++    c=summary['final_comparison'];res=summary['residuals'];q=summary['final_quality']
++    lines=[]
++    def add(text=''):lines.extend([text,''])
++    add('# Q 条件可学习性诊断报告')
++    add('本轮执行了**新的训练**：Q_correct（A）和 Q_independent（B）各 1000 次更新，共 2000 次；不是零训练调试。只使用旧 train manifest 顺序前 4 个真实父对象及 12 组预先固定几何提示。结论限于这 4 个训练对象、训练 seed10、两个独立生成噪声 6101/6102，不代表泛化，也不检验 G 或 H1 优势。')
++    levels=summary['evidence_levels']
++    add('三级证据分别判断：')
++    add(table(['层级','本轮结论'],[
++        ['实现、稳定运行与梯度门禁','通过' if levels['all_execution_and_gradient_gates_passed'] else '存在未通过项，见derived证据'],
++        ['是否存在条件响应','；'.join(LABELS[arm]+' 已记录循环配对中 '+str(r['nonzero_response_pairs'])+'/'+str(r['recorded_cyclic_pairs'])+' 非零，RMS范围 '+f(r['rms_min'])+'–'+f(r['rms_max']) for arm,r in summary['condition_response'].items())],
++        ['是否建立有用条件映射',levels['useful_condition_mapping']['assessment']],
++        ['是否证明H1或泛化','本轮不检验H1，未训练G；仅4个训练父对象，不作泛化结论']]))
++    add('条件响应存在也不等于正确条件有用。上述响应只汇总终点已有24个同类型、同噪声循环配对；不新增评分、不构造额外配对，也不把24行当作24个独立父对象。')
++    add('五个问题的直接回答：')
++    add('1. **稳定配置是否进入实际路径：**'+('是。' if summary['stable_runtime_in_actual_paths'] else '未全部确认，见运行证据。')+
++        '训练、teacher、完整生成都记录严格 deterministic=True / warn_only=False、BF16 autocast、FP32 参数/积分坐标、TF32 关闭与 SDPA math；确定性反向门禁通过，未静默切换数值路径。')
++    old=[r for r in res['old_step200'] if r['mode']=='correct']
++    old_lost=[r['unchanged_nonzero_fraction'] for r in old];old_ratio=[r['effective_to_raw_rms'] for r in old]
++    add('2. **加法实际保留多少：**旧 step200 已观测 correct 状态的 RMS(r_eff)/RMS(r) 范围为 '+f(min(old_ratio))+'–'+f(max(old_ratio))+
++        '；在 r 非零元素中，加法后 h 不变比例为 '+pct(min(old_lost))+'–'+pct(max(old_lost))+
++        '。四层及新 step1000 的具体值见下表。这个 RMS 比不是语义信息保留率；量化误差或高不变比例本身不能证明学习失败的根因。')
++    add('3. **correct 是否胜 independent：**最终 step1000 的 B−A guide='+f(c['guide_B_minus_A'])+'，B−A completion='+f(c['completion_B_minus_A'])+
++        '，A−B 绑定改善='+f(c['binding_A_minus_B'])+'；4 个父对象中 A 的 guide 更低者 '+str(c['parent_guide_A_better_than_B'])+'/4。'+
++        ('各项总体均值方向有利于 A。' if c['guide_B_minus_A']>0 and c['completion_B_minus_A']>0 and c['binding_A_minus_B']>0 else '这些指标未一致支持 A 胜出。')+
++        '未做预注册显著性检验或 bootstrap，因此不作统计显著性声明；可学习性仍依据预定终点的效应幅度、父对象一致性、teacher 与自由生成证据判断。')
++    add('4. **新噪声完整生成有无收益：**Base−A guide='+f(c['guide_Base_minus_A'])+'，Base−A completion='+f(c['completion_Base_minus_A'])+
++        '；A guide 优于 Base 的父对象 '+str(c['parent_guide_A_better_than_Base'])+'/4。'+
++        ('本次固定噪声上两个总体误差均值下降。' if c['guide_Base_minus_A']>0 and c['completion_Base_minus_A']>0 else '未同时得到 guide 与完整表面误差均值下降。')+
++        '必须同时看负对照、父对象绑定和质量，不能用训练损失或非零坐标响应替代生成证据。')
++    add('有用条件映射的终点判断：'+summary['evidence_levels']['useful_condition_mapping']['assessment'])
++    add('5. **下一步扩数据还是定位学习：**'+summary['interpretation']['recommendation'])
++    add('所有最终判断只使用预定 step1000；step0/200/500 用于呈现过程，未选择最佳 checkpoint、延长训练、调整损失或超参数。')
++    add('## 固定协议与数据身份')
++    add(table(['项目','记录'],[
++        ['父对象','；'.join(main['data_bank']['parent_uids'])],['真实训练/teacher 面数','768 / 348 / 750 / 217，按真实 N 掩码，无截断或凑足 512'],
++        ['训练对照','A：目标自身同类型提示；B：4 父对象每样本独立均匀抽 donor，允许正确 1/4'],
++        ['初始化','同一新 seed10，零出口；未续旧 step200；state SHA256 '+main['fresh_initialization']['sha256']],
++        ['优化器','AdamW lr=1e-4，betas=(0.9,0.95)，wd=0，clip=1；effective8 / micro2'],
++        ['损失','原 masked FM velocity MSE，有效坐标求和 / effective batch 有效坐标数'],
++        ['生成','独立 CPU Gaussian seeds6101/6102；原 50 步 Euler；FP32 k/50；face condition512；CFG均1'],
++        ['Teacher','固定真实 OT target/noise 配对，每父对象1例；仅评价取 t=.05/.2/.5/.8/.95，训练时间分布不变'],
++        ['数据 bank SHA256',main['data_bank_sha256']],['双臂逐更新输入匹配',f(main['paired_input_streams_all_1000_updates_equal'])],
++        ['B 实际正确 donor 比例',pct(main['arms']['Q_independent']['independent_prompt_correct_fraction'])]]))
++    noise=main['data_bank']['evaluation_noise']
++    add('评价噪声 hash（bank 原始 dtype/shape/bytes 定义）：'+ '; '.join(str(seed)+'='+value for seed,value in noise['array_sha256'].items())+'。它们没有与任何 GT 目标做 OT 配对；GT 仅用于 teacher 和 CPU 几何评分。旧 4 个 diagnostic 对象没有参加这次训练，也未用于挑选终点。')
++    add('## 预定 checkpoint 的生成指标')
++    add('误差单位均为 bbox 对角线的百分比，越低越好；绑定改善为错条件输出误差减自身条件输出误差，正值较好。Base 为同一组 2 次独立生成，跨父对象、类型、checkpoint 复用评分；表格行和循环配对不是额外独立样本。')
++    add(table(['类型','Base guide','Base completion'],[[LABELS[k],f(evaluations[('Q_correct',0)]['scores']['summary'][k]['base_guide_mean']),f(evaluations[('Q_correct',0)]['scores']['summary'][k]['base_completion_mean'])] for k in (*KINDS,'all')]))
++    add(table(['step','模型','类型','guide','completion','guide绑定','表面绑定'],[
++        [r['step'],LABELS[r['arm']],LABELS[r['kind']],f(r['own_guide_mean']),f(r['own_completion_mean']),
++         f(r['guide_mean_binding_improvement']),f(r['completion_mean_binding_improvement'])] for r in summary['checkpoint_summary']]))
++    add('四格定义：E(Ca,Ma)、E(Ca,Mb)、E(Cb,Mb)、E(Cb,Ma)。配对绑定量 = [(E(Ca,Mb)−E(Ca,Ma))+(E(Cb,Ma)−E(Cb,Mb))]/2。完整表面绑定使用相同四格、目标表面 Ta/Tb。')
++    add('## 最终父对象比较（仅 step1000）')
++    add('每个父对象的绑定量汇总它在循环四格中作为 a 和 b 的两侧邻居，共 3 类型×2 噪声×2 邻居=12 项；不是只取 parent_a 方向。')
++    add(table(['父对象','Base guide','A guide','B guide','A绑定均值','A正项/12','B绑定均值','B正项/12'],[
++        [p['parent_index'],f(p['base']['guide']),f(p['Q_correct']['guide']),f(p['Q_independent']['guide']),
++         f(p['Q_correct']['binding_two_neighbors']['mean']),str(p['Q_correct']['binding_two_neighbors']['positive'])+'/12',
++         f(p['Q_independent']['binding_two_neighbors']['mean']),str(p['Q_independent']['binding_two_neighbors']['positive'])+'/12'] for p in summary['final_parent_summary']]))
++    add(table(['父对象','Base completion','A completion','B completion','A表面绑定','B表面绑定'],[
++        [p['parent_index'],f(p['base']['completion']),f(p['Q_correct']['completion']),f(p['Q_independent']['completion']),
++         f(p['Q_correct']['completion_binding_two_neighbors']['mean']),f(p['Q_independent']['completion_binding_two_neighbors']['mean'])] for p in summary['final_parent_summary']]))
++    add('## 最终 teacher：方向与损失恒等式')
++    add('每个 t 的分母为 18747 个真实有效坐标，4 个父对象按坐标数加权，不按对象或 microbatch 平均。e=u−v_off，d=v_correct−v_off；Lcorrect−Loff=mean(d²)−2mean(e·d)。模型输出后用 FP64 汇总恒等式，未改变前向精度或训练损失。负 ΔL 表示正确提示改善 teacher MSE。')
++    add(table(['模型','t','MSE off','MSE correct','MSE mismatch','mean d²','2mean e·d','ΔL','代数误差'],[
++        [LABELS[arm],f(r['t']),f(r['mse']['off']),f(r['mse']['correct']),f(r['mse']['cyclic_mismatch']),
++         f(r['mean_d2']),f(r['two_mean_ed']),f(r['Lcorrect_minus_Loff']),f(r['algebra_absolute_error'])]
++        for arm in ARMS for r in summary['final_teacher'][arm]]))
++    add('最终恒等式最大绝对误差='+f(summary['teacher_algebra_max_absolute_error'])+'。不同 t 的 teacher 结果分别报告，不用人为时间加权合成新目标；teacher 改善与自由生成改善必须分开判断。')
++    add('## 实际残差加法与量化')
++    add('r_eff=h_after.float()−h.float()；误差=r_eff−r.float()（scale1）。dtype 顺序为 h/r/h_after/下一模块输入。RMS 均只计有效 hidden 元素；“不变%”分母仅为 r 非零元素。旧记录是原 teacher 首个 microbatch2 和采样初始状态，不能当成整个轨迹的量化率。所有旧捕获有 hook/无 hook/移除 hook 输出逐位一致：'+f(res['hook_identity'])+'。')
++    add(table(['旧模型/状态','模式','层','dtype','RMS(h)','RMS(r)','r/h','RMS(r_eff)','r_eff/r','RMS误差','非零r加后不变','correct-mismatch r_eff RMS'],[
++        [r['arm']+'/'+('teacher' if 'teacher' in r['state'] else 'sample k0'),r['mode'],r['layer'],','.join(r['dtype_chains']),
++         f(r['h_rms']),f(r['r_rms']),f(r['residual_to_feature_rms']),f(r['r_eff_rms']),f(r['effective_to_raw_rms']),
++         f(r['quantization_error_rms']),pct(r['unchanged_nonzero_fraction']),f(r['correct_minus_mismatch_effective_rms'])] for r in res['old_step200']]))
++    add('新 step1000 的 t=.5 固定 teacher：跨两个 microbatch 的 square_sum / 元素数合并后开方，未直接平均 RMS。correct 与 mismatch 有相同 mask。')
++    add(table(['模型','模式','层','dtype','RMS(h)','RMS(r)','r/h','RMS(r_eff)','r_eff/r','RMS误差','非零r加后不变','正确−错配r_eff RMS'],[
++        [LABELS[r['arm']],r['mode'],r['layer'],','.join(r['dtype_chains']),f(r['h_rms']),f(r['r_rms']),
++         f(r['residual_to_feature_rms']),f(r['r_eff_rms']),f(r['effective_to_raw_rms']),f(r['quantization_error_rms']),
++         pct(r['unchanged_nonzero_fraction']),f(r['correct_minus_mismatch_effective_rms'])] for r in res['new_step1000_teacher_t05']]))
++    add('h_after 与下一模块输入逐位相等的观测均通过：'+f(all(r['next_input_matches'] for r in res['old_step200']+res['new_step1000_teacher_t05']))+'。这里记录量化风险与实际加法，不据此推定因果，也未改 FP32 残差路径、scale、初始化或学习率。')
++    add('## 稀疏梯度与实际参数更新')
++    add('仅在预定 step1/2/10/50/200/500/1000 观测。step1 零出口导致上游梯度为零可以正常；“后续为零”只覆盖下列采样步，不能外推未记录的每一步。更新 RMS 用 optimizer.step 前后真实参数差，梯度为裁剪前值。')
++    rows=[]
++    for arm,groups in summary['gradient_update_diagnostics'].items():
++        for group,values in groups.items():
++            for r in values['rows']:
++                rows.append([LABELS[arm],group,r['step'],f(r['gradient_rms']),r['gradient_nonzero'],f(r['update_rms']),r['update_nonzero']])
++    add(table(['模型','参数组','step','梯度RMS','非零梯度元素','实际更新RMS','非零更新元素'],rows))
++    for arm,groups in summary['gradient_update_diagnostics'].items():
++        add(LABELS[arm]+'：'+ '；'.join(group+' 后续观测梯度全零='+f(v['all_later_observed_gradients_zero'])+'，实际更新全零='+f(v['all_later_observed_updates_zero'])+'，零更新步='+str(v['later_zero_update_steps']) for group,v in groups.items())+'。')
++    add('## 最终网格与完整表面诊断')
++    add(table(['模型','生成网格数','最小角<5°面比例','退化面比例','全部内角p05均值(°)','NaN坐标数','Inf坐标数'],[
++        [LABELS[arm],r['actual_mesh_records'],pct(r['narrow_face_fraction']),pct(r['degenerate_fraction']),f(r['angle_p05_degrees_mean']),r['nan_count'],r['inf_count']] for arm,r in q.items()]))
++    add('完整表面 completion 为原实现的双向面积采样 RMS：生成与目标各 512 个表面点、固定局部评分 seed9911，再到另一三角表面的最近距离，按目标 bbox 对角线归一化。它是有限采样诊断。sliver 以最小角<5°记录；自交、水密、流形性均为 **NOT_RUN**，不能据本表声称有效闭合流形。原始网格没有投影、修补或后处理。')
++    add('## 实际执行次数与不变性')
++    counts=main['counts']
++    add(table(['计数','实际值'],[
++        ['官方forward attempts / returns',str(counts['official_forward_attempts'])+' / '+str(counts['official_forward_returns'])],
++        ['训练官方前向',summary['actual_counts']['reconciled']['training_official_forwards']],
++        ['旧残差预检官方前向',summary['actual_counts']['reconciled']['residual_preflight_official_forwards']],
++        ['零更新反向probe官方前向',summary['actual_counts']['reconciled']['zero_update_backward_probe_official_forwards']],
++        ['评价官方前向',counts['evaluation_official_forwards']],['完整生成',counts['evaluation_complete_rollouts']],
++        ['Base / Q生成',str(counts['evaluation_base_rollouts'])+' / '+str(counts['evaluation_adapted_rollouts'])],
++        ['Teacher前向',counts['evaluation_teacher_forwards']],
++        ['总encoder调用',summary['actual_counts']['reconciled']['total_condition_encodes']],
++        ['训练 / 评价 / 门禁encoder调用',str(summary['actual_counts']['reconciled']['training_condition_encodes'])+' / '+str(summary['actual_counts']['reconciled']['evaluation_condition_encodes'])+' / '+str(summary['actual_counts']['reconciled']['gate_condition_encodes'])],
++        ['backward attempts / completed',str(counts['backward_attempts'])+' / '+str(counts['backward_completed'])],
++        ['optimizer attempts / completed',str(counts['optimizer_step_attempts'])+' / '+str(counts['optimizer_updates'])],
++        ['guide / completion / quality评分',str(counts['evaluation_guide_scores'])+' / '+str(counts['evaluation_completion_scores'])+' / '+str(counts['evaluation_quality_scores'])],
++        ['Base更新 / Phase3更新',str(counts['base_updates'])+' / '+str(counts['phase3_updates'])]]))
++    add('step0 相同初始化跨臂复用次数='+str(counts.get('evaluation_checkpoint_reuses',0))+'；复用只引用相同权重、Base、bank 的已保存输出，未虚增生成或 teacher 次数。实际计数分阶段及逐checkpoint对账见主结果 derived_summary.actual_counts。')
++    add(table(['冻结/身份项目','结果'],[
++        ['官方EMA state SHA256',main['backbone_before']],['结束EMA state SHA256',main['backbone_after']],
++        ['原2GB文件、旧adapter、旧split/prompt/report哈希不变',f(main['protected_assets_unchanged'])],
++        ['两臂1000更新输入逐步匹配',f(main['paired_input_streams_all_1000_updates_equal'])],
++        ['所有评价训练RNG未变',f(all(ev.get('rng_unchanged') is True for ev in evaluations.values()))],
++        ['所有评价bank未变',f(all(ev.get('bank_unchanged') is True for ev in evaluations.values()))],
++        ['前向/评价计数对账',f(all(summary['actual_counts']['checks'].values()))]]))
++    add('原文件身份只引用主入口前后实际核验记录，不复制或重新装载官方 2GB checkpoint：')
++    add(table(['原资产','bytes','SHA256'],[['/'.join(Path(path).parts[-3:]),value['bytes'],value['sha256']] for path,value in main['protected_assets_before'].items()]))
++    add('CPU 数据检查已合并至 derived_summary.data_validation，并保留原文件 [data_checks.json](learning_bank/data_checks.json)：A/B/原流前三批 target/noise/t/N/真实 mask 一致，类型同流，独立 donor 允许正确对象，五个 RNG 状态恢复一致，独立评价 Gaussian 可逐位重建。')
++    add('运行环境：Python '+str(main['environment']['python'])+'；PyTorch '+str(main['environment']['torch'])+'；CUDA '+str(main['environment']['cuda'])+'；GPU '+str(main['environment'].get('gpu'))+'；Git '+str(main['environment'].get('git_head'))+'。协议与实际runtime完整字段保留在主结果。')
++    add('## 原始输出与交付索引')
++    add('[本轮授权](TASK_zh.md) · [主结果与derived汇总](learning_diagnosis_results.json) · [固定数据bank身份](learning_bank_manifest.json) · [原始完整生成](raw_evaluation/) · [各checkpoint评价](results/)')
++    add(table(['模型','step','本轮checkpoint','SHA256'],[
++        [LABELS[arm],record['step'],'['+Path(record['path']).name+']('+Path(record['path']).relative_to(output).as_posix()+')',record['sha256']]
++        for arm in ARMS for record in main['arms'][arm]['checkpoints']]))
++    add('两臂共享的 step0 raw 引用和每次生成数组 SHA256 均保留在评价 JSON；没有复制官方权重、旧数据或历史输出。代码 diff 由主线程独立交付。本轮到预定终点即停止，不自动进入下一阶段。')
++    return '\n'.join(lines)
++
++
++def build_report(output):
++    output=Path(output).resolve()
++    result_path=output/RESULT_NAME
++    main=read_json(result_path)
++    if main.get('status')!='PASS_EXECUTION':
++        raise RuntimeError('Finalization requires completed main status PASS_EXECUTION; never report an in-progress run as complete')
++    if 'derived_summary' in main or (output/REPORT_NAME).exists():
++        raise FileExistsError('Preserve already-finalized report and derived evidence')
++    for arm in ARMS:
++        state=main['arms'][arm]
++        if state.get('status')!='PASS_EXECUTION' or state['completed_updates']!=1000 or state['optimizer_step_in_progress']:
++            raise RuntimeError('Both arms must finish exactly 1000 updates')
++        if [c['step'] for c in state['checkpoints']]!=list(STEPS):
++            raise RuntimeError('Required fixed checkpoints are missing or unexpected checkpoints exist')
++        for checkpoint in state['checkpoints']:path_in_output(checkpoint['path'],output)
++    if (not main.get('protected_assets_unchanged') or not main.get('paired_input_streams_all_1000_updates_equal')
++            or main['backbone_before']!=main['backbone_after']):
++        raise RuntimeError('Frozen asset or paired-input invariants did not pass')
++    task_path=path_in_output(output/'TASK_zh.md',output)
++    task_text=task_path.read_text(encoding='utf-8-sig')
++    if not task_text.strip():raise ValueError('The authorized task record is empty')
++    evaluations={};source_hashes={}
++    for arm in ARMS:
++        for step in STEPS:
++            path=path_in_output(output/'results'/f'evaluation_{arm}_step{step:04d}.json',output)
++            ev=read_json(path)
++            if ev.get('status') not in ('PASS','PASS_REUSED_IDENTICAL_INITIAL_STATE') or ev['arm']!=arm or ev['step']!=step:
++                raise RuntimeError('Every declared checkpoint evaluation must be complete')
++            path_in_output(ev['raw_path'],output)
++            if len(ev['scores']['own_condition_rows'])!=24 or len(ev['teacher']['rows'])!=5:
++                raise RuntimeError('Incomplete fixed evaluation grid')
++            evaluations[(arm,step)]=ev;source_hashes[str(path.relative_to(output))]=sha256(path)
++    base_path=path_in_output(output/'results/evaluation_base.json',output)
++    base=read_json(base_path)
++    if base.get('status')!='PASS' or base['independent_base_draws']!=2:
++        raise RuntimeError('Exactly two completed shared Base draws are required')
++    path_in_output(base['raw_path'],output)
++    source_hashes[str(base_path.relative_to(output))]=sha256(base_path)
++    summary=derive(main,evaluations,base)
++    data_checks_path=path_in_output(output/'learning_bank/data_checks.json',output)
++    data_checks=read_json(data_checks_path)
++    if data_checks.get('status')!='PASS' or data_checks.get('bank_manifest_sha256')!=main['data_bank_sha256']:
++        raise RuntimeError('Completed CPU bank validation does not match this run')
++    summary['data_validation']=dict(path=str(data_checks_path.relative_to(output)),sha256=sha256(data_checks_path),record=data_checks)
++    summary['source_evidence']=dict(main_result_sha256_before_finalize=sha256(result_path),
++        task_sha256=sha256(task_path),task_characters_read=len(task_text),
++        evaluation_json_sha256=source_hashes,finalizer_source_sha256=sha256(Path(__file__)),
++        no_new_models_or_scores=True,no_checkpoint_deserialization=True)
++    report=render(main,summary,evaluations,base,output)
++    summary['report']=dict(path=REPORT_NAME,sha256=hashlib.sha256(report.encode('utf-8')).hexdigest())
++    return main,summary,report
++
++
++def finalize(output):
++    output=Path(output).resolve()
++    main,summary,report=build_report(output)
++    destination=output/RESULT_NAME
++    if sha256(destination)!=summary['source_evidence']['main_result_sha256_before_finalize']:
++        raise RuntimeError('Main results changed during finalization')
++    main['derived_summary']=summary
++    temporary=output/(RESULT_NAME+'.finalize.tmp')
++    if temporary.exists():raise FileExistsError('Preserve interrupted finalization temporary file')
++    payload=json.dumps(main,indent=2,allow_nan=False)
++    # All validation/rendering finishes before either final artifact is touched.
++    with temporary.open('x',encoding='utf-8') as stream:stream.write(payload)
++    with (output/REPORT_NAME).open('x',encoding='utf-8',newline='\n') as stream:stream.write(report)
++    temporary.replace(destination)
++    print(json.dumps(dict(status='PASS',report=str(output/REPORT_NAME),merged_into=str(destination),
++        official_forwards_added=0,rollouts_added=0,optimizer_updates_added=0)),flush=True)
++    return summary
++
++
++def main():
++    parser=argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('--output',required=True)
++    args=parser.parse_args();finalize(args.output)
++
++
++if __name__=='__main__':
++    main()

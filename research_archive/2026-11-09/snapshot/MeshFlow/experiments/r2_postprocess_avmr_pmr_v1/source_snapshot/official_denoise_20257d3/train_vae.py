@@ -1,0 +1,474 @@
+import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader
+from utils.logger import WandBLogger as SummaryWriter
+
+import math
+import yaml
+import json
+import numpy as np
+import logging
+import os
+import argparse
+from time import time
+from glob import glob
+from copy import deepcopy
+from collections import OrderedDict
+from torch.optim.lr_scheduler import LambdaLR
+from accelerate import Accelerator
+from tqdm import tqdm
+from functools import partial
+import warnings
+
+warnings.filterwarnings("ignore", message=".*torch.cpu.amp.autocast.*")
+os.environ["NCCL_P2P_DISABLE"] = "1"
+os.environ["NCCL_IB_DISABLE"] = "1"
+
+from datasets.mesh_dataset import ObjaverseDataset, collate_fn
+from datasets.mesh_dataset import save_mesh
+
+
+def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps, min_lr=1e-6, last_epoch=-1):
+    base_lr = optimizer.param_groups[0]['lr']
+    
+    def lr_lambda(current_step):
+        if current_step < num_warmup_steps:
+            return float(current_step) / float(max(1, num_warmup_steps))
+        
+        if current_step > num_training_steps:
+            return min_lr / base_lr
+            
+        progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
+        
+        cosine_coeff = 0.5 * (1.0 + math.cos(math.pi * progress))
+        decay_factor = (1 - min_lr / base_lr) * cosine_coeff + (min_lr / base_lr)
+        
+        return decay_factor
+
+    return LambdaLR(optimizer, lr_lambda, last_epoch=last_epoch)
+
+def do_train(train_config, accelerator):
+    """
+    Trains a LightningDiT.
+    """
+    # Setup accelerator:
+    device = accelerator.device
+
+    # Setup an experiment folder:
+    # Compute exp_name for all processes (needed for checkpoint_dir)
+    model_string_name = train_config['model']['model_type'].replace("/", "-")
+    if train_config['train']['exp_name'] is None:
+        # Only main process computes experiment_index to avoid race conditions
+        # Then we'll broadcast it, but for simplicity, all processes can compute the same way
+        # (race condition only matters if multiple processes create dirs simultaneously)
+        if accelerator.is_main_process:
+            os.makedirs(train_config['train']['output_dir'], exist_ok=True)
+        accelerator.wait_for_everyone()  # Ensure directory exists before glob
+        experiment_index = len(glob(f"{train_config['train']['output_dir']}/*"))
+        exp_name = f'{experiment_index:03d}-{model_string_name}'
+    else:
+        exp_name = train_config['train']['exp_name']
+    
+    # Now exp_name is available to all processes
+    checkpoint_dir = f"{train_config['train']['output_dir']}/{exp_name}/checkpoints"
+    
+    if accelerator.is_main_process:
+        experiment_dir = f"{train_config['train']['output_dir']}/{exp_name}"  # Create an experiment folder
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        logger = create_logger(experiment_dir)
+        logger.info(f"Experiment directory created at {experiment_dir}")
+        # Initialize wandb logger
+        writer = SummaryWriter(log_dir=experiment_dir, project="MeshFlow2", name=exp_name, config=train_config)
+
+    # get rank
+    rank = accelerator.local_process_index
+
+    # Create model:
+    from models.equivae import AutoencoderKL, loss_vae, index_to_float
+    model = AutoencoderKL(latent_channels=train_config['model']['latent_channels'], 
+                        decoder_type=train_config['model']['decoder_type'],
+                        num_bins=train_config['data']['num_bins'],
+                        use_rmsnorm=train_config['model']['use_rms'],
+                        noise_level=train_config['model']['noise_std'] if train_config['model']['fixed_noise'] else None, # should be input
+                        use_equi_model = train_config['model']['use_equi_model'],
+                        use_encoder = train_config['model']['use_encoder'],
+                        fixed_noise = train_config['model']['fixed_noise'],
+                        use_coord_encoding_decoder = train_config['model']['use_coord_encoding_decoder'],
+                        )
+    ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
+
+    # load pretrained model
+    if 'weight_init' in train_config['train']:
+        checkpoint = torch.load(train_config['train']['weight_init'], map_location=lambda storage, loc: storage)
+        # remove the prefix 'module.' from the keys
+        checkpoint['model'] = {k.replace('module.', ''): v for k, v in checkpoint['model'].items()}
+        model = load_weights_with_shape_check(model, checkpoint, rank=rank)
+        ema = load_weights_with_shape_check(ema, checkpoint, rank=rank)
+        if accelerator.is_main_process:
+            logger.info(f"Loaded pretrained model from {train_config['train']['weight_init']}")
+    requires_grad(ema, False)
+    
+    model = DDP(model.to(device), device_ids=[int(os.environ["LOCAL_RANK"])])
+    if accelerator.is_main_process:
+        logger.info(f"LightningDiT Parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
+        logger.info(f"Optimizer: AdamW, lr={train_config['optimizer']['lr']}, beta2={train_config['optimizer']['beta2']}")
+    opt = torch.optim.AdamW(model.parameters(), lr=train_config['optimizer']['lr'], weight_decay=0, betas=(0.9, train_config['optimizer']['beta2']))
+
+    for param_group in opt.param_groups:
+        param_group['initial_lr'] = train_config['optimizer']['lr']
+        
+    # Setup data
+    dataset = ObjaverseDataset(
+        data_pth=train_config['data']['data_path'],
+        training=True,
+        noise_sort=train_config['data']['noise_sort'],
+        use_custom_prior=train_config['data']['use_custom_prior'] if 'use_custom_prior' in train_config['data'] else False,
+        use_decimated_dataset=train_config['data']['use_decimated_dataset'] if 'use_decimated_dataset' in train_config['data'] else False,
+        do_dataset_normalize=train_config['data']['do_dataset_normalize'] if 'do_dataset_normalize' in train_config['data'] else False,
+        vae=True,
+        overfit=train_config['data']['overfit'] if 'overfit' in train_config['data'] else False,
+        use_rot_aug=train_config['data']['use_rot_aug'] if 'use_rot_aug' in train_config['data'] else True,
+        use_scale_aug=train_config['data']['use_scale_aug'] if 'use_scale_aug' in train_config['data'] else True,
+    )
+    batch_size_per_gpu = int(np.round(train_config['train']['global_batch_size'] / accelerator.num_processes))
+    global_batch_size = batch_size_per_gpu * accelerator.num_processes
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size_per_gpu,
+        shuffle=True,
+        num_workers=train_config['data']['num_workers'],
+        pin_memory=True,
+        drop_last=True,
+        collate_fn=partial(collate_fn, max_seq_length=800)
+    )
+    if accelerator.is_main_process:
+        logger.info(f"Dataset contains {len(dataset):,} images {train_config['data']['data_path']}")
+        logger.info(f"Batch size {batch_size_per_gpu} per gpu, with {global_batch_size} global batch size")
+    
+    if 'valid_path' in train_config['data']:
+        valid_dataset = ObjaverseDataset(
+        data_pth=train_config['data']['data_path'],
+        noise_sort=train_config['data']['noise_sort'],
+        training=False,
+        use_custom_prior=train_config['data']['use_custom_prior'] if 'use_custom_prior' in train_config['data'] else False,
+        use_decimated_dataset=train_config['data']['use_decimated_dataset'] if 'use_decimated_dataset' in train_config['data'] else False,
+        do_dataset_normalize=train_config['data']['do_dataset_normalize'] if 'do_dataset_normalize' in train_config['data'] else False,
+        vae=True,
+        overfit=train_config['data']['overfit'] if 'overfit' in train_config['data'] else False,
+    )
+
+        valid_loader = DataLoader(
+            valid_dataset,
+            batch_size=1,
+            shuffle=False,
+            num_workers=train_config['data']['num_workers'],
+            pin_memory=True,
+            drop_last=False, # should drop last false for validation
+            collate_fn=partial(collate_fn, max_seq_length=800)
+        )
+        if accelerator.is_main_process:
+            logger.info(f"Validation Dataset contains {len(valid_dataset):,} images {train_config['data']['valid_path']}")
+    # Prepare models for training:
+    update_ema(ema, model.module, decay=0)  # Ensure EMA is initialized with synced weights
+    model.train()  # important! This enables embedding dropout for classifier-free guidance
+    ema.eval()  # EMA model should always be in eval mode
+    
+    train_config['train']['resume'] = train_config['train']['resume'] if 'resume' in train_config['train'] else False
+
+    if train_config['train']['resume']:
+        # check if the checkpoint exists
+        checkpoint_files = glob(f"{checkpoint_dir}/*.pt")
+        if checkpoint_files:
+            checkpoint_files.sort(key=lambda x: os.path.getsize(x))
+            latest_checkpoint = checkpoint_files[-1]
+            checkpoint = torch.load(latest_checkpoint, map_location=lambda storage, loc: storage)
+            model.load_state_dict(checkpoint['model'])
+            # opt.load_state_dict(checkpoint['opt'])
+            ema.load_state_dict(checkpoint['ema'])
+            train_steps = int(latest_checkpoint.split('/')[-1].split('.')[0])
+            if accelerator.is_main_process:
+                logger.info(f"Resuming training from checkpoint: {latest_checkpoint}")
+        else:
+            if accelerator.is_main_process:
+                logger.info("No checkpoint found. Starting training from scratch.")
+    model, opt, loader = accelerator.prepare(model, opt, loader)
+    
+    # Variables for monitoring/logging purposes:
+    if not train_config['train']['resume']:
+        train_steps = 0
+        
+    scheduler = get_cosine_schedule_with_warmup(opt, 500, train_config['train']['max_steps'], last_epoch=train_steps-1)
+
+    log_steps = 0
+    running_loss = 0
+    running_kl_loss = 0
+    running_mae = 0
+    running_rmse = 0
+    start_time = time()
+    use_checkpoint = train_config['train']['use_checkpoint'] if 'use_checkpoint' in train_config['train'] else True
+    if accelerator.is_main_process:
+        logger.info(f"Using checkpointing: {use_checkpoint}")
+
+    while True:
+        for data in loader:
+            x1 = data['tokens']
+            y = data['num_faces']
+            mask = data['masks']
+
+            if accelerator.mixed_precision == 'no':
+                x1 = x1.to(device, dtype=torch.float32)
+                y = y
+            else:
+                x1 = x1.to(device)
+                y = y.to(device)
+            clean_mesh, posterior, z = model(x1, cond=y, mask=mask)    
+            
+            kwargs = {} if "v_weights" not in data.keys() else {"v_weights": data['v_weights']}    
+            loss, kl_l, mae, rmse = loss_vae(x1, 
+                                         clean_mesh, 
+                                         posterior=posterior, mask=mask, kl_weight=train_config['train']['kl_weight'], num_bins=train_config['data']['num_bins'], 
+                                         decoder_type=train_config['model']['decoder_type'],
+                                         loss_type=train_config['model']['loss_type'], 
+                                         noise_scale=train_config['model']['noise_std'],
+                                         fixed_noise=train_config['model']['fixed_noise'],
+                                         **kwargs
+                                         )
+
+            opt.zero_grad()
+            accelerator.backward(loss)
+            
+            # Calculate and log gradient norm
+            total_norm = 0.0
+            if accelerator.sync_gradients:
+                for p in model.parameters():
+                    if p.grad is not None:
+                        param_norm = p.grad.data.norm(2)
+                        total_norm += param_norm.item() ** 2
+                total_norm = total_norm ** (1. / 2)
+            
+            if 'max_grad_norm' in train_config['optimizer']:
+                if accelerator.sync_gradients:
+                    accelerator.clip_grad_norm_(model.parameters(), train_config['optimizer']['max_grad_norm'])
+            opt.step()
+            scheduler.step()
+            update_ema(ema, model.module)
+
+            # Log loss values:
+            running_loss += loss.item()
+            running_kl_loss += kl_l.item()
+            running_mae += mae.item()
+            running_rmse += rmse.item()
+            log_steps += 1
+            train_steps += 1
+            if train_steps % train_config['train']['log_every'] == 0:
+                # Measure training speed:
+                torch.cuda.synchronize()
+                end_time = time()
+                steps_per_sec = log_steps / (end_time - start_time)
+                # Reduce loss history over all processes:
+                avg_loss = torch.tensor(running_loss / log_steps, device=device)
+                avg_kl   = torch.tensor(running_kl_loss / log_steps, device=device)
+                avg_mae  = torch.tensor(running_mae / log_steps, device=device)
+                avg_rmse = torch.tensor(running_rmse / log_steps, device=device)
+                avg_grad_norm = torch.tensor(total_norm, device=device) if accelerator.sync_gradients else torch.tensor(0.0, device=device)
+                dist.all_reduce(avg_kl, op=dist.ReduceOp.SUM)
+                dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
+                dist.all_reduce(avg_mae, op=dist.ReduceOp.SUM)
+                dist.all_reduce(avg_rmse, op=dist.ReduceOp.SUM)
+                if accelerator.sync_gradients:
+                    dist.all_reduce(avg_grad_norm, op=dist.ReduceOp.SUM)
+                avg_loss = avg_loss.item() / dist.get_world_size()
+                avg_kl   = avg_kl.item() / dist.get_world_size()
+                avg_mae  = avg_mae.item() / dist.get_world_size()
+                avg_rmse = avg_rmse.item() / dist.get_world_size()
+                avg_grad_norm = avg_grad_norm.item() / dist.get_world_size() if accelerator.sync_gradients else 0.0
+                if accelerator.is_main_process:
+                    logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.6f}, MAE: {avg_mae:.6f}, RMSE: {avg_rmse:.6f}, Train Steps/Sec: {steps_per_sec:.2f}, LR: {scheduler.get_last_lr()[0]:.6f}, Grad Norm: {avg_grad_norm:.4f}")
+                    writer.add_scalar('Loss/train_kl', avg_kl, train_steps)
+                    writer.add_scalar('Loss/train', avg_loss, train_steps)
+                    writer.add_scalar('Metrics/train_mae', avg_mae, train_steps)
+                    writer.add_scalar('Metrics/train_rmse', avg_rmse, train_steps)
+                    writer.add_scalar('Training/grad_norm', avg_grad_norm, train_steps)
+                # Reset monitoring variables:
+                running_loss = 0
+                running_kl_loss = 0
+                running_mae = 0
+                running_rmse = 0
+                log_steps = 0
+                start_time = time()
+
+            # Save checkpoint:
+            if train_steps % train_config['train']['ckpt_every'] == 0 and train_steps > 0:
+                if accelerator.is_main_process:
+                    checkpoint = {
+                        "model": model.module.state_dict(),
+                        "ema": ema.state_dict(),
+                        "opt": opt.state_dict(),
+                        "config": train_config,
+                    }
+                    checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
+                    torch.save(checkpoint, checkpoint_path)
+                    if accelerator.is_main_process:
+                        logger.info(f"Saved checkpoint to {checkpoint_path}")
+                dist.barrier()
+
+                # TODO: Evaluate on validation set
+                if 'valid_path' in train_config['data']:
+                    if accelerator.is_main_process: # only validate on main process
+                        logger.info(f"Start evaluating at step {train_steps}")
+                        
+                        total_rec_loss = 0.0
+                        total_kl_loss = 0.0
+                        total_mae = 0.0
+                        total_rmse = 0.0
+                        num_batches = 0
+                        
+                        save_mesh_dir = f'{experiment_dir}/mesh_{train_steps}'
+                        os.makedirs(save_mesh_dir, exist_ok=True)
+                        for i, data in tqdm(enumerate(valid_loader), desc="Generating Demo Samples"):
+                            x1 = data['tokens'].to(device)
+                            y = data['num_faces'].to(device)
+                            mask = data['masks'].to(device)
+                            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                                with torch.no_grad():
+                                    clean_mesh, posterior, z = ema(x1, cond=y, mask=mask, sample_posterior=True)
+                                    val_kwargs = {} if "v_weights" not in data.keys() else {"v_weights": data['v_weights']}
+                                    val_rec_loss, val_kl, val_mae, val_rmse = loss_vae(x1, 
+                                                                                   clean_mesh, 
+                                                                                   posterior=posterior, 
+                                                                                   mask=mask, 
+                                                                                   kl_weight=train_config['train']['kl_weight'], 
+                                                                                   num_bins=train_config['data']['num_bins'], 
+                                                                                   decoder_type=train_config['model']['decoder_type'],
+                                                                                   loss_type=train_config['model']['loss_type'], 
+                                                                                   noise_scale=train_config['model']['noise_std'],
+                                                                                   fixed_noise=train_config['model']['fixed_noise'],
+                                                                                   **val_kwargs
+                                                                                   )
+                                    total_rec_loss += val_rec_loss.item()
+                                    total_kl_loss += val_kl.item()
+                                    total_mae += val_mae.item()
+                                    total_rmse += val_rmse.item()
+                                    num_batches += 1
+                                    
+                                    if i < 10:
+                                        # Save ground truth mesh
+                                        save_mesh(x1[0].to(torch.float32).cpu().numpy(), f'{save_mesh_dir}/{i:03d}_gt.obj', num_bins=train_config['data']['num_bins'])
+                                        
+                                        if train_config['model']['decoder_type'] == 'cls':
+                                            recon_indices = torch.argmax(clean_mesh, dim=-1)
+                                            recon_coords = index_to_float(
+                                                recon_indices, 
+                                                min_val=-0.5, 
+                                                max_val=0.5, 
+                                                num_bins=train_config['data']['num_bins']
+                                            )
+                                            save_mesh(recon_coords[0].to(torch.float32).cpu().numpy(), f'{save_mesh_dir}/{i:03d}.obj', num_bins=train_config['data']['num_bins'])
+
+                                        if train_config['model']['decoder_type'] == 'reg':
+                                            save_mesh(clean_mesh[0].to(torch.float32).cpu().numpy(), f'{save_mesh_dir}/{i:03d}.obj', num_bins=train_config['data']['num_bins'])
+
+                        if num_batches > 0:
+                            avg_rec_loss = total_rec_loss / num_batches
+                            avg_kl_loss = total_kl_loss / num_batches
+                            avg_mae = total_mae / num_batches
+                            avg_rmse = total_rmse / num_batches
+                        if accelerator.is_main_process:
+                            logger.info(f"Validation Rec Loss: {avg_rec_loss:.6f}, Validation KL Loss: {avg_kl_loss:.6f}, Validation MAE: {avg_mae:.6f}, Validation RMSE: {avg_rmse:.6f}")
+                            writer.add_scalar('Loss/validation_rec', avg_rec_loss, train_steps)
+                            writer.add_scalar('Loss/validation_kl', avg_kl_loss, train_steps)
+                            writer.add_scalar('Metrics/validation_mae', avg_mae, train_steps)
+                            writer.add_scalar('Metrics/validation_rmse', avg_rmse, train_steps)
+                        writer.add_scalar('Loss/validation_rmse', avg_rmse, train_steps)
+                    model.train()
+            if train_steps >= train_config['train']['max_steps']:
+                break
+        if train_steps >= train_config['train']['max_steps']:
+            break
+
+    if accelerator.is_main_process:
+        logger.info("Done!")
+
+    return accelerator
+
+def load_weights_with_shape_check(model, checkpoint, rank=0):
+    
+    model_state_dict = model.state_dict()
+    # check shape and load weights
+    for name, param in checkpoint['model'].items():
+        if name in model_state_dict:
+            if param.shape == model_state_dict[name].shape:
+                model_state_dict[name].copy_(param)
+            elif name == 'x_embedder.proj.weight':
+                # special case for x_embedder.proj.weight
+                # the pretrained model is trained with 256x256 images
+                # we can load the weights by resizing the weights
+                # and keep the first 3 channels the same
+                weight = torch.zeros_like(model_state_dict[name])
+                weight[:, :16] = param[:, :16]
+                model_state_dict[name] = weight
+            else:
+                if rank == 0:
+                    print(f"Skipping loading parameter '{name}' due to shape mismatch: "
+                        f"checkpoint shape {param.shape}, model shape {model_state_dict[name].shape}")
+        else:
+            if rank == 0:
+                print(f"Parameter '{name}' not found in model, skipping.")
+    # load state dict
+    model.load_state_dict(model_state_dict, strict=False)
+    
+    return model
+
+@torch.no_grad()
+def update_ema(ema_model, model, decay=0.999):
+    """
+    Step the EMA model towards the current model.
+    """
+    ema_params = OrderedDict(ema_model.named_parameters())
+    model_params = OrderedDict(model.named_parameters())
+
+    for name, param in model_params.items():
+        name = name.replace("module.", "")
+        # TODO: Consider applying only to params that require_grad to avoid small numerical changes of pos_embed
+        ema_params[name].mul_(decay).add_(param.data, alpha=1 - decay)
+
+
+def requires_grad(model, flag=True):
+    """
+    Set requires_grad flag for all parameters in a model.
+    """
+    for p in model.parameters():
+        p.requires_grad = flag
+
+def load_config(config_path):
+    with open(config_path, "r") as file:
+        config = yaml.safe_load(file)
+    return config
+
+def create_logger(logging_dir):
+    """
+    Create a logger that writes to a log file and stdout.
+    """
+    if dist.get_rank() == 0:  # real logger
+        logging.basicConfig(
+            level=logging.INFO,
+            format='[\033[34m%(asctime)s\033[0m] %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S',
+            handlers=[logging.StreamHandler(), logging.FileHandler(f"{logging_dir}/log.txt")]
+        )
+        logger = logging.getLogger(__name__)
+    else:  # dummy logger (does nothing)
+        logger = logging.getLogger(__name__)
+        logger.addHandler(logging.NullHandler())
+    return logger
+
+if __name__ == "__main__":
+    # read config
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--config', type=str, default='configs/debug.yaml')
+    args = parser.parse_args()
+
+    accelerator = Accelerator()
+    train_config = load_config(args.config)
+    do_train(train_config, accelerator)

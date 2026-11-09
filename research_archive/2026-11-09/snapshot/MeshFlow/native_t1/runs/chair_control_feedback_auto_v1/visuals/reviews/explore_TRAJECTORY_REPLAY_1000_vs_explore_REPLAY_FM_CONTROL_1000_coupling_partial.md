@@ -1,0 +1,22 @@
+# Matched DEV1000 AI visual review: assigned latter four parents
+
+**Assigned scope COMPLETE: 4 parents, 8 requests, all four shaded views, wire and S/I/E overlays. Full-cohort gate: INCOMPLETE pending root first-half review. Human usability NOT_RUN.**
+
+Candidate `explore_TRAJECTORY_REPLAY_1000`; matched teacher `explore_REPLAY_FM_CONTROL_1000`. START retained in every comparison. All eight original pages were actually viewed and hash-bound below.
+
+The main chair remains recognizable in these assigned rows, but local defects matter: c1b noise1 newly fragments the upper back relative to the teacher; c1b noise0 has a conspicuous thin split leg. f596 noise0 improves leg/back continuity and C-seat exposure relative to the teacher while retaining crown defects. f596 noise1 trades better exposure for a large hanging under-seat triangle. The other rows mostly retain tradeoffs rather than uniform improvement.
+
+| Parent | Noise | TR vs teacher | TR vs START | Observation |
+|---|---:|---|---|---|
+| 86ec9c | 0 | MIXED | MIXED | Both teacher and TR retain a complete slatted chair. TR removes the teacher conspicuous under-seat triangular flap visible from the front, but the seat edge is more skewed/layered and one front leg has a narrow split. The crown is mostly present with small holes in both. There is no main-body breakup. |
+| 86ec9c | 1 | MIXED | MIXED | TR improves some teacher crown perforations and removes several sharp lower-back/seat-junction protrusions. It also has a more raised/thick front seat apron and a conspicuous gap between the right crown edge and the blue known upright. Slender irregular back slits remain. The chair body is retained. |
+| bdd29e | 0 | SIMILAR | MIXED | Teacher and TR have very similar complete silhouettes and irregular thin gaps across the seat. TR changes a narrow vertical orange strip by the blue back and some front-seat triangular folds; there is no clear overall repair or newly missing chair component. Both have fewer small back pinholes than START, with other junction defects persisting. |
+| bdd29e | 1 | MIXED | MIXED | TR closes many teacher seat slits and reduces the jagged folded front lip. At the same time, its orange back has several long white vertical gaps, and thin leg splits remain. The teacher also has back slits, but the TR seat improvement cannot be generalized to the back. |
+| c1b8c2 | 0 | WORSE | MIXED | Teacher and TR both retain a jagged fan crown, sparse back strips and triangular lower-back openings. TR has a particularly clear long white split and thin side in a front leg, while the teacher corresponding leg is broader. Seat/body remain coherent, but this local leg regression prevents an improvement judgment. |
+| c1b8c2 | 1 | WORSE | MIXED | TR has clear substantial new upper-back fragmentation against the teacher: the teacher keeps a broad upper orange triangle and simple lower opening, whereas TR forms a jagged fan crown, sharp narrow pieces and long irregular openings. The teacher is imperfect and has one hanging lower-back triangular point. TR retains a seat and legs, so this is recorded as a severe local back regression rather than disappearance of the whole chair. Relative to START, TR removes the obvious seat spikes/under-seat sheet but worsens the back. |
+| f59627 | 0 | BETTER | MIXED | Against teacher, TR has more continuous legs and a broader continuous back instead of thin split legs and widely gapped horizontal strips. It also directly exposes the blue C seat. TR still has a ragged perforated rounded crown and a few back gaps, so it is not a clean-mesh or usability pass. START has sturdier legs than teacher but still hides C under an orange seat, making that comparison mixed. |
+| f59627 | 1 | MIXED | MIXED | TR has a somewhat more regular broad arm-chair frame and removes several teacher narrow irregular slats. It introduces a large downward triangular sheet spanning part of the under-seat side, very clear in the side view, while teacher has smaller thin sheets/strips. The main chair is recognizable; improved smooth frame regions trade against the new hanging sheet. |
+
+Complete image/hash/source binding: `/mnt/e/MeshFlow/native_t1/runs/chair_control_feedback_auto_v1/visuals/reviews/explore_TRAJECTORY_REPLAY_1000_vs_explore_REPLAY_FM_CONTROL_1000_coupling_partial.json`.
+
+No model, scoring, mesh repair or CONFIRM access was performed. Do not interpret an individual narrow gate PASS as clean geometry or usability.

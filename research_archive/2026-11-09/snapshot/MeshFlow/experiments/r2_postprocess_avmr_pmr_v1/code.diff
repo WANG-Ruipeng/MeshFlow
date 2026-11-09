@@ -1,0 +1,1275 @@
+--- /dev/null
++++ b/r2/tools/postprocess_avmr_pmr_v1/denoise_run.py
+@@ -0,0 +1,213 @@
++"""One official released Chair denoiser forward for each of 48 existing RAWs.
++No encoder sampling, training, generator construction, or additional rollouts.
++Official historical source stays read-only; C projection is explicitly local.
++"""
++from __future__ import annotations
++import os
++os.environ['CUBLAS_WORKSPACE_CONFIG']=':4096:8'
++for k in ('OMP_NUM_THREADS','MKL_NUM_THREADS','OPENBLAS_NUM_THREADS','NUMEXPR_NUM_THREADS'):os.environ[k]='4'
++import argparse, ast, csv, gc, hashlib, importlib, json, subprocess, sys, time, types
++from pathlib import Path
++import numpy as np
++import torch
++REPO=Path(__file__).resolve().parents[3]
++OUT=REPO/'experiments/r2_postprocess_avmr_pmr_v1'
++ASSET=OUT/'assets/chair_denoiser_0030000.pt'
++SRC=OUT/'source_snapshot/official_denoiser_db86bc3'
++SCALE=.95*.3762
++VERSION='official_chair_denoise_c_projection_v1'
++EXPECTED='6a31f4c7dcbea7a6ac58c26075b20c897fd19aad4c33b5295cc4c93ed7078c36'
++
++def sha(p):
++    h=hashlib.sha256()
++    with Path(p).open('rb') as f:
++        for b in iter(lambda:f.read(8<<20),b''):h.update(b)
++    return h.hexdigest()
++def read(p):return json.loads(Path(p).read_text(encoding='utf-8-sig'))
++def write(p,obj):
++    p=Path(p);p.parent.mkdir(parents=True,exist_ok=True);tmp=p.with_name(p.name+'.tmp')
++    tmp.write_text(json.dumps(obj,indent=2,ensure_ascii=False,allow_nan=False)+'\n');tmp.replace(p)
++def event(kind,**kw):
++    with (OUT/'denoise_ledger.jsonl').open('a') as f:
++        f.write(json.dumps(dict(utc=time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),event=kind,**kw))+'\n')
++def nv():
++    def run(args):
++        p=subprocess.run(args,capture_output=True,text=True,timeout=15)
++        return dict(returncode=p.returncode,stdout=p.stdout,stderr=p.stderr)
++    return dict(gpu=run(['nvidia-smi','--query-gpu=name,memory.total,memory.used,memory.free,utilization.gpu','--format=csv,noheader,nounits']),
++        processes=run(['nvidia-smi','--query-compute-apps=pid,process_name,used_memory','--format=csv']),
++        cpu_logical=os.cpu_count(),loadavg=list(os.getloadavg()),memory=Path('/proc/meminfo').read_text())
++def check_headroom(resources):
++    line=resources['gpu']['stdout'].strip().splitlines()[0]
++    fields=[p.strip() for p in line.split(',')];total,free=float(fields[1]),float(fields[3])
++    if free<max(2048.,.1*total):raise RuntimeError('GPU headroom below protected margin')
++    return dict(total_MiB=total,free_MiB=free,additional_headroom_MiB=max(2048.,.1*total))
++
++def official_modules():
++    manifest=read(OUT/'asset_audit/official_denoiser_source_manifest.json')
++    for f in manifest['files']:
++        if sha(SRC/f['path'])!=f['sha256']:raise ValueError('Official source hash mismatch')
++    # Exact official RMSNorm class, with no unused fairscale parallel classes.
++    source=(SRC/'models/rmsnorm.py').read_text()
++    node=next(n for n in ast.parse(source).body if isinstance(n,ast.ClassDef) and n.name=='RMSNorm')
++    segment=ast.get_source_segment(source,node)
++    shim=types.ModuleType('models.rmsnorm');shim.__dict__['torch']=torch;shim.__dict__['nn']=torch.nn
++    exec(compile(segment,str(SRC/'models/rmsnorm.py')+'[RMSNorm only]','exec'),shim.__dict__)
++    sys.modules['models.rmsnorm']=shim
++    adapter=OUT/'source_snapshot/runtime/RMSNorm_exact_extraction.py'
++    if adapter.exists() and adapter.read_text()!='import torch\nfrom torch import nn\n\n'+segment+'\n':raise ValueError('RMSNorm extraction changed')
++    adapter.parent.mkdir(parents=True,exist_ok=True);adapter.write_text('import torch\nfrom torch import nn\n\n'+segment+'\n')
++    utils_source=(SRC/'models/utils.py').read_text()
++    wanted={'get_2d_sincos_pos_embed','get_2d_sincos_pos_embed_from_grid','get_1d_sincos_pos_embed_from_grid'}
++    functions=[ast.get_source_segment(utils_source,n) for n in ast.parse(utils_source).body if isinstance(n,ast.FunctionDef) and n.name in wanted]
++    if len(functions)!=3:raise ValueError('Official positional helper extraction incomplete')
++    utils_code='import numpy as np\n\n'+'\n\n'.join(functions)+'\n'
++    utils_shim=types.ModuleType('models.utils');exec(compile(utils_code,str(SRC/'models/utils.py')+'[sincos helpers only]','exec'),utils_shim.__dict__)
++    sys.modules['models.utils']=utils_shim
++    utils_path=OUT/'source_snapshot/runtime/positional_utils_exact_extraction.py'
++    if utils_path.exists() and utils_path.read_text()!=utils_code:raise ValueError('Positional helper extraction changed')
++    utils_path.write_text(utils_code)
++    sys.path.insert(0,str(SRC))
++    model_module=importlib.import_module('models.equivae')
++    attention=importlib.import_module('models.attention')
++    if not str(Path(model_module.__file__).resolve()).startswith(str(SRC.resolve())):raise ValueError('Wrong models module')
++    return model_module,attention,manifest
++
++def math_checks(att):
++    # Fixed CPU attention arithmetic, not a model forward or GPU probe.
++    q=torch.arange(24,dtype=torch.float32).reshape(1,3,2,4)/20
++    k=torch.arange(32,dtype=torch.float32).reshape(1,4,2,4)/30
++    v=torch.arange(32,dtype=torch.float32).reshape(1,4,2,4)/10
++    direct=torch.softmax((q.transpose(1,2)@k.transpose(1,2).transpose(-1,-2))/2,dim=-1)@v.transpose(1,2)
++    actual=att.attention(q,k,v,mask_q=None,mask_kv=None,dropout=0,causal=False,backend='pytorch-sdpa')
++    err=float((actual-direct.transpose(1,2)).abs().max())
++    if err>1e-6:raise AssertionError('Unmasked SDPA mismatch')
++    write(OUT/'denoise_math_checks.json',dict(status='PASS',CPU_fixed_attention_max_abs_error=err,
++        model_forwards=0,GPU_forwards=0,no_padding=True,mask=None,scale=SCALE))
++
++def run():
++    OUT.mkdir(parents=True,exist_ok=True);start=time.perf_counter()
++    torch.set_num_threads(4);torch.set_num_interop_threads(1)
++    torch.use_deterministic_algorithms(True,warn_only=False)
++    torch.backends.cuda.matmul.allow_tf32=False;torch.backends.cudnn.allow_tf32=False;torch.backends.cudnn.benchmark=False
++    torch.backends.cuda.enable_flash_sdp(False);torch.backends.cuda.enable_mem_efficient_sdp(False);torch.backends.cuda.enable_math_sdp(True)
++    asset=read(OUT/'asset_audit/denoiser_asset_registration.json')
++    if not ASSET.is_file() or ASSET.stat().st_size!=asset['expected_bytes']:raise ValueError('Verified full denoiser checkpoint unavailable')
++    if sha(ASSET)!=EXPECTED:raise ValueError('Official checkpoint SHA256 mismatch')
++    checkpoint_stat=(ASSET.stat().st_size,ASSET.stat().st_mtime_ns)
++    pre=nv();head=check_headroom(pre);write(OUT/'resources_before_denoise.json',pre)
++    if head['free_MiB']-head['additional_headroom_MiB']<2400:raise RuntimeError('Not enough observed free memory for single 500M inference worker plus headroom')
++    mod,attention,source_manifest=official_modules();math_checks(attention)
++    event('CPU_CHECKPOINT_LOAD_STARTED',checkpoint_sha256=EXPECTED,weights_only=True,mmap=True)
++    t=time.perf_counter();ck=torch.load(ASSET,map_location='cpu',weights_only=True,mmap=True)
++    config=ck['config'];cfg=config['model'];data=config['data']
++    kw=dict(hidden_dim=cfg['hidden_dim'],num_layers=cfg['num_layers'],num_heads=cfg['num_heads'],latent_channels=cfg['latent_channels'],
++        decoder_type=cfg['decoder_type'],num_bins=data['num_bins'],use_rmsnorm=cfg['use_rms'],face_bin=cfg['face_bin'],
++        use_identity_encoder=cfg['use_identity_encoder'],fixed_std=cfg['fixed_std'])
++    if kw!=asset['model_config_from_pickle_opcodes']:raise ValueError('Actual checkpoint config differs from registered official shape contract')
++    if '03001627' not in str(data['data_path']):raise ValueError('Not the Chair checkpoint')
++    branch='ema' if 'ema' in ck else 'model'
++    state={k.removeprefix('module.'):v for k,v in ck[branch].items()}
++    if len(state)!=len(ck[branch]):raise ValueError('State prefix collision')
++    model=mod.AutoencoderKL(**kw)
++    result=model.load_state_dict(state,strict=True)
++    if result.missing_keys or result.unexpected_keys:raise ValueError('Non-strict official load')
++    if any(p.dtype!=torch.float32 for p in model.parameters()):raise ValueError('Expected FP32 parameters')
++    num_params=sum(p.numel() for p in model.parameters());state_keys=len(state)
++    model.eval().requires_grad_(False)
++    for m in model.modules():
++        if isinstance(m,attention.SelfAttention):
++            if m.dropout!=0 or m.causal:raise ValueError('Unexpected stochastic/causal attention')
++            m.mixed_precision='fp32' # backend selector only; outer BF16 remains
++    load_info=dict(status='PASS',checkpoint_sha256=EXPECTED,checkpoint_bytes=ASSET.stat().st_size,
++       state_branch=branch,state_keys=state_keys,parameters=num_params,config=config,init_kwargs=kw,
++       strict_missing_keys=[],strict_unexpected_keys=[],CPU_load_seconds=time.perf_counter()-t,
++       official_source_commit=source_manifest['commit'])
++    write(OUT/'strict_load.json',load_info);del state,ck;gc.collect()
++    reg=dict(version=VERSION,source_sha256=sha(__file__),official_source_manifest=source_manifest,
++       checkpoint_sha256=EXPECTED,checkpoint_bytes=ASSET.stat().st_size,state_branch=branch,init_kwargs=kw,
++       input_registration_sha256=sha(OUT/'registration.json'),raw_records=read(OUT/'registration.json')['records'],
++       coordinate_scale=SCALE,coordinate_operation='Fixed multiply before network, fixed divide after; no bbox fit/clip/axis reorder',
++       network='pe_nerf(x.reshape(1,3N,3)); decode(z,N,mask=None); FP32 residual sum; no encode/sample',
++       C_contract='Save unconstrained proposal; replace first K faces with original RAW FP32 C before GEO_C',
++       precision='BF16 network autocast; FP32 weights, residual addition, scaling and output; SDPA math; TF32 off; strict deterministic',
++       compatibility=['Exact official RMSNorm class extracted to avoid unused fairscale imports',
++         'Three exact official sincos helpers extracted to avoid unused megfile IO imports',
++         'SelfAttention backend selector=fp32 enables SDPA; does not change outer BF16 autocast',
++         'No padding N faces, mask=None; avoids inverted historical masked-SDPA code path',
++         'FP32 residual sum instead of historical BF16 in-place sum; explicit local precision adaptation'],
++       budget=dict(raw_outputs=48,denoiser_forwards=48,training_updates=0,generator_forwards=0,new_noise=0),
++       inference_worker_policy='One already-authorized real output first; measure peaks and remaining job duration before dispatch choice')
++    reg_path=OUT/'denoise_registration.json'
++    if reg_path.exists() and read(reg_path)!=reg:raise ValueError('Denoise registration changed on resume')
++    if not reg_path.exists():write(reg_path,reg)
++    regh=sha(reg_path);prior=[]
++    lp=OUT/'denoise_ledger.jsonl'
++    if lp.exists():prior=[json.loads(x) for x in lp.read_text().splitlines() if x]
++    attempts={(x['label'],x['request_id']) for x in prior if x['event']=='DENOISER_FORWARD_STARTED'}
++    torch.cuda.reset_peak_memory_stats();model=model.to('cuda');torch.cuda.synchronize()
++    on_device=nv();check_headroom(on_device);write(OUT/'resources_model_resident.json',on_device)
++    before_buffer_keys=set(dict(model.named_buffers()))
++    calls=0;phase=time.perf_counter();observed=[]
++    for r in reg['raw_records']:
++        label,rid=r['label'],r['request_id'];K,N=int(r['K']),int(r['N']);dest=OUT/'denoised'/label/rid
++        receipt=dest/'receipt.json';outpath=dest/'denoised.npz'
++        expected_id=dict(label=label,request_id=rid,raw_sha256=r['raw_sha256'],denoise_registration_sha256=regh,checkpoint_sha256=EXPECTED)
++        if sha(r['raw_path'])!=r['raw_sha256']:raise ValueError('RAW hash changed')
++        if receipt.exists():
++            saved=read(receipt)
++            if saved['status']!='PASS' or any(saved[k]!=v for k,v in expected_id.items()) or sha(outpath)!=saved['output_sha256']:raise ValueError('Cannot resume invalid completed denoise')
++            continue
++        if (label,rid) in attempts:raise RuntimeError('Prior started forward lacks valid completed receipt; no silent rerun')
++        if len(attempts)>=48:raise RuntimeError('Denoiser forward budget exhausted')
++        dest.mkdir(parents=True,exist_ok=False)
++        with np.load(r['raw_path'],allow_pickle=False) as a:raw=a['raw'].reshape(N,3,3).copy();C=a['C'].copy()
++        if raw[:K].tobytes()!=C.tobytes():raise ValueError('C identity mismatch')
++        x=torch.from_numpy(raw.reshape(1,N,9)).to('cuda')*SCALE
++        cond=torch.tensor([N],device='cuda',dtype=torch.long)
++        rng_cpu=torch.get_rng_state().clone();rng_gpu=torch.cuda.get_rng_state().clone()
++        torch.cuda.reset_peak_memory_stats();torch.cuda.synchronize();tick=time.perf_counter()
++        event('DENOISER_FORWARD_STARTED',**expected_id,N=N,K=K);attempts.add((label,rid))
++        try:
++            with torch.inference_mode(),torch.autocast(device_type='cuda',dtype=torch.bfloat16):
++                z=model.pe_nerf(x.reshape(1,3*N,3));residual=model.decode(z,cond,mask=None)
++            reconstruction=(residual.float()+x.float())/SCALE
++            proposed=reconstruction.reshape(N,3,3).cpu().numpy().copy()
++            torch.cuda.synchronize();elapsed=time.perf_counter()-tick;calls+=1
++            if proposed.dtype!=np.float32 or not np.isfinite(proposed).all():raise ValueError('Nonfinite or non-FP32 denoised coordinates')
++            if not torch.equal(rng_cpu,torch.get_rng_state()) or not torch.equal(rng_gpu,torch.cuda.get_rng_state()):raise ValueError('Denoiser forward consumed RNG')
++            output=proposed.copy();output[:K]=raw[:K]
++            delta=output.astype(np.float64)-raw.astype(np.float64)
++            distances=np.linalg.norm(delta,axis=-1);c_move=np.linalg.norm(proposed[:K].astype(float)-raw[:K].astype(float),axis=-1)
++            with outpath.open('xb') as f:np.savez_compressed(f,output=output,C=C,official_unconstrained_proposal=proposed,
++                 displacement_from_RAW=delta,known_faces=np.asarray(K),input_faces=np.asarray(N),coordinate_scale=np.asarray(SCALE))
++            with np.load(outpath,allow_pickle=False) as saved:
++                if saved['output'].tobytes()!=output.tobytes() or saved['output'][:K].tobytes()!=C.tobytes():raise ValueError('Denoise roundtrip/C failed')
++            vram=dict(peak_allocated_bytes=torch.cuda.max_memory_allocated(),peak_reserved_bytes=torch.cuda.max_memory_reserved(),
++                  scope='One real denoiser forward with resident FP32 model, input, PE and output; no optimizer')
++            proof=dict(status='PASS',**expected_id,output_sha256=sha(outpath),N=N,K=K,seconds=elapsed,
++                  max_free_displacement_model=float(distances[K:].max()),mean_free_displacement_model=float(distances[K:].mean()),
++                  C_proposal_max_displacement_model=float(c_move.max()),C_proposal_mean_displacement_model=float(c_move.mean()),
++                  C_original_bits_restored=True,output_FP32=True,no_rng_consumed=True,residual_dtype=str(residual.dtype),
++                  model_parameters_FP32=True,vram=vram)
++            write(receipt,proof);event('DENOISER_FORWARD_COMPLETE',**expected_id,seconds=elapsed,**vram);observed.append(elapsed)
++            if calls==1:
++                first=nv();check_headroom(first)
++                write(OUT/'first_denoise_measurement.json',dict(resources=first,result=proof,actual_GPU_workers=1,
++                  dispatch_reason='Measured first real output; remaining 47 small forwards complete faster than duplicating the large official checkpoint process/load. Keep one owned model; CPU scoring uses two workers later.'))
++            del x,z,residual,reconstruction,cond
++        except BaseException as e:
++            write(dest/'failure.json',dict(status='STOPPED',**expected_id,error=repr(e),forward_attempt_consumed=True))
++            event('DENOISER_FAILED',**expected_id,error=repr(e));raise
++    torch.cuda.synchronize();after=nv();write(OUT/'resources_after_denoise.json',after)
++    if (ASSET.stat().st_size,ASSET.stat().st_mtime_ns)!=checkpoint_stat:raise ValueError('Checkpoint file changed')
++    completed=list((OUT/'denoised').glob('*/*/receipt.json'))
++    if len(completed)!=48 or any(read(p)['status']!='PASS' for p in completed):raise ValueError('Incomplete denoise outputs')
++    summary=dict(status='PASS',outputs=48,new_forwards_this_invocation=calls,total_forward_attempts=len(attempts),
++       GPU_workers=1,model_parameters=num_params,checkpoint_sha256=EXPECTED,checkpoint_unchanged_stat=True,
++       forward_phase_wall_seconds=time.perf_counter()-phase,total_wall_seconds=time.perf_counter()-start,
++       sum_forward_seconds=sum(observed),generator_forwards=0,training_updates=0,new_noise=0,
++       peak_allocated_bytes=max(read(p)['vram']['peak_allocated_bytes'] for p in completed),
++       peak_reserved_bytes=max(read(p)['vram']['peak_reserved_bytes'] for p in completed))
++    write(OUT/'denoise_completion.json',summary);print(json.dumps(summary));event('DENOISE_COMPLETE',**summary)
++if __name__=='__main__':run()--- /dev/null
++++ b/r2/tools/postprocess_avmr_pmr_v1/finalize_reports.py
+@@ -0,0 +1,203 @@
++"""Finalize reports from completed fixed-panel receipts; no model imports or forward calls."""
++from pathlib import Path
++import csv,json,hashlib,shutil,difflib,statistics,datetime
++ROOT=Path('/mnt/e/MeshFlow'); OUT=ROOT/'experiments/r2_postprocess_avmr_pmr_v1'; CODE=ROOT/'r2/tools/postprocess_avmr_pmr_v1'
++def j(n): return json.loads((OUT/n).read_text(encoding='utf-8-sig'))
++def rows(n): return list(csv.DictReader((OUT/n).open(encoding='utf-8-sig')))
++def sha(p):
++ h=hashlib.sha256()
++ with Path(p).open('rb') as f:
++  for chunk in iter(lambda:f.read(8*1024*1024),b''): h.update(chunk)
++ return h.hexdigest()
++def write(n,s):
++ p=OUT/n; assert p.resolve().is_relative_to(OUT.resolve());p.parent.mkdir(parents=True,exist_ok=True);p.write_text(s,encoding='utf-8')
++def js(n,v): write(n,json.dumps(v,ensure_ascii=False,indent=2,allow_nan=False)+'\n')
++def table(headers,rs): return '\n'.join(['| '+' | '.join(headers)+' |','|'+'|'.join(['---']*len(headers))+'|']+['| '+' | '.join(map(str,r))+' |' for r in rs])
++def csvsave(n,rs):
++ with (OUT/n).open('w',encoding='utf-8-sig',newline='') as f:
++  w=csv.DictWriter(f,fieldnames=list(rs[0]));w.writeheader();w.writerows(rs)
++def pct(v): return f'{float(v)*100:.2f}'
++reg=j('registration.json'); summary=rows('summary.csv'); quality=rows('quality_per_output.csv');qs=rows('quality_summary.csv');mods=rows('modifications_per_output.csv');top=rows('topology_per_output.csv')
++labels=['R2_FROZEN','R2_CONT_OLD','R2_CONT_USER','R2_USER_MIX']; stage='DENOISE_C_GEO_C'
++def q(label,s,group='ALL'): return next(r for r in qs if (r['label'],r['stage'],r['group'])==(label,s,group))
++def a(label,s,setting,group='ALL'): return next(r for r in summary if (r['label'],r['stage'],r['setting'],r['group'])==(label,s,setting,group))
++qkeys=['CF_proper_affected_free_fraction','FF_illegal_affected_free_fraction','ConflictCov_C','ConflictCov_C_cross','ConflictCov_C_dup','free_minimum_angle_lt5_fraction']
++qnames=['CF穿插受影响面↓','FF非法相交受影响面↓','I冲突覆盖↓','I_cross↓','I_dup候选↓','free小角<5°↓']
++byq={(r['label'],r['request_id'],r['stage']):r for r in quality}
++pairs=[]
++for record in reg['records']:
++ label,req=record['label'],record['request_id'];r=byq[label,req,'RAW'];p=byq[label,req,stage]
++ for key in qkeys:
++  pairs.append(dict(label=label,request_id=req,parent_id=r['parent_id'],region_type=r['region_type'],candidate=r['candidate'],metric=key,RAW=float(r[key]),POST=float(p[key]),delta_POST_minus_RAW=float(p[key])-float(r[key]),units='fraction',lower_is_better=True))
++csvsave('quality_paired_RAW_POST.csv',pairs)
++paired_summary=[]
++for label in labels:
++ for group in ['ALL','seat','back']:
++  for key in qkeys:
++   rr=[r for r in pairs if r['label']==label and r['metric']==key and (group=='ALL' or r['region_type']==group)];ds=[r['delta_POST_minus_RAW'] for r in rr]
++   paired_summary.append(dict(label=label,group=group,metric=key,outputs=len(rr),mean_delta=statistics.mean(ds),median_delta=statistics.median(ds),min_delta=min(ds),max_delta=max(ds),improved=sum(v < -1e-12 for v in ds),tied=sum(abs(v)<=1e-12 for v in ds),worsened=sum(v>1e-12 for v in ds)))
++csvsave('quality_paired_summary.csv',paired_summary)
++mainrows=[]
++for label in labels:
++ r,p=q(label,'RAW'),q(label,stage)
++ mainrows.append([label]+[pct(r[k])+' → '+pct(p[k]) for k in [qkeys[0],qkeys[1],qkeys[2],qkeys[5]]])
++maintable=table(['模型','CF（%）','FF（%）','I（%）','小角（%）'],mainrows)
++matching=[]
++for label in labels:
++ t=[r for r in top if r['label']==label and r['stage']=='POST_INDEXED']
++ matching.append([label,pct(a(label,stage,'raw_tau_1e-6')['A_VMR']),pct(a(label,stage,'raw_tau_1e-6')['PMR']),pct(a(label,'RAW','L_tau_0.01')['A_VMR'])+' → '+pct(a(label,stage,'L_tau_0.01')['A_VMR']),str(sum(int(r['C_open_edges_with_free'])>0 for r in t))+'/12'])
++matchtable=table(['模型','POST严格A-VMR↑（%）','POST严格PMR↑（%）','A-VMR@1%L RAW→POST（%）','POST存在C/free共边的输出'],matching)
++fullmatch=[]
++for st in ['RAW',stage]:
++ for label in labels:
++  fullmatch.append([st,label]+[pct(a(label,st,x['name'])['A_VMR'])+'/'+pct(a(label,st,x['name'])['PMR']) for x in reg['settings']])
++fulltable=table(['阶段','模型']+[x['name'] for x in reg['settings']],fullmatch)
++costrows=[]
++for label in labels:
++ r=[x for x in mods if x['label']==label];t=[x for x in top if x['label']==label and x['stage']=='POST_INDEXED'];deleted=sum(int(x['deleted_free_faces']) for x in r);orig=sum(int(x['N'])-int(x['K']) for x in r)
++ costrows.append([label,f'{deleted}/{orig} ({deleted/orig*100:.2f}%)',max(int(x['deleted_free_faces']) for x in r),f"{max(float(x['denoise_max_free_displacement']) for x in r):.5f}",f"{statistics.mean(int(x['shared_edge_components']) for x in t):.2f}",f"{statistics.mean(int(x['nonmanifold_edges']) for x in t):.2f}"])
++costtable=table(['模型','free删面总数/原数','单例最大删面','去噪最大free角点位移（模型单位）','POST共边分量均数','POST非流形边均数'],costrows)
++regionrows=[]
++for label in labels:
++ for group in ['seat','back']:
++  r,p=q(label,'RAW',group),q(label,stage,group)
++  regionrows.append([label,group,r['outputs']]+[pct(r[k])+' → '+pct(p[k]) for k in [qkeys[0],qkeys[1],qkeys[2],qkeys[5]]])
++regiontable=table(['模型','区域','输出数','CF%','FF%','I%','小角%'],regionrows)
++conditions=sorted({(r['parent_id'],r['region_type'],r['tier'],r['K'],r['N']) for r in reg['records']})
++conditiontable=table(['parent_id','区域','范围','K','原N'],conditions)
++ffwins=sum(r['delta_POST_minus_RAW']<0 for r in pairs if r['metric']==qkeys[1])
++findings=f'''# 同一48份RAW经过完整后处理后的结论
++
++已完成官方Chair学习式去噪48次、C原样恢复、GEO_C几何整理及48份复评分。没有重新生成网格，没有训练，也没有新抽噪声。全部48份最终输出的C坐标、顺序、重复数和绕序保持不变。
++
++**你的判断有实验证据支持：单看RAW会明显高估最终生成面之间的冲突。** 同一评分器下，FF在全部{ffwins}/48个配对输出中下降。但后处理对“C和生成主体真正接合”的帮助有限，不能用FF改善替代接合结论。
++
++数值为百分比，箭头表示同一输出集RAW→POST；CF/FF/I/小角是各自不同的量，均低为好。
++
++{maintable}
++
++**USER_MIX：FF 89.65%→12.02%，CF 5.60%→4.88%，I 3.77%→3.69%。** 它在本面板POST的这三项仍最低；这是几何冲突证据，不等于完整生成质量或接合最好。小角面17.18%→17.06%，几乎没解决，座面子集反而31.93%→33.28%。
++
++{matchtable}
++
++RAW严格A-VMR和PMR四组原本均为0。POST虽然多了少量精确顶点匹配，严格PMR仍全部为0；真正存在至少一条C开放边与free共享的输出，仅OLD和MIX各1/12。MIX的4份座面在最宽2%L阈值下依旧没有边界顶点匹配。匹配域是C所有开放边，仅作描述性观察，未把所有边登记成必须接合接口。
++
++图集24张（12请求×2视角）全部实际审阅，使用统一相机和同请求统一范围。主要外形和C的位置关系大多延续RAW，没有普遍修复错层/悬空C的图像证据。33ec中等座面n0的MIX细腿明显变细；n1的FROZEN两视角中可清楚看到的细腿变少。删面不一定都是坏事：f596 n1大量减面后主体轮廓仍接近RAW。完整逐例观察属于AI_PROXY，不是人评或盲评。
++
++**目前可以采用的结论：后续比较应同时保留RAW和同一固定POST，不能只用RAW自交给生成器定性；目前也不能把接合问题归因于“只是没开后处理”。** 本轮不修改loss、默认模型或训练计划，固定任务到此结束。
++
++[完整流程、全阈值和代价](REPORT.md) · [全部图集](gallery/index.html) · [逐输出几何评分](quality_per_output.csv) · [逐输出A-VMR/PMR](per_output.csv) · [最终网格索引](post_index.csv)
++
++准备阶段曾因路径变量错误误写1份父网格缓存，已从历史交付包按原SHA256恢复原字节；77份原输入终态hash全部匹配，正式去噪在恢复后开始，RAW未被改写。[事故与恢复记录](engineering_registration_path_incident/RESTORATION.json)。
++'''
++write('FINDINGS.md',findings)
++report=f'''# R2 官方Chair去噪＋C保护几何整理与配对复评分
++
++日期：2026-10-10。状态：48/48完整执行，固定任务结束。版本：r2_official_denoise_c_geo_c_evaluation_v1。
++
++本轮读取四模型已有同请求RAW，补齐学习式去噪和几何整理后再评分。最终结果：**FF普遍明显下降，C边界匹配和实际共享边没有普遍改善。** 正负结果一并保存，不将C精确保留称为接合成功。
++
++## 1. 样本和真实执行量
++
++四模型R2_FROZEN、R2_CONT_OLD、R2_CONT_USER、R2_USER_MIX各12份：以下6个USER开发条件各2份既有噪声，共48。历史RAW、请求、条件、噪声数组和原评分保持可追溯；新结果全部在本独立目录。不是新增holdout，也不把两个噪声当两次独立训练。
++
++{conditiontable}
++
++48次官方去噪前向全部成功，无新增生成器前向、训练、优化器更新或Gaussian。48次C保护几何整理、48次POST几何评分；RAW数值读取历史评分，质量适配器另对1份RAW回算核对40个量完全一致。原注册的8档A-VMR/PMR全部保留。每个条件使用原冻结2048个C查询点，没有重新抽点。
++
++## 2. 实际完整流程与适配边界
++
++`已有RAW → 固定坐标缩放 → 官方Chair denoiser单次前向 → FP32残差相加/逆缩放 → 将C原字节写回 → GEO_C顶点合并/退化重复free面删除 → indexed PLY/NPZ → 统一复评分`
++
++官方资产：[qsun2001/meshflow，固定HF revision](https://huggingface.co/datasets/qsun2001/meshflow/tree/98d9f4a16bf5e8a187c02f12c4812000e8181614/denoiser/002_500M_chair)，文件0030000.pt。大小7,289,979,546字节，SHA256 `6a31f4c7dcbea7a6ac58c26075b20c897fd19aad4c33b5295cc4c93ed7078c36`。保存在assets/，不是新训练权重。下载1次成功、0重试。
++
++匹配源码：[qiisun/MeshFlow commit db86bc32423c316c00bcc2f645a26243e8010f20](https://github.com/qiisun/MeshFlow/tree/db86bc32423c316c00bcc2f645a26243e8010f20)。14个原文件保存在source_snapshot/official_denoiser_db86bc3/。当前denoise分支HEAD与此权重PE不匹配，未用不匹配版本前向。加载实际EMA参数455,592,963个，296个state keys，strict=True无缺失/额外key。加载证据在strict_load.json，资产及历史版本核查在asset_audit/。
++
++匹配历史数据和后处理源码的坐标换算为`x_denoiser = 0.95 × 0.3762 × x_model = 0.35739 × x_model`，输出除以同一个常数。没有按生成bbox归一、clip或重新定尺度。几何合并固定工程阈值`0.015 / 0.35739 = 0.0419709561`模型单位；没有扫阈值。论文原运行时阈值单位仍不可完整追溯，不能称该阈值严格复现论文。
++
++这次是**官方发布Chair denoiser的保持C适配流程**，并非原版无约束导出的逐位复现。必须披露以下差别：
++
++- 原导出会量化坐标、合并顶点和整理法向；为保留C，这里用已有GEO_C替换最终导出整理，没有全局2048档量化、法向翻转、平滑或补洞。C先还原再几何整理，只移动/删free。
++- 每例独立且无padding，使用`mask=None`；避开历史masked-SDPA布尔方向问题。用SDPA math代替未安装的FlashAttention。原SelfAttention的`mixed_precision='fp32'`在这里仅选择后端，网络仍BF16 autocast，参数和残差累加为FP32，TF32关闭、deterministic严格开启。
++- 从官方源码原样提取RMSNorm和3个sin/cos函数，避开未用的fairscale/megfile依赖；原源码未修改。没有调用随机encode/sample。48个receipt均确认前后RNG状态未消耗。
++- 历史脚本是BF16原位残差相加，这里为本地精度合同采用FP32残差相加。官方发布实现带face-count AdaLN，与论文关于denoiser描述并不逐项一致；使用真实发布权重，不宣称重建了文字描述的另一模型。
++- 去噪器本身没有C硬约束，会提出C移动；先保存完整无约束proposal及位移，再恢复原C。各组最大C建议位移约0.19–0.29模型单位。不能把恢复C之前的结果当满足条件输出，也不能从本结果推断“允许移动C”时的表现。
++
++GEO_C采用唯一C锚点吸附、free原始点代表合并，角点移动不超过固定半径；非传递聚类，不作均值。只删free的精确退化或重复面。C保留坐标、顺序、重复数和绕序，不承诺恢复输入未提供的任意顶点ID图。最终48个PLY与NPZ实际索引几何逐位一致。
++
++## 3. 几何质量RAW→POST
++
++下表为逐输出宏平均百分比，均低为好。每模型6父×2噪声均衡，等于先噪声平均再父等权。
++
++{maintable}
++
++CF是与C发生严格穿插的受影响free面比例；FF是发生严格穿插或正面积共面重叠的受影响free面比例。**不是相交面配对数除以所有面配对数，也不是有问题物体的比例。** 读取并调用原扫描算法，保留接触分类；POST分母用实际保留下来的free面数，不能假装N仍未变化。
++
++I=ConflictCov_C是冻结C面积查询点上的冲突覆盖；cross与近并行dup候选的并集，保留交集和upper/status。dup候选可能包含合法薄壁，不直接等同非法重复层。无唯一GT排名；未登记必要接口，S/SeamCov记NA，不启用S_join；没有外露任务，不算E。未算FID/KID或新增特征前向，不将低CF/FF/I称完整形状质量认证。
++
++FF在{ffwins}/48对均下降。这个收益包含学习式位移、合并后合法共边/接触形成及删面的合并作用；本轮没有额外去噪-only/几何-only对照，不能把全部收益单独归功于其中一步。最终FF下降约74–78个百分点，删面加权比例约10–15%；两者分母和事件定义不同，不作简单相减或纯贡献归因。
++
++另对保存的面对分类与source_face_ids核账（未重评分）：MIX原2620个非法FF对中，646对涉及被删面，1886对两面都保留却变为共享点956/共享边791/分离139，88对仍非法；另新增120个非法对，最终208。全48例也出现543个新增非法对，已完整保留。**FF改善不仅由删面造成**，但此指标按面计数，对相邻三角形的轻微穿插敏感，不代表等量的大体积穿透消失。[独立分解及语义核对](independent_review/interpretation.md)。
++
++细分区域完整保留如下，避免靠背平均掩盖座面问题。
++
++{regiontable}
++
++## 4. A-VMR／PMR与实际连接
++
++沿用[MeshFIM附录A](https://arxiv.org/html/2605.08744v1#A1)的匹配形式：对C源ID拓扑开放边的唯一顶点，查**仅F角点**最近欧氏距离，严格`d < tau`；每例比例宏平均为A-VMR，全部边界顶点都匹配的输出比例为PMR。两者高为好，many-to-one可用，不包含C自匹配。
++
++这里的匹配域是全部C开放边，尚未由用户登记哪些必须接合；坐标尺度与论文评分兼容性UNKNOWN，因此是本地适配，不是论文表格数值复现。固定尺度L=`sqrt(3)*2/.3762=9.208138264587333`，不按输出bbox改变。严格模型单位1e-6的旧设置名`raw_tau_1e-6`也用于POST，仅为兼容字段名。
++
++{matchtable}
++
++四模型RAW严格A-VMR/PMR均0。POST精确匹配很少；严格PMR仍0/48。MIX在1%L甚至6.75%→5.56%，2%L为17.13%→16.40%；MIX全部4份seat在2%L仍0，说明并非只差微小焊接精度。不能据此说C整张表面都远离生成面，因为此处度量是边界顶点到F顶点而非到表面。
++
++全部8档表，每格A-VMR/PMR（%）：
++
++{fulltable}
++
++RAW拓扑采用严格相同坐标的索引，POST采用实际导出vertices/faces。检测C开放边是否与free使用同一对索引；全48输出只有OLD和MIX各1例有1条这种共享边，也各存在双面反向绕序。不能从两条局部边认定整个接口接通、水密或流形。最终48例均非所有边恰好两面；保留边界边、非流形边和共边连通分量表，没有只报一个看起来有利的连接率。
++
++## 5. 修改代价和图像
++
++{costtable}
++
++位移列是去噪阶段相对RAW的最大free角点移动；后续几何合并另有≤0.0419709561位移，不能把该半径冒充全流程总位移上界。删面总数/原数为加权统计，其他分数仍逐输出宏平均。连通分量按共享完整边，不代表语义部件；非流形边数低也不足以认证全网格流形。
++
++[24张完整图集](gallery/index.html)：每个请求2视角，四模型各RAW/POST并排；同请求8幅子图同坐标范围和相机，蓝C/灰F，未隐藏或美化删除三角面。[逐图AI_PROXY观察](gallery/AI_PROXY_REVIEW.md)另外记录；不是盲评、人评或通用质量分数。整体形状/C相对位置多数延续RAW，部分三角缝和碎边被整理；个别细构件损伤见33ec n0 MIX和33ec n1 FROZEN。大量减面不一定损伤外形，例如f596 n1。小角面也不是这条流程必然删掉的对象。
++
++## 6. 执行、资源和核验
++
++先记录RTX5080总16303MiB及Windows/WSL资源、GPU进程、CPU24核、可用主机RAM约44GiB。真实首例之后测峰再决定保留1个去噪worker；48个短前向总共约5.13秒阶段墙钟，多开一个大权重进程成本大于剩余工作。无额外探针/采样。GPU常驻FP32模型及单例前向scope的PyTorch峰allocated约1.752GiB，reserved约1.779GiB；设备使用约8761→10757MiB含其他进程，不能冒充本进程峰。WDDM无法可靠提供逐进程显存，已保留原nvidia-smi输出。
++
++成功去噪进程总墙钟34.10秒（包含加载等），48次forward计时之和2.60秒，forward阶段含I/O等5.13秒。资源复核后CPU评分用2worker、每worker2线程，墙钟48.58秒；图集1CPU/1线程并行7.01秒。独立终态审计3.61秒。资产下载743秒与源码准备不计入推理速度；并行阶段墙钟不能当成独立性能benchmark。
++
++独立审计没有导入主评分器：NumPy源ID边计数、SciPy cKDTree、手动binary PLY解析及索引edge incidence/union-find，复算768指标行、496顶点距离、192汇总、96拓扑行与384配对，全部一致，最大距离差0。C48/48逐位保持。denoise账本48START+48COMPLETE，无GPU重试。主评分结束171份保护路径核验通过，其中原RAW分析保护的77份原文件最终hash全匹配。[独立报告](independent_review/REPORT.json)。
++
++**工程事故必须保留：** 准备阶段run.py局部路径变量重用，注册JSON曾误写一份父网格缓存`native_t1/runs/control_mvp48_v1/data/meshes/f59627a077dcc2566c63b8b48495261a.npz`。首个执行因此在CPU严格加载后、任何GPU前向前停止。用历史交付ZIP中同路径14375字节副本恢复，SHA256 `df43456d0e2bfa5321d3985d768c6c34774b09852745e9c2b33c5e3942739a0b`与事故前一致，77原输入复核全部通过；随后改用独立变量并加入只允许写本轮OUT的强制边界和负例检查。原始误写记录和恢复证据均在engineering_registration_path_incident/。CPU权重加载共2次，不能写成仅1次；正式GPU48次没有重试。另有未用megfile导入预检失败发生在模型构造前，修复方式见运行适配，不隐瞒这些准备错误。
++
++## 7. 交付和停止边界
++
++- 最终48个可打开的索引PLY与完整NPZ：outputs/；post_index.csv记录完整请求、父、模型和路径。
++- denoised/保留恢复C前完整proposal、恢复后中间结果、位移和每例receipt。
++- per_output.csv：RAW/POST 768指标行；per_vertex_distances_POST.csv：496边界顶点距离；summary.csv及paired_RAW_POST.csv保留全部阈值、seat/back和逐噪声配对。
++- quality_per_output.csv：96行；quality_paired_RAW_POST.csv、quality_paired_summary.csv保存均值/中位数/尾部和改善/退化数。topology_per_output.csv、modifications_per_output.csv保存连接和改动代价。
++- scores/：原几何逐对扫描、C逐点冲突向量、逐面形状、完整身份/hash。source_snapshot/、source_hashes.csv、code.diff保存实际代码。asset_manifest.json记录大权重，不将它伪装成小交付。
++- 可恢复入口：先`run.py --stage prepare`，再`denoise_run.py`，随后`run.py --stage postprocess`、`run.py --stage score --workers 2`，最后`gallery.py`。所有路径以本工作区注册身份为准；已有有效receipt复用，不重新前向。不要用这个固定面板入口悄悄扩样本。
++
++本轮完成后停止。未自动commit/push，未修改默认模型、训练入口或loss；没有自动开始新训练/阈值扫描。优先修正今后的评价流程：始终配对报告固定RAW和POST，同时单列C接合与细构件损伤；现有证据尚不足以指定某种新loss一定解决接合。
++'''
++write('REPORT.md',report)
++# Freeze executed tool files and readable diff without touching git or old files.
++for file in CODE.glob('*.py'):
++ dst=OUT/'source_snapshot/local'/file.relative_to(ROOT);dst.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(file,dst)
++changes=[]
++for file in sorted(CODE.glob('*.py')):
++ changes.extend(difflib.unified_diff([],file.read_text(encoding='utf-8-sig').splitlines(keepends=True),fromfile='/dev/null',tofile='b/'+file.relative_to(ROOT).as_posix()))
++write('code.diff',''.join(changes))
++source_rows=[dict(path=f.relative_to(OUT).as_posix(),bytes=f.stat().st_size,sha256=sha(f)) for f in sorted((OUT/'source_snapshot').rglob('*')) if f.is_file()]
++csvsave('source_hashes.csv',source_rows)
++asset=OUT/'assets/chair_denoiser_0030000.pt'; actual=sha(asset);expected='6a31f4c7dcbea7a6ac58c26075b20c897fd19aad4c33b5295cc4c93ed7078c36';assert actual==expected
++js('asset_manifest.json',dict(status='FINAL_SHA256_PASS',path=str(asset),bytes=asset.stat().st_size,sha256=actual,download_receipt='asset_audit/weight_download_receipt.json',source_commit='db86bc32423c316c00bcc2f645a26243e8010f20',source_snapshot_files=len(source_rows)))
++print(json.dumps(dict(status='REPORTS_WRITTEN',FF_improved_pairs=ffwins,source_files=len(source_rows),quality_pairs=len(pairs),quality_paired_summaries=len(paired_summary),asset_hash='PASS'),ensure_ascii=False))--- /dev/null
++++ b/r2/tools/postprocess_avmr_pmr_v1/gallery.py
+@@ -0,0 +1,277 @@
++"""Fixed 48-output CPU RAW/POST gallery; no GT, models, sampling or geometry edits.
++
++The renderer reads post_index.csv after the parent runner has produced final
++DENOISE_C_GEO_C meshes. Each request has four model rows and RAW/POST columns,
++with identical camera and joint bounds across all eight panels. Matplotlib's
++opaque polygon rasterization is a review aid, not a topology or attachment test.
++"""
++from __future__ import annotations
++
++import argparse
++import csv
++import hashlib
++import html
++import json
++import os
++import re
++import time
++from pathlib import Path
++
++for _name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
++    os.environ[_name] = "1"
++os.environ["CUDA_VISIBLE_DEVICES"] = ""
++
++import numpy as np
++import matplotlib
++matplotlib.use("Agg")
++import matplotlib.pyplot as plt
++from matplotlib.colors import to_rgb
++from mpl_toolkits.mplot3d.art3d import Poly3DCollection
++
++SCHEMA = "r2_postprocess_gallery_v1"
++LABELS = ("R2_FROZEN", "R2_CONT_OLD", "R2_CONT_USER", "R2_USER_MIX")
++CAMERAS = ((22.0, -60.0), (22.0, 120.0))
++COLORS = {"C": "#2387c9", "F": "#b8bec4", "edges": "#38424b"}
++DEFAULT_ROOT = "/mnt/e/MeshFlow/experiments/r2_postprocess_avmr_pmr_v1"
++
++
++def sha256(path):
++    digest = hashlib.sha256()
++    with Path(path).open("rb") as handle:
++        for chunk in iter(lambda: handle.read(1 << 20), b""):
++            digest.update(chunk)
++    return digest.hexdigest()
++
++
++def path_value(value):
++    value = str(value)
++    if os.name != "nt" and re.match(r"^[A-Za-z]:[\\/]", value):
++        value = "/mnt/" + value[0].lower() + "/" + value[3:].replace("\\", "/")
++    return Path(value)
++
++
++def json_write(path, value):
++    Path(path).write_text(json.dumps(value, indent=2, ensure_ascii=False, allow_nan=False) + "\n", encoding="utf8")
++
++
++def same_bits(a, b):
++    return a.shape == b.shape and a.dtype == b.dtype and a.tobytes() == b.tobytes()
++
++
++def triangles(array, name):
++    a = np.asarray(array)
++    if a.ndim == 2 and a.shape[1:] == (9,):
++        a = a.reshape(-1, 3, 3)
++    if a.ndim != 3 or a.shape[1:] != (3, 3) or a.dtype.kind != "f" or not np.isfinite(a).all():
++        raise ValueError(f"{name}: expected finite float triangle array")
++    return a.copy()
++
++
++def load_mesh(path, k, stage):
++    with np.load(path, allow_pickle=False) as data:
++        keys = set(data.files)
++        if stage == "RAW":
++            if "raw" not in keys:
++                raise ValueError(f"{path}: missing RAW array")
++            mesh = triangles(data["raw"], "raw")
++        elif {"vertices", "faces"} <= keys:
++            vertices = np.asarray(data["vertices"])
++            faces = np.asarray(data["faces"])
++            if vertices.ndim != 2 or vertices.shape[1:] != (3,) or faces.ndim != 2 or faces.shape[1:] != (3,):
++                raise ValueError(f"{path}: invalid indexed mesh shape")
++            if not np.issubdtype(faces.dtype, np.integer) or (faces.size and (faces.min() < 0 or faces.max() >= len(vertices))):
++                raise ValueError(f"{path}: invalid vertex indices")
++            mesh = triangles(vertices[faces], "indexed POST")
++            if "output" in keys and not same_bits(mesh, triangles(data["output"], "output")):
++                raise ValueError(f"{path}: indexed POST differs from output triangles")
++        elif "output" in keys:
++            mesh = triangles(data["output"], "output")
++        elif {"C", "free"} <= keys:
++            mesh = np.concatenate([triangles(data["C"], "C"), triangles(data["free"], "free")])
++        else:
++            raise ValueError(f"{path}: unsupported explicit POST schema: {sorted(keys)}")
++        if k <= 0 or k > len(mesh):
++            raise ValueError(f"{path}: invalid K")
++        if "C" in keys and not same_bits(mesh[:k], triangles(data["C"], "C")):
++            raise ValueError(f"{path}: C identity mismatch")
++        if "known_faces" in keys and int(data["known_faces"]) != k:
++            raise ValueError(f"{path}: K differs from stored known_faces")
++        if "known_face_indices" in keys and not np.array_equal(np.asarray(data["known_face_indices"]), np.arange(k)):
++            raise ValueError(f"{path}: C not in declared prefix order")
++    return mesh
++
++
++def shaded(tri, color):
++    tri = np.asarray(tri, dtype=float)
++    normal = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
++    norms = np.linalg.norm(normal, axis=1)
++    normal = np.divide(normal, norms[:, None], out=np.zeros_like(normal), where=norms[:, None] > 0)
++    light = np.asarray([.3, .7, .6]); light /= np.linalg.norm(light)
++    factor = .70 + .30 * np.abs(normal @ light)
++    return np.clip(np.asarray(to_rgb(color))[None, :] * factor[:, None], 0, 1)
++
++
++def draw(ax, mesh, k, bounds, camera):
++    color = shaded(mesh, COLORS["F"])
++    color[:k] = shaded(mesh[:k], COLORS["C"])
++    ax.add_collection3d(Poly3DCollection(mesh[:, :, [0, 2, 1]].astype(float), facecolors=color,
++                                        edgecolors=COLORS["edges"], linewidths=.35, alpha=1., zsort="average"))
++    center = np.asarray(bounds["center_model_xyz"])[[0, 2, 1]]
++    half = bounds["span"] / 2
++    ax.set(xlim=(center[0]-half, center[0]+half), ylim=(center[1]-half, center[1]+half), zlim=(center[2]-half, center[2]+half))
++    ax.set_proj_type("ortho"); ax.set_box_aspect((1, 1, 1))
++    ax.view_init(elev=camera[0], azim=camera[1]); ax.set_axis_off()
++
++
++def render_request(rows, out):
++    request_id = rows[0]["request_id"]
++    if not re.fullmatch(r"[A-Za-z0-9_.-]+", request_id):
++        raise ValueError("Unsafe request identifier")
++    loaded = []
++    source_hashes = {}
++    shared_c = None
++    for label in LABELS:
++        row = next(row for row in rows if row["label"] == label)
++        k = int(row["K"])
++        raw_path, post_path = path_value(row["raw_path"]), path_value(row["post_path"])
++        for path in (raw_path, post_path):
++            source_hashes[str(path)] = sha256(path)
++        raw, post = load_mesh(raw_path, k, "RAW"), load_mesh(post_path, k, "POST")
++        if not same_bits(raw[:k], post[:k]):
++            raise ValueError(f"C changed across stages: {label}/{request_id}")
++        if shared_c is None:
++            shared_c = raw[:k]
++        elif not same_bits(shared_c, raw[:k]):
++            raise ValueError(f"C differs across labels: {request_id}")
++        loaded.append((row, raw, post, k))
++    all_vertices = np.concatenate([mesh.reshape(-1, 3) for _, raw, post, _ in loaded for mesh in (raw, post)]).astype(float)
++    lo, hi = all_vertices.min(0), all_vertices.max(0)
++    span = float(np.max(hi-lo)) * 1.12
++    if span <= 0:
++        raise ValueError("All panels have zero spatial extent")
++    bounds = {"bounds_model_xyz": [lo.tolist(), hi.tolist()], "center_model_xyz": ((lo+hi)/2).tolist(),
++              "span": span, "coordinate_rescaling": False, "same_bounds_all_8_panels": True,
++              "axis_transform": "model[x,y,z] -> plot[x,z,y]; model Y vertical", "projection": "orthographic"}
++    receipts = []
++    for view_id, camera in enumerate(CAMERAS):
++        path = out / f"{request_id}__v{view_id}.png"
++        identity = {"schema": SCHEMA, "request_id": request_id, "parent_id": rows[0]["parent_id"],
++                    "region_type": rows[0]["region_type"], "stage": "DENOISE_C_GEO_C", "labels": list(LABELS),
++                    "bounds": bounds, "camera_elev_azim": list(camera), "source_hashes": source_hashes,
++                    "source_code_sha256": sha256(__file__), "matplotlib_version": matplotlib.__version__,
++                    "numpy_version": np.__version__, "colors": COLORS, "pixels": [1400,1600],
++                    "hidden_triangles_removed": False, "GT_read": False, "model_calls": 0, "GPU": 0}
++        sidecar = path.with_suffix(".png.json")
++        if path.exists() or sidecar.exists():
++            if not path.exists() or not sidecar.exists():
++                raise RuntimeError(f"Incomplete existing image receipt: {path}")
++            existing = json.loads(sidecar.read_text(encoding="utf8"))
++            if existing["identity"] != identity or existing["sha256"] != sha256(path):
++                raise RuntimeError(f"Existing gallery identity mismatch: {path}")
++            receipts.append(existing)
++            continue
++        fig = plt.figure(figsize=(14,16), dpi=100, facecolor="white")
++        for i, (row, raw, post, k) in enumerate(loaded):
++            for j, (stage, mesh) in enumerate((("RAW",raw),("DENOISE_C_GEO_C",post))):
++                ax = fig.add_subplot(4,2,i*2+j+1,projection="3d")
++                draw(ax, mesh, k, bounds, camera)
++                ax.set_title(f"{row['label']} | {stage}\nN={len(mesh)} | C={k}, F={len(mesh)-k}", fontsize=10, pad=0)
++        noise = request_id.rsplit("__", 1)[-1]
++        fig.suptitle(f"RAW vs final DENOISE_C_GEO_C | {rows[0]['parent_id']}\n{rows[0]['region_type']} | {noise} | view {view_id+1}: elev {camera[0]:g}, azim {camera[1]:g}", fontsize=12, y=.985)
++        fig.text(.5,.015,"BLUE = unchanged C | GRAY = generated F | All 8 panels: same camera and bounds; no geometry normalization",ha="center",fontsize=9)
++        fig.text(.5,.005,"Opaque surfaces and edges; C may be occluded. Pictures do not certify attachment or shared topology.",ha="center",fontsize=8)
++        fig.subplots_adjust(left=.02,right=.98,top=.945,bottom=.033,hspace=.03,wspace=0)
++        temporary = path.with_suffix(".png.tmp")
++        fig.savefig(temporary,format="png",dpi=100,facecolor="white")
++        plt.close(fig)
++        for source, expected in source_hashes.items():
++            if sha256(source) != expected:
++                raise RuntimeError(f"Source changed while rendering: {source}")
++        temporary.replace(path)
++        receipt = {"status":"COMPLETE","identity":identity,"image":str(path),"sha256":sha256(path),"visual_review":"PENDING_AI_PROXY"}
++        json_write(sidecar,receipt)
++        receipts.append(receipt)
++    return receipts
++
++
++def artifact_link(path, gallery_dir, label):
++    path = path_value(path)
++    if not path.exists():
++        return f"{html.escape(label)}: unavailable"
++    href = Path(os.path.relpath(path, gallery_dir)).as_posix()
++    return f'<a href="{html.escape(href, quote=True)}">{html.escape(label)}</a>'
++
++
++def make_html(out, rows, receipts):
++    blocks = ['<!doctype html><html lang="en"><meta charset="utf-8"><title>R2 RAW / POST review</title>',
++        '<style>body{font:15px Arial,sans-serif;margin:24px;max-width:1450px}img{width:49%;vertical-align:top}table{border-collapse:collapse}td,th{padding:5px 12px;border:1px solid #ddd}section{margin:35px 0}code{background:#eee}a{color:#176299}</style>',
++        '<h1>R2 RAW / DENOISE_C_GEO_C</h1>',
++        '<p>48 existing RAW outputs; 12 fixed requests; all four labels included. Two opposite views per request. '
++        'Blue: unchanged C; gray: generated F. Same camera and joint RAW/POST bounds across each request. '
++        'No source-parent GT, geometry rescaling, clipping or hidden-face removal. '
++        'These are opaque CPU review renders, not human ratings or proof of attachment.</p>',
++        '<p>POST is the C-preserving adaptation of the official denoiser followed by GEO_C; '
++        'it must not be read as unmodified official unconditional postprocessing. '
++        '<a href="../post_index.csv">Input index</a> | <a href="gallery_manifest.json">Render provenance</a></p>']
++    for request_id in sorted({r["request_id"] for r in rows}):
++        rr = [r for r in rows if r["request_id"] == request_id]
++        blocks.append(f'<section><h2>{html.escape(request_id)}</h2><table><tr><th>Model</th><th>RAW</th><th>Final POST</th></tr>')
++        for label in LABELS:
++            row = next(r for r in rr if r["label"] == label)
++            post = path_value(row["post_path"])
++            raw = path_value(row["raw_path"])
++            post_ply = row.get("post_ply_path") or row.get("post_ply") or str(post.with_suffix(".ply"))
++            if not path_value(post_ply).exists() and (post.parent/"output.ply").exists():
++                post_ply = str(post.parent/"output.ply")
++            blocks.append(f'<tr><td>{label}</td><td>{artifact_link(raw,out,"NPZ")}</td><td>{artifact_link(post,out,"NPZ")} | {artifact_link(post_ply,out,"PLY")}</td></tr>')
++        blocks.append('</table>')
++        for view_id in range(2):
++            name = f"{request_id}__v{view_id}.png"
++            blocks.append(f'<a href="{name}"><img src="{name}" alt="{html.escape(request_id)} view {view_id+1}"></a>')
++        blocks.append('</section>')
++    blocks.append('</html>')
++    (out/"index.html").write_text("\n".join(blocks),encoding="utf8")
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--root",default=DEFAULT_ROOT)
++    parser.add_argument("--check-only",action="store_true",help="Check imports and fixed rendering interface, no data/model reads or rendered meshes")
++    args = parser.parse_args()
++    if args.check_only:
++        print(json.dumps({"status":"PASS_INTERFACE_IMPORTS","schema":SCHEMA,"matplotlib":matplotlib.__version__,"numpy":np.__version__,"CPU_threads":1,"model_calls":0,"renders":0}))
++        return
++    started = time.monotonic()
++    root = path_value(args.root)
++    index = root/"post_index.csv"
++    with index.open(encoding="utf-8-sig",newline="") as handle:
++        rows = list(csv.DictReader(handle))
++    required = {"label","request_id","parent_id","region_type","raw_path","post_path","K"}
++    if len(rows) != 48 or any(not required <= row.keys() for row in rows):
++        raise ValueError("Expected fixed 48-row POST index with explicit source identities")
++    request_ids = sorted({r["request_id"] for r in rows})
++    if len(request_ids) != 12 or {(r["request_id"],r["label"]) for r in rows} != {(q,l) for q in request_ids for l in LABELS}:
++        raise ValueError("Request / label panel differs from fixed 12 x 4 contract")
++    out = root/"gallery"; out.mkdir(parents=True,exist_ok=True)
++    index_sha = sha256(index)
++    receipts = []
++    for request_id in request_ids:
++        rr = [r for r in rows if r["request_id"] == request_id]
++        if len({(r["parent_id"],r["region_type"],int(r["K"])) for r in rr}) != 1:
++            raise ValueError("Request C identity inconsistent across models")
++        receipts.extend(render_request(rr,out))
++        print(json.dumps({"request_id":request_id,"renders_complete":len(receipts)}),flush=True)
++    if sha256(index) != index_sha:
++        raise RuntimeError("POST index changed during rendering")
++    make_html(out,rows,receipts)
++    manifest = {"schema":SCHEMA,"status":"COMPLETE","requests":12,"labels":list(LABELS),"input_meshes":48,
++                "PNG_count":len(receipts),"stage":"DENOISE_C_GEO_C","index_sha256":index_sha,
++                "source_code_sha256":sha256(__file__),"wall_seconds":time.monotonic()-started,"CPU_workers":1,
++                "CPU_threads":1,"GPU":0,"model_calls":0,"GT_read":False,"source_geometry_modified":False,
++                "visual_review_status":"PENDING_AI_PROXY","receipts":receipts}
++    json_write(out/"gallery_manifest.json",manifest)
++    print(json.dumps({"status":"COMPLETE","images":len(receipts),"wall_seconds":manifest["wall_seconds"]}),flush=True)
++
++
++if __name__ == "__main__":
++    main()--- /dev/null
++++ b/r2/tools/postprocess_avmr_pmr_v1/quality.py
+@@ -0,0 +1,276 @@
++"""Read-only frozen R2 quality mathematics, adapted to variable-face-count POST.
++
++Only this module and explicitly supplied details_dir are new outputs. No model,
++GT reconstruction, fresh C queries, fresh F surface samples, or topology repair.
++score_quality(record, processed_npz_path, details_dir) returns JSON-safe evidence.
++record needs request_id, label, raw_path, raw_sha256; other registered metadata
++is checked when supplied. POST is FP32 ordered C-prefix triangles at model scale.
++"""
++from __future__ import annotations
++
++import hashlib
++import importlib.util
++import json
++import os
++from pathlib import Path
++import sys
++import time
++
++# Must be set by the CPU worker before importing NumPy. Keep caller thread budget.
++for _key in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
++    os.environ.setdefault(_key, "2")
++
++import numpy as np
++
++VERSION = "r2_postprocess_frozen_quality_variable_N_v1"
++REPO = Path(__file__).resolve().parents[3]
++MIX_ROOT = REPO / "experiments/r2_user_mix_from_official_v1"
++REGISTRATION = MIX_ROOT / "evaluation/registration.json"
++OLD_ADAPTER = REPO / "r2/pilots/user_condition_finetune_v1/evaluation.py"
++MIX_ADAPTER = REPO / "r2/pilots/user_mix_from_official_v1/evaluation.py"
++L = float(np.sqrt(3.) * 2 / .3762)
++
++
++def resolve(value):
++    value = str(value)
++    if os.name != "nt" and len(value) > 2 and value[1] == ":":
++        return Path("/mnt/" + value[0].lower() + "/" + value[3:].replace("\\", "/"))
++    if os.name == "nt" and value.startswith("/mnt/") and len(value) > 7:
++        return Path(value[5].upper() + ":/" + value[7:])
++    return Path(value)
++
++
++def digest(path):
++    result = hashlib.sha256()
++    with resolve(path).open("rb") as handle:
++        for block in iter(lambda: handle.read(1 << 20), b""):
++            result.update(block)
++    return result.hexdigest()
++
++
++def read(path):
++    return json.loads(resolve(path).read_text(encoding="utf-8-sig"))
++
++
++def _old():
++    name = "_r2_post_quality_readonly_old_adapter"
++    if name not in sys.modules:
++        # Original adapter fixes threads at two. Restore caller's environment
++        # immediately; it imports no new NumPy instance or model.
++        threads = {k: os.environ.get(k) for k in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS")}
++        spec = importlib.util.spec_from_file_location(name, OLD_ADAPTER)
++        module = importlib.util.module_from_spec(spec)
++        sys.modules[name] = module
++        spec.loader.exec_module(module)
++        for key, value in threads.items():
++            if value is None:
++                os.environ.pop(key, None)
++            else:
++                os.environ[key] = value
++    return sys.modules[name]
++
++
++def protected_paths():
++    """Source files and frozen query/input assets, not model checkpoints."""
++    reg = read(REGISTRATION)
++    paths = {str(REGISTRATION), str(OLD_ADAPTER), str(MIX_ADAPTER)}
++    paths.update(reg["scorer_sources"])
++    paths.add(reg["old_registration_path"])
++    paths.update(q["path"] for q in reg["queries"])
++    paths.update(q["input_path"] for q in reg["requests"])
++    return sorted(str(resolve(p)) for p in paths)
++
++
++def source_hashes():
++    reg = read(REGISTRATION)
++    if digest(MIX_ADAPTER) != reg["adapter_sha256"] or digest(OLD_ADAPTER) != reg["old_adapter_sha256"]:
++        raise ValueError("Original adapter source differs from frozen registration")
++    for path, expected in reg["scorer_sources"].items():
++        if digest(path) != expected:
++            raise ValueError("Original quality mathematics changed: " + path)
++    if digest(reg["old_registration_path"]) != reg["old_registration_sha256"]:
++        raise ValueError("Original underlying evaluation registration changed")
++    return {**reg["scorer_sources"], str(MIX_ADAPTER): digest(MIX_ADAPTER),
++            str(OLD_ADAPTER): digest(OLD_ADAPTER), str(Path(__file__).resolve()): digest(__file__)}
++
++
++def definition():
++    reg = read(REGISTRATION)
++    return {
++        "version": VERSION,
++        "source_metric_version": reg["definition"]["source_metric_version"],
++        "original_definition": reg["definition"]["original_definition"],
++        "L": L,
++        "scale_source": "Fixed canonical training cube diagonal sqrt(3)*2/.3762; unchanged from RAW",
++        "stage": "POST with preserved ordered C prefix; variable actual free-face count",
++        "CF_FF": "Unmodified complete independently verified original pair_scan, all C/F and unique F/F pairs",
++        "denominator": "CF/FF affected-free fractions use actual POST len(F); I retains full original C2048 query weight",
++        "I": "Original ConflictCov_C cross/dup union, bounds, uncertainty and low-support status",
++        "queries": "Read exact frozen per-condition C2048 NPZ and verify file/array hashes; never resample",
++        "small_angles": "Unmodified shape_quality; free minimum triangle angle strictly <5 degrees",
++        "topology": "Not inferred here; actual indexed topology must be reported separately by caller",
++        "GT": "NA_NOT_UNIQUE_GENERATIVE_TARGET", "S": "NA_NO_REGISTERED_REQUIRED_INTERFACE",
++        "E": "NA_NO_EXPOSURE_TASK", "D_free": "NOT_RUN_NO_NEW_PREDICTION_QUERIES",
++        "empty_free_extension": "Zero pair/area counts; free-face fractions NA with denominator0; I computed with frozen C queries and empty F",
++        "new_C_queries": 0, "new_F_queries": 0, "model_calls": 0,
++        "software_versions": reg["definition"]["software_versions"],
++    }
++
++
++def _triangles(path):
++    with np.load(resolve(path), allow_pickle=False) as loaded:
++        payload = {k: loaded[k].copy() for k in loaded.files}
++    key = next((k for k in ("triangles", "output", "raw", "post") if k in payload), None)
++    if key is None:
++        if "vertices" not in payload or "faces" not in payload:
++            raise ValueError("POST NPZ needs triangles/output/raw/post or vertices+faces")
++        faces = payload["faces"]
++        if faces.dtype.kind not in "iu" or faces.ndim != 2 or faces.shape[1:] != (3,):
++            raise ValueError("POST faces must be integer [N,3]")
++        vertices = payload["vertices"]
++        if vertices.ndim != 2 or vertices.shape[1:] != (3,) or np.any(faces < 0) or np.any(faces >= len(vertices)):
++            raise ValueError("POST indexed mesh invalid")
++        tri = vertices[faces]
++    else:
++        tri = payload[key]
++    if tri.ndim == 2 and tri.shape[1:] == (9,):
++        tri = tri.reshape(-1, 3, 3)
++    if tri.ndim != 3 or tri.shape[1:] != (3, 3) or tri.dtype != np.float32 or not np.isfinite(tri).all():
++        raise ValueError("POST requires finite original-model-coordinate FP32 [N,3,3]")
++    if "vertices" in payload and "faces" in payload:
++        indexed = payload["vertices"][payload["faces"]]
++        if indexed.shape != tri.shape or indexed.dtype != tri.dtype or indexed.tobytes() != tri.tobytes():
++            raise ValueError("POST indexed geometry differs from triangle payload")
++    return np.ascontiguousarray(tri), payload
++
++
++def _empty_scans(K):
++    common = dict(status="PASS_STATIC_SCAN", tested_pairs=0, expected_full_pairs=0,
++                  affected_subset=None, classification_counts={}, proper_pair_count=0,
++                  proper_affected_faces=[], proper_affected_face_count=0,
++                  proper_affected_face_denominator=0, proper_affected_face_fraction=None,
++                  coplanar_positive_area_pairs=0, unresolved_or_degenerate_pairs=0,
++                  contacts=[], independent_verification=True, continuous_collision_safety="NOT_RUN")
++    return {**common, "scope": "all C/free pairs"}, {**common, "scope": "all unique free/free pairs"}
++
++
++def _clean(value):
++    if isinstance(value, dict):
++        return {str(k): _clean(v) for k, v in value.items()}
++    if isinstance(value, (list, tuple)):
++        return [_clean(v) for v in value]
++    if isinstance(value, np.ndarray):
++        return _clean(value.tolist())
++    if isinstance(value, np.generic):
++        return _clean(value.item())
++    if isinstance(value, float) and not np.isfinite(value):
++        raise ValueError("Nonfinite result must be explicitly status-coded")
++    return value
++
++
++def score_quality(raw_record, processed_npz_path, details_dir):
++    """Score one registered output; caller owns registration, scheduling and cache.
++
++    Returns status PASS with metric-specific NA/PARTIAL retained. Errors raise:
++    caller must persist BLOCKED/FAILED receipts instead of dropping the request.
++    This function writes only pairs.json, vectors.npz and shape_per_face.json in
++    details_dir. It never writes into any historical experiment/source folder.
++    """
++    started = time.perf_counter()
++    reg = read(REGISTRATION)
++    sources = source_hashes()
++    old = _old()
++    matches = [q for q in reg["requests"] if q["request_id"] == raw_record["request_id"]]
++    if len(matches) != 1 or raw_record["label"] not in reg["labels"]:
++        raise ValueError("Output outside frozen48 panel")
++    q = matches[0]
++    for name in old.META:
++        if name in raw_record:
++            actual, expected = raw_record[name], q[name]
++            if isinstance(expected, int):
++                actual = int(actual)
++            elif isinstance(expected, float):
++                actual = float(actual)
++            if actual != expected:
++                raise ValueError("Registered metadata differs: " + name)
++    if digest(raw_record["raw_path"]) != raw_record["raw_sha256"]:
++        raise ValueError("Protected RAW hash mismatch")
++    query = next(a for a in reg["queries"] if a["condition_id"] == q["condition_id"])
++    inputs = old.read_input(q)
++    reference = old.load_queries(query)
++    C, K = inputs["C"], int(q["K"])
++    original, _ = _triangles(raw_record["raw_path"])
++    if len(original) != int(q["N"]) or not old.byte_equal(original[:K], C):
++        raise ValueError("Original RAW C/N differs from frozen input")
++    tri, payload = _triangles(processed_npz_path)
++    if len(tri) < K or not old.byte_equal(tri[:K], C):
++        raise ValueError("POST did not preserve ordered FP32 C prefix")
++    if "C" in payload and not old.byte_equal(payload["C"].reshape(K, 3, 3), C):
++        raise ValueError("POST C field differs from input")
++    F = tri[K:]
++    if "free" in payload and not old.byte_equal(payload["free"].reshape(-1, 3, 3), F):
++        raise ValueError("POST free field differs from ordered suffix")
++    mod = old.cpu_math()
++    if len(F):
++        metrics, cf, ff = mod["geometry"].scan_geometry(C, F, L)
++    else:
++        cf, ff = _empty_scans(K)
++        metrics = {name + "_" + field: value for name in ("CF", "FF")
++                   for field, value in (("proper_pair_count", 0), ("coplanar_pair_count", 0),
++                                        ("proper_affected_free_fraction", None), ("unresolved_or_degenerate_pair_count", 0))}
++        metrics.update(FF_illegal_pair_count=0, FF_illegal_affected_free_fraction=None,
++                       free_minimum_angle_lt5_fraction=None, free_angle_p05_degrees=None,
++                       free_q_gt10_fraction=None, free_q_mean=None, free_near_degenerate_count=0,
++                       free_near_degenerate_fraction=None, free_exact_zero_area_count=0,
++                       free_exact_zero_area_fraction=None, free_total_surface_area=0.)
++    trusted = mod["control"].trusted_cf(C, F, L, cf_scan=cf)
++    im, vectors = mod["control"].conflict_metrics(F, {"C": C, "L0": L}, reference, trusted)
++    if abs(im["ConflictCov_C"] - im["ConflictCov_C_cross"] - im["ConflictCov_C_dup"] + im["ConflictCov_C_cross_and_dup"]) > 1e-12:
++        raise ValueError("I cross/dup union identity failed")
++    metrics.update(im)
++    illegal = {"proper_transverse_penetration", "coplanar_positive_area_overlap"}
++    cf_free = {row["pair"][1] for row in cf["contacts"] if row["classification"] in illegal}
++    metrics["CF_illegal_pair_count"] = sum(row["classification"] in illegal for row in cf["contacts"])
++    metrics["CF_illegal_affected_free_fraction"] = len(cf_free) / len(F) if len(F) else None
++    cq = mod["shape"].shape_quality(C, L)
++    fq = mod["shape"].shape_quality(F, L)
++    whole = mod["shape"].shape_quality(tri, L)
++    metrics.update(C_total_surface_area=cq["total_area"], C_near_degenerate_count=cq["near_degenerate_area_count"],
++                   C_exact_zero_area_count=cq["exact_zero_area_count"], whole_total_surface_area=whole["total_area"],
++                   whole_near_degenerate_count=whole["near_degenerate_area_count"],
++                   whole_minimum_angle_lt5_fraction=whole["min_angle_lt5_fraction"])
++    details = resolve(details_dir).resolve()
++    repo = REPO.resolve()
++    if not details.is_relative_to(repo) or details.is_relative_to(MIX_ROOT.resolve()):
++        raise ValueError("Details must be in a new independent folder inside E:/MeshFlow")
++    pairs_path, vectors_path = details / "pairs.json", details / "vectors.npz"
++    shape_path = details / "shape_per_face.json"
++    old.write(pairs_path, _clean({"CF": cf, "FF": ff}))
++    old.save_npz(vectors_path, vectors)
++    old.write(shape_path, _clean({"C": cq, "free": fq, "whole": whole}))
++    result = {k: q[k] for k in old.META}
++    result.update(
++        version=VERSION, label=raw_record["label"], stage="POST", status="PASS", metrics=metrics,
++        identity={"raw_path": str(resolve(raw_record["raw_path"])), "raw_sha256": raw_record["raw_sha256"],
++                  "processed_path": str(resolve(processed_npz_path)), "processed_sha256": digest(processed_npz_path),
++                  "input_sha256": q["input_sha256"], "query_path": query["path"], "query_sha256": query["sha256"],
++                  "original_registration_path": str(REGISTRATION), "original_registration_sha256": digest(REGISTRATION),
++                  "adapter_sha256": digest(__file__), "scorer_sources": sources},
++        definition=definition(), source_hashes=sources,
++        contracts={"C_output_bitwise": True, "finite": True, "FP32": True,
++                   "actual_POST_N": len(tri), "raw_N": int(q["N"]), "actual_free_N": len(F), "K": K},
++        metric_status={"ConflictCov_C": im["ConflictCov_C_status"],
++                       "free_face_fractions": "PASS" if len(F) else "NA_EMPTY_FREE_DENOMINATOR",
++                       "SeamCov": "NA_NO_REGISTERED_REQUIRED_INTERFACE", "ExposedRetain": "NA_NO_EXPOSURE_TASK",
++                       "GT_reconstruction": "NA_NOT_UNIQUE_GENERATIVE_TARGET", "topology": "CALLER_SUPPLIED_SEPARATELY",
++                       "D_free": "NOT_RUN_NO_NEW_PREDICTION_QUERIES", "human_usability": "NOT_RUN"},
++        C_query_count=len(reference["arrays"]["C_points"]),
++        C_query_denominator=float(reference["arrays"]["C_weights"].sum()),
++        free_face_denominator=len(F), full_CF_scans=1, full_FF_scans=1, I_reuses_CF=True,
++        CF_tested_pair_denominator=K * len(F), FF_tested_pair_denominator=len(F) * (len(F) - 1) // 2,
++        pair_audit_path=str(pairs_path), vectors_path=str(vectors_path), shape_details_path=str(shape_path),
++        files={str(p): digest(p) for p in (pairs_path, vectors_path, shape_path)},
++        seconds=time.perf_counter() - started, model_calls=0, new_C_queries=0, new_F_queries=0)
++    result = _clean(result)
++    json.dumps(result, allow_nan=False)
++    return result--- /dev/null
++++ b/r2/tools/postprocess_avmr_pmr_v1/run.py
+@@ -0,0 +1,295 @@
++"""Fixed 48-output RAW -> official DENOISE_C -> GEO_C -> CPU scoring controller.
++Old scoring files and raw assets are read-only. No training or new rollouts.
++"""
++from __future__ import annotations
++import os
++for key in ('OMP_NUM_THREADS','OPENBLAS_NUM_THREADS','MKL_NUM_THREADS','NUMEXPR_NUM_THREADS'):
++    os.environ[key]='2'
++os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
++import argparse, collections, concurrent.futures, importlib.util, json, sys, time, resource, multiprocessing
++from pathlib import Path
++import numpy as np
++REPO=Path(__file__).resolve().parents[3]
++OUT=REPO/'experiments/r2_postprocess_avmr_pmr_v1'
++OLD=REPO/'experiments/r2_avmr_pmr_offline_v1'
++MIX=REPO/'experiments/r2_user_mix_from_official_v1'
++sys.path.insert(0,str(REPO))
++def module(name,path):
++    spec=importlib.util.spec_from_file_location(name,path)
++    m=importlib.util.module_from_spec(spec);sys.modules[name]=m;spec.loader.exec_module(m);return m
++A=module('_post_frozen_avmr',REPO/'r2/tools/avmr_pmr_v1/run.py')
++for key in ('OMP_NUM_THREADS','OPENBLAS_NUM_THREADS','MKL_NUM_THREADS','NUMEXPR_NUM_THREADS'):os.environ[key]='2'
++from native_t1 import postprocess_cli as PC
++from native_t1.postprocessing import FIXED_CONFIG
++sha,read,csv_read=A.sha,A.read,A.csv_read
++
++def checked_output(path):
++    path=Path(path).resolve()
++    if not path.is_relative_to(OUT.resolve()):raise ValueError('Refusing any output outside experiment root: '+str(path))
++    return path
++
++def write(path,value):return A.write(checked_output(path),value)
++def csv_write(path,rows):return A.csv_write(checked_output(path),rows)
++VERSION='r2_official_denoise_c_geo_c_evaluation_v1'
++STAGE='DENOISE_C_GEO_C'
++META=('request_id','condition_id','parent_id','region_type','tier','candidate','N','K')
++
++def event(kind,**fields):
++    OUT.mkdir(parents=True,exist_ok=True)
++    with (OUT/'ledger.jsonl').open('a',encoding='utf-8') as f:
++        f.write(json.dumps(dict(utc=time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),event=kind,**fields))+'\n')
++
++def records():
++    oldreg=read(MIX/'evaluation/registration.json')
++    req={q['request_id']:q for q in oldreg['requests']}
++    rows=[dict(req[r['request_id']],**{k:v for k,v in r.items() if k not in req[r['request_id']]}) for r in csv_read(MIX/'evaluation/raw_index.csv')]
++    assert len(rows)==48 and len({(r['label'],r['request_id']) for r in rows})==48
++    return sorted(rows,key=lambda r:(A.LABELS.index(r['label']),r['request_id']))
++
++def quality_module():
++    return module('_post_quality_adapter',Path(__file__).with_name('quality.py'))
++
++def prepare():
++    OUT.mkdir(parents=True,exist_ok=True)
++    path=OUT/'registration.json'
++    if path.exists():
++        reg=read(path)
++        for p,h in reg['protected'].items():
++            if sha(p)!=h:raise ValueError('Protected source changed: '+p)
++        return reg
++    q=quality_module()
++    protected=dict(read(OLD/'registration.json')['protected'])
++    for protected_path,expected in protected.items():
++        if sha(protected_path)!=expected:raise ValueError('Original frozen hash mismatch: '+protected_path)
++    q.source_hashes()
++    for folder in (OLD,):
++        for p in folder.rglob('*'):
++            if p.is_file():protected[str(p)]=sha(p)
++    extra=q.protected_paths()+[str(Path(__file__)),str(Path(__file__).with_name('quality.py')),
++      str(REPO/'native_t1/postprocessing.py'),str(REPO/'native_t1/postprocess_cli.py'),str(REPO/'r2/tools/avmr_pmr_v1/run.py')]
++    for p in extra:
++        actual=sha(p)
++        if str(p) in protected and protected[str(p)]!=actual:raise ValueError('Conflicting protection hash')
++        protected[str(p)]=actual
++    reg=dict(version=VERSION,stage=STAGE,outputs=48,records=records(),protected=protected,
++      avmr_definition=read(OLD/'registration.json'),postprocess_config=FIXED_CONFIG,
++      denoise_contract='See denoise_registration.json; one official frozen forward per existing RAW; restore original C exactly before GEO_C',
++      quality_definition=q.definition(),quality_source_hashes=q.source_hashes(),status='REGISTERED',budget=dict(final_post_outputs=48,new_generator_rollouts=0,training_updates=0,
++        denoiser_forwards=48,quality_outputs=48),settings=read(OLD/'registration.json')['settings'],
++      topology='Exact-coordinate indexed RAW versus actual exported indexed POST; C-open edges descriptive, no required attachment domain',
++      C_protection='C coordinates, order, multiplicity and winding fixed; no claim of arbitrary original vertex-ID graph preservation',
++      exclusions=['No threshold sweep','No new Gaussian','No GT reconstruction score','No S_join','No default model change'])
++    if path!=OUT/'registration.json':raise AssertionError('Registration destination identity changed')
++    write(path,reg);write(OUT/'resources_before_cpu.json',A.resources())
++    for p in extra:
++        src=Path(p);dst=OUT/'source_snapshot/local'/src.relative_to(REPO) if src.is_relative_to(REPO) else OUT/'source_snapshot/external'/src.name
++        dst.parent.mkdir(parents=True,exist_ok=True);dst.write_bytes(src.read_bytes())
++    event('REGISTERED',outputs=48,geometry_config=FIXED_CONFIG,model_loads=0)
++    return reg
++
++def exact_index(tri):
++    vertices=[];mapping={};faces=[]
++    for face in tri:
++        row=[]
++        for p in face:
++            key=p.tobytes()
++            if key not in mapping:mapping[key]=len(vertices);vertices.append(p)
++            row.append(mapping[key])
++        faces.append(row)
++    return np.asarray(vertices,np.float32).reshape(-1,3),np.asarray(faces,np.int64).reshape(-1,3)
++
++def topology_stats(vertices,faces,K):
++    edges=collections.defaultdict(list);ce=collections.Counter();fe=collections.Counter()
++    for i,f in enumerate(faces):
++        for a,b in ((f[0],f[1]),(f[1],f[2]),(f[2],f[0])):
++            key=tuple(sorted((int(a),int(b))));edges[key].append((i,int(a),int(b)))
++            (ce if i<K else fe)[key]+=1
++    cb=[e for e,n in ce.items() if n==1]
++    attached=[e for e in cb if fe[e]>0]
++    valid=[e for e in attached if len(edges[e])==2 and edges[e][0][1:]==edges[e][1][1:][::-1]]
++    cb_length=sum(float(np.linalg.norm(vertices[a].astype(float)-vertices[b])) for a,b in cb)
++    att_length=sum(float(np.linalg.norm(vertices[a].astype(float)-vertices[b])) for a,b in attached)
++    parent=list(range(len(faces)))
++    def find(i):
++        while parent[i]!=i:parent[i]=parent[parent[i]];i=parent[i]
++        return i
++    for info in edges.values():
++        for item in info[1:]:parent[find(item[0])]=find(info[0][0])
++    return dict(vertices=len(vertices),faces=len(faces),C_open_edges=len(cb),C_open_edges_with_free=len(attached),
++       C_open_edge_attached_fraction=len(attached)/len(cb) if cb else None,
++       C_open_length_attached_fraction=att_length/cb_length if cb_length else None,
++       C_free_two_face_opposite_winding_edges=len(valid),
++       boundary_edges=sum(len(v)==1 for v in edges.values()),nonmanifold_edges=sum(len(v)>2 for v in edges.values()),
++       all_edges_two_faces=bool(edges) and all(len(v)==2 for v in edges.values()),
++       shared_edge_components=len({find(i) for i in range(len(faces))}),
++       interpretation='Descriptive indexed connectivity; no self-intersection/manifold/watertight certificate')
++
++def postprocess_all():
++    reg=prepare();index=[]
++    for r in reg['records']:
++        label,rid,K=r['label'],r['request_id'],int(r['K'])
++        den=OUT/'denoised'/label/rid/'denoised.npz'
++        denreceipt=read(den.with_name('receipt.json'))
++        if any(denreceipt[k]!=v for k,v in dict(label=label,request_id=rid,raw_sha256=r['raw_sha256'],denoise_registration_sha256=sha(OUT/'denoise_registration.json')).items()):raise ValueError('Denoise RAW/request/contract identity mismatch')
++        if denreceipt['status']!='PASS' or sha(den)!=denreceipt['output_sha256']:raise ValueError('Denoise receipt invalid')
++        dest=OUT/'outputs'/label/rid
++        receipt=dest/'postprocess.json'
++        if receipt.exists():
++            p=read(receipt)
++            if p['status']!='PASS' or p['input']['file_sha256']!=sha(den):raise ValueError('Cannot resume failed/mismatched POST')
++            for f,v in p['files'].items():
++                if sha(dest/f)!=v['sha256']:raise ValueError('POST hash mismatch')
++        else:
++            event('GEO_C_STARTED',label=label,request_id=rid)
++            p=PC.run(den,K,dest,input_key='output')
++            event('GEO_C_COMPLETE',label=label,request_id=rid,seconds=p['seconds'],deleted=p['stats']['deleted_free_faces'])
++        with np.load(r['raw_path'],allow_pickle=False) as a:raw=a['raw'].reshape(-1,3,3)
++        with np.load(dest/'post.npz',allow_pickle=False) as a:
++            if not A.bit_equal(a['C'],raw[:K]) or not A.bit_equal(a['output'][:K],raw[:K]):raise ValueError('RAW-to-POST C changed')
++        index.append({**r,'post_path':str(dest/'post.npz'),'post_sha256':sha(dest/'post.npz'),
++                      'post_ply':str(dest/'post.ply'),'denoised_path':str(den),'stage':STAGE,'output_N':p['output_faces']})
++    csv_write(OUT/'post_index.csv',index)
++    write(OUT/'postprocess_completion.json',dict(status='PASS',outputs=len(index),stage=STAGE,all_C_unchanged=True))
++    return index
++
++def score_one(r):
++    start=time.perf_counter();K=int(r['K']);dest=OUT/'scores'/r['label']/r['request_id'];receipt=dest/'score.json'
++    identity=dict(label=r['label'],request_id=r['request_id'],raw_sha256=r['raw_sha256'],post_sha256=r['post_sha256'],
++                  registration_sha256=sha(OUT/'registration.json'))
++    if sha(r['raw_path'])!=r['raw_sha256'] or sha(r['post_path'])!=r['post_sha256']:raise ValueError('Geometry hash mismatch before cache reuse')
++    dr=read(Path(r['denoised_path']).with_name('receipt.json'))
++    if any(dr[k]!=v for k,v in dict(label=r['label'],request_id=r['request_id'],raw_sha256=r['raw_sha256'],denoise_registration_sha256=sha(OUT/'denoise_registration.json')).items()):raise ValueError('Denoise identity mismatch')
++    if sha(r['denoised_path'])!=dr['output_sha256']:raise ValueError('Denoised file changed')
++    pp=read(Path(r['post_path']).with_name('postprocess.json'))
++    if pp['input']['file_sha256']!=dr['output_sha256'] or pp['files']['post.npz']['sha256']!=r['post_sha256'] or pp['status']!='PASS':raise ValueError('POST ancestry mismatch')
++    if receipt.exists():
++        saved=read(receipt)
++        if saved['identity']!=identity or saved['status']!='PASS':raise ValueError('Existing score identity/status mismatch')
++        for p,h in saved['files'].items():
++            if sha(p)!=h:raise ValueError('Score detail changed')
++        return {'reused':True,'path':str(receipt),'label':r['label'],'request_id':r['request_id']}
++    if sha(r['raw_path'])!=r['raw_sha256'] or sha(r['post_path'])!=r['post_sha256']:raise ValueError('Geometry hash mismatch')
++    with np.load(r['raw_path'],allow_pickle=False) as a:raw=a['raw'].reshape(-1,3,3)
++    with np.load(r['post_path'],allow_pickle=False) as a:
++        post=a['output'];vertices=a['vertices'];faces=a['faces'];source_ids=a['source_face_ids']
++    if not A.bit_equal(raw[:K],post[:K]):raise ValueError('C changed')
++    with np.load(r['condition_source'],allow_pickle=False) as a:
++        C=a['C'];bid,pts,ba=A.topology(C,a['C_source_vertex_ids'])
++    if not A.bit_equal(C,raw[:K]):raise ValueError('Source C differs')
++    ds,nearest=A.nearest(pts,post[K:]);vs=[]
++    for vid,p,d,j in zip(bid,pts,ds,nearest):
++        v=post[K:].reshape(-1,3)[j] if j>=0 else [None]*3
++        vs.append(dict(source_vertex_id=vid,cx=float(p[0]),cy=float(p[1]),cz=float(p[2]),
++           distance_model=float(d) if np.isfinite(d) else None,distance_L_fraction=float(d/A.L) if np.isfinite(d) else None,
++           nearest_free_face=int(j)//3 if j>=0 else None,nearest_free_corner=int(j)%3 if j>=0 else None,
++           nearest_original_source_face=int(source_ids[K+int(j)//3]) if j>=0 else None,
++           fx=float(v[0]) if j>=0 else None,fy=float(v[1]) if j>=0 else None,fz=float(v[2]) if j>=0 else None))
++    vm=[dict(setting=n,threshold_model=t,scale=s,tau=v,**A.metric(ds,t)) for n,t,s,v in A.SETTINGS]
++    rv,rf=exact_index(raw)
++    topo_raw=topology_stats(rv,rf,K);topo_post=topology_stats(vertices,faces,K)
++    q=quality_module().score_quality(r,r['post_path'],dest/'quality')
++    pp=read(Path(r['post_path']).with_name('postprocess.json'))
++    dr=read(Path(r['denoised_path']).with_name('receipt.json'))
++    details=dict(status='PASS',identity=identity,metadata={k:r[k] for k in META},stage=STAGE,
++         metrics=vm,vertices=vs,topology_RAW_EXACT_COORD_INDEX=topo_raw,topology_POST_INDEXED=topo_post,
++         quality=q,postprocess_stats=pp['stats'],denoise=dr,seconds=time.perf_counter()-start,
++         C_unchanged=True,files={})
++    details['files']=dict(q.get('files',{}))
++    dest.mkdir(parents=True,exist_ok=True);write(receipt,details)
++    return dict(reused=False,path=str(receipt),label=r['label'],request_id=r['request_id'],seconds=details['seconds'],
++                peak_rss_kib=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
++
++def score_all(workers=2):
++    reg=prepare();rows=csv_read(OUT/'post_index.csv')
++    if len(rows)!=48 or len({(r['label'],r['request_id']) for r in rows})!=48 or {(r['label'],r['request_id']) for r in rows}!={(r['label'],r['request_id']) for r in reg['records']}:raise ValueError('Incomplete or duplicated POST panel')
++    tick=time.perf_counter();first=score_one(rows[0]);event('CPU_SCORE_COMPLETE',**first)
++    snapshot=A.resources();snapshot['dispatch']=dict(CPU_workers=workers,BLAS_threads_per_worker=2,GPU_workers=0,
++         first_actual_score=first,reason='48 independent geometry audits, previous 1-3 sec/output; 24 CPU cores and >40GiB host RAM observed; cap two workers')
++    write(OUT/'resources_before_parallel_cpu.json',snapshot)
++    with concurrent.futures.ProcessPoolExecutor(max_workers=workers,mp_context=multiprocessing.get_context('spawn')) as pool:
++        jobs={pool.submit(score_one,r):r for r in rows[1:]}
++        for f in concurrent.futures.as_completed(jobs):
++            r=jobs[f]
++            try:result=f.result();event('CPU_SCORE_COMPLETE',**result)
++            except Exception as e:
++                event('CPU_SCORE_FAILED',label=r['label'],request_id=r['request_id'],error=repr(e));raise
++    write(OUT/'score_completion.json',dict(status='PASS',outputs=48,CPU_workers=workers,
++          wall_seconds=time.perf_counter()-tick,model_forwards=0))
++    summarize()
++
++def summarize():
++    reg=prepare();per=[];vrows=[];qrows=[];trows=[];effects=[]
++    indexed=csv_read(OUT/'post_index.csv')
++    if len(indexed)!=48 or len({(r['label'],r['request_id']) for r in indexed})!=48:raise ValueError('POST index mismatch')
++    for r in indexed:
++        if not (OUT/'scores'/r['label']/r['request_id']/'score.json').exists():raise ValueError('Missing score, run score stage first')
++        score_one(r)
++    old_quality={(r['label'],r['request_id']):r for r in csv_read(MIX/'evaluation/per_output.csv')}
++    for r in reg['records']:
++        p=read(OUT/'scores'/r['label']/r['request_id']/'score.json')
++        old=read(OLD/'scores'/r['label']/(r['request_id']+'.json'))
++        meta={k:r[k] for k in META};meta['label']=r['label']
++        for stage,vals in [('RAW',old['metrics']),(STAGE,p['metrics'])]:
++            for v in vals:per.append(dict(meta,stage=stage,**v))
++        for v in p['vertices']:vrows.append(dict(meta,stage=STAGE,**v))
++        for name,t in [('RAW_EXACT_COORD_INDEX',p['topology_RAW_EXACT_COORD_INDEX']),('POST_INDEXED',p['topology_POST_INDEXED'])]:
++            trows.append(dict(meta,stage=name,**t))
++        qrows.append(dict(meta,stage=STAGE,**p['quality']['metrics'],free_face_denominator=p['quality']['free_face_denominator']))
++        original=old_quality[(r['label'],r['request_id'])]
++        old_values={}
++        for k,v in p['quality']['metrics'].items():
++            if k not in original:raise ValueError('Original quality field absent: '+k)
++            value=original[k]
++            if value in ('','None','null'):old_values[k]=None
++            else:
++                try:old_values[k]=float(value)
++                except ValueError:old_values[k]=value
++        qrows.append(dict(meta,stage='RAW',**old_values,free_face_denominator=int(r['N'])-int(r['K'])))
++        effects.append(dict(meta,**{k:v for k,v in p['postprocess_stats'].items() if isinstance(v,(str,int,float,bool))},
++                            denoise_max_free_displacement=p['denoise'].get('max_free_displacement_model'),
++                            denoise_C_proposal_max_displacement=p['denoise'].get('C_proposal_max_displacement_model')))
++    csv_write(OUT/'per_output.csv',per);csv_write(OUT/'per_vertex_distances_POST.csv',vrows)
++    csv_write(OUT/'quality_per_output.csv',qrows);csv_write(OUT/'topology_per_output.csv',trows);csv_write(OUT/'modifications_per_output.csv',effects)
++    summary=[];paired=[]
++    for stage in ('RAW',STAGE):
++        for label in A.LABELS:
++            for setting,_,_,_ in A.SETTINGS:
++                for group in ('ALL','seat','back'):
++                    sub=[v for v in per if v['label']==label and v['stage']==stage and v['setting']==setting and (group=='ALL' or v['region_type']==group)]
++                    summary.append(dict(stage=stage,label=label,setting=setting,group=group,outputs=len(sub),
++                        A_VMR=float(np.mean([v['VMR'] for v in sub])),PMR=float(np.mean([v['perfect'] for v in sub]))))
++    by={(r['label'],r['request_id'],r['setting'],r['stage']):r for r in per}
++    for r in reg['records']:
++        for name,_,_,_ in A.SETTINGS:
++            a,b=(by[(r['label'],r['request_id'],name,s)] for s in ('RAW',STAGE))
++            paired.append(dict(label=r['label'],request_id=r['request_id'],parent_id=r['parent_id'],region_type=r['region_type'],setting=name,
++                RAW_VMR=a['VMR'],POST_VMR=b['VMR'],delta_VMR=b['VMR']-a['VMR'],RAW_perfect=a['perfect'],POST_perfect=b['perfect'],
++                delta_matched_count=b['matched_count']-a['matched_count']))
++    csv_write(OUT/'summary.csv',summary);csv_write(OUT/'paired_RAW_POST.csv',paired)
++    qsummary=[]
++    for stage in ('RAW',STAGE):
++        for label in A.LABELS:
++            for group in ('ALL','seat','back'):
++                sub=[v for v in qrows if v['label']==label and v['stage']==stage and (group=='ALL' or v['region_type']==group)]
++                fields=set.intersection(*(set(v) for v in sub))-set(META)-{'label','stage'}
++                vals={}
++                for k in fields:
++                    values=[v[k] for v in sub if isinstance(v[k],(int,float)) and v[k] is not None]
++                    if values or all(v[k] is None for v in sub):
++                        vals[k]=float(np.mean(values)) if values else None
++                        vals[k+'_valid_outputs']=len(values)
++                qsummary.append(dict(stage=stage,label=label,group=group,outputs=len(sub),**vals))
++    csv_write(OUT/'quality_summary.csv',qsummary)
++    after={p:sha(p) for p in reg['protected']}
++    if after!=reg['protected']:raise ValueError('Protected source changed during execution')
++    write(OUT/'protected_after.json',dict(status='PASS',count=len(reg['protected']),files=after))
++    event('AGGREGATED',outputs=48,threshold_rows=len(per))
++    print(json.dumps(dict(status='PASS',outputs=48,summary=str(OUT/'summary.csv'))))
++
++def main():
++    p=argparse.ArgumentParser();p.add_argument('--stage',choices=['prepare','postprocess','score','summarize','all'],default='all');p.add_argument('--workers',type=int,choices=[1,2],default=2);a=p.parse_args()
++    if a.stage=='prepare':prepare()
++    if a.stage in ('postprocess','all'):postprocess_all()
++    if a.stage in ('score','all'):score_all(a.workers)
++    if a.stage=='summarize':summarize()
++if __name__=='__main__':main()

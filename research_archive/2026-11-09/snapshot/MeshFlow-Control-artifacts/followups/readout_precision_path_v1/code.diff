@@ -1,0 +1,1517 @@
+--- a/src/meshflow_control/models/native.py
++++ b/src/meshflow_control/models/native.py
+@@ -7,6 +7,7 @@
+ 
+ # Establish CUBLAS policy before importing torch in a new entrypoint.
+ from .. import runtime as _stable
++from ..precision import current_precision, readout_execution_options
+ 
+ from contextlib import contextmanager
+ from contextvars import ContextVar
+@@ -53,7 +54,7 @@
+             raise RuntimeError('Native production autocast must be BF16')
+     facts.update(
+         native_active_context_depth=_DEPTH.get(),
+-        native_precision='bf16' if _BF16.get() else 'fp32_gate_only',
++        native_precision=current_precision() or ('bf16' if _BF16.get() else 'fp32_gate_only'),
+         all_modules_eval=True, gradient_checkpointing=False,
+         trainable_parameters=trainable, all_backbone_parameters_trainable=model.experiment_trainable,
+         role_parameters=model.role_embedding.numel(),
+@@ -66,7 +67,8 @@
+ def native_execution(model, *, coordinates=None, autocast=True):
+     """Shared train/teacher/sample policy; preserve the caller's grad mode.
+ 
+-    ``autocast=False`` is reserved for the predefined FP32 implementation gate.
++    ``autocast=False`` supports the predefined FP32 gate and the explicitly
++    selected FP32_REFERENCE fixed-weight precision context.
+     The context does not use no_grad, alter requires_grad, or catch unsupported
+     deterministic operations. Each training microbatch should use a fresh
+     context; never keep an autocast weight cache across optimizer updates.
+@@ -246,7 +248,7 @@
+             if str(index) in self.readouts:
+                 hidden = apply_readout(hidden, known_mask, valid_mask, self.readouts[str(index)],
+                     memory=memory, observer=self.readout_observer, layer=index,
+-                    source_mode=self.readout_mode)
++                    source_mode=self.readout_mode, **readout_execution_options())
+         output = native_final_forward(self.backbone.final_layer, hidden, c_free,
+             c_known, known_mask, observer=observer, face_time=face_time)
+         return output.view(batch, faces, 9)
+--- a/src/meshflow_control/models/readout.py
++++ b/src/meshflow_control/models/readout.py
+@@ -102,19 +102,27 @@
+ 
+ 
+ def apply_readout(hidden, known_mask, valid_mask, module, *, memory=None,
+-                  observer=None, layer=None, source_mode=None, reference=False):
++                  observer=None, layer=None, source_mode=None, reference=False,
++                  addition_mode="on", capture=None):
+     """Only valid free corners receive residuals; all other bytes are copied.
+ 
+     index_select preserves the original instance order. index_copy uses unique
+     destination indices, so no reduction or arbitrary coordinate sorting occurs.
+     Existing H0 and stored CLEAN memory are never modified in place.
+     """
++    if addition_mode not in ("on", "off", "zero"):
++        raise ValueError("Unknown readout addition mode")
++    if capture is not None and not callable(capture):
++        raise TypeError("capture must be callable or None")
+     if hidden.ndim != 3 or hidden.shape[1] != 3 * known_mask.shape[1] or known_mask.shape != valid_mask.shape:
+         raise ValueError("Hidden and face mask dimensions differ")
+     if known_mask.dtype != torch.bool or valid_mask.dtype != torch.bool:
+         raise ValueError("Separate boolean masks required")
+     if known_mask.device != hidden.device or valid_mask.device != hidden.device:
+         raise ValueError("Masks must be colocated")
++    if addition_mode == "off":
++        # The original backbone/Geo/role/CLEAN-H0 path still executes.
++        return hidden
+     if memory is None:
+         memory = gather_known_corners(hidden, known_mask, valid_mask)
+     if len(memory) != hidden.shape[0]:
+@@ -134,6 +142,16 @@
+             residual = module.forward_reference(query, memory[b])
+         else:
+             residual = module(query, memory[b], observer=observe)
+-        updated = query + residual.to(dtype=hidden.dtype)
++        cast = residual.to(dtype=hidden.dtype)
++        applied = torch.zeros_like(cast) if addition_mode == "zero" else cast
++        updated = query + applied
+         rows.append(hidden[b].index_copy(0, indices, updated))
++        if capture is not None:
++            # Actual free-only operands, after the output row has been copied.
++            # Retain real r/cast under ZERO and separately expose applied zeros.
++            capture(dict(site="readout_addition", batch_index=b, layer=layer,
++                source_mode=source_mode, addition_mode=addition_mode,
++                free_corner_indices=indices.detach(), before=query.detach(),
++                residual=residual.detach(), cast=cast.detach(),
++                applied=applied.detach(), after=updated.detach()))
+     return torch.stack(rows)
+--- /dev/null
++++ b/src/meshflow_control/precision.py
+@@ -0,0 +1,170 @@
++"""Explicit, scoped precision/readout controls for fixed-weight diagnostics.
++
++Default model calls retain the original BF16 path. This module never loads
++weights, changes parameters, initializes CUDA or invokes a model on import.
++"""
++from __future__ import annotations
++
++# Set the existing deterministic import policy before torch.
++from . import runtime as _stable
++
++from contextlib import contextmanager, nullcontext
++from contextvars import ContextVar
++import torch
++from torch import nn
++
++PRECISIONS = ("LEGACY_BF16", "FP32_REFERENCE")
++READOUT_SWITCHES = ("on", "off", "zero")
++_POLICY = ContextVar("meshflow_precision_readout_policy", default=None)
++
++
++def current_precision():
++    """None outside this explicit experimental context."""
++    policy = _POLICY.get()
++    return None if policy is None else policy["precision"]
++
++
++def readout_execution_options():
++    """No options outside the context, preserving default call semantics."""
++    policy = _POLICY.get()
++    if policy is None:
++        return {}
++    return {"addition_mode": policy["readout"], "capture": policy["capture"]}
++
++
++@contextmanager
++def precision_execution(model, precision="LEGACY_BF16", readout="on", *,
++                        coordinates=None, capture=None):
++    """Execute the unchanged model under one declared, fixed-weight policy.
++
++    OFF skips the four extra readout computations/additions only. ZERO computes
++    their real residuals, casts as usual, then adds an all-zero tensor. CLEAN
++    H0 construction, masks, Geo, role and original blocks are untouched.
++
++    capture(record) is optional. At each actual free-corner addition it gets
++    detached before/residual/cast/applied/after tensors and original corner
++    indices. In ZERO, residual and cast remain the real branch result; applied
++    is the zero tensor actually added. The callback must treat them read-only.
++    No CPU copies are made here. The caller owns storage/statistical reduction.
++
++    Parameters stay FP32 and frozen. The caller owns inference/no_grad mode;
++    this context does not perform a forward or backward. Autocast, policy and
++    caller matmul-precision selection unwind even on exceptions.
++    """
++    if precision not in PRECISIONS:
++        raise ValueError(f"Unknown precision: {precision}")
++    if readout not in READOUT_SWITCHES:
++        raise ValueError(f"Unknown readout switch: {readout}")
++    if capture is not None and not callable(capture):
++        raise TypeError("capture must be callable or None")
++    if getattr(model, "experiment_trainable", False) or any(
++            p.requires_grad for p in model.parameters()):
++        raise RuntimeError("Precision-path experiment requires frozen parameters")
++    if any(module.training for module in model.modules()):
++        raise RuntimeError("Precision-path experiment requires all modules eval")
++    if any(p.is_floating_point() and p.dtype != torch.float32
++           for p in model.parameters()):
++        raise RuntimeError("Precision-path experiment requires FP32 parameters")
++    from .models.native import native_execution
++
++    old_matmul = torch.get_float32_matmul_precision()
++    policy_token = _POLICY.set(dict(precision=precision, readout=readout, capture=capture))
++    fp32 = precision == "FP32_REFERENCE"
++    try:
++        if fp32:
++            torch.set_float32_matmul_precision("highest")
++        # The native context controls CUDA autocast. Also defeat a caller's CPU
++        # autocast in the explicit FP32 route (useful for compact CPU contracts).
++        with (torch.autocast("cpu", enabled=False) if fp32 else nullcontext()):
++            with native_execution(model, coordinates=coordinates, autocast=not fp32) as facts:
++                facts.update(precision=precision, readout_switch=readout,
++                    readout_computation_skipped=(readout == "off"),
++                    actual_zero_addition=(readout == "zero"),
++                    float32_matmul_precision=torch.get_float32_matmul_precision())
++                yield facts
++    finally:
++        _POLICY.reset(policy_token)
++        if fp32:
++            torch.set_float32_matmul_precision(old_matmul)
++
++
++def _tensor_facts(value, prefix=""):
++    if isinstance(value, torch.Tensor):
++        return [{"path": prefix, "dtype": str(value.dtype),
++                 "shape": list(value.shape), "device": str(value.device),
++                 "floating": value.is_floating_point()}]
++    if isinstance(value, dict):
++        return [item for key, child in value.items()
++                for item in _tensor_facts(child, f"{prefix}.{key}" if prefix else str(key))]
++    if isinstance(value, (tuple, list)):
++        return [item for i, child in enumerate(value)
++                for item in _tensor_facts(child, f"{prefix}[{i}]")]
++    return []
++
++
++class DtypeAudit:
++    """Bounded dtype-only hooks: no tensor values, reductions or device copies.
++
++    Use once around an already budgeted forward, then retain records/summary().
++    Pass observer=audit.observe to NativeModel.forward to include its embedding
++    role/Geo fusion, free/known modulation, hidden streams and CLEAN memory.
++    Optionally call audit.observe(record) from the readout capture callback.
++    These observations do not replace model-call accounting or finite checks.
++    """
++    _CLASSES = {"XEmbedder", "TimestepEmbedder", "LabelEmbedder",
++                "ContextGeometryEncoder", "RMSNorm", "PrecisionSafeLayerNorm",
++                "SelfAttention", "FeedForward", "SwiGLUFFN", "CornerReadout",
++                "FinalLayer", "NativeModel"}
++
++    def __init__(self, model, precision="LEGACY_BF16", *, strict=True):
++        if precision not in PRECISIONS:
++            raise ValueError(f"Unknown precision: {precision}")
++        self.model, self.precision, self.strict = model, precision, bool(strict)
++        self.records = []
++        self._handles = []
++
++    def _record(self, site, value, **fields):
++        facts = _tensor_facts(value)
++        bad = [x for x in facts if x["floating"] and x["dtype"] != "torch.float32"]
++        row = dict(site=site, tensors=facts, **fields)
++        self.records.append(row)
++        if self.strict and self.precision == "FP32_REFERENCE" and bad:
++            raise RuntimeError(f"FP32_REFERENCE dtype violation at {site}: {bad}")
++
++    def observe(self, record):
++        """NativeModel observer / readout-capture-compatible metadata consumer."""
++        self._record("native_observer", record,
++                     observed_site=record.get("site"), layer=record.get("layer"))
++
++    def __enter__(self):
++        if self._handles:
++            raise RuntimeError("DtypeAudit is already active")
++        for name, module in self.model.named_modules():
++            if not (isinstance(module, (nn.Linear, nn.Embedding, nn.LayerNorm))
++                    or type(module).__name__ in self._CLASSES):
++                continue
++            def before(mod, args, kwargs, name=name):
++                self._record("module_input", {"args": args, "kwargs": kwargs},
++                             module=name, module_type=type(mod).__name__)
++            def after(mod, args, kwargs, output, name=name):
++                self._record("module_output", output,
++                             module=name, module_type=type(mod).__name__)
++            self._handles.append(module.register_forward_pre_hook(before, with_kwargs=True))
++            self._handles.append(module.register_forward_hook(after, with_kwargs=True))
++        return self
++
++    def __exit__(self, *exc):
++        for handle in self._handles:
++            handle.remove()
++        self._handles.clear()
++
++    def summary(self):
++        tensors = [t for row in self.records for t in row["tensors"] if t["floating"]]
++        dtypes = sorted({t["dtype"] for t in tensors})
++        bad = sum(t["dtype"] != "torch.float32" for t in tensors)
++        return dict(precision=self.precision, records=len(self.records),
++                    floating_tensor_observations=len(tensors), floating_dtypes=dtypes,
++                    fp32_contract_violations=bad if self.precision == "FP32_REFERENCE" else None,
++                    status=("NO_OBSERVATIONS" if not tensors else
++                            "FAIL" if self.precision == "FP32_REFERENCE" and bad else "PASS"),
++                    value_copies=0, model_calls_performed_by_auditor=0)
+--- /dev/null
++++ b/tests/test_precision.py
+@@ -0,0 +1,203 @@
++"""Small CPU precision contracts: no checkpoint, real model, CUDA or updates."""
++from contextlib import contextmanager
++from types import SimpleNamespace
++from unittest import mock
++import unittest
++
++from meshflow_control.precision import (
++    precision_execution, current_precision, readout_execution_options, DtypeAudit)
++from meshflow_control.models.readout import (
++    CornerReadout, apply_readout, gather_known_corners, corner_indices)
++from meshflow_control.models import native
++import torch
++from torch import nn
++
++
++class ContractOnlyModel(nn.Module):
++    """Runtime contract shape only; has no NativeModel forward."""
++    def __init__(self):
++        super().__init__()
++        self.role_embedding = nn.Parameter(torch.zeros(2, 4), requires_grad=False)
++        self.linear = nn.Linear(4, 4).requires_grad_(False)
++        self.backbone = SimpleNamespace(layers=[SimpleNamespace(gradient_checkpointing=False)])
++        self.experiment_trainable = False
++        self.eval()
++
++
++class CountResidual(nn.Module):
++    def __init__(self):
++        super().__init__()
++        self.calls = 0
++
++    def forward(self, query, memory, *, observer=None):
++        self.calls += 1
++        return query.float() * .001 + .003
++
++
++def fixture(dtype):
++    hidden = torch.arange(2 * 12 * 4, dtype=torch.float32).reshape(2, 12, 4) / 11 + 1
++    hidden = hidden.to(dtype)
++    known = torch.tensor([[True, False, False, False], [False, True, True, False]])
++    valid = torch.tensor([[True, True, True, False], [True, True, True, True]])
++    return hidden, known, valid
++
++
++def original_addition(hidden, known, valid, module, memory=None):
++    memory = gather_known_corners(hidden, known, valid) if memory is None else memory
++    rows = []
++    for b in range(hidden.shape[0]):
++        indices = corner_indices(valid[b] & ~known[b])
++        query = hidden[b].index_select(0, indices)
++        residual = module(query, memory[b])
++        updated = query + residual.to(dtype=hidden.dtype)
++        rows.append(hidden[b].index_copy(0, indices, updated))
++    return torch.stack(rows)
++
++
++class PrecisionTests(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        torch.set_num_threads(2)
++
++    def tearDown(self):
++        self.assertFalse(torch.cuda.is_initialized())
++        self.assertIsNone(current_precision())
++        self.assertEqual(readout_execution_options(), {})
++
++    def test_default_addition_bitwise_matches_original_and_preserves_masks(self):
++        for dtype in (torch.float32, torch.bfloat16):
++            h, k, v = fixture(dtype)
++            before = h.clone()
++            actual = apply_readout(h, k, v, CountResidual())
++            expected = original_addition(h, k, v, CountResidual())
++            self.assertTrue(torch.equal(actual.view(torch.uint8), expected.view(torch.uint8)))
++            self.assertTrue(torch.equal(h.view(torch.uint8), before.view(torch.uint8)))
++            fixed = (k | ~v).repeat_interleave(3, dim=1)
++            self.assertTrue(torch.equal(actual[fixed].view(torch.uint8), h[fixed].view(torch.uint8)))
++
++    def test_off_skips_only_extra_computation_zero_keeps_real_r_and_actual_zeros(self):
++        h, k, v = fixture(torch.bfloat16)
++        module = CountResidual()
++        off = apply_readout(h, k, v, module, addition_mode="off")
++        self.assertIs(off, h)
++        self.assertEqual(module.calls, 0)
++        captures = []
++        zero = apply_readout(h, k, v, module, addition_mode="zero", capture=captures.append)
++        self.assertEqual(module.calls, 2)
++        self.assertTrue(torch.equal(off.view(torch.uint8), zero.view(torch.uint8)))
++        self.assertEqual(len(captures), 2)
++        for i, record in enumerate(captures):
++            idx = corner_indices(v[i] & ~k[i])
++            self.assertTrue(torch.equal(record["free_corner_indices"], idx))
++            self.assertTrue(torch.equal(record["before"], h[i, idx]))
++            self.assertGreater(torch.count_nonzero(record["residual"]).item(), 0)
++            self.assertGreater(torch.count_nonzero(record["cast"]).item(), 0)
++            self.assertEqual(torch.count_nonzero(record["applied"]).item(), 0)
++            self.assertTrue(torch.equal(record["after"], record["before"] + record["applied"]))
++
++    def test_capture_is_actual_free_only_addition_and_clean_memory_not_mutated(self):
++        h, k, v = fixture(torch.float32)
++        memory = tuple(x + .7 for x in gather_known_corners(h, k, v))
++        saved_memory = [x.clone() for x in memory]
++        records = []
++        result = apply_readout(h, k, v, CountResidual(), memory=memory,
++                               capture=records.append, layer=6, source_mode="clean")
++        for i, record in enumerate(records):
++            idx = record["free_corner_indices"]
++            self.assertEqual(record["layer"], 6)
++            self.assertEqual(record["source_mode"], "clean")
++            self.assertTrue(torch.equal(result[i, idx], record["after"]))
++            self.assertTrue(torch.equal(record["cast"], record["applied"]))
++            self.assertTrue(torch.equal(record["after"], record["before"] + record["cast"]))
++            self.assertTrue(torch.equal(memory[i], saved_memory[i]))
++
++    def test_scalar_cast_survives_but_bf16_addition_can_round_away(self):
++        h = torch.tensor([1.], dtype=torch.bfloat16)
++        r = torch.tensor([.001], dtype=torch.float32)
++        c = r.to(h.dtype)
++        self.assertGreater(c.item(), 0)
++        self.assertEqual((h + c).item(), h.item())
++        self.assertNotEqual((h.float() + r).item(), h.float().item())
++
++    def test_routes_and_scope_restore_on_exception_without_parameter_change(self):
++        model = ContractOnlyModel()
++        state = {k: v.clone() for k, v in model.state_dict().items()}
++        seen = []
++
++        @contextmanager
++        def execution(m, *, coordinates=None, autocast=True):
++            seen.append((m, coordinates, autocast, current_precision()))
++            yield {}
++
++        with mock.patch.object(native, "native_execution", execution):
++            for precision in ("LEGACY_BF16", "FP32_REFERENCE"):
++                for switch in ("on", "off", "zero"):
++                    with precision_execution(model, precision, switch) as facts:
++                        self.assertEqual(current_precision(), precision)
++                        self.assertEqual(readout_execution_options()["addition_mode"], switch)
++                        self.assertEqual(facts["readout_switch"], switch)
++                        self.assertEqual(seen[-1][2], precision == "LEGACY_BF16")
++            with self.assertRaisesRegex(RuntimeError, "scope test"):
++                with precision_execution(model, "FP32_REFERENCE", "off"):
++                    raise RuntimeError("scope test")
++        self.assertTrue(all(torch.equal(v, state[k]) for k, v in model.state_dict().items()))
++
++    def test_fp32_runtime_context_disables_nested_autocast_and_restores_selection(self):
++        model = ContractOnlyModel()
++        previous = torch.get_float32_matmul_precision()
++        try:
++            torch.set_float32_matmul_precision("high")
++            with torch.autocast("cpu", dtype=torch.bfloat16):
++                with precision_execution(model, "FP32_REFERENCE", "on",
++                        coordinates=(torch.zeros(1, 4), torch.zeros(1))) as facts:
++                    self.assertFalse(torch.is_autocast_enabled("cpu"))
++                    self.assertFalse(torch.is_autocast_enabled("cuda"))
++                    self.assertEqual(torch.get_float32_matmul_precision(), "highest")
++                    self.assertFalse(torch.backends.cuda.matmul.allow_tf32)
++                    self.assertTrue(torch.backends.cuda.math_sdp_enabled())
++                    self.assertFalse(torch.backends.cuda.flash_sdp_enabled())
++                    self.assertEqual(facts["native_precision"], "FP32_REFERENCE")
++                self.assertTrue(torch.is_autocast_enabled("cpu"))
++            self.assertEqual(torch.get_float32_matmul_precision(), "high")
++        finally:
++            torch.set_float32_matmul_precision(previous)
++            torch.backends.cuda.matmul.allow_tf32 = False
++
++    def test_real_small_readout_dtype_hooks_and_exception_cleanup(self):
++        with torch.random.fork_rng(devices=[]):
++            torch.manual_seed(71)
++            module = CornerReadout(8, 4, 2).requires_grad_(False).eval()
++            module.W_O.weight.fill_(.1)
++        q = torch.arange(24, dtype=torch.float32).reshape(3, 8) / 13
++        memory = torch.arange(16, dtype=torch.float32).reshape(2, 8) / 17
++        before = torch.get_rng_state().clone()
++        with DtypeAudit(module, "FP32_REFERENCE") as audit:
++            with torch.autocast("cpu", dtype=torch.bfloat16):
++                output = module(q, memory)
++            audit.observe(dict(site="embedding", role=torch.zeros(1, 8),
++                               known_mask=torch.tensor([True]), hidden=output))
++        self.assertEqual(audit.summary()["status"], "PASS")
++        self.assertEqual(audit.summary()["floating_dtypes"], ["torch.float32"])
++        self.assertTrue({"norm", "W_Q", "W_K", "W_V", "W_O"}.issubset(
++            {r.get("module") for r in audit.records}))
++        self.assertTrue(torch.equal(before, torch.get_rng_state()))
++        self.assertTrue(all(not m._forward_hooks and not m._forward_pre_hooks for m in module.modules()))
++        with self.assertRaisesRegex(RuntimeError, "dtype violation"):
++            with DtypeAudit(module, "FP32_REFERENCE"):
++                module(q.to(torch.bfloat16), memory)
++        self.assertTrue(all(not m._forward_hooks and not m._forward_pre_hooks for m in module.modules()))
++
++    def test_invalid_route_and_trainable_weights_refused_before_execution(self):
++        model = ContractOnlyModel()
++        for precision, switch in (("FP16", "on"), ("FP32_REFERENCE", "per_layer")):
++            with self.assertRaises(ValueError):
++                with precision_execution(model, precision, switch):
++                    self.fail("invalid policy entered")
++        model.linear.weight.requires_grad_(True)
++        with self.assertRaisesRegex(RuntimeError, "frozen"):
++            with precision_execution(model, "FP32_REFERENCE"):
++                self.fail("trainable model accepted")
++
++
++if __name__ == "__main__":
++    unittest.main()
+--- /dev/null
++++ b/tools/readout_precision_analysis.py
+@@ -0,0 +1,317 @@
++"""CPU-only fixed-state precision analysis. Never imports torch or loads weights.
++The model runner may import layer_numbers and pass CPU NumPy captures. All new
++artifacts remain external; existing BF16 captures and results are read-only.
++"""
++from __future__ import annotations
++import os
++os.environ.setdefault("OMP_NUM_THREADS","2")
++os.environ.setdefault("MKL_NUM_THREADS","2")
++os.environ.setdefault("OPENBLAS_NUM_THREADS","2")
++from pathlib import Path
++import argparse, collections, csv, hashlib, itertools, json, math, time
++import numpy as np
++
++VERSION="readout_precision_fixed_cpu_v1"
++DEFAULT_ROOT="/mnt/e/MeshFlow-Control-artifacts/followups/readout_precision_path_v1"
++DEFAULT_OLD="/mnt/e/MeshFlow-Control-artifacts/followups/readout_effective_injection_v1"
++LAYERS=(3,6,9,12)
++PRECISIONS=("LEGACY_BF16","FP32_REFERENCE")
++QUANTILES=(0,5,25,50,75,95,100)
++DEFINITIONS={
++ "scope":"Fixed existing ON trajectory states; four observed conditions, not 24 independent conditions. No quality inference.",
++ "effective":"e=FP64(after)-FP64(before), from captured values.",
++ "effective_error_relative_l2":"||e-r||/||r||; FP64 reduction.",
++ "effective_residual_projection":"<e,r>/||r||^2; unbounded.",
++ "effective_over_residual_l2":"||e||/||r||; unbounded above, not retained-information percentage.",
++ "residual_nonzero_swallowed_fraction":"count(r!=0 and e==0)/count(r!=0); not information loss.",
++ "zero_denominators":"None with explicit UNDEFINED status in JSON; UNDEFINED in CSV. No epsilon denominator or zero/one imputation.",
++ "near_zero":"No cutoff changes a nonzero denominator; report absolute norms and the denominator beside ratios.",
++ "local_fp32":"Same saved BF16-path h and original FP32 r, NumPy FP32 add h+r. Local arithmetic only, no downstream model.",
++ "D_BF":"v_BF_ON-v_BF_OFF on valid free coordinates.",
++ "D_FP":"v_FP_ON-v_FP_OFF on valid free coordinates.",
++ "P":"v_FP_OFF-v_BF_OFF: precision change with new readout bypassed.",
++ "J":"D_FP-D_BF: precision/readout interaction; not unique residual-addition causality.",
++ "algebra":"v_FP_ON-v_BF_ON=P+J; FP64 check with explicit floating-roundoff bound.",
++ "relative_difference":"||D_FP-D_BF||/||D_BF|| plus symmetric 2||D_FP-D_BF||/(||D_FP||+||D_BF||).",
++ "Euler":"Original FP32 state + velocity.float()*(1/50), C copied; isolated step is not an OFF rollout.",
++ "aggregation":"Equal cells within label/data_panel/time; layers additionally separated. Missing cells never silently reduce denominators.",
++ "precision_comparison":"Whole FP32 path can change h and r; its layer statistics are not a same-h/r local intervention.",
++ "B_C_comparison":"At t>0 B/C use their own ON trajectory states; no same-state architecture causal comparison.",
++}
++def digest(p):
++ h=hashlib.sha256()
++ with Path(p).open("rb") as f:
++  for b in iter(lambda:f.read(8*1024*1024),b""):h.update(b)
++ return h.hexdigest()
++def ah(x):return hashlib.sha256(np.ascontiguousarray(x).tobytes()).hexdigest()
++def read(p):return json.loads(Path(p).read_text(encoding="utf-8-sig"))
++def write_json(p,v):
++ p=Path(p);p.parent.mkdir(parents=True,exist_ok=True);tmp=p.with_suffix(p.suffix+".tmp")
++ tmp.write_text(json.dumps(v,ensure_ascii=False,indent=2,allow_nan=False)+"\n",encoding="utf-8");os.replace(tmp,p)
++def bitwise(a,b):return a.shape==b.shape and a.dtype==b.dtype and a.tobytes()==b.tobytes()
++def norm(x):return float(np.sqrt(np.sum(np.asarray(x,dtype=np.float64)**2,dtype=np.float64)))
++def ratio(row,key,numerator,denominator):
++ row[key]=float(numerator/denominator) if denominator>0 else None
++ row[key+"_status"]="DEFINED" if denominator>0 else "UNDEFINED"
++def distribution(prefix,x):
++ x=np.asarray(x,dtype=np.float64).reshape(-1);x=x[np.isfinite(x)]
++ out={prefix+"_valid_count":len(x),prefix+"_mean":float(np.mean(x)) if len(x) else None}
++ for q in QUANTILES:out[f"{prefix}_q{q:02d}"]=float(np.quantile(x,q/100)) if len(x) else None
++ return out
++
++def layer_numbers(before,residual,cast,after):
++ """Return JSON-safe scalar metrics; inputs are finite CPU arrays [corners,D].
++ Actual arithmetic producing the inputs is never rerun. FP64 reductions retain
++ the previous diagnostic definitions and add error/projection/explicit statuses.
++ """
++ original=[np.asarray(x) for x in (before,residual,cast,after)]
++ if not original or original[0].ndim!=2 or 0 in original[0].shape:
++  raise ValueError("Expected nonempty [free_corners,hidden_dim] CPU arrays")
++ if any(x.shape!=original[0].shape or x.dtype.kind!="f" or not np.isfinite(x).all() for x in original):
++  raise ValueError("All captures must be finite, floating and identically shaped")
++ b,r,c,a=[x.astype(np.float64,copy=False) for x in original];e=a-b
++ values=dict(before=b,residual=r,cast=c,after=a,effective=e,cast_error=c-r,addition_error=e-c,effective_error=e-r)
++ out=dict(element_count=int(r.size),corner_count=int(r.shape[0]),hidden_width=int(r.shape[1]),reduction_dtype="float64")
++ for name,v in values.items():
++  out[name+"_l2"]=norm(v);out[name+"_rms"]=float(np.sqrt(np.mean(v*v)));out[name+"_max_abs"]=float(np.max(np.abs(v)))
++ rn,cn,en=out["residual_l2"],out["cast_l2"],out["effective_l2"]
++ for key,num,den in [
++  ("cast_error_relative_l2",out["cast_error_l2"],rn),
++  ("addition_error_relative_l2_cast",out["addition_error_l2"],cn),
++  ("effective_error_relative_l2",out["effective_error_l2"],rn),
++  ("effective_over_residual_l2",en,rn),("cast_over_residual_l2",cn,rn),("effective_over_cast_l2",en,cn),
++  ("effective_residual_cosine",float(np.sum(e*r,dtype=np.float64)),en*rn),
++  ("cast_residual_cosine",float(np.sum(c*r,dtype=np.float64)),cn*rn),
++  ("effective_residual_projection",float(np.sum(e*r,dtype=np.float64)),rn*rn),
++  ("residual_to_hidden_l2",rn,out["before_l2"]),("effective_to_hidden_l2",en,out["before_l2"])]:
++  ratio(out,key,num,den)
++ nz=int(np.count_nonzero(r!=0));sw=int(np.count_nonzero((r!=0)&(e==0)));cz=int(np.count_nonzero((r!=0)&(c==0)))
++ out.update(residual_nonzero_elements=nz,residual_nonzero_swallowed_elements=sw,
++  cast_zero_elements_nonzero_residual=cz,changed_element_count=int(np.count_nonzero(a!=b)),
++  changed_element_fraction=float(np.mean(a!=b)),changed_corner_count=int(np.count_nonzero(np.any(e!=0,axis=1))),
++  changed_corner_fraction=float(np.mean(np.any(e!=0,axis=1))))
++ ratio(out,"residual_nonzero_swallowed_fraction",sw,nz);ratio(out,"cast_zero_fraction_nonzero_residual",cz,nz)
++ cnorms={}
++ for name in ("residual","cast","effective","cast_error","addition_error","effective_error"):
++  cnorms[name]=np.sqrt(np.sum(values[name]**2,axis=1,dtype=np.float64))
++  out.update(distribution("corner_"+name+"_l2",cnorms[name]))
++ good=cnorms["residual"]>0
++ out.update(distribution("corner_effective_over_residual",cnorms["effective"][good]/cnorms["residual"][good]))
++ out["corner_ratio_zero_denominator_count"]=int(np.count_nonzero(~good))
++ ratio(out,"corner_nonzero_residual_swallowed_fraction",int(np.count_nonzero(good&(cnorms["effective"]==0))),int(np.count_nonzero(good)))
++ return out
++
++def vector_numbers(name,x):
++ x=np.asarray(x,dtype=np.float64)
++ if x.ndim!=2 or x.shape[1]!=9 or not len(x) or not np.isfinite(x).all():raise ValueError("Expected free [F,9]")
++ return {name+"_l2":norm(x),name+"_rms":float(np.sqrt(np.mean(x*x))),name+"_max_abs":float(np.max(np.abs(x))),
++  name+"_changed_scalar_fraction":float(np.mean(x!=0)),
++  name+"_changed_corner_fraction":float(np.mean(np.any(x.reshape(-1,3)!=0,axis=1))),
++  name+"_changed_face_fraction":float(np.mean(np.any(x!=0,axis=1)))}
++def four_grid(bon,boff,fon,foff):
++ """Four free-coordinate velocity arrays; outputs metrics and exact FP64 differences."""
++ a,b,c,d=[np.asarray(x,dtype=np.float64) for x in (bon,boff,fon,foff)]
++ if any(x.shape!=a.shape for x in (b,c,d)):raise ValueError("Four-grid shape mismatch")
++ vv=dict(D_BF=a-b,D_FP=c-d,P=d-b,J=(c-d)-(a-b),precision_ON=c-a)
++ out={}
++ for key,x in dict(v_BF_ON=a,v_BF_OFF=b,v_FP_ON=c,v_FP_OFF=d,**vv).items():out.update(vector_numbers(key,x))
++ nr,nf,nj=out["D_BF_l2"],out["D_FP_l2"],out["J_l2"]
++ for key,num,den in [
++  ("D_FP_D_BF_cosine",float(np.sum(vv["D_FP"]*vv["D_BF"])),nf*nr),
++  ("D_relative_difference_to_BF",nj,nr),("D_symmetric_relative_difference",2*nj,nr+nf),
++  ("D_FP_over_D_BF_l2",nf,nr),("D_BF_relative_to_own_ON",nr,out["v_BF_ON_l2"]),
++  ("D_FP_relative_to_own_ON",nf,out["v_FP_ON_l2"]),
++  ("P_relative_to_BF_OFF",out["P_l2"],out["v_BF_OFF_l2"]),
++  ("J_projection_onto_D_BF",float(np.sum(vv["J"]*vv["D_BF"])),nr*nr)]:
++  ratio(out,key,num,den)
++ error=vv["precision_ON"]-(vv["P"]+vv["J"])
++ bound=16*np.finfo(np.float64).eps*(np.abs(c)+np.abs(a)+np.abs(vv["P"])+np.abs(vv["J"]))+np.nextafter(0.,1.)
++ out.update(algebra_exact=bool(np.all(error==0)),algebra_roundoff_pass=bool(np.all(np.abs(error)<=bound)),
++  algebra_error_l2=norm(error),algebra_error_max_abs=float(np.max(np.abs(error))),
++  algebra_max_pointwise_bound=float(np.max(bound)))
++ return out,vv
++
++def cell_key(r):return (r["label"],r["request_id"],int(r["step"]),r["mode"])
++def index_cells(folder):
++ found={};duplicates=[]
++ for p in sorted(Path(folder).glob("*.json")):
++  r=read(p)
++  if not all(k in r for k in ("label","request_id","step","mode")):raise ValueError("Non-cell JSON in cells: "+str(p))
++  key=cell_key(r)
++  if key in found:duplicates.append(key)
++  found[key]=(p,r)
++ if duplicates:raise ValueError("Duplicate fixed cells: "+repr(duplicates))
++ return found
++def resolve(p,jp):
++ p=Path(p)
++ return p if p.is_absolute() else jp.parent/p
++def required_array(a,shape,name):
++ if a.dtype!=np.float32 or a.shape!=shape or not np.isfinite(a).all():raise ValueError(name+": expected finite FP32 "+str(shape))
++def write_csv(p,rr):
++ keys=list(dict.fromkeys(k for r in rr for k in r))
++ with Path(p).open("w",encoding="utf-8-sig",newline="") as f:
++  w=csv.DictWriter(f,fieldnames=keys);w.writeheader()
++  for r in rr:w.writerow({k:("UNDEFINED" if v is None and r.get(k+"_status")=="UNDEFINED" else v) for k,v in r.items()})
++def grouped(rr,fields,metrics):
++ groups=collections.defaultdict(list)
++ for r in rr:groups[tuple(r.get(k) for k in fields)].append(r)
++ out=[]
++ for values,gg in sorted(groups.items(),key=lambda q:str(q[0])):
++  for metric in metrics:
++   nums=[r[metric] for r in gg if r["status"]=="COMPLETE" and isinstance(r.get(metric),(int,float)) and not isinstance(r.get(metric),bool) and math.isfinite(r[metric])]
++   out.append(dict(zip(fields,values),metric=metric,expected_cells=len(gg),finite_cells=len(nums),
++    mean=float(math.fsum(nums)/len(nums)) if len(nums)==len(gg) else None,
++    observed_mean=float(math.fsum(nums)/len(nums)) if nums else None,
++    minimum=min(nums) if nums else None,maximum=max(nums) if nums else None,
++    status="COMPLETE" if len(nums)==len(gg) else "UNDEFINED_OR_INCOMPLETE"))
++ return out
++
++def run(root=DEFAULT_ROOT,legacy_root=DEFAULT_OLD):
++ root=Path(root).resolve();old=Path(legacy_root).resolve();out=root/"analysis";out.mkdir(parents=True,exist_ok=True)
++ tick=time.perf_counter();plan=read(old/"plan.json")
++ if plan["labels"]!=["B1000","C1000"] or plan["steps"]!=[0,25,45] or len(plan["requests"])!=4:raise ValueError("Legacy fixed plan changed")
++ oldsummary=read(old/"analysis/summary.json")
++ if oldsummary["status"]!="COMPLETE" or digest(old/"plan.json")!=oldsummary["plan_sha256"]:raise ValueError("Unverified old summary/plan")
++ expected={(l,q["request_id"],s,m) for l,q,s,m in itertools.product(plan["labels"],plan["requests"],plan["steps"],("on","off"))}
++ indexes={"LEGACY_BF16":index_cells(old/"cells"),"FP32_REFERENCE":index_cells(root/"fixed/cells")}
++ if any(set(v)-expected for v in indexes.values()):raise ValueError("Unexpected fixed-state cell")
++ requests={q["request_id"]:q for q in plan["requests"]};streams={(r["label"],r["request_id"]):r for r in plan["streams"]}
++ representative={next(q["request_id"] for q in plan["requests"] if q["panel"]==panel) for panel in ("P1","P2")}
++ records=[];layers=[];local=[];pred={};source_hashes={str(old/"plan.json"):digest(old/"plan.json"),str(old/"analysis/summary.json"):digest(old/"analysis/summary.json"),str(Path(__file__)):digest(__file__)}
++ if (root/"plan.json").exists():source_hashes[str(root/"plan.json")]=digest(root/"plan.json")
++ retained_layers=0
++ for precision in PRECISIONS:
++  for key in sorted(expected):
++   label,rid,step,mode=key;q=requests[rid];n,k=q["N"],q["K"]
++   base=dict(label=label,request_id=rid,panel=q["panel"],data_panel=q["panel"],N=n,K=k,step=step,t=step/50.,mode=mode,precision=precision)
++   audit=dict(base,status="MISSING",error=None)
++   lr=[dict(base,layer=l,status="MISSING",error=None) for l in LAYERS] if mode=="on" else []
++   try:
++    if key not in indexes[precision]:raise FileNotFoundError("Fixed cell not present")
++    jp,receipt=indexes[precision][key];ap=resolve(receipt["array_path"],jp)
++    if receipt["status"]!="COMPLETE" or receipt["N"]!=n or receipt["K"]!=k or receipt["t"]!=step/50:raise ValueError("Receipt identity/status mismatch")
++    if receipt["checkpoint_sha256"]!=plan["checkpoints"][label]["sha256"]:raise ValueError("Checkpoint identity mismatch")
++    if precision=="FP32_REFERENCE" and receipt.get("precision")!="FP32_REFERENCE":raise ValueError("New cell not declared FP32_REFERENCE")
++    if precision=="LEGACY_BF16" and mode=="on" and receipt.get("trajectory_replay_exact") is not True:raise ValueError("Old ON replay unverified")
++    h=digest(ap)
++    if h!=receipt["array_sha256"]:raise ValueError("NPZ hash mismatch")
++    source_hashes[str(jp)]=digest(jp);source_hashes[str(ap)]=h
++    audit.update(receipt_path=str(jp),receipt_sha256=source_hashes[str(jp)],array_path=str(ap),array_sha256=h)
++    with np.load(ap,allow_pickle=False) as z:
++     v,x,nxt=[z[name].copy() for name in ("velocity","state","next_state")]
++     for name,arr in (("velocity",v),("state",x),("next_state",nxt)):required_array(arr,(1,n,9),name)
++     if ah(x)!=streams[label,rid]["state_hashes"][str(step)]:raise ValueError("Not the original common input state")
++     calc=x.copy();calc[:,k:]=x[:,k:]+v[:,k:]*(1/50)
++     if not bitwise(calc,nxt):raise ValueError("Isolated FP32 Euler expression mismatch")
++     if precision=="LEGACY_BF16" and mode=="on" and ah(nxt)!=streams[label,rid]["next_state_hashes"][str(step)]:raise ValueError("Actual old ON replay hash mismatch")
++     pred[precision,key]=dict(velocity=v,state=x,next_state=nxt,audit=audit)
++     for row in lr:
++      layer=row["layer"];names=[f"l{layer}_{name}" for name in ("before","residual","cast","after")]
++      present=all(name in z.files for name in names)
++      row.update(receipt_path=str(jp),receipt_sha256=source_hashes[str(jp)],array_path=str(ap),array_sha256=h,capture_arrays_saved=present)
++      if precision=="LEGACY_BF16":
++       if not present:raise ValueError("Old full layer capture missing")
++       arrays=[z[name] for name in names]
++       for arr in arrays:required_array(arr,(3*(n-k),768),"layer capture")
++       metrics=layer_numbers(*arrays)
++       dtype=next(c for c in receipt["layer_checks"] if c["layer"]==layer)
++       if tuple(dtype[x] for x in ("hidden_dtype","residual_dtype","output_dtype"))!=("torch.bfloat16","torch.float32","torch.bfloat16"):raise ValueError("Legacy layer dtype differs")
++       b,r=arrays[:2];local_after=np.add(b.astype(np.float32),r.astype(np.float32),dtype=np.float32)
++       local.append(dict(base,layer=layer,status="COMPLETE",comparison="SAME_BF16_PATH_H_R_LOCAL_FP32_ADD_ONLY",source_array_path=str(ap),source_array_sha256=h,**layer_numbers(b,r,r,local_after)))
++      else:
++       metrics_list=receipt.get("layer_metrics",[])
++       if len(metrics_list)!=4 or {c["layer"] for c in metrics_list}!=set(LAYERS):raise ValueError("Need four immediate FP32 layer metric records")
++       dtype=next(c for c in metrics_list if c["layer"]==layer)
++       metrics=dtype.get("metrics",dtype).copy()
++       for name in ("element_count","corner_count","effective_error_relative_l2","effective_residual_projection","effective_over_residual_l2","changed_corner_fraction"):
++        if name not in metrics:raise ValueError("Missing immediate layer metric: "+name)
++       if metrics["corner_count"]!=3*(n-k) or metrics["element_count"]!=3*(n-k)*768:raise ValueError("FP32 metric domain differs")
++       if tuple(dtype.get(x) for x in ("hidden_dtype","residual_dtype","output_dtype"))!=("torch.float32",)*3:raise ValueError("FP32 layer dtype not verified")
++       should_save=rid in representative and step==25
++       if present!=should_save:raise ValueError("Full capture storage does not match representative registration")
++       if present:
++        arrays=[z[name] for name in names]
++        for arr in arrays:required_array(arr,(3*(n-k),768),"representative capture")
++        re=layer_numbers(*arrays)
++        if any(metrics.get(name)!=value for name,value in re.items()):raise ValueError("Immediate/recomputed FP32 metrics differ")
++        retained_layers+=1
++      row.update({kk:vv for kk,vv in metrics.items() if kk not in ("layer","status","error")})
++      row.update(hidden_dtype=dtype["hidden_dtype"],residual_dtype=dtype["residual_dtype"],output_dtype=dtype["output_dtype"],status="COMPLETE",error=None)
++    audit.update(status="COMPLETE",error=None,original_state_hash=ah(x),euler_expression_exact=True,known_next_exact=bitwise(x[:,:k],nxt[:,:k]))
++   except Exception as ex:
++    audit.update(status="MISSING" if isinstance(ex,FileNotFoundError) else "FAILED",error=type(ex).__name__+": "+str(ex))
++    pred.pop((precision,key),None)
++    for row in lr:row.update(status=audit["status"],error=audit["error"])
++   records.append(audit);layers.extend(lr)
++ pairs=[];interactions=[];(out/"fixed_vectors").mkdir(exist_ok=True)
++ for label,q,step in itertools.product(plan["labels"],plan["requests"],plan["steps"]):
++  rid=q["request_id"];k=q["K"];base=dict(label=label,request_id=rid,panel=q["panel"],data_panel=q["panel"],N=q["N"],K=k,step=step,t=step/50.)
++  pair=dict(base,status="INCOMPLETE",error=None);inter=dict(pair)
++  try:
++   aa=[pred[p,(label,rid,step,m)] for p,m in (("LEGACY_BF16","on"),("LEGACY_BF16","off"),("FP32_REFERENCE","on"),("FP32_REFERENCE","off"))]
++   if not all(bitwise(aa[0]["state"],a["state"]) for a in aa[1:]):raise ValueError("Four cells do not share exact input state")
++   for name,a in zip(("BF_ON","BF_OFF","FP_ON","FP_OFF"),aa):
++    pair[name+"_array_path"]=a["audit"]["array_path"];pair[name+"_array_sha256"]=a["audit"]["array_sha256"]
++    pair[name+"_receipt_sha256"]=a["audit"]["receipt_sha256"]
++   metrics,vectors=four_grid(*[a["velocity"][0,k:] for a in aa])
++   if not metrics["algebra_roundoff_pass"]:raise ValueError("Four-grid algebra failed")
++   nextmetrics,_=four_grid(*[a["next_state"][0,k:] for a in aa])
++   pair.update(metrics,**{"isolated_next_"+name:value for name,value in nextmetrics.items()},state_four_grid_bitwise=True,input_state_sha256=ah(aa[0]["state"]),status="COMPLETE",error=None)
++   dest=out/"fixed_vectors"/f"{label}__{rid}__s{step:02d}.npz";np.savez_compressed(dest,**vectors)
++   inter.update(metrics,vector_path=str(dest),vector_sha256=digest(dest),status="COMPLETE",error=None)
++  except Exception as ex:
++   pair["error"]=inter["error"]=type(ex).__name__+": "+str(ex)
++  pairs.append(pair);interactions.append(inter)
++ assert len(records)==96 and len(layers)==192 and len(pairs)==len(interactions)==24
++ files={
++  "fixed_state_pairs.csv":pairs,"layer_precision_metrics.csv":layers,"prediction_precision_interactions.csv":interactions,
++  "same_hr_local_fp32.csv":local,"fixed_cell_audit.csv":records,
++  "layer_precision_group_summary.csv":grouped(layers,("precision","label","data_panel","step","layer"),("residual_nonzero_swallowed_fraction","effective_over_residual_l2","effective_residual_cosine","effective_error_relative_l2","effective_residual_projection","changed_corner_fraction")),
++  "prediction_precision_group_summary.csv":grouped(interactions,("label","data_panel","step"),("D_BF_l2","D_FP_l2","P_l2","J_l2","D_FP_D_BF_cosine","D_relative_difference_to_BF","D_BF_relative_to_own_ON","D_FP_relative_to_own_ON"))}
++ for name,rr in files.items():write_csv(out/name,rr)
++ complete=[sum(r["status"]=="COMPLETE" for r in rr) for rr in (records,layers,pairs)]
++ status="COMPLETE" if complete==[96,192,24] and retained_layers==16 and len(local)==96 else "INCOMPLETE"
++ errors=[{k:r.get(k) for k in ("label","request_id","step","mode","precision","status","error")} for r in records+pairs if r["status"]!="COMPLETE"]
++ summary=dict(schema=VERSION,status=status,complete_cells=complete[0],expected_cells=96,complete_layers=complete[1],expected_layers=192,
++  complete_four_grid_units=complete[2],expected_four_grid_units=24,old_cached_on_layers=96,new_fp32_on_layers=96,
++  retained_new_layer_arrays=retained_layers,local_same_hr_layers=len(local),preflight_records_included=0,
++  model_calls=0,checkpoint_loads=0,new_rollouts=0,errors=errors,source_hashes=source_hashes,
++  output_hashes={name:digest(out/name) for name in files},definitions=DEFINITIONS,wall_seconds=time.perf_counter()-tick,
++  interpretation="Numerical diagnostics only. Whole-front precision affects hidden/residual/prediction; no mesh-quality or causal training conclusion.")
++ write_json(out/"fixed_state_summary.json",summary);write_json(out/"fixed_metric_definitions.json",DEFINITIONS)
++ print(json.dumps({k:summary[k] for k in ("status","complete_cells","complete_layers","complete_four_grid_units","retained_new_layer_arrays","local_same_hr_layers","wall_seconds")}))
++ return summary
++
++def self_test(root):
++ z=np.zeros((3,8),np.float32);one=np.ones_like(z);small=np.full_like(z,.001)
++ a=layer_numbers(one,small,small,one)
++ assert a["residual_nonzero_swallowed_fraction"]==1 and a["effective_over_residual_l2"]==0 and a["effective_residual_cosine"] is None and a["effective_error_relative_l2"]==1
++ zz=layer_numbers(z,z,z,z)
++ assert zz["effective_over_residual_l2"] is None and zz["effective_over_residual_l2_status"]=="UNDEFINED" and zz["residual_nonzero_swallowed_fraction"] is None
++ a=layer_numbers(one,small,small,one+np.float32(.002))
++ assert a["effective_over_residual_l2"]>1 and a["effective_residual_projection"]>1
++ a=layer_numbers(z,one,one,-one)
++ assert np.allclose([a["effective_residual_cosine"],a["effective_residual_projection"],a["effective_error_relative_l2"]],[-1.,-1.,2.],rtol=1e-14,atol=0.)
++ x=np.arange(18,dtype=np.float32).reshape(2,9)
++ row,v=four_grid(x+2,x,x+5,x+1)
++ assert row["algebra_roundoff_pass"] and np.array_equal(v["P"]+v["J"],v["precision_ON"]) and row["D_FP_over_D_BF_l2"]==2
++ row,_=four_grid(np.zeros_like(x),np.zeros_like(x),np.zeros_like(x),np.zeros_like(x))
++ assert row["D_FP_D_BF_cosine"] is None and row["D_relative_difference_to_BF_status"]=="UNDEFINED"
++ local=np.add(one,small,dtype=np.float32);a=layer_numbers(one,small,small,local)
++ assert a["effective_error_relative_l2"]<1e-3 and a["changed_corner_fraction"]==1
++ mixed=z.copy();mixed[0,0]=1
++ a=layer_numbers(z,mixed,mixed,mixed)
++ assert a["changed_corner_fraction"]==1/3 and a["changed_element_fraction"]==1/24
++ failed=False
++ try:layer_numbers(z,one[:2],one,z)
++ except ValueError:failed=True
++ assert failed
++ r=dict(status="PASS",test_groups=9,checks=["full_swallow","zero_UNDEFINED","unbounded_ratio","opposite_direction","four_grid_algebra","zero_prediction","same_hr_fp32","corner_denominator","shape_rejection"],model_calls=0,checkpoint_loads=0,script_sha256=digest(__file__))
++ write_json(Path(root)/"analysis/fixed_cpu_tests.json",r);print(json.dumps(r));return r
++
++def main():
++ p=argparse.ArgumentParser(description=__doc__);p.add_argument("--root",default=DEFAULT_ROOT);p.add_argument("--legacy-root",default=DEFAULT_OLD);p.add_argument("--self-test",action="store_true")
++ a=p.parse_args()
++ if a.self_test:self_test(a.root);return 0
++ return 0 if run(a.root,a.legacy_root)["status"]=="COMPLETE" else 2
++if __name__=="__main__":raise SystemExit(main())
+--- /dev/null
++++ b/tools/readout_precision_evaluation.py
+@@ -0,0 +1,374 @@
++#!/usr/bin/env python3
++"""CPU-only fixed precision/readout rollout scoring and gallery; old evidence read-only."""
++from __future__ import annotations
++import os
++for _k in ("OMP_NUM_THREADS","MKL_NUM_THREADS","OPENBLAS_NUM_THREADS","NUMEXPR_NUM_THREADS"):os.environ[_k]="2"
++import argparse,copy,csv,hashlib,html,importlib,itertools,json,math,statistics,subprocess,sys,time,traceback,types
++from collections import defaultdict
++from concurrent.futures import ProcessPoolExecutor
++from pathlib import Path
++sys.path.insert(0,str(Path(__file__).resolve().parents[1]/"src"))
++import numpy as np
++ev=importlib.import_module("meshflow_control.evaluation.evaluate")
++ren=importlib.import_module("meshflow_control.evaluation.render")
++from meshflow_control.evaluation import registry
++from meshflow_control.evaluation.io import resolve,digest,read_json,write_json,write_csv,arrays,array_sha
++VERSION="readout_precision_rollout_evaluation_v1"
++MODELS=("B1000","C1000")
++PRECISIONS=("LEGACY_BF16","FP32_REFERENCE")
++SWITCHES=("ON","OFF")
++REQUEST_IDS=("P1__33ec1e64a02ff718faaadcdc0221eb72_C1__n4","P1__f59627a077dcc2566c63b8b48495261a_C1__n4","P2_seat2__n0","P2_seat_back4__n0")
++DEFAULT_OUT="E:/MeshFlow-Control-artifacts/followups/readout_precision_path_v1"
++REPO=Path(__file__).resolve().parents[1]
++REQUIRED_REQUEST=("request_id","panel","cohort","condition_id","parent_id","candidate","N","K","input_path","input_sha256","reference_path","reference_sha256")
++QUAD=(("LEGACY_BF16","ON"),("LEGACY_BF16","OFF"),("FP32_REFERENCE","ON"),("FP32_REFERENCE","OFF"))
++CONTRAST_COEFFICIENTS={"branch_BF":(1,-1,0,0),"branch_FP":(0,0,1,-1),"precision_ON":(-1,0,1,0),"precision_OFF":(0,-1,0,1),"interaction":(-1,1,1,-1)}
++CONTRACT_NAMES=("C_output_bitwise","N_preserved","finite","C_all51_bitwise","actual_Gaussian_bitwise","NPZ_C_bitwise","PLY_C_bitwise")
++def canonical_sha(v):return hashlib.sha256(json.dumps(v,sort_keys=True,separators=(",",":"),ensure_ascii=False,allow_nan=False).encode()).hexdigest()
++def full_label(m,p,s):return f"{m}__{p}__{s}"
++def expected_keys():return set(itertools.product(MODELS,PRECISIONS,SWITCHES,REQUEST_IDS))
++def folder(out):
++    out=resolve(out).resolve()
++    if out.name!="readout_precision_path_v1" or out.parent.name!="followups":raise ValueError("Output outside authorized followup")
++    out.mkdir(parents=True,exist_ok=True);return out
++def artifacts_for(out,artifacts=None):return resolve(artifacts).resolve() if artifacts else folder(out).parents[1]
++def source_map():
++    return dict(adapter=dict(path=str(Path(__file__).resolve()),sha256=digest(__file__)),scoring_package=ev.sources(),
++        renderer_path=str(Path(ren.__file__).resolve()),renderer_sha256=digest(ren.__file__),definition_change=False,
++        P2_reference_adapter="Function-local globals copy: open_reference loads existing frozen I_reference; original module globals unchanged.",
++        omitted_wrappers="No original aggregate/diversity/fixed-seven-label render wrapper; score_request mathematics retained.")
++def selected_originals(art):
++    rows=read_json(art/"outputs/all_completed.json")["rows"];by={(r["label"],r["request_id"]):r for r in rows}
++    return {(m,r):copy.deepcopy(by[m,r]) for m,r in itertools.product(MODELS,REQUEST_IDS)}
++def canonical_raw(d,N,K):
++    return dict(raw=np.asarray(d.get("raw",d.get("output"))).reshape(N,9),
++        trajectory=np.asarray(d.get("trajectory",d.get("path"))).reshape(51,N,9),
++        C=np.asarray(d["C"]).reshape(K,3,3),z=np.asarray(d["z"]).reshape(1,N,9))
++def read_only_I_reference(c,cid,folder=None):
++    d=resolve(folder);meta=read_json(d/"I_reference.json");p=d/"I_reference.npz"
++    if digest(p)!=meta["npz_sha256"]:raise ValueError("Frozen P2 I NPZ changed")
++    aa=arrays(p)
++    if {k:array_sha(v) for k,v in aa.items()}!=meta["arrays_sha256"]:raise ValueError("Frozen P2 I arrays changed")
++    ident=meta["identity"]
++    if ident["condition_id"]!=cid or ident["C_sha256"]!=array_sha(c["C"]) or float(ident["L0"])!=float(c["L0"]):raise ValueError("P2 reference identity differs")
++    return dict(arrays=aa,identity=ident)
++def original_score_function():
++    gg=dict(ev.score_request.__globals__);gg["open_reference"]=read_only_I_reference
++    return types.FunctionType(ev.score_request.__code__,gg,"score_request_frozen_queries",ev.score_request.__defaults__,ev.score_request.__closure__)
++def validate_original(original,art):
++    model,rid=original["label"],original["request_id"];sp=art/"evaluation/scoring"/model/rid/"score.json";saved=read_json(sp)
++    if saved.get("status")!="PASS":raise ValueError("Historical score not PASS")
++    for k in ("request_id","label","raw_sha256","input_sha256","reference_sha256"):
++        if saved["identity"][k]!=original[k]:raise ValueError("Historical identity differs: "+k)
++    if saved["identity"]["sources"]!=ev.sources():raise ValueError("Original scoring source hashes changed")
++    hashes={str(sp):digest(sp)}
++    for k,hk in (("raw_path","raw_sha256"),("input_path","input_sha256"),("reference_path","reference_sha256")):
++        if digest(original[k])!=original[hk]:raise ValueError("Historical asset changed: "+k)
++        hashes[original[k]]=original[hk]
++    hashes[original["result_path"]]=digest(original["result_path"])
++    bank,meta,c=ev._data(original);raw=arrays(original["raw_path"]);result=read_json(original["result_path"])
++    _,facts=ev._contracts(original,raw,bank,result)
++    if any(facts.get(k) is not True for k in CONTRACT_NAMES):raise ValueError("Historical hard/export contract not proven")
++    canon=canonical_raw(raw,original["N"],original["K"])
++    if array_sha(canon["raw"])!=array_sha(canon["trajectory"][-1]):raise ValueError("Historical final/trajectory differs")
++    for p,h in saved.get("files",{}).items():
++        if digest(p)!=h:raise ValueError("Historical score witness changed")
++        hashes[p]=h
++    if original["panel"]=="P2":
++        d=resolve(original["reference_path"]).parent;read_only_I_reference(c,original["condition_id"],d)
++        for name in ("I_reference.json","I_reference.npz"):hashes[str(d/name)]=digest(d/name)
++    else:
++        for spec in meta["assets"].values():
++            if digest(spec["path"])!=spec["sha256"]:raise ValueError("P1 frozen query changed")
++            hashes[spec["path"]]=spec["sha256"]
++    return dict(model_label=model,request_id=rid,score_path=str(sp),score_sha256=digest(sp),
++        raw_path=original["raw_path"],raw_sha256=original["raw_sha256"],
++        result_path=original["result_path"],result_sha256=digest(original["result_path"]),
++        scalar_metrics_sha256=canonical_sha(saved["metrics"]),array_hashes={k:array_sha(v) for k,v in canon.items()},
++        hashes=hashes,contracts=facts,scientific_scores_recomputed=0)
++def prepare(out,artifacts=None):
++    out=folder(out);art=artifacts_for(out,artifacts);dest=out/"evaluation";originals=selected_originals(art)
++    receipt=dict(schema=VERSION,status="PASS",artifacts=str(art),source_manifest_sha256=digest(art/"outputs/all_completed.json"),
++        original_requests_sha256=digest(art/"data/evaluation/requests.json"),
++        entries=[validate_original(r,art) for r in originals.values()],model_calls=0,geometry_rescoring=0,cache_count=8)
++    write_json(dest/"baseline_cache_manifest.json",receipt,freeze=True)
++    write_json(dest/"evaluation_source_map.json",source_map(),freeze=True)
++    if not (dest/"git_status_before.txt").exists():
++        v=subprocess.run(["git","-C",str(REPO),"status","--short"],capture_output=True,text=True,check=True)
++        (dest/"git_status_before.txt").write_text(v.stdout,encoding="utf8")
++    print(json.dumps(dict(stage="prepare",status="PASS",verified_baselines=8,scientific_scores_recomputed=0)));return receipt
++def read_manifest(out):
++    out=folder(out);data=read_json(out/"outputs/manifest.json");rows=data["rows"] if isinstance(data,dict) else data
++    if len(rows)!=32:raise ValueError("All32 registered terminal outputs required before scoring/rendering")
++    got={}
++    for original in rows:
++        r=copy.deepcopy(original)
++        for k in REQUIRED_REQUEST:
++            if k not in r:raise ValueError("Output manifest missing "+k)
++        m,p,s=r["model_label"],r["precision"],str(r["readout"]).upper();r["readout"]=s
++        if r["label"]!=full_label(m,p,s):raise ValueError("Composite label differs")
++        key=(m,p,s,r["request_id"])
++        if key in got:raise ValueError("Duplicate output cell")
++        got[key]=r
++        if r.get("status") in ("PENDING","RUNNING","NOT_RUN"):raise ValueError("Output still pending")
++        if r.get("status") not in ("FAILED","BLOCKED","NONFINITE","INVALID_OUTPUT"):
++            for k in ("raw_path","result_path"):
++                if not r.get(k) or not resolve(r[k]).is_file():raise ValueError("Completed asset absent: "+k)
++            if not r.get("raw_sha256") or digest(r["raw_path"])!=r["raw_sha256"]:raise ValueError("RAW hash absent/changed")
++    if set(got)!=expected_keys():raise ValueError("Output cells differ from fixed2x4x4")
++    return [got[k] for k in sorted(got)]
++def cache_new_row(r,out,entry):
++    old=read_json(entry["score_path"])
++    if digest(entry["score_path"])!=entry["score_sha256"]:raise ValueError("Frozen old score changed")
++    for p,h in entry["hashes"].items():
++        if digest(p)!=h:raise ValueError("Frozen baseline witness changed")
++    bank,meta,c=ev._data(r);raw=arrays(r["raw_path"]);result=read_json(r["result_path"]);_,facts=ev._contracts(r,raw,bank,result)
++    if any(facts.get(k) is not True for k in CONTRACT_NAMES):raise ValueError("Cached output contracts failed")
++    canon=canonical_raw(raw,r["N"],r["K"])
++    if {k:array_sha(v) for k,v in canon.items()}!=entry["array_hashes"]:raise ValueError("BF16_ON arrays differ")
++    row=copy.deepcopy(old)
++    for k in REQUIRED_REQUEST+("label","model_label","precision","readout","raw_path"):row[k]=r[k]
++    row["original_scoring_identity"]=old["identity"];row["identity"]=dict(old["identity"],label=r["label"],raw_sha256=r["raw_sha256"])
++    row.update(cache="VERIFIED_PREVIOUS_BF16_ON",scientific_scores_recomputed=0,original_scoring_seconds=old.get("scoring_seconds"),
++        scoring_seconds=0,source_score_path=entry["score_path"],source_score_sha256=entry["score_sha256"],source_result_path=r["result_path"],contracts=facts)
++    if canonical_sha(row["metrics"])!=entry["scalar_metrics_sha256"]:raise ValueError("Cached metric values changed")
++    return row
++def _worker(args):
++    r,out,entry=args;out=resolve(out);dest=out/"evaluation/rows"/r["label"]/(r["request_id"]+".json")
++    ident=dict(version=VERSION,label=r["label"],request_id=r["request_id"],raw_sha256=r.get("raw_sha256"),
++        input_sha256=r["input_sha256"],reference_sha256=r["reference_sha256"],sources=ev.sources(),adapter_sha256=digest(__file__))
++    if dest.exists():
++        saved=read_json(dest)
++        if saved.get("adapter_identity")!=ident:raise ValueError("CPU cached result identity changed")
++        for p,h in saved.get("files",{}).items():
++            if digest(p)!=h:raise ValueError("Completed score witness changed")
++        return saved
++    tick=time.perf_counter()
++    try:
++        if r.get("status") in ("FAILED","BLOCKED","NONFINITE","INVALID_OUTPUT"):raise ValueError("Generation failed; denominator retained")
++        if entry is not None:row=cache_new_row(r,out,entry)
++        else:
++            row=original_score_function()(r,out/"evaluation")
++            for k in ("model_label","precision","readout"):row[k]=r[k]
++            row["cache"]="NEW_SCIENTIFIC_SCORE"
++        row.update(adapter_identity=ident,cpu_adapter_seconds=time.perf_counter()-tick,execution_precision=r["precision"],rollout_readout=r["readout"])
++    except Exception as exc:
++        row={k:r.get(k) for k in REQUIRED_REQUEST+("label","model_label","precision","readout")}
++        row.update(status="SCORING_BLOCKED",metrics={},metric_status={},contracts={},files={},adapter_identity=ident,
++            error=repr(exc),traceback=traceback.format_exc(),scientific_scores_recomputed=None,cpu_adapter_seconds=time.perf_counter()-tick)
++    write_json(dest,row);return row
++def finite(x):return isinstance(x,(int,float)) and not isinstance(x,bool) and math.isfinite(x)
++def metric_interval(metric,values):
++    v=values.get(metric)
++    if not finite(v):return None,None
++    if metric=="ExposedRetain":return values.get("ExposedRetain_global_lower",v),values.get("ExposedRetain_global_upper",v)
++    up={"SeamCov":"SeamCov_upper","ConflictCov_C":"ConflictCov_C_upper"}.get(metric)
++    if metric.startswith("SeamCov_") and not metric.startswith("SeamCov_upper"):up="SeamCov_upper"+metric[len("SeamCov"):]
++    return float(v),values.get(up,v) if up else float(v)
++def contrasts(values,intervals):
++    out={}
++    for name,coef in CONTRAST_COEFFICIENTS.items():
++        selected=[i for i,c in enumerate(coef) if c]
++        out[name]=math.fsum(coef[i]*values[i] for i in selected) if all(finite(values[i]) for i in selected) else None
++        if all(all(finite(v) for v in intervals[i]) for i in selected):
++            out[name+"_lower"]=sum(coef[i]*(intervals[i][0] if coef[i]>0 else intervals[i][1]) for i in selected)
++            out[name+"_upper"]=sum(coef[i]*(intervals[i][1] if coef[i]>0 else intervals[i][0]) for i in selected)
++        else:out[name+"_lower"]=out[name+"_upper"]=None
++    return out
++def summarize(out):
++    out=folder(out);rows=read_json(out/"evaluation/per_output.json")["rows"]
++    by={(r["model_label"],r["precision"],r["readout"],r["request_id"]):r for r in rows}
++    if set(by)!=expected_keys():raise ValueError("Summary requires32 fixed records")
++    metrics=sorted({k for r in rows for k,v in r["metrics"].items() if finite(v) or v is None});flat=[]
++    for r in rows:
++        record={k:r.get(k) for k in REQUIRED_REQUEST+("label","model_label","precision","readout","status")}
++        record.update(cache=r.get("cache"),scientific_scores_recomputed=r.get("scientific_scores_recomputed"),
++            scoring_seconds=r.get("scoring_seconds"),cpu_adapter_seconds=r.get("cpu_adapter_seconds"),
++            reference_completion_scope="REFERENCE_COMPLETION_DIAGNOSTICS" if r["panel"]=="P1" else "NO_SOURCE_GT",
++            human_usability="NOT_RUN",**r["metrics"])
++        record.update({k:r.get("contracts",{}).get(k) for k in CONTRACT_NAMES})
++        for k,v in r.get("metric_status",{}).items():record[k+"_status"]=v
++        flat.append(record)
++    write_csv(out/"rollout_metrics.csv",flat);paired=[]
++    for model,rid in itertools.product(MODELS,REQUEST_IDS):
++        qq=[by[model,p,s,rid] for p,s in QUAD]
++        for metric in metrics:
++            vals=[x["metrics"].get(metric) for x in qq];ints=[metric_interval(metric,x["metrics"]) for x in qq];r=qq[0]
++            spec=registry.describe(metric,r["panel"],r["N"],r["K"],r.get("L0") or 1)
++            row=dict(model_label=model,request_id=rid,panel=r["panel"],condition_id=r["condition_id"],parent_id=r["parent_id"],
++                candidate=r["candidate"],metric=metric,BF16_ON=vals[0],BF16_OFF=vals[1],FP32_ON=vals[2],FP32_OFF=vals[3],
++                finite_cells=sum(finite(v) for v in vals),expected_cells=4,
++                status="COMPLETE" if all(finite(v) for v in vals) else "NA_NOT_APPLICABLE" if r["panel"]=="P2" and spec.get("requires_GT") else "INCOMPLETE",
++                interval_basis="global reference-eligibility bounds" if metric=="ExposedRetain" else "original metric bounds or point values",
++                interpretation="Descriptive final-rollout four-cell contrast; independent trajectories, no same-state derivative.",**contrasts(vals,ints))
++            for tag,x in zip(("BF16_ON","BF16_OFF","FP32_ON","FP32_OFF"),qq):row[tag+"_status"]=x.get("metric_status",{}).get(metric,x["status"])
++            paired.append(row)
++    write_csv(out/"paired_rollout_comparisons.csv",paired)
++    grouped=defaultdict(list)
++    for row in paired:grouped[row["model_label"],row["panel"],row["metric"]].append(row)
++    agg=[]
++    for (model,panel,metric),rr in grouped.items():
++        assert len(rr)==2
++        for name in CONTRAST_COEFFICIENTS:
++            vv=[x[name] for x in rr if finite(x[name])];lo=[x[name+"_lower"] for x in rr if finite(x[name+"_lower"])];hi=[x[name+"_upper"] for x in rr if finite(x[name+"_upper"])]
++            agg.append(dict(model_label=model,panel=panel,metric=metric,contrast=name,expected_conditions=2,
++                finite_conditions=len(vv),NA_conditions=2-len(vv),mean=statistics.mean(vv) if len(vv)==2 else None,
++                observed_mean=statistics.mean(vv) if vv else None,minimum=min(vv) if vv else None,maximum=max(vv) if vv else None,
++                positive_conditions=sum(v>0 for v in vv),negative_conditions=sum(v<0 for v in vv),zero_conditions=sum(v==0 for v in vv),
++                mean_lower=statistics.mean(lo) if len(lo)==2 else None,mean_upper=statistics.mean(hi) if len(hi)==2 else None,
++                meaning="Condition-equal; panel scales not pooled; sign not automatic quality judgment."))
++    write_csv(out/"evaluation/paired_panel_summary.csv",agg)
++    write_csv(out/"evaluation/metric_registry_results.csv",[v for r in rows if r.get("L0") for v in registry.records(r)])
++    summary=dict(status="COMPLETE" if all(r["status"]=="PASS" for r in rows) else "INCOMPLETE",
++        expected_outputs=32,scored=sum(r["status"]=="PASS" for r in rows),
++        verified_cached_outputs=sum(r.get("cache")=="VERIFIED_PREVIOUS_BF16_ON" for r in rows),
++        new_scored_outputs=sum(r.get("scientific_scores_recomputed")==1 for r in rows),paired_metric_rows=len(paired),
++        actual_conditions=4,P1_parents=2,P2_handcrafted_conditions=2,candidates_per_model_condition=1,
++        diversity="NOT_APPLICABLE_ONE_NOISE",human_usability="NOT_RUN",
++        references="P1 S/E/source distances are reference completion diagnostics, not unique-target gates. P2 has no source GT.",
++        source_hashes={n:digest(out/n) for n in ["rollout_metrics.csv","paired_rollout_comparisons.csv","evaluation/paired_panel_summary.csv"]})
++    write_json(out/"evaluation/summary.json",summary);return summary
++def score(out,workers=2,artifacts=None):
++    out=folder(out);art=artifacts_for(out,artifacts)
++    if not (out/"evaluation/baseline_cache_manifest.json").exists():prepare(out,art)
++    if read_json(out/"evaluation/evaluation_source_map.json")!=source_map():raise ValueError("Frozen scoring sources differ")
++    manifest=read_manifest(out);receipt=read_json(out/"evaluation/baseline_cache_manifest.json")
++    entries={(e["model_label"],e["request_id"]):e for e in receipt["entries"]}
++    try:
++        import psutil
++        available=psutil.virtual_memory().available;cores=psutil.cpu_count()
++    except ImportError:available=None;cores=os.cpu_count()
++    workers=max(1,min(int(workers),2))
++    if available is not None and available<4*1024**3:workers=1
++    args=[(r,str(out),entries[r["model_label"],r["request_id"]] if r["precision"]=="LEGACY_BF16" and r["readout"]=="ON" else None) for r in manifest]
++    tick=time.perf_counter()
++    if workers==1:results=[_worker(a) for a in args]
++    else:
++        with ProcessPoolExecutor(max_workers=workers) as pool:results=list(pool.map(_worker,args))
++    write_json(out/"evaluation/per_output.json",dict(schema=VERSION,rows=results));summary=summarize(out)
++    run=dict(status=summary["status"],workers=workers,threads_per_worker=2,available_RAM_before=available,cpu_cores=cores,
++        wall_seconds=time.perf_counter()-tick,model_calls=0,expected_outputs=32,baseline_scores_recomputed=0,
++        diversity_computed=False,source_manifest_sha256=digest(out/"outputs/manifest.json"),summary=summary)
++    p=out/"evaluation/execution.json";write_json(out/"evaluation/last_resume.json" if p.exists() else p,run)
++    print(json.dumps(run));return run
++def page_four_cells(p,columns,bounds,title):
++    """Original rendering geometry/material/views, transposed to four-cell columns."""
++    import matplotlib
++    matplotlib.use("Agg")
++    import matplotlib.pyplot as plt
++    from mpl_toolkits.mplot3d.art3d import Poly3DCollection,Line3DCollection
++    n=len(columns);fig=plt.figure(figsize=(3*n,14.5),dpi=110,facecolor="white")
++    lo,hi=np.asarray(bounds[0]),np.asarray(bounds[1]);center=(lo+hi)/2;span=max(float(np.max(hi-lo)),.01)*1.08
++    for i,(view,elev,azim) in enumerate(ren.VIEWS):
++        for j,(label,C,F) in enumerate(columns):
++            ax=fig.add_subplot(5,n,i*n+j+1,projection="3d");tri=np.concatenate([F,C])
++            colors=["#e7994c"]*len(F)+["#3a82c5"]*len(C);displayed=np.asarray(tri)[:,:,(0,2,1)]
++            if view=="wire":
++                edges=displayed[:,((0,1),(1,2),(2,0)),:].reshape(-1,2,3)
++                artist=Line3DCollection(edges,colors=np.repeat(colors,3),linewidths=.38)
++            else:artist=Poly3DCollection(displayed,facecolors=colors,edgecolors="#444444",linewidths=.10,alpha=1)
++            ax.add_collection3d(artist);cc=center[(0,2,1),]
++            ax.set_xlim(cc[0]-span/2,cc[0]+span/2);ax.set_ylim(cc[1]-span/2,cc[1]+span/2);ax.set_zlim(cc[2]-span/2,cc[2]+span/2)
++            ax.set_box_aspect((1,1,1));ax.view_init(elev=elev,azim=azim);ax.set_axis_off();ax.set_title(label+" / "+view,fontsize=8,pad=0)
++    fig.suptitle(title,fontsize=12,y=.994);fig.subplots_adjust(left=0,right=1,top=.95,bottom=0,wspace=0,hspace=.02)
++    p.parent.mkdir(parents=True,exist_ok=True);fig.savefig(p,facecolor="white");plt.close(fig)
++def render(out,artifacts=None):
++    out=folder(out);art=artifacts_for(out,artifacts);rows=read_manifest(out)
++    if any(r.get("status") in ("FAILED","BLOCKED","NONFINITE","INVALID_OUTPUT") for r in rows):raise ValueError("Failed outputs: cannot silently reduce gallery denominator")
++    gallery=out/"gallery";gallery.mkdir(exist_ok=True);old=read_json(art/"gallery/camera_manifest.json")
++    identity=dict(source_manifest_sha256=digest(out/"outputs/manifest.json"),original_camera_sha256=digest(art/"gallery/camera_manifest.json"),
++        adapter_sha256=digest(__file__),renderer_sha256=digest(ren.__file__))
++    mp=gallery/"gallery_manifest.json"
++    if mp.exists():
++        prior=read_json(mp)
++        if prior.get("identity")!=identity:raise ValueError("Completed gallery identity changed")
++        for x in prior["pages"]:
++            for kind in ("blind","reference"):
++                if kind+"_page" in x and digest(x[kind+"_page"])!=x[kind+"_sha256"]:raise ValueError("Completed image changed")
++        return prior
++    tick=time.perf_counter();camera={};pages=[]
++    for rid in REQUEST_IDS:
++        rr=[r for r in rows if r["request_id"]==rid];assert len(rr)==8
++        first=rr[0];meta=read_json(first["reference_path"]);condition=arrays(meta["condition_path"]);C=condition["C"];K=first["K"];loaded={}
++        for r in rr:
++            t=ren._triangles(r)
++            if t[:K].tobytes()!=C.tobytes() or not np.isfinite(t).all():raise ValueError("Render raw/C contract")
++            loaded[r["label"]]=t
++        geometry=[C]+list(loaded.values())+([condition["GT_full"]] if first["panel"]=="P1" else [])
++        pts=np.concatenate([x.reshape(-1,3) for x in geometry]);newlo,newhi=pts.min(0),pts.max(0)
++        prev=np.asarray(old["conditions"][first["condition_id"]]["bounds"]);lo=np.minimum(prev[0],newlo);hi=np.maximum(prev[1],newhi);bounds=(lo,hi)
++        camera[rid]=dict(bounds=[lo.tolist(),hi.tolist()],old_bounds=prev.tolist(),expanded=bool(np.any(newlo<prev[0]) or np.any(newhi>prev[1])),
++            scope="Both checkpoints and all4 cells; P1 source included; no per-output scaling/centering",views=ren.VIEWS,
++            raw_hashes={r["label"]:r["raw_sha256"] for r in rr})
++        for model in MODELS:
++            cols=[("Input C",C,np.empty((0,3,3),np.float32))]
++            for precision,switch in QUAD:
++                t=loaded[full_label(model,precision,switch)];cols.append((precision+"\n"+switch,C,t[K:]))
++            bp=gallery/"blind"/(model+"__"+rid+".png")
++            page_four_cells(bp,cols,bounds,model+" | "+rid+" | C blue/free orange | source hidden")
++            pg=dict(model_label=model,request_id=rid,panel=first["panel"],condition_id=first["condition_id"],
++                labels=[full_label(model,p,s) for p,s in QUAD],candidate=first["candidate"],blind_page=str(bp),blind_sha256=digest(bp),
++                view_scope=[x[0] for x in ren.VIEWS],AI_VISUAL_REVIEW="PENDING",human_usability="NOT_RUN")
++            if first["panel"]=="P1":
++                rp=gallery/"reference"/(model+"__"+rid+".png")
++                page_four_cells(rp,cols+[("One source\ncompletion",C,condition["GT_free"])],bounds,
++                    model+" | "+rid+" | one source completion, not the unique valid target")
++                pg.update(reference_page=str(rp),reference_sha256=digest(rp))
++            pages.append(pg)
++    write_json(gallery/"camera_manifest.json",dict(status="FINAL_COMPLETE",identity=identity,requests=camera))
++    result=dict(status="FINAL_COMPLETE",identity=identity,pages=pages,output_count=32,request_count=4,blind_pages=8,reference_pages=4,
++        wall_seconds=time.perf_counter()-tick,workers=1,model_calls=0,mesh_modified=False,AI_VISUAL_REVIEW="PENDING",human_usability="NOT_RUN")
++    write_json(mp,result)
++    lines=["<!doctype html><html><meta charset='utf-8'><title>Precision/readout four-cell gallery</title>",
++        "<h1>Precision/readout:32 raw outputs</h1><p>Four conditions,2 checkpoints,1 Gaussian per condition. C blue/free orange. Four views+wire; no repair. Rendering is not review.</p>",
++        "<h2>1. View without source completion</h2>"]
++    for pg in pages:
++        link=resolve(pg["blind_page"]).relative_to(out).as_posix()
++        lines.append("<p><a href='"+html.escape(link)+"'>"+html.escape(pg["model_label"]+" "+pg["request_id"])+"</a></p>")
++    lines.append("<h2>2. Source reference (P1 only; not a unique target)</h2>")
++    for pg in pages:
++        if "reference_page" in pg:
++            link=resolve(pg["reference_page"]).relative_to(out).as_posix()
++            lines.append("<p><a href='"+html.escape(link)+"'>"+html.escape(pg["model_label"]+" "+pg["request_id"])+"</a></p>")
++    lines.append("<p>AI_VISUAL_REVIEW=PENDING until separate actual review receipts. Human usability=NOT_RUN.</p></html>")
++    (out/"OPEN_GALLERY.html").write_text("\n".join(lines),encoding="utf8");return result
++def verify(out):
++    out=folder(out);read_manifest(out);sm=read_json(out/"evaluation/summary.json")
++    if sm["status"]!="COMPLETE":raise ValueError("Incomplete scoring")
++    po=read_json(out/"evaluation/per_output.json")["rows"];assert len(po)==32 and sum(x.get("cache")=="VERIFIED_PREVIOUS_BF16_ON" for x in po)==8
++    for row in po:
++        assert row["status"]=="PASS"
++        for p,h in row.get("files",{}).items():
++            if digest(p)!=h:raise ValueError("Score witness changed")
++    g=read_json(out/"gallery/gallery_manifest.json");assert g["status"]=="FINAL_COMPLETE" and len(g["pages"])==8
++    for pg in g["pages"]:
++        for kind in ("blind","reference"):
++            if kind+"_page" in pg and digest(pg[kind+"_page"])!=pg[kind+"_sha256"]:raise ValueError("Image changed")
++    result=dict(status="PASS",outputs=32,cached_scores=8,new_scores=24,gallery_outputs=32,
++        actual_review_status="See separate visual_review.csv; rendering is not review.",source_map=source_map(),
++        files={n:digest(out/n) for n in ["rollout_metrics.csv","paired_rollout_comparisons.csv","OPEN_GALLERY.html"]})
++    write_json(out/"evaluation/verify.json",result);return result
++def self_test(out):
++    out=folder(out);v=[1.,2.,4.,8.];d=contrasts(v,[(x,x) for x in v])
++    assert d["branch_BF"]==-1 and d["branch_FP"]==-4 and d["interaction"]==-3
++    assert d["precision_ON"]==3 and d["precision_OFF"]==6
++    d=contrasts([None,2.,4.,8.],[(None,None),(2.,2.),(4.,4.),(8.,8.)])
++    assert d["branch_BF"] is None and d["branch_FP"]==-4 and d["precision_OFF"]==6
++    q=contrasts([1.,2.,4.,8.],[(0.,1.),(1.,3.),(3.,5.),(7.,9.)])
++    assert q["interaction_lower"]==-6 and q["interaction_upper"]==1
++    assert len(expected_keys())==32 and "torch" not in sys.modules
++    result=dict(status="PASS",tests=["four_cell_algebra","NA_not_zero","conservative_intervals","fixed32","no_torch_import"],
++        adapter_sha256=digest(__file__),model_calls=0,geometry_rescoring=0)
++    write_json(out/"evaluation/cpu_interface_test.json",result);print(json.dumps(result));return result
++def main():
++    p=argparse.ArgumentParser(description=__doc__);p.add_argument("--stage",choices=["prepare","score","render","summarize","verify","self-test"],required=True)
++    p.add_argument("--out",default=DEFAULT_OUT);p.add_argument("--artifacts");p.add_argument("--workers",type=int,default=2);a=p.parse_args()
++    if a.stage=="prepare":r=prepare(a.out,a.artifacts)
++    elif a.stage=="score":r=score(a.out,a.workers,a.artifacts)
++    elif a.stage=="render":r=render(a.out,a.artifacts)
++    elif a.stage=="summarize":r=summarize(a.out)
++    elif a.stage=="verify":r=verify(a.out)
++    else:r=self_test(a.out)
++    if a.stage not in ("prepare","score","self-test"):print(json.dumps(r))
++    return 0 if r.get("status") in ("PASS","COMPLETE","FINAL_COMPLETE") else 2
++if __name__=="__main__":sys.exit(main())
+--- /dev/null
++++ b/tools/run_readout_precision.py
+@@ -0,0 +1,351 @@
++"""Bounded READOUT_PRECISION_PATH_AND_ROLLOUT_V1, external artifacts only."""
++from __future__ import annotations
++import os
++os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG',':4096:8')
++os.environ.setdefault('OMP_NUM_THREADS','4')
++from pathlib import Path
++import argparse,contextlib,csv,gc,hashlib,json,subprocess,time,threading,sys,difflib
++import numpy as np
++from meshflow_control import runtime
++from meshflow_control.artifacts import atomic_json as _atomic_json,file_sha256
++from meshflow_control.accounting import resource_snapshot
++from meshflow_control.checkpoints import load_checkpoint,state_hash,rng_state
++from meshflow_control.mesh_io import write_ply,read_ply
++import torch
++torch.set_num_threads(4)
++REPO=Path(__file__).resolve().parents[1]
++ART=Path('/mnt/e/MeshFlow-Control-artifacts')
++OLD=ART/'followups/readout_effective_injection_v1'
++ROOT=ART/'followups/readout_precision_path_v1'
++PRECISIONS=('LEGACY_BF16','FP32_REFERENCE')
++MODES=('on','off');LAYERS=(3,6,9,12)
++
++def atomic_json(p,value):
++    Path(p).parent.mkdir(parents=True,exist_ok=True);return _atomic_json(p,value)
++def read(p):return json.loads(Path(p).read_text(encoding='utf-8-sig'))
++def ah(a):return hashlib.sha256(np.ascontiguousarray(a).tobytes()).hexdigest()
++def same(a,b):return a.dtype==b.dtype and a.shape==b.shape and a.tobytes()==b.tobytes()
++def cid(label,req,step,mode):return f'{label}__{req}__s{step:02d}__{mode}'
++def rng_hash():
++    v=rng_state();h=hashlib.sha256()
++    for k in ('python','numpy'):h.update(repr(v[k]).encode())
++    h.update(v['torch_cpu'].numpy().tobytes())
++    for x in v['torch_cuda']:h.update(x.cpu().numpy().tobytes())
++    return h.hexdigest()
++def save_npz(p,**arrays):
++    p=Path(p);p.parent.mkdir(parents=True,exist_ok=True);tmp=p.with_suffix('.partial')
++    with tmp.open('wb') as f:np.savez_compressed(f,**arrays);f.flush();os.fsync(f.fileno())
++    os.replace(tmp,p)
++def event(event_type,**kw):
++    p=ROOT/'budget/calls.jsonl';p.parent.mkdir(parents=True,exist_ok=True)
++    with p.open('a') as f:f.write(json.dumps(dict(event=event_type,time_unix=time.time(),**kw),allow_nan=False)+'\n');f.flush();os.fsync(f.fileno())
++def events():
++    p=ROOT/'budget/calls.jsonl';return [json.loads(x) for x in p.read_text().splitlines()] if p.exists() else []
++def budget_snapshot():
++    es=events();counts={k:sum(e['event']=='RESERVE' and e['kind']==k for e in es) for k in ('preflight','fixed','sampling')}
++    attempts=sum(e['event']=='ROLLOUT_START' for e in es)
++    returns=sum(e['event']=='RETURN' for e in es);commits=sum(e['event']=='COMMIT' for e in es)
++    errors=[e for e in es if e['event']=='ERROR']
++    occ=ROOT/'budget/gpu_occupancy.jsonl';orows=[json.loads(x) for x in occ.read_text().splitlines()] if occ.exists() else []
++    used=sum(x['seconds'] for x in orows if x['event']=='END')
++    return dict(actual_forwards=sum(counts.values()),by_kind=counts,returned_forwards=returns,committed_forwards=commits,
++        new_rollout_attempts=attempts,new_rollouts_complete=sum(e['event']=='ROLLOUT_COMPLETE' for e in es),cached_rollouts=8,cached_fixed_cells=48,
++        backward=0,optimizer_updates=0,new_gaussians=0,new_conditions=0,errors=errors,gpu_completed_owner_seconds=used,
++        limits=dict(total_forwards=1664,fixed=48,preflight=16,sampling=1600,rollout_attempts=32,gpu_seconds=2700))
++def persist_budget():atomic_json(ROOT/'budget.json',budget_snapshot())
++def validate_ledger():
++    es=events();groups={k:{} for k in ('RESERVE','RETURN','COMMIT')}
++    for i,e in enumerate(es):
++        if e['event'] not in groups:continue
++        group=groups[e['event']]
++        if e['id'] in group:raise RuntimeError('Duplicate ledger cell '+e['id'])
++        group[e['id']]=(i,e)
++    for ident,(i,e) in groups['RESERVE'].items():
++        if ident not in groups['RETURN'] or ident not in groups['COMMIT']:raise RuntimeError('Unclosed attempt; preserve and recover returned arrays, never silent retry: '+ident)
++        assert i<groups['RETURN'][ident][0]<groups['COMMIT'][ident][0]
++        receipt=read(groups['COMMIT'][ident][1]['receipt_path'])
++        assert receipt['call_id']==ident and receipt['status']=='COMPLETE'
++        assert file_sha256(receipt['array_path'])==receipt['array_sha256']
++    assert set(groups['RESERVE'])==set(groups['RETURN'])==set(groups['COMMIT'])
++    return set(groups['COMMIT'])
++def old_cell(label,req,step,mode):return OLD/'cells'/(cid(label,req,step,mode)+'.json')
++def check_sources(plan,weights=True):
++    for p,h in plan['protected_files'].items():
++        if not weights and p.endswith('.pt'):continue
++        if file_sha256(p)!=h:raise RuntimeError('Protected file changed '+p)
++def input_arrays(row):
++    assert file_sha256(row['input_path'])==row['input_sha256']
++    with np.load(row['input_path'],allow_pickle=False) as z:d={k:z[k].copy() for k in z.files}
++    N,K=row['N'],row['K'];assert int(d['N'])==N and int(d['K'])==K
++    assert d['known_mask'].dtype==d['valid_mask'].dtype==bool
++    assert same(d['known_mask'],np.arange(N)<K) and bool(d['valid_mask'].all())
++    assert d['z'].dtype==d['C'].dtype==np.float32 and d['z'].shape==(1,N,9)
++    return d
++
++def prepare():
++    ROOT.mkdir(parents=True,exist_ok=True)
++    if (ROOT/'plan.json').exists() and (ROOT/'outputs/manifest.json').exists():
++        p=read(ROOT/'plan.json');check_sources(p);print('Prepared identity verified; no model calls');return
++    old=read(OLD/'plan.json');assert old['labels']==['B1000','C1000']
++    allrows=read(ART/'outputs/all_completed.json')['rows'];reqs=old['requests'];ids=[x['request_id'] for x in reqs]
++    rows=[next(r for r in allrows if r['label']==l and r['request_id']==q) for l in old['labels'] for q in ids]
++    protected={p:h for p,h in old['protected_files'].items() if not p.startswith(str(REPO)+'/')}
++    source_before=[];before_dir=ROOT/'source_before';before_dir.mkdir(exist_ok=True)
++    for row in csv.DictReader((ART/'audit/final_source_hashes.csv').open(encoding='utf-8-sig')):
++        source_before.append(row);src=REPO/row['path'];dst=before_dir/row['path']
++        if not dst.exists():
++            assert file_sha256(src)==row['sha256'],str(src)
++            dst.parent.mkdir(parents=True,exist_ok=True);dst.write_bytes(src.read_bytes())
++        assert file_sha256(dst)==row['sha256']
++    atomic_json(ROOT/'source_before_manifest.json',dict(files=source_before))
++    git={}
++    for name,path in [('original',Path('/mnt/e/MeshFlow')),('control',REPO)]:
++        git[name]={cmd:subprocess.run(['git','-C',str(path)]+cmd.split(),capture_output=True,text=True).__dict__ for cmd in ['status --short','rev-parse HEAD']}
++        for row in git[name].values():row.pop('args',None)
++    atomic_json(ROOT/'git_before.json',git)
++    for name in ['plan.json','analysis/metric_definitions.json','analysis/layer_metrics.csv','analysis/prediction_pairs.csv','analysis/cell_audit.csv','analysis/summary.json','derived_layer_ratios.csv','B1000_integrity.json','C1000_integrity.json','run_check.py','analyze.py']:
++        p=OLD/name;protected[str(p)]=file_sha256(p)
++    fixed_cache=[]
++    for row in rows:
++        d=input_arrays(row);N,K=row['N'],row['K']
++        for k in ['raw_path','input_path','reference_path']:assert file_sha256(row[k])==row[k.replace('_path','_sha256')]
++        with np.load(row['raw_path'],allow_pickle=False) as z:
++            tr=z['trajectory'];raw=z['raw'];assert tr.shape==(51,N,9) and tr.dtype==np.float32
++            assert same(tr[-1],raw) and same(tr[0,K:],d['z'][0,K:])
++            assert all(x[:K].tobytes()==d['C'].tobytes() for x in tr)
++        for p in [Path(row['result_path']),Path(row['raw_path']).with_suffix('.ply'),Path(row['reference_path'])]:protected[str(p)]=file_sha256(p)
++        for s in old['steps']:
++            for mode in MODES:
++                jp=old_cell(row['label'],row['request_id'],s,mode);c=read(jp)
++                assert c['status']=='COMPLETE' and c['checkpoint_sha256']==row['checkpoint_sha256']
++                assert c['N']==N and c['K']==K and c['t']==s/50 and file_sha256(c['array_path'])==c['array_sha256']
++                with np.load(c['array_path'],allow_pickle=False) as z:
++                    assert same(z['state'][0],tr[s])
++                    if mode=='on':assert same(z['next_state'][0],tr[s+1]) and c['trajectory_replay_exact'] is True
++                protected[str(jp)]=file_sha256(jp);protected[c['array_path']]=c['array_sha256'];fixed_cache.append(dict(**c,receipt_path=str(jp)))
++    plan=dict(schema='READOUT_PRECISION_PATH_AND_ROLLOUT_V1',labels=old['labels'],requests=reqs,steps=[0,25,45],precisions=list(PRECISIONS),modes=list(MODES),layers=list(LAYERS),
++        checkpoints=old['checkpoints'],source_rows=rows,old_followup=str(OLD),fixed_cache=fixed_cache,
++        protected_files=protected,new_fixed_forwards=48,planned_preflight_forwards=12,preflight_cap=16,
++        planned_new_rollouts=24,cached_rollouts=8,sampling_cap=1600,total_forward_cap=1664,gpu_seconds_cap=2700,
++        worker_count=1,cpu_score_workers=2,cpu_threads_per_score=2,
++        fixture_requests=[ids[0],ids[2]],fixture_step=25,
++        full_layer_capture='B/C x first P1/P2 x t=.5 x four layers =16 FP32 layer arrays; remaining80 FP32 layer records statistics+hash only',
++        zero_norm='UNDEFINED; absolute norms/RMS retained; no clipping norm ratios',
++        local_replay='CPU same old BF16 h/r -> FP32 addition; not downstream model result',
++        preflight_order='4 legacy replay +8 zero-residual probes; 4 of48 planned FP32_OFF references evaluated within preflight and reused; remaining44 fixed calls only after gate PASS',
++        rollout_order='all eight caches plus 24 new independent Euler50; no quality-based early stop',
++        created_unix=time.time())
++    check_sources(plan);atomic_json(ROOT/'plan.json',plan)
++    atomic_json(ROOT/'checkpoint_and_input_manifest.json',dict(checkpoints=old['checkpoints'],rows=rows,old_fixed_cache=fixed_cache))
++    atomic_json(ROOT/'resources_prepare.json',resource_snapshot());persist_budget()
++    manifest=[]
++    for row in rows:
++        for precision,mode in [('LEGACY_BF16','ON'),('LEGACY_BF16','OFF'),('FP32_REFERENCE','ON'),('FP32_REFERENCE','OFF')]:
++            label=row['label']+'__'+precision+'__'+mode
++            if precision=='LEGACY_BF16' and mode=='ON':
++                manifest.append(dict(row,model_label=row['label'],label=label,precision=precision,readout=mode,generation_status='VERIFIED_CACHE',ply_path=str(Path(row['raw_path']).with_suffix('.ply'))))
++    atomic_json(ROOT/'outputs/manifest.json',dict(rows=manifest))
++    print(json.dumps(dict(status='PREPARED',cached_fixed=len(fixed_cache),cached_rollouts=len(manifest),planned_new_forwards=1260)))
++
++class Capture:
++    def __init__(self,save_full):self.full=save_full;self.arrays={};self.metrics=[];self.dtypes=[]
++    def __call__(self,record):
++        if record['site']!='readout_addition':return
++        from readout_precision_analysis import layer_numbers
++        layer=record['layer'];values={k:record[k].detach().float().cpu().numpy().copy() for k in ('before','residual','cast','after')}
++        self.metrics.append(dict(layer=layer,hidden_dtype=str(record['before'].dtype),residual_dtype=str(record['residual'].dtype),cast_dtype=str(record['cast'].dtype),output_dtype=str(record['after'].dtype),
++            array_hashes={k:ah(v) for k,v in values.items()},arrays_saved=self.full,**layer_numbers(**values)))
++        if self.full:
++            self.arrays.update({f'l{layer}_{k}':v for k,v in values.items()})
++
++class DtypeProbe:
++    def __init__(self,model):self.model=model;self.rows=[];self.handles=[]
++    def tensors(self,x):
++        if isinstance(x,torch.Tensor):return [x]
++        if isinstance(x,(tuple,list)):return [v for a in x for v in self.tensors(a)]
++        if isinstance(x,dict):return [v for a in x.values() for v in self.tensors(a)]
++        return []
++    def note(self,name,inp,out):
++        f=lambda v:sorted({str(t.dtype) for t in self.tensors(v) if t.is_floating_point()})
++        self.rows.append(dict(site=name,input_float_dtypes=f(inp),output_float_dtypes=f(out)))
++    def __enter__(self):
++        for name,module in self.model.named_modules():
++            if name and (isinstance(module,(torch.nn.Linear,torch.nn.LayerNorm,torch.nn.Embedding)) or any(s in name for s in ['norm','x_embedder','t_embedder','y_embedder','attn','context_encoder','readouts','final_layer'])):
++                self.handles.append(module.register_forward_hook(lambda m,i,o,n=name:self.note(n,i,o)))
++        return self
++    def observer(self,record):
++        self.note('native_'+str(record['site'])+'_'+str(record.get('layer','')),record,record)
++    def __exit__(self,*exc):
++        for h in self.handles:h.remove()
++    def assert_precision(self,p):
++        if p=='FP32_REFERENCE':
++            bad=[r for r in self.rows if any(d!='torch.float32' for d in r['input_float_dtypes']+r['output_float_dtypes'])]
++            assert not bad,str(bad[:3])
++        assert self.rows
++
++def reserve_call(ident,kind):
++    b=budget_snapshot();assert b['actual_forwards']<1664
++    assert b['by_kind'][kind]<{'fixed':48,'preflight':16,'sampling':1600}[kind]
++    runtime.check_gpu_deadline();event('RESERVE',id=ident,kind=kind)
++def call_forward(model,x,t,y,valid,known,*,ident,kind,precision,mode,path,capture_full=False,inspect_dtype=False,metadata=None):
++    from meshflow_control.precision import precision_execution
++    path=Path(path);jp=path.with_suffix('.json')
++    if jp.exists():
++        c=read(jp);assert c['status']=='COMPLETE' and c['call_id']==ident and file_sha256(c['array_path'])==c['array_sha256'];return c
++    reserve_call(ident,kind);tick=time.perf_counter();capture=Capture(capture_full) if kind=='fixed' and mode=='on' else None
++    probe=DtypeProbe(model) if inspect_dtype else None
++    try:
++        with torch.no_grad(),precision_execution(model,precision=precision,readout=mode,coordinates=(x,t),capture=capture), (probe if probe else contextlib.nullcontext()):
++            velocity=model(x,t,y,valid,known,observer=probe.observer if probe else None)
++        torch.cuda.synchronize();forward_seconds=time.perf_counter()-tick
++        expected=torch.bfloat16 if precision=='LEGACY_BF16' else torch.float32
++        assert velocity.dtype==expected and velocity.shape==x.shape and bool(torch.isfinite(velocity).all())
++        if probe:probe.assert_precision(precision)
++        K=int(known[0].sum());nxt=x.clone();nxt[:,K:]=x[:,K:]+velocity.float()[:,K:]*(1/50);nxt[:,:K]=x[:,:K]
++        arrays=dict(velocity=velocity.float().cpu().numpy().copy(),state=x.cpu().numpy().copy(),next_state=nxt.cpu().numpy().copy())
++        assert same(arrays['next_state'][:,:K],arrays['state'][:,:K]) and np.isfinite(arrays['next_state']).all()
++        if capture:arrays.update(capture.arrays);assert [m['layer'] for m in capture.metrics]==list(LAYERS)
++        event('RETURN',id=ident,kind=kind,seconds=forward_seconds)
++        save_npz(path,**arrays)
++        c=dict(call_id=ident,status='COMPLETE',precision=precision,mode=mode,array_path=str(path),array_sha256=file_sha256(path),
++            state_sha256=ah(arrays['state']),next_state_sha256=ah(arrays['next_state']),velocity_dtype=str(velocity.dtype),
++            layer_metrics=capture.metrics if capture else [],dtype_records=probe.rows if probe else [],seconds=forward_seconds,**(metadata or {}))
++        atomic_json(jp,c);event('COMMIT',id=ident,kind=kind,receipt_path=str(jp));persist_budget();return c
++    except BaseException as ex:event('ERROR',id=ident,kind=kind,error=repr(ex));persist_budget();raise
++
++def frozen_state(row,step):
++    d=input_arrays(row)
++    with np.load(row['raw_path'],allow_pickle=False) as z:state=z['trajectory'][step:step+1].copy()
++    return tensors(d,state,step)
++def tensors(d,state,step):
++    return (torch.from_numpy(state).cuda(),torch.full((1,),step/50,dtype=torch.float32,device='cuda'),
++        torch.tensor([int(d['N'])],dtype=torch.long,device='cuda'),torch.from_numpy(d['valid_mask'][None].copy()).cuda(),torch.from_numpy(d['known_mask'][None].copy()).cuda())
++def metadata(row,step):return {k:row[k] for k in ('label','request_id','panel','N','K','checkpoint_sha256','input_sha256')}|dict(step=step,t=step/50,cell_id=cid(row['label'],row['request_id'],step,'off'))
++def fixed_call(model,row,step,mode,inspect=False):
++    ident=cid(row['label'],row['request_id'],step,mode);meta=metadata(row,step);meta['cell_id']=ident
++    full=mode=='on' and step==25 and row['request_id'] in read(ROOT/'plan.json')['fixture_requests']
++    return call_forward(model,*frozen_state(row,step),ident='fixed__'+ident,kind='fixed',precision='FP32_REFERENCE',mode=mode,
++        path=ROOT/'fixed/cells'/(ident+'.npz'),capture_full=full,inspect_dtype=inspect or full,metadata=meta)
++def extract(c,key='velocity'):
++    with np.load(c['array_path'],allow_pickle=False) as z:return z[key].copy()
++def monitor_loop(stop,stage):
++    while not stop.is_set():
++        snap=resource_snapshot();snap['stage']=stage
++        with (ROOT/'resource_monitor.jsonl').open('a') as f:f.write(json.dumps(snap)+'\n')
++        stop.wait(2)
++def sources_freeze():
++    paths=[REPO/r['path'] for r in read(ROOT/'source_before_manifest.json')['files']]
++    paths += [p for p in [REPO/'src/meshflow_control/precision.py',Path(__file__),REPO/'tools/readout_precision_analysis.py'] if p not in paths]
++    current={str(p):file_sha256(p) for p in paths}
++    p=ROOT/'execution_source_hashes.json'
++    if p.exists():assert read(p)==current,'Executed sources changed; explicit version recovery required'
++    else:atomic_json(p,current)
++def run_gpu(stage):
++    plan=read(ROOT/'plan.json');validate_ledger();check_sources(plan);sources_freeze()
++    if stage!='preflight':assert read(ROOT/'preflight/status.json')['status']=='PASS'
++    if stage=='preflight' and (ROOT/'preflight/status.json').exists():assert read(ROOT/'preflight/status.json')['status']=='PASS';print('Preflight PASS reused; zero forwards');return
++    if stage=='fixed-state' and len(list((ROOT/'fixed/cells').glob('*.json')))==48:print('48 fixed cells verified and reused; zero forwards');return
++    if stage=='rollout' and len(read(ROOT/'outputs/manifest.json')['rows'])==32:print('32 outputs reused; zero forwards');return
++    used=budget_snapshot()['gpu_completed_owner_seconds'];assert used<2700
++    stop=threading.Event();thread=None;stage_tick=time.perf_counter();checks=[]
++    try:
++        with runtime.gpu_worker(ROOT/'budget',stage):
++            runtime._GPU_DEADLINE=min(runtime._GPU_DEADLINE,time.monotonic()+2700-used)
++            thread=threading.Thread(target=monitor_loop,args=(stop,stage),daemon=True);thread.start()
++            for label in plan['labels']:
++                rs=[r for r in plan['source_rows'] if r['label']==label]
++                snap=resource_snapshot();atomic_json(ROOT/('resources_'+stage+'_'+label+'.json'),snap)
++                line=snap['gpu']['stdout'].strip().splitlines()[1].split(',');assert float(line[3].split()[0])>=max(2048,.15*float(line[1].split()[0]))
++                load_tick=time.perf_counter();model,opt,payload=load_checkpoint(plan['checkpoints'][label]['path'],device='cuda',trainable=False)
++                assert opt is None and payload['pilot_step']==1000 and model.readout_mode=={'B1000':'mixed','C1000':'clean'}[label]
++                expected=payload['model_state_sha256'];del payload
++                before=state_hash(model.state_dict());assert before==expected;before_rng=rng_hash();torch.cuda.reset_peak_memory_stats()
++                event('MODEL_LOAD',stage=stage,label=label,seconds=time.perf_counter()-load_tick)
++                if stage=='preflight':
++                    for row in rs:
++                        if row['request_id'] not in plan['fixture_requests']:continue
++                        stem=label+'__'+row['request_id'];meta=metadata(row,25)
++                        c=call_forward(model,*frozen_state(row,25),ident='preflight__replay__'+stem,kind='preflight',precision='LEGACY_BF16',mode='on',path=ROOT/'preflight/cells'/('replay__'+stem+'.npz'),inspect_dtype=True,metadata=meta)
++                        previous=read(old_cell(label,row['request_id'],25,'on'));assert same(extract(c),extract(previous))
++                        checks.append(dict(check='legacy_replay',label=label,request_id=row['request_id'],bitwise=True))
++                        fp_off=fixed_call(model,row,25,'off',True)
++                        for precision in PRECISIONS:
++                            c=call_forward(model,*frozen_state(row,25),ident='preflight__zero__'+precision+'__'+stem,kind='preflight',precision=precision,mode='zero',path=ROOT/'preflight/cells'/('zero__'+precision+'__'+stem+'.npz'),inspect_dtype=True,metadata=meta)
++                            ref=read(old_cell(label,row['request_id'],25,'off')) if precision=='LEGACY_BF16' else fp_off
++                            assert same(extract(c),extract(ref))
++                            checks.append(dict(check='zero_matches_OFF',label=label,request_id=row['request_id'],precision=precision,bitwise=True))
++                elif stage=='fixed-state':
++                    for row in rs:
++                        for step in plan['steps']:
++                            for mode in MODES:fixed_call(model,row,step,mode)
++                        print(json.dumps(dict(stage=stage,label=label,request_id=row['request_id'],budget=budget_snapshot()['by_kind'])),flush=True)
++                else:
++                    for row in rs:
++                        for precision,mode in [('LEGACY_BF16','off'),('FP32_REFERENCE','on'),('FP32_REFERENCE','off')]:rollout(model,row,precision,mode)
++                after_rng=rng_hash();after=state_hash(model.state_dict());assert before==after and before_rng==after_rng
++                assert all(not p.requires_grad and p.grad is None for p in model.parameters())
++                atomic_json(ROOT/'integrity'/(stage+'__'+label+'.json'),dict(before=before,after=after,RNG_before=before_rng,RNG_after=after_rng,unchanged=True,optimizer=False,
++                    peak_allocated_bytes=torch.cuda.max_memory_allocated(),peak_reserved_bytes=torch.cuda.max_memory_reserved(),peak_scope='phase reset after load; not standalone process or training VRAM'))
++                del model;gc.collect();torch.cuda.empty_cache()
++                atomic_json(ROOT/('resources_after_'+stage+'_'+label+'.json'),resource_snapshot())
++        if stage=='preflight':atomic_json(ROOT/'preflight/status.json',dict(status='PASS',checks=checks,new_preflight_calls=12,planned_fixed_OFF_references=4))
++        atomic_json(ROOT/(stage+'_status.json'),dict(status='COMPLETE',seconds=time.perf_counter()-stage_tick))
++    except BaseException as ex:
++        atomic_json(ROOT/(stage+'_status.json'),dict(status='ERROR',error=repr(ex),seconds=time.perf_counter()-stage_tick));raise
++    finally:
++        stop.set()
++        if thread:thread.join(timeout=10)
++        persist_budget()
++    check_sources(plan);print(json.dumps(budget_snapshot()),flush=True)
++
++def rollout(model,row,precision,mode):
++    name=row['label']+'__'+precision+'__'+mode.upper();ident=name+'__'+row['request_id'];dst=ROOT/'outputs'/name/row['request_id'];rp=dst/'receipt.json'
++    if rp.exists():
++        r=read(rp);assert file_sha256(r['raw_path'])==r['raw_sha256'];return
++    dst.mkdir(parents=True,exist_ok=True);started=dst/'started.json'
++    if not started.exists():
++        assert budget_snapshot()['new_rollout_attempts']<32
++        event('ROLLOUT_START',id=ident,label=name,request_id=row['request_id'])
++        atomic_json(started,dict(label=name,checkpoint_sha256=row['checkpoint_sha256'],input_sha256=row['input_sha256']))
++    d=input_arrays(row);N,K=row['N'],row['K'];state=d['z'].copy();state[:,:K]=d['C'].reshape(1,K,9)
++    path=[state[0].copy()];velocities=[];stepchecks=[];timings=[];tick=time.perf_counter();torch.cuda.reset_peak_memory_stats()
++    for step in range(50):
++        callid='rollout__'+ident+'__s'+str(step).zfill(2)
++        c=call_forward(model,*tensors(d,state,step),ident=callid,kind='sampling',precision=precision,mode=mode,path=dst/'steps'/f's{step:02d}.npz',metadata=dict(label=row['label'],request_id=row['request_id'],step=step,t=step/50,N=N,K=K))
++        with np.load(c['array_path'],allow_pickle=False) as z:
++            assert same(z['state'],state);state=z['next_state'].copy();velocity=z['velocity'].copy()
++        assert state[0,:K].tobytes()==d['C'].tobytes() and np.isfinite(state).all()
++        velocities.append(velocity[0]);path.append(state[0].copy());timings.append(c['seconds'])
++        stepchecks.append(dict(step=step,finite=True,known_bitwise=True,N=N,K=K,state_sha256=ah(state),velocity_dtype=c['velocity_dtype']))
++    tr=np.stack(path);raw=state[0];v=np.stack(velocities)
++    save_npz(dst/'raw.npz',raw=raw,free=raw[K:].reshape(-1,3,3),C=d['C'],z=d['z'],trajectory=tr,velocities=v,
++        known_mask=d['known_mask'],valid_mask=d['valid_mask'],known_face_indices=np.arange(K,dtype=np.int64),source_corner_to_output_vertex=np.arange(3*K,dtype=np.int64))
++    plytemp=dst/'raw.partial.ply';write_ply(plytemp,raw);assert same(read_ply(plytemp)[0].reshape(N,9),raw);os.replace(plytemp,dst/'raw.ply')
++    audit=dict(nfe=50,known_all51_bitwise=True,known_coordinates_bitwise=True,NPZ_C_bitwise=True,PLY_C_bitwise=True,export_npz_ply_bitwise=True,
++        N=N,K=K,seconds=time.perf_counter()-tick,model_forward_seconds=sum(timings),precision=precision,readout=mode.upper(),prediction_parameterization='velocity; no extra conversion',
++        actual_velocity_dtype='torch.bfloat16' if precision=='LEGACY_BF16' else 'torch.float32',integration_dtype='torch.float32',seed=row['noise_seed'],frozen_gaussian_reused=True,
++        checkpoint_sha256=row['checkpoint_sha256'],input_sha256=row['input_sha256'],known_state_checks=51,step_checks=stepchecks,output_stage='RAW',postprocessing=None,
++        cuda_peak_allocated_bytes=torch.cuda.max_memory_allocated(),cuda_peak_reserved_bytes=torch.cuda.max_memory_reserved(),peak_scope='rollout with loaded weights and actual journaling; not pure deployment time',human_usability='NOT_RUN')
++    atomic_json(dst/'run.json',audit)
++    out=dict(row,model_label=row['label'],label=name,precision=precision,readout=mode.upper(),raw_path=str(dst/'raw.npz'),raw_sha256=file_sha256(dst/'raw.npz'),
++        result_path=str(dst/'run.json'),ply_path=str(dst/'raw.ply'),ply_sha256=file_sha256(dst/'raw.ply'),generation_status='GENERATED')
++    atomic_json(rp,out);event('ROLLOUT_COMPLETE',id=ident,receipt_path=str(rp),nfe=50,seconds=audit['seconds'])
++    m=read(ROOT/'outputs/manifest.json');m['rows']=[r for r in m['rows'] if (r['label'],r['request_id'])!=(name,row['request_id'])]+[out]
++    atomic_json(ROOT/'outputs/manifest.json',m);persist_budget();print(json.dumps(dict(stage='rollout',completed=budget_snapshot()['new_rollouts_complete'],label=name,request_id=row['request_id'])),flush=True)
++
++def main():
++    p=argparse.ArgumentParser();p.add_argument('--stage',required=True,choices=['prepare','preflight','fixed-state','rollout','score','render','summarize','verify']);a=p.parse_args()
++    if a.stage=='prepare':prepare()
++    elif a.stage in ('preflight','fixed-state','rollout'):run_gpu(a.stage)
++    elif a.stage in ('score','render'):
++        subprocess.run([sys.executable,'-B',str(REPO/'tools/readout_precision_evaluation.py'),'--stage',a.stage,'--out',str(ROOT)],check=True)
++    elif a.stage=='summarize':
++        subprocess.run([sys.executable,'-B',str(REPO/'tools/readout_precision_analysis.py'),'--root',str(ROOT)],check=True)
++        subprocess.run([sys.executable,'-B',str(REPO/'tools/readout_precision_evaluation.py'),'--stage','summarize','--out',str(ROOT)],check=True)
++    else:
++        validate_ledger();check_sources(read(ROOT/'plan.json'));sources_freeze();persist_budget()
++        b=budget_snapshot();assert b['by_kind']['fixed']==48 and b['by_kind']['sampling']==1200 and b['new_rollouts_complete']==24 and not b['errors']
++        assert len(read(ROOT/'outputs/manifest.json')['rows'])==32
++        atomic_json(ROOT/'verification.json',dict(status='PASS',budget=b,source_hashes_unchanged=True,model_calls_in_verification=0))
++        print(json.dumps(b))
++if __name__=='__main__':main()

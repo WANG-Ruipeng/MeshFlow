@@ -1,0 +1,7 @@
+# Source-winding export review package
+
+Open ../REPORT.md. All new per-output, per-source-face, per-corner witness, edge-constraint, component, pairing and full-threshold CSVs are included. See ../mesh_export_index.csv for all 108 mesh stages: 36 original MODEL_POST, 36 restored C, and 36 final free-oriented outputs, each in NPZ and PLY. The six original condition NPZ and six prepared parent NPZ are included for source lineage. No coordinates or connectivity were changed, and inherited geometric quality is not a new scoring result.
+
+Original MODEL_POST diagnostics and prior source-C orientation evidence are copied unchanged and separately indexed. All actual new and original solver/scorer source snapshots, diffs, hashes, registrations, receipts and independent audits are retained. Weights and large unrelated earlier assets remain local, listed with source path/hash in omitted_local_assets.json. No new images were requested or made.
+
+Standard ZIP DEFLATE. Source code.diff lists new files as additions; old_source.diff is empty after frozen hash verification. Archive hash/verification receipts are stored locally after assembly to avoid a self-hash cycle. Absolute references inside historical receipts are provenance, while mesh_export_index.csv supplies portable mesh paths.

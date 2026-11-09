@@ -1,0 +1,11 @@
+# Frozen panel and known-context identities
+
+Read `panel_identity_summary.json` first. This folder distinguishes known-context C from panel C (observed holdout).
+
+`c1b8c2f0c4f3cc43aff7c08b060f5ed6` is in A20 validation, but is absent from the entire B control panel and C holdout. B validation has four parents, all a subset of A20 validation eight; A20/B shared parents have different registered known patches. Do not attribute c1b width-response behavior from the B control curves.
+
+`panel_parent_membership.csv` lists panel membership. `known_contexts.csv` identifies every registered input, preserving unavailable rows, with input/C/mask/source-face hashes. `context_slots.json` maps 0-based model slots to source face IDs. `A20_B_context_comparison.csv` compares A20 with B alpha=1 for shared parents. All eight shared A20/B parents (four train and four validation) have equal model known-mask slots but different C byte hashes and different source-face sets at alpha=1. Model known-mask equality does not imply C geometry or source-face equality.
+
+All C arrays are float32 [K,3,3], known/valid masks bool [N]; model known slots are 0..K-1. Historical and current array hash headers differ and are explicitly named. Source-face IDs address retained source mesh rows; C holdout additionally includes original pre-cleanup face IDs from frozen patch records. Original input arrays were read only, with no regenerated geometry or scores.
+
+Original identity sources are `native_t1/runs/chair_domain_control_v1/panels.json`, `native_t1/runs/chair_moment_channel_v2/registration/evaluation_records.json`, and `native_t1/runs/control_mvp48_v1/data/patches.json`. `source_tables/` contains the exact V2 evaluation manifest and protocol plus extracted original A/B/C records and C holdout patch records. `sources.csv` gives original absolute/relative paths, file hashes and sizes. `package_files.json` hashes every file here except itself. Reproduce using `python -B build_panel_mapping.py --workspace /mnt/e/MeshFlow --out <new_folder>` in an environment with NumPy. Reproduction reads original paths; this packaged mapping and source extracts are self-contained for reviewing the UID/context identity conclusions.

@@ -1,0 +1,125 @@
+--- attempt1/training_diagnostics.py
++++ training_diagnostics.py
+@@ -17,7 +17,8 @@
+ 
+ import numpy as np
+ 
+-from .common import OUT, START_SHA, atomic_json, array_hash
++from .common import OUT, START_SHA, atomic_json
++from experiments.mf_h1_local0.chair_hybrid_coupling_v1.coupling import array_hash
+ 
+ 
+ def _sha(data):
+@@ -223,6 +224,7 @@
+         if completed:
+             check("completed_arm_exactly_1000", len(rows) == 1000 and marked["stream_state"]["batch_index"] == 1000 and marked["stream_state"]["sample_index"] == 8000, label)
+         previous_ot = Counter()
++        previous_pid = None
+         arm_steps, arm_gradients = [], []
+         for r in rows:
+             step = int(r["pilot_step"])
+@@ -248,11 +250,16 @@
+                     individual_free_MSE=s["FM_contribution"]*denominator/s["free_coordinates"],
+                     t_bin=min(4, int(s["t"]*5))))
+             counts = r["actual_OT_counts"]
++            # Restored HybridStream counters restart for each worker process.
++            counter_reset = previous_pid is not None and r['pid'] != previous_pid
++            if counter_reset:
++                previous_ot = Counter()
+             increments = {k: counts[k]-previous_ot[k] for k in counts}
+             check("OT_cumulative_counts_nonnegative", all(v >= 0 for v in increments.values()), scope)
+             statuses = Counter(s["ot_cache_status"] for s in batch)
+             check("OT_per_step_counts_match_sample_cache", increments.get("OT_cache_hits", 0) == statuses["HIT"] and increments.get("actual_OT_attempts", 0) == increments.get("actual_OT_returns", 0) == statuses["MISS"], scope)
+             previous_ot = Counter(counts)
++            previous_pid = r['pid']
+             audit = r.get("aux_audit", {})
+             if arm != "FM_CONTROL":
+                 expected, task = _expected_aux(step, arm, 20261008 if phase == "explore" else 20261009, pool)
+@@ -300,7 +307,8 @@
+                 update_seconds=r["update_total_seconds"],
+                 input_plus_update_seconds=r["OT_and_input_seconds"]+r["update_total_seconds"],
+                 OT_hits=increments.get("OT_cache_hits", 0), OT_attempts=increments.get("actual_OT_attempts", 0),
+-                OT_returns=increments.get("actual_OT_returns", 0), shared_batch_sha256=r["shared_batch_sha256"],
++                OT_returns=increments.get("actual_OT_returns", 0), OT_counter_reset_new_worker=counter_reset,
++                shared_batch_sha256=r["shared_batch_sha256"],
+                 coupled_batch_sha256=r["coupled_batch_sha256"], time_unix=r["time_unix"])
+             steps.append(row)
+             arm_steps.append(row)
+@@ -313,7 +321,10 @@
+             actual_weighted_aux_norm=_stats([r["actual_weighted_aux_gradient_norm"] for r in arm_gradients]),
+             FM_aux_cosine=_stats([r["cosine"] for r in arm_gradients]),
+             negative_cosine_fraction=_stats([r["cosine"] < 0 for r in arm_gradients if r["cosine"] is not None])["mean"],
+-            hook_observation_count=len(arm_gradients), actual_OT_counts=rows[-1]["actual_OT_counts"],
++            hook_observation_count=len(arm_gradients), last_worker_OT_counters=rows[-1]["actual_OT_counts"],
++            actual_OT_counts=dict(OT_cache_hits=sum(r['OT_hits'] for r in arm_steps),
++                actual_OT_attempts=sum(r['OT_attempts'] for r in arm_steps),
++                actual_OT_returns=sum(r['OT_returns'] for r in arm_steps)),
+             input_seconds=_stats([r["input_seconds"] for r in arm_steps]),
+             input_plus_update_seconds=_stats([r["input_plus_update_seconds"] for r in arm_steps]),
+             sum_input_plus_update_seconds=sum(r["input_plus_update_seconds"] for r in arm_steps)))
+@@ -336,6 +347,7 @@
+                 check("actual_repeat_inputs_differ_from_explore", x["shared_batch_sha256"] != y["shared_batch_sha256"], [arm, x["pilot_step"]])
+ 
+     ledger_counts = defaultdict(Counter)
++    primary_micro_counts = defaultdict(Counter)
+     begin, terminal = {}, {}
+     outside, callfiles = Counter(), sorted((out/"ledger").glob("calls_*.jsonl"))
+     for path in callfiles:
+@@ -356,6 +368,7 @@
+             slot = "aux" if micro == "aux" else "primary" if isinstance(micro, int) else "update"
+             ledger_counts[key][(entry["kind"], slot, event)] += 1
+             if slot == "primary":
++                primary_micro_counts[key][(entry['kind'], event, micro)] += 1
+                 samples_at_step = row_index[key]["sample_diagnostics"]
+                 check("ledger_primary_microbatch_identity", 0 <= micro < 8 and ctx.get("sample_index") == samples_at_step[micro]["sample_index"] and ctx.get("shared_input_sha256") == samples_at_step[micro]["shared_input_sha256"], [cid, event])
+             elif slot == "aux":
+@@ -379,6 +392,8 @@
+                 row[kind+"_"+slot+"_"+event] = number
+                 check("step_actual_F_B_update_budget_exact", number == (0 if event == "CALL_FAIL" else count), [phase, arm, step, kind, slot, event])
+         check("step_no_unexpected_training_calls", sum(counter.values()) == 2*sum(expected.values()), [phase, arm, step])
++        check('primary_each_microbatch_exactly_one_F_and_B', all(primary_micro_counts[key][(kind, event, micro)] == 1
++            for kind in ('training_forward', 'training_backward') for event in ('CALL_BEGIN', 'CALL_RETURN') for micro in range(8)), [phase, arm, step])
+         ledger_rows.append(row)
+ 
+     starts = []
+@@ -417,6 +432,7 @@
+     for (phase, arm, t), rows in sorted(aux_groups.items()):
+         fm, aux = np.mean([r["FM"] for r in rows]), np.mean([r["aux_weighted"] for r in rows])
+         t_aux.append(dict(phase=phase, arm=arm, aux_t=t, steps=len(rows), FM_mean=float(fm),
++            unweighted_aux_mean=float(np.mean([r['aux_unweighted'] for r in rows])),
+             weighted_aux_mean=float(aux), weighted_aux_to_FM_ratio_of_means=_ratio(aux, fm),
+             weighted_aux_to_FM_mean_of_step_ratios=_stats([r["weighted_aux_over_FM"] for r in rows])["mean"],
+             clipping_fraction=float(np.mean([r["clip_active"] for r in rows]))))
+@@ -426,13 +442,14 @@
+         _csv(destination/(name+".csv"), values)
+     _plot(destination/"learning_diagnostics.png", steps, gradients)
+     incomplete = [r["phase"]+"_"+r["arm"] for r in arm_summaries if r["status"] == "INCOMPLETE"]
+-    status = "FAIL" if check.errors else "LIVE_PASS" if live else "INCOMPLETE" if incomplete else "PASS"
++    missing_explore = [a for a in ("FM_CONTROL", "REPLAY_FM_CONTROL", "TRAJECTORY_REPLAY") if ("explore", a) not in metrics]
++    status = "FAIL" if check.errors else "LIVE_PASS" if live else "INCOMPLETE" if incomplete or missing_explore else "PASS"
+     source_files = ("training.py", "stream.py", "replay.py", "training_diagnostics.py")
+     summary = dict(status=status, live=live, started_unix=started, finished_unix=time.time(),
+         CPU_only=True, model_calls=0, backward_calls=0, optimizer_updates=0, OT_matching_calls=0,
+         checks=sum(check.counts.values()), checks_by_name=dict(check.counts), errors=check.errors,
+         observed_arms=arm_summaries, incomplete_actual_arms=incomplete,
+-        not_yet_observed_explore_arms=[a for a in ("FM_CONTROL", "REPLAY_FM_CONTROL", "TRAJECTORY_REPLAY") if ("explore", a) not in metrics],
++        not_yet_observed_explore_arms=missing_explore,
+         independent_random_seed_counts=independence, matched_primary_batch_pairs=len(pair_rows),
+         audited_actual_call_pairs=len(begin), calls_outside_completed_metric_snapshot=dict(outside),
+         source_START_sha256=START_SHA, load_audits=load_audits, snapshots=snapshots,
+@@ -444,6 +461,7 @@
+             cosine_scope="Only step 1 and each multiple of 25. Other steps are NA. Zero norm means UNDEFINED.",
+             clipping="Fraction of rows with total pre-clip norm > 1; coefficient is reconstructed from PyTorch clip formula, not observed parameter delta.",
+             time="Input + update excludes checkpoint I/O, DEV sampling, loading and idle time; concurrent load can affect wall timing.",
++            OT_counts="Cache hits and OT attempts/returns are differenced within each worker PID; a restored stream resets process counters. Aggregates sum per-step increments.",
+             time_strata="Primary bins show actual t and coordinate-weighted MSE. Auxiliary t strata compare weighted aux with that step's primary batch, not a same-example loss.",
+             independence="Repeat uses independent registered main-stream/teacher-epsilon seeds; fixed START trajectory feedback pool and auxiliary selection are intentionally shared.",
+             ledger="Every completed metric step is checked against actual BEGIN/RETURN/FAIL. Later calls and inference stages are outside this snapshot.",
+@@ -473,5 +491,6 @@
+     parser.add_argument("--live", action="store_true")
+     args = parser.parse_args()
+     result = run(args.out, live=args.live)
+-    print(json.dumps({k: result[k] for k in ("status", "checks", "errors", "output_directory")}, indent=2))
++    print(json.dumps(dict(status=result["status"], checks=result["checks"], error_count=len(result["errors"]),
++        first_errors=result["errors"][:5], output_directory=result["output_directory"]), indent=2))
+     raise SystemExit(1 if result["status"] == "FAIL" else 0)

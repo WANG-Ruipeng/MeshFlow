@@ -1,0 +1,1483 @@
+diff --git a/experiments/mf_h1_local0/soft_matching_energy.py b/experiments/mf_h1_local0/soft_matching_energy.py
+new file mode 100644
+--- /dev/null
++++ b/experiments/mf_h1_local0/soft_matching_energy.py
+@@ -0,0 +1,347 @@
++"""The user's frozen-model soft-matching potential; no model or optimizer code.
++
++The face assignment is soft, but the inner minimum over six vertex permutations
++is piecewise smooth, not everywhere smooth. Different targets may choose the
++same generated face: this potential does not impose one-to-one assignments.
++Distances are sums over three vertices and three coordinates, without averaging.
++"""
++from __future__ import annotations
++
++import itertools
++import json
++import math
++from typing import Any
++
++import torch
++
++
++PERMUTATIONS = tuple(itertools.permutations(range(3)))
++
++
++def _faces(value: torch.Tensor, name: str) -> torch.Tensor:
++    if value.ndim == 2 and value.shape[-1] == 9:
++        return value.reshape(1, value.shape[0], 3, 3)
++    if value.ndim == 3 and tuple(value.shape[-2:]) == (3, 3):
++        return value.unsqueeze(0)
++    if value.ndim == 3 and value.shape[-1] == 9:
++        return value.reshape(value.shape[0], value.shape[1], 3, 3)
++    if value.ndim == 4 and tuple(value.shape[-2:]) == (3, 3):
++        return value
++    raise ValueError(f'{name} must have shape [N,9], [B,N,9], [N,3,3], or [B,N,3,3]')
++
++
++def _energy_and_details(
++    xt: torch.Tensor, targets: torch.Tensor, tau: float,
++    mask: torch.Tensor | None,
++) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
++    if not math.isfinite(float(tau)) or float(tau) <= 0:
++        raise ValueError('tau must be finite and strictly positive')
++    if xt.dtype not in (torch.float32, torch.float64):
++        raise TypeError('Potential coordinates must be FP32 or FP64')
++    x = _faces(xt, 'xt')
++    c = _faces(targets, 'targets').to(device=x.device, dtype=x.dtype)
++    batch, faces = x.shape[:2]
++    if faces == 0 or c.shape[1] == 0:
++        raise ValueError('At least one generated face and one target are required')
++    if c.shape[0] not in (1, batch):
++        raise ValueError('Target batch must be one or match the current state')
++    c = c.expand(batch, -1, -1, -1)
++    if mask is None:
++        valid = torch.ones((batch, faces), dtype=torch.bool, device=x.device)
++    else:
++        if mask.dtype != torch.bool:
++            raise TypeError('mask must be boolean')
++        valid = mask.to(device=x.device)
++        if valid.ndim == 1:
++            valid = valid.unsqueeze(0)
++        if valid.shape not in ((1, faces), (batch, faces)):
++            raise ValueError('mask must have shape [N], [1,N], or [B,N]')
++        valid = valid.expand(batch, -1)
++    if not bool(valid.any(dim=1).all()):
++        raise ValueError('Every batch item must contain a valid face')
++    # Remove masked coordinates before arithmetic: NaN padding must not create
++    # NaN * zero during backward through otherwise masked pair distances.
++    safe_x = torch.where(valid[..., None, None], x, torch.zeros_like(x))
++    if not bool(torch.isfinite(safe_x).all()) or not bool(torch.isfinite(c).all()):
++        raise ValueError('Valid state coordinates and all targets must be finite')
++    permutations = torch.tensor(PERMUTATIONS, dtype=torch.long, device=x.device)
++    permuted_targets = c[:, :, permutations, :]
++    distances_per_permutation = (
++        safe_x[:, :, None, None, :, :] - permuted_targets[:, None, :, :, :, :]
++    ).square().sum(dim=(-1, -2))
++    distances, permutation_index = distances_per_permutation.min(dim=-1)
++    distances = distances.masked_fill(~valid[..., None], float('inf'))
++    logits = -distances / float(tau)
++    per_target_energy = -float(tau) * torch.logsumexp(logits, dim=1)
++    per_batch_energy = per_target_energy.sum(dim=1)
++    energy = per_batch_energy.sum()
++    responsibilities = torch.softmax(logits, dim=1)
++    closest_distances, winning_faces = distances.min(dim=1)
++    winning_permutation_index = torch.gather(
++        permutation_index, 1, winning_faces.unsqueeze(1)
++    ).squeeze(1)
++    # Pair count is zero exactly when all hard winners are distinct. The
++    # differentiable objective is unchanged by this diagnostic.
++    same_winner = winning_faces[:, :, None] == winning_faces[:, None, :]
++    collision_pairs = torch.triu(same_winner, diagonal=1).sum(dim=(1, 2))
++    if not bool(torch.isfinite(energy)) or not bool(torch.isfinite(responsibilities).all()):
++        raise FloatingPointError('Non-finite soft-matching energy or assignment')
++    return energy, {
++        'energy_per_batch': per_batch_energy,
++        'energy_per_target': per_target_energy,
++        'distance_sq': distances,
++        'responsibilities': responsibilities,
++        'best_vertex_permutation_index': permutation_index,
++        'winning_faces': winning_faces,
++        'winning_vertex_permutation': permutations[winning_permutation_index],
++        'closest_distance_sq': closest_distances,
++        'hard_winner_collision_pairs': collision_pairs,
++        'valid_mask': valid,
++    }
++
++
++def soft_matching_energy(
++    xt: torch.Tensor, targets: torch.Tensor, tau: float,
++    mask: torch.Tensor | None = None,
++    *, return_details: bool = False,
++) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
++    """Return E summed over targets and batch, retaining the caller's graph.
++
++    FP64 is supported for independent CPU finite differences. Use
++    :func:`soft_matching_gradient` for detached, FP32 production forces.
++    """
++    energy, details = _energy_and_details(xt, targets, tau, mask)
++    return (energy, details) if return_details else energy
++
++
++def soft_matching_gradient(
++    xt: torch.Tensor, targets: torch.Tensor, tau: float,
++    mask: torch.Tensor | None = None,
++) -> tuple[torch.Tensor, dict[str, Any]]:
++    """Compute only dE/dXt on a fresh FP32 graph; never backpropagate a model.
++
++    Input coordinates are never mutated. This helper is safe inside an outer
++    ``torch.inference_mode()`` and autocast context. The returned gradient has
++    the input shape, and every returned tensor is detached. Diagnostic arrays
++    use canonical [B,N,K] or [B,K] shapes. Neither parameters nor optimizers are
++    accepted by this function.
++    """
++    with torch.inference_mode(False), torch.enable_grad(), torch.autocast(
++        device_type=xt.device.type, enabled=False
++    ):
++        local_x = xt.detach().to(dtype=torch.float32).clone().requires_grad_(True)
++        local_c = targets.detach().to(device=xt.device, dtype=torch.float32).clone()
++        local_mask = None if mask is None else mask.detach().to(xt.device).clone()
++        energy, details = _energy_and_details(local_x, local_c, tau, local_mask)
++        gradient, = torch.autograd.grad(
++            energy, local_x, create_graph=False, retain_graph=False
++        )
++        if not bool(torch.isfinite(gradient).all()):
++            raise FloatingPointError('Non-finite soft-matching gradient')
++        detached = {key: value.detach() for key, value in details.items()}
++        detached['energy'] = energy.detach()
++        detached['gradient_rms'] = gradient.square().mean().sqrt().detach()
++        detached['actual_coordinate_dtype'] = str(local_x.dtype)
++        detached['actual_energy_dtype'] = str(energy.dtype)
++        detached['actual_gradient_dtype'] = str(gradient.dtype)
++        detached['geometry_autograd_calls'] = 1
++        detached['model_backward_calls'] = 0
++        return gradient.detach(), detached
++
++
++
++def compact_matching_details(details: dict[str, Any]) -> dict[str, Any]:
++    """Small JSON-safe trace; omit dense face-by-target/permutation arrays."""
++    weights = details['responsibilities']
++    distances = details['distance_sq']
++    valid_distances = torch.where(torch.isfinite(distances), distances, torch.zeros_like(distances))
++    entropy = -(weights * weights.clamp_min(torch.finfo(weights.dtype).tiny).log()).sum(dim=1)
++    winners = details['winning_faces']
++    winning_weight = torch.gather(weights, 1, winners.unsqueeze(1)).squeeze(1)
++    return {
++        'energy': float(details['energy']),
++        'energy_per_target': details['energy_per_target'].cpu().tolist(),
++        'winning_faces': winners.cpu().tolist(),
++        'winning_vertex_permutation': details['winning_vertex_permutation'].cpu().tolist(),
++        'closest_distance_sq': details['closest_distance_sq'].cpu().tolist(),
++        'expected_distance_sq': (weights * valid_distances).sum(dim=1).cpu().tolist(),
++        'assignment_entropy': entropy.cpu().tolist(),
++        'assignment_effective_face_count': entropy.exp().cpu().tolist(),
++        'winning_responsibility': winning_weight.cpu().tolist(),
++        'hard_winner_collision_pairs': details['hard_winner_collision_pairs'].cpu().tolist(),
++        'gradient_rms': float(details['gradient_rms']),
++        'actual_coordinate_dtype': details['actual_coordinate_dtype'],
++        'actual_energy_dtype': details['actual_energy_dtype'],
++        'actual_gradient_dtype': details['actual_gradient_dtype'],
++        'geometry_autograd_calls': details['geometry_autograd_calls'],
++        'model_backward_calls': details['model_backward_calls'],
++    }
++
++
++def _independent_analytic_gradient(
++    x: torch.Tensor, c: torch.Tensor, tau: float,
++) -> torch.Tensor:
++    """Slow CPU loop reference, independent of the production vectorization."""
++    result = torch.zeros_like(x)
++    for target in c:
++        distances, chosen = [], []
++        for face in x:
++            candidate = [(float(((face - target[list(p)]) ** 2).sum()), p)
++                         for p in PERMUTATIONS]
++            best_distance, best_perm = min(candidate, key=lambda pair: pair[0])
++            distances.append(best_distance)
++            chosen.append(target[list(best_perm)])
++        weights = torch.softmax(-torch.tensor(distances, dtype=x.dtype) / tau, dim=0)
++        for face_index in range(len(x)):
++            result[face_index] += 2 * weights[face_index] * (x[face_index] - chosen[face_index])
++    return result
++
++
++def run_cpu_tests() -> dict[str, Any]:
++    """Pure math checks; no model, CUDA initialization, or optimizer updates."""
++    if torch.cuda.is_initialized():
++        raise RuntimeError('Run this CPU-only test before CUDA initialization')
++    generator = torch.Generator(device='cpu').manual_seed(2026092821)
++    x = torch.randn((4, 3, 3), generator=generator, dtype=torch.float64) * .31
++    c = torch.randn((2, 3, 3), generator=generator, dtype=torch.float64) * .27
++    tau = .19
++    calls = {'energy_evaluations': 0, 'gradient_helper_calls': 0,
++             'autograd_grad_calls': 0, 'model_forwards': 0,
++             'optimizer_updates': 0, 'gpu_calls': 0}
++    passed: list[str] = []
++
++    def energy(value: torch.Tensor, target: torch.Tensor = c, **kwargs):
++        calls['energy_evaluations'] += 1
++        return soft_matching_energy(value, target, tau, **kwargs)
++
++    def force(value: torch.Tensor, target: torch.Tensor = c,
++              temperature: float = tau, **kwargs):
++        calls['gradient_helper_calls'] += 1
++        calls['energy_evaluations'] += 1
++        calls['autograd_grad_calls'] += 1
++        return soft_matching_gradient(value, target, temperature, **kwargs)
++
++    variable = x.clone().requires_grad_(True)
++    grad, = torch.autograd.grad(energy(variable), variable)
++    calls['autograd_grad_calls'] += 1
++    analytic = _independent_analytic_gradient(x, c, tau)
++    torch.testing.assert_close(grad, analytic, rtol=1e-12, atol=1e-12)
++    passed.append('double_autograd_matches_independent_loop_analytic_gradient')
++    # Check every coordinate, well away from an inner-permutation tie.
++    permuted = torch.stack([c[:, list(p)] for p in PERMUTATIONS], dim=1)
++    choices = (x[:, None, None] - permuted[None]).square().sum((-1, -2)).sort(-1).values
++    smallest_gap = float((choices[..., 1] - choices[..., 0]).min())
++    assert smallest_gap > 1e-5
++    epsilon = 1e-6
++    finite_difference = torch.empty_like(x)
++    for index in range(x.numel()):
++        high, low = x.clone(), x.clone()
++        high.view(-1)[index] += epsilon
++        low.view(-1)[index] -= epsilon
++        finite_difference.view(-1)[index] = (energy(high) - energy(low)) / (2 * epsilon)
++    torch.testing.assert_close(grad, finite_difference, rtol=2e-6, atol=2e-9)
++    passed.append('all_coordinate_central_finite_differences_away_from_ties')
++    fp32_gradient, details = force(x.reshape(1, 4, 9))
++    torch.testing.assert_close(fp32_gradient.reshape_as(x).double(), grad, rtol=3e-5, atol=4e-7)
++    torch.testing.assert_close(details['responsibilities'].sum(1), torch.ones((1, 2)))
++    assert fp32_gradient.dtype == torch.float32 and not fp32_gradient.requires_grad
++    passed.append('fp32_detached_production_force_and_normalized_assignments')
++    face_order = torch.tensor([2, 0, 3, 1])
++    vertex_order = torch.tensor([2, 0, 1])
++    target_order = torch.tensor([1, 0])
++    face_gradient, face_details = force(x[face_order])
++    vertex_gradient, vertex_details = force(x[:, vertex_order], c[:, vertex_order])
++    target_gradient, target_details = force(x, c[target_order])
++    reference = fp32_gradient.reshape_as(x)
++    torch.testing.assert_close(face_gradient, reference[face_order], rtol=2e-5, atol=4e-7)
++    torch.testing.assert_close(vertex_gradient, reference[:, vertex_order], rtol=2e-5, atol=4e-7)
++    torch.testing.assert_close(target_gradient, reference, rtol=2e-5, atol=4e-7)
++    for other in (face_details, vertex_details, target_details):
++        torch.testing.assert_close(other['energy'], details['energy'], rtol=2e-5, atol=4e-7)
++    # Independent vertex permutation of every generated and target triangle.
++    xp = torch.stack([x[i, list(PERMUTATIONS[i])] for i in range(4)])
++    cp = torch.stack([c[i, list(PERMUTATIONS[i + 3])] for i in range(2)])
++    arbitrary_gradient, arbitrary_details = force(xp, cp)
++    expected = torch.stack([reference[i, list(PERMUTATIONS[i])] for i in range(4)])
++    torch.testing.assert_close(arbitrary_gradient, expected, rtol=2e-5, atol=4e-7)
++    torch.testing.assert_close(arbitrary_details['energy'], details['energy'], rtol=2e-5, atol=4e-7)
++    passed.append('generated_face_target_order_and_independent_vertex_permutations')
++    padded = torch.cat([x, torch.full((2, 3, 3), float('nan'), dtype=x.dtype)])
++    valid = torch.tensor([True, True, True, True, False, False])
++    masked_gradient, masked_details = force(padded, mask=valid)
++    torch.testing.assert_close(masked_gradient[:4], reference)
++    assert torch.equal(masked_gradient[4:], torch.zeros_like(masked_gradient[4:]))
++    assert torch.equal(masked_details['responsibilities'][:, 4:], torch.zeros((1, 2, 2)))
++    assert bool(torch.isfinite(masked_gradient).all())
++    passed.append('masked_nan_padding_has_zero_force_and_no_valid_effect')
++    zero_gradient, zero_details = force(c[:1], c[:1])
++    assert torch.equal(zero_gradient, torch.zeros_like(zero_gradient))
++    assert float(zero_details['energy']) == 0
++    passed.append('one_face_equal_to_one_target_has_exact_zero_force')
++    for temperature in (1e-7, 1e-3, 1.0, 1e6):
++        stable_gradient, stable_details = force(x + 1e4, c, temperature)
++        assert bool(torch.isfinite(stable_gradient).all())
++        assert bool(torch.isfinite(stable_details['energy']))
++    passed.append('stable_logsumexp_tiny_and_large_tau_with_far_targets')
++    single_gradient, single_details = force(x, c[:1])
++    repeated_gradient, repeated_details = force(x, c[:1].repeat(2, 1, 1))
++    torch.testing.assert_close(repeated_gradient, 2 * single_gradient)
++    torch.testing.assert_close(repeated_details['energy'], 2 * single_details['energy'])
++    assert int(repeated_details['hard_winner_collision_pairs'][0]) == 1
++    passed.append('duplicate_targets_share_winner_and_double_force_no_one_to_one_constraint')
++    batched_gradient, batched_details = force(torch.stack([x, x]), c)
++    torch.testing.assert_close(batched_gradient, reference.unsqueeze(0).expand(2, -1, -1, -1))
++    torch.testing.assert_close(batched_details['energy_per_batch'], details['energy'].expand(2))
++    passed.append('target_broadcast_and_batch_energy_sum_do_not_scale_individual_forces')
++    original = x.float().clone()
++    with torch.inference_mode(), torch.autocast(device_type='cpu', dtype=torch.bfloat16):
++        inference_x = original.clone()
++        outer_gradient, outer_details = force(inference_x)
++    torch.testing.assert_close(outer_gradient, reference)
++    assert torch.equal(inference_x, original)
++    assert outer_gradient.dtype == torch.float32 and not outer_gradient.requires_grad
++    assert not outer_gradient.is_inference()
++    assert outer_details['actual_coordinate_dtype'] == 'torch.float32'
++    assert outer_details['actual_energy_dtype'] == 'torch.float32'
++    assert outer_details['actual_gradient_dtype'] == 'torch.float32'
++    assert outer_details['geometry_autograd_calls'] == 1
++    json.dumps(compact_matching_details(outer_details), allow_nan=False)
++    passed.append('outer_inference_mode_and_bf16_autocast_safe_input_unchanged')
++    prior_graph_x = x.clone().requires_grad_(True)
++    prior_graph_c = c.clone().requires_grad_(True)
++    independent_gradient, _ = force(prior_graph_x, prior_graph_c)
++    assert prior_graph_x.grad is None and prior_graph_c.grad is None
++    assert not independent_gradient.requires_grad and independent_gradient.grad_fn is None
++    passed.append('force_does_not_populate_or_retain_existing_coordinate_or_target_graph')
++    for invalid_tau in (0, -1, float('nan'), float('inf')):
++        try:
++            calls['energy_evaluations'] += 1
++            soft_matching_energy(x, c, invalid_tau)
++        except ValueError:
++            pass
++        else:
++            raise AssertionError('Invalid tau accepted')
++    try:
++        energy(x, mask=torch.zeros(4, dtype=torch.bool))
++    except ValueError:
++        pass
++    else:
++        raise AssertionError('All-invalid mask accepted')
++    passed.append('invalid_temperature_and_all_invalid_mask_rejected')
++    assert not torch.cuda.is_initialized()
++    return {
++        'status': 'PASS', 'tests': passed, 'counts': calls,
++        'finite_difference_max_absolute_error': float((grad - finite_difference).abs().max()),
++        'independent_analytic_max_absolute_error': float((grad - analytic).abs().max()),
++        'fp32_max_absolute_error_vs_double': float((reference.double() - grad).abs().max()),
++        'smallest_permutation_distance_gap': smallest_gap,
++        'objective': '-tau * sum_k logsumexp_i(-min_vertex_permutation_sum_squared_distance/tau)',
++        'no_distance_or_target_count_normalization': True,
++        'inner_min_is_piecewise_smooth': True,
++        'one_to_one_constraint': False,
++        'cuda_initialized': torch.cuda.is_initialized(),
++    }
++
++
++if __name__ == '__main__':
++    print(json.dumps(run_cpu_tests(), indent=2))
+diff --git a/experiments/mf_h1_local0/soft_matching_data.py b/experiments/mf_h1_local0/soft_matching_data.py
+new file mode 100644
+--- /dev/null
++++ b/experiments/mf_h1_local0/soft_matching_data.py
+@@ -0,0 +1,140 @@
++﻿"""CPU-only fixed real triangle targets and independent noise for soft matching.
++
++The sampler receives only cases[i]['constraints']; complete targets are held for
++independent scoring. No checkpoint, model, training batch, OT or CUDA execution.
++"""
++from __future__ import annotations
++import copy
++import itertools
++import json
++import re
++import zipfile
++from pathlib import Path
++import numpy as np
++import torch
++from .inference_pilot_data import (
++    HISTORY, EXPECTED_RESULT_SHA, _load_fixed_bank, _preserve_cpu_rng, _file_record)
++from .nxc112_data import PROJECT, MIXED, B_UIDS, _persist
++from .learning_data import array_hash
++from .prompt_dataset import file_sha256, sample_surface_primitive
++
++NOISE_SEEDS=(9101,9102)
++PERMUTATIONS=np.asarray(list(itertools.permutations(range(3))),dtype=np.int64)
++PATTERN=re.compile(r'(?<![A-Za-z0-9.])(?:9101|9102)(?![A-Za-z0-9.])|seed[_-]?(?:9101|9102)(?![0-9])',re.I)
++
++
++def _seed_audit(output):
++    files=[];hits=[];npz_count=0
++    roots=[PROJECT/'outputs',PROJECT/'tests']
++    paths={p.resolve() for root in roots for p in root.rglob('*') if p.is_file()}
++    paths.update(p.resolve() for p in PROJECT.glob('*.py'))
++    for path in sorted(paths):
++        if path.is_relative_to(output) or path.name.startswith('soft_matching'):
++            continue
++        if path.suffix.lower() in {'.py','.json','.jsonl','.md','.txt','.yaml','.yml'}:
++            content=path.read_text(encoding='utf-8-sig')
++            files.append(dict(path=str(path),bytes=path.stat().st_size,sha256=file_sha256(path)))
++            for number,line in enumerate(content.splitlines(),1):
++                if PATTERN.search(line):hits.append(dict(path=str(path),line=number,text=line.strip()))
++        elif path.suffix.lower()=='.npz':
++            npz_count+=1
++            with zipfile.ZipFile(path) as saved:
++                for name in saved.namelist():
++                    if PATTERN.search(name):hits.append(dict(path=str(path),array_key=name))
++    if hits:raise RuntimeError('Unresolved previous 9101/9102 usage: '+json.dumps(hits))
++    return dict(status='PASS_WITH_FINITE_SCOPE',seeds=list(NOISE_SEEDS),
++        scope='Existing experimental outputs and tests plus experiment-root Python sources; current output and new soft_matching sources excluded; NPZ member names inspected without payload loading',
++        text_files=files,text_file_count=len(files),text_bytes=sum(p['bytes'] for p in files),
++        npz_archives_scanned=npz_count,previous_recorded_seed_occurrences=hits,
++        no_recorded_model_or_hyperparameter_selection_use=True,
++        limitations='No claim about unlogged or external runs. Numeric substrings in floats/hashes are not seed uses.')
++
++
++def _matching_indices(triangles,face):
++    equal=(triangles[:,None,:,:]==face[PERMUTATIONS][None,:,:,:]).all(axis=(2,3)).any(axis=1)
++    return np.flatnonzero(equal)
++
++
++def _cases_from_arrays(arrays,records):
++    cases=[]
++    for record in records:
++        p=record['parent_index'];k=record['K'];prefix=f'parent{p}_K{k}_'
++        cases.append(dict(**copy.deepcopy(record),
++            constraints=arrays[prefix+'constraints'].copy(),
++            checks=arrays[prefix+'checks'].copy(),
++            target=arrays[f'parent{p}_target'].copy()))
++    return cases
++
++
++def prepare_inputs(output,persist=True):
++    """Return (bank, JSON-safe audit); load back persisted tensors before use."""
++    out=Path(output).resolve()
++    if not out.is_relative_to(PROJECT/'outputs') or not out.name.startswith('soft_matching_'):
++        raise ValueError('Use a separate soft_matching_* output directory')
++    if torch.cuda.is_initialized():raise RuntimeError('Prepare CPU inputs before initializing CUDA')
++    with _preserve_cpu_rng():
++        report_path=HISTORY/'results.json'
++        if file_sha256(report_path)!=EXPECTED_RESULT_SHA:raise RuntimeError('Historical results changed')
++        report=json.loads(report_path.read_text(encoding='utf-8-sig'))
++        old,old_audit=_load_fixed_bank(report)
++        coverage=_seed_audit(out)
++        arrays={};records=[];parent_records=[]
++        for index,uid in enumerate(B_UIDS):
++            target=old['targets'][uid].copy();triangles=target.reshape(112,3,3)
++            prompt=old['prompts'][(uid,MIXED)]
++            face=np.asarray(prompt['vertices'][np.flatnonzero(prompt['arity']==3)[0]],dtype=np.float32)
++            first=_matching_indices(triangles,face)
++            if len(first)!=1:raise RuntimeError('Archived face is not one unique canonical target face')
++            extent=np.ptp(triangles.reshape(-1,3),axis=0)
++            diagonal=float(np.linalg.norm(extent));scale=float(extent.max())
++            area2=np.linalg.norm(np.cross(triangles[:,1]-triangles[:,0],triangles[:,2]-triangles[:,0]),axis=1)
++            legal=np.flatnonzero(area2>scale**2*1e-12)
++            second=next((int(i) for i in legal if i not in first),None)
++            if second is None:raise RuntimeError('Missing second valid distinct target face')
++            selected=np.stack([face,triangles[second]]).astype(np.float32)
++            # K=1 retains the exact original independent interior checks.
++            checks=np.stack([old['checks'][(uid,MIXED)][2].copy(),
++                sample_surface_primitive(selected[1],3,128,np.random.RandomState(9200+index),False)])
++            arrays[f'parent{index}_target']=target
++            for k in (1,2):
++                prefix=f'parent{index}_K{k}_'
++                arrays[prefix+'constraints']=selected[:k].copy()
++                arrays[prefix+'checks']=checks[:k].copy()
++                records.append(dict(case_id=f'P{index}_K{k}',parent_index=index,parent_uid=uid,K=k,
++                    N=112,bbox_diagonal=diagonal,bbox_extent=extent.tolist(),
++                    constraint_face_indices=[int(first[0]),second][:k],
++                    constraints_sha256=array_hash(selected[:k]),checks_sha256=array_hash(checks[:k]),
++                    target_sha256=array_hash(target),tau=3*(0.05*diagonal)**2,
++                    target_selection='K1: archived mixed prompt face; K2: append first different area-valid face in archived canonical target order',
++                    constraints_selected_from_input_geometry_only=True,model_outputs_consulted=False,
++                    check_seed_second=9200+index if k==2 else None,
++                    exact_shared_vertices_K2=int(sum(any(np.array_equal(v,w) for w in selected[1]) for v in selected[0])) if k==2 else None))
++            parent_records.append(dict(parent_index=index,parent_uid=uid,bbox_diagonal=diagonal,
++                bbox_extent=extent.tolist(),coordinate_min=triangles.reshape(-1,3).min(0).tolist(),
++                coordinate_max=triangles.reshape(-1,3).max(0).tolist(),faces=112,
++                source_file=copy.deepcopy(old['parents'][index]),target_sha256=array_hash(target)))
++        for seed in NOISE_SEEDS:
++            arrays[f'noise_seed{seed}']=torch.randn((1,112,9),generator=torch.Generator(device='cpu').manual_seed(seed),dtype=torch.float32,device='cpu').numpy()
++        artifact=_persist(out/'inputs.npz',arrays,persist)
++        if persist:
++            with np.load(artifact['path'],allow_pickle=False) as saved:
++                reloaded={key:saved[key].copy() for key in saved.files}
++            if set(reloaded)!=set(arrays) or any(array_hash(reloaded[key])!=array_hash(value) for key,value in arrays.items()):
++                raise RuntimeError('Persisted input roundtrip differs')
++            arrays=reloaded
++        bank=dict(cases=_cases_from_arrays(arrays,records),parents=copy.deepcopy(old['parents']),
++            parent_uids=list(B_UIDS),targets={uid:arrays[f'parent{i}_target'].copy() for i,uid in enumerate(B_UIDS)},
++            noises={seed:torch.from_numpy(arrays[f'noise_seed{seed}'].copy()) for seed in NOISE_SEEDS},
++            noise_seeds=list(NOISE_SEEDS),N=112)
++        audit=dict(status='PASS',schema=1,model_forwards=0,optimizer_updates=0,
++            source_results=_file_record(report_path),historical_bank=old_audit,
++            seed_coverage=coverage,inputs=artifact,roundtrip_reloaded_from_saved_NPZ=bool(persist),
++            parents=parent_records,cases=records,
++            noise_rule='Independent CPU torch.Generator.manual_seed(seed), Gaussian [1,112,9] FP32, shared across all cases and settings; no OT or target coupling',
++            noise_hashes={str(seed):array_hash(bank['noises'][seed].numpy()) for seed in NOISE_SEEDS},
++            coordinates=dict(unit='Official normalized model coordinate units; no physical meter/micron calibration',
++                transform='Raw bbox center and max-side normalization, clip [-0.5,0.5], canonical vertex/face order, divide by official std 0.3762, final coordinate multiplication by 2; prompts copied in identical coordinates',
++                no_additional_alignment_or_rescaling=True,GT_endpoint_available_to_sampler=False),
++            fresh_noise_seed_selection_independent_of_outputs=True,cuda_initialized=torch.cuda.is_initialized(),caller_CPU_RNG_preserved=True)
++        json.dumps(audit,allow_nan=False)
++    return bank,audit
+diff --git a/experiments/mf_h1_local0/soft_matching_metrics.py b/experiments/mf_h1_local0/soft_matching_metrics.py
+new file mode 100644
+--- /dev/null
++++ b/experiments/mf_h1_local0/soft_matching_metrics.py
+@@ -0,0 +1,359 @@
++"""Independent CPU metrics and fixed views for training-free triangle capture.
++
++No model calls, geometry repair, or coordinate transformations occur here.
++Distances are in model coordinates and relative to the supplied GT bbox diagonal;
++they have no physical micrometre interpretation.
++"""
++from __future__ import annotations
++
++from itertools import permutations
++from pathlib import Path
++
++import numpy as np
++from scipy.optimize import linear_sum_assignment
++
++from .evaluate import completion_rms, raw_quality, surface_distance_squared
++
++
++PERMUTATIONS = np.asarray(list(permutations(range(3))), dtype=np.int64)
++RELATIVE_THRESHOLDS = (1e-3, 1e-4, 1e-5)
++
++
++def _triangles(value):
++    value = np.asarray(value, dtype=np.float64)
++    if value.ndim == 2 and value.shape[-1] == 9:
++        value = value.reshape(-1, 3, 3)
++    if value.ndim != 3 or value.shape[1:] != (3, 3):
++        raise ValueError(f"Expected [N,9] or [N,3,3], got {value.shape}")
++    return value
++
++
++def exact_face_distances(tokens, targets):
++    """Return D[N,K], argmin permutation[N,K], all permutation distances.
++
++    D is the sum of three squared Euclidean vertex distances, with an exact
++    NumPy minimum over all six permutations. This independently checks the
++    PyTorch guidance implementation. Vertex RMS is sqrt(D / 3).
++    """
++    generated, desired = _triangles(tokens), _triangles(targets)
++    if not (np.isfinite(generated).all() and np.isfinite(desired).all()):
++        raise ValueError("Exact matching requires finite coordinates")
++    reordered = desired[:, PERMUTATIONS, :]
++    difference = generated[:, None, None, :, :] - reordered[None, :, :, :, :]
++    all_distances = np.sum(difference * difference, axis=(-1, -2))
++    argmin = np.argmin(all_distances, axis=-1)
++    return np.min(all_distances, axis=-1), argmin, all_distances
++
++
++def independent_check_points(targets, count=128, seed=29317):
++    """Fixed uniform interior points; RNG is independent of model/noise/output.
++
++    The same barycentric bank applies to each target. All weights are strictly
++    positive, so target vertices/edges are not reused as evaluation points.
++    """
++    desired = _triangles(targets)
++    uv = np.random.RandomState(seed).uniform(1e-9, 1 - 1e-9, (count, 2))
++    root = np.sqrt(uv[:, 0])
++    weights = np.stack((1 - root, root * (1 - uv[:, 1]), root * uv[:, 1]), axis=1)
++    if not np.all(weights > 0):
++        raise AssertionError("Independent check points must be strictly interior")
++    return np.einsum("pa,kad->kpd", weights, desired)
++
++
++def _matched_rows(generated, desired, distances, permutation_indices, indices, diagonal):
++    rows = []
++    for target_index, face_index in enumerate(indices):
++        permutation_index = int(permutation_indices[face_index, target_index])
++        permutation = PERMUTATIONS[permutation_index]
++        vertex_errors = np.linalg.norm(
++            generated[face_index] - desired[target_index, permutation], axis=-1)
++        rms = float(np.sqrt(distances[face_index, target_index] / 3))
++        maximum = float(vertex_errors.max())
++        rows.append(dict(
++            target_index=target_index, face_index=int(face_index),
++            target_vertex_permutation=permutation.tolist(),
++            sum_squared_vertex_distance=float(distances[face_index, target_index]),
++            vertex_rms=rms, vertex_rms_bbox_fraction=rms / diagonal,
++            vertex_rms_bbox_pct=100 * rms / diagonal,
++            max_vertex_error=maximum,
++            max_vertex_error_bbox_fraction=maximum / diagonal,
++            max_vertex_error_bbox_pct=100 * maximum / diagonal,
++            per_vertex_error=vertex_errors.tolist()))
++    return rows
++
++
++def _matching_summary(rows, diagonal):
++    rms = np.asarray([row["vertex_rms"] for row in rows])
++    maximum = np.asarray([row["max_vertex_error"] for row in rows])
++    return dict(
++        rows=rows, mean_target_vertex_rms=float(rms.mean()),
++        aggregate_vertex_rms=float(np.sqrt(np.mean(rms * rms))),
++        mean_target_vertex_rms_bbox_pct=float(100 * rms.mean() / diagonal),
++        aggregate_vertex_rms_bbox_pct=float(100 * np.sqrt(np.mean(rms * rms)) / diagonal),
++        maximum_vertex_error_bbox_pct=float(100 * maximum.max() / diagonal),
++        thresholds=[dict(
++            relative_bbox_threshold=threshold,
++            coordinate_threshold=threshold * diagonal,
++            target_count_rms_pass=int(np.sum(rms <= threshold * diagonal)),
++            target_count_all_vertices_pass=int(np.sum(maximum <= threshold * diagonal)),
++            all_targets_rms_pass=bool(np.all(rms <= threshold * diagonal)),
++            all_targets_all_vertices_pass=bool(np.all(maximum <= threshold * diagonal)))
++            for threshold in RELATIVE_THRESHOLDS])
++
++
++def _displacement(generated, base, excluded_indices, diagonal):
++    keep = np.ones(len(generated), dtype=bool)
++    keep[np.asarray(sorted(set(excluded_indices)), dtype=np.int64)] = False
++    difference = generated[keep] - base[keep]
++    result = dict(
++        excluded_face_indices=sorted(set(map(int, excluded_indices))),
++        remaining_face_count=int(keep.sum()),
++        correspondence="Original Euler face and vertex indices; no rematching")
++    if not len(difference):
++        result.update(vertex_rms=None, vertex_rms_bbox_pct=None,
++                      max_vertex_displacement=None, max_vertex_displacement_bbox_pct=None,
++                      unchanged_face_count=0, unchanged_face_fraction=None)
++        return result
++    vertex_distances = np.linalg.norm(difference, axis=-1)
++    rms = float(np.sqrt(np.mean(vertex_distances * vertex_distances)))
++    unchanged = np.all(generated[keep] == base[keep], axis=(1, 2))
++    result.update(
++        vertex_rms=rms, vertex_rms_bbox_pct=100 * rms / diagonal,
++        max_vertex_displacement=float(vertex_distances.max()),
++        max_vertex_displacement_bbox_pct=float(100 * vertex_distances.max() / diagonal),
++        median_face_vertex_rms_bbox_pct=float(
++            100 * np.median(np.sqrt(np.mean(vertex_distances * vertex_distances, axis=1))) / diagonal),
++        unchanged_face_count=int(unchanged.sum()),
++        unchanged_face_fraction=float(unchanged.mean()))
++    return result
++
++
++def evaluate_output(tokens, targets, full_target, bbox_diagonal,
++                    base_tokens=None, check_points=None):
++    """JSON-safe exact matching, surface, quality, and Base-displacement scores.
++
++    A one-to-one assignment minimizes the sum of D, not independently selected
++    nearest targets. Both RMS and maximum-vertex threshold checks are retained:
++    a low interior point-to-surface distance alone does not prove face capture.
++    """
++    generated, desired, reference = map(_triangles, (tokens, targets, full_target))
++    diagonal = float(bbox_diagonal)
++    if not np.isfinite(diagonal) or diagonal <= 0:
++        raise ValueError("bbox_diagonal must be finite and positive")
++    if len(desired) not in (1, 2) or len(generated) < len(desired):
++        raise ValueError("This diagnostic requires K in {1,2}, N >= K")
++    if not (np.isfinite(desired).all() and np.isfinite(reference).all()):
++        raise ValueError("Input target geometry must be finite")
++    result = dict(
++        schema="soft_matching_metrics_v1", num_faces=len(generated),
++        num_targets=len(desired), bbox_diagonal=diagonal,
++        units="Model coordinates; percentage of supplied GT bbox diagonal; no physical unit claim",
++        quality=raw_quality(generated),
++        independent_matching=None, one_to_one_matching=None,
++        interior_surface=None, completion_rms_bbox_pct=None,
++        nonwinning_displacement_vs_same_noise_base=None)
++    if not np.isfinite(generated).all():
++        result["status"] = "NONFINITE_OUTPUT"
++        return result
++
++    distances, permutation_indices, _ = exact_face_distances(generated, desired)
++    closest = np.argmin(distances, axis=0)
++    independent_rows = _matched_rows(
++        generated, desired, distances, permutation_indices, closest, diagonal)
++    independent = _matching_summary(independent_rows, diagonal)
++    independent.update(
++        selected_face_indices=closest.tolist(),
++        unique_selected_face_count=len(set(closest.tolist())),
++        collision_count=len(desired) - len(set(closest.tolist())),
++        has_collision=len(set(closest.tolist())) < len(desired),
++        collision_target_groups=[
++            np.flatnonzero(closest == face).tolist()
++            for face in sorted(set(closest.tolist()))
++            if np.sum(closest == face) > 1])
++
++    assigned_faces, assigned_targets = linear_sum_assignment(distances)
++    by_target = np.empty(len(desired), dtype=np.int64)
++    by_target[assigned_targets] = assigned_faces
++    if len(set(by_target.tolist())) != len(desired):
++        raise AssertionError("Assignment must select distinct generated faces")
++    assigned_rows = _matched_rows(
++        generated, desired, distances, permutation_indices, by_target, diagonal)
++    assigned = _matching_summary(assigned_rows, diagonal)
++    assigned.update(
++        objective="Minimum sum of six-permutation squared vertex distances D",
++        selected_face_indices=by_target.tolist(),
++        distinct_faces=True,
++        total_sum_squared_vertex_distance=float(distances[by_target, np.arange(len(desired))].sum()))
++
++    points = independent_check_points(desired) if check_points is None else np.asarray(check_points, dtype=np.float64)
++    if points.ndim != 3 or points.shape[0] != len(desired) or points.shape[-1] != 3:
++        raise ValueError("check_points must have shape [K,P,3]")
++    if not np.isfinite(points).all() or points.shape[1] == 0:
++        raise ValueError("check_points must contain finite points")
++    per_target = []
++    squared = []
++    for target_index, target_points in enumerate(points):
++        d2 = surface_distance_squared(target_points, generated)
++        squared.append(d2)
++        rms = float(np.sqrt(d2.mean()))
++        per_target.append(dict(
++            target_index=target_index, check_point_count=len(target_points),
++            rms=rms, rms_bbox_pct=100 * rms / diagonal,
++            max_bbox_pct=float(100 * np.sqrt(d2.max()) / diagonal)))
++    result.update(
++        status="PASS", independent_matching=independent, one_to_one_matching=assigned,
++        interior_surface=dict(
++            check_point_rule="Fixed uniform strictly interior barycentric samples, output-independent",
++            check_point_seed=29317 if check_points is None else None,
++            point_bank="generated_independent" if check_points is None else "caller_supplied",
++            per_target=per_target,
++            rms_bbox_pct=float(100 * np.sqrt(np.mean([v.mean() for v in squared])) / diagonal)),
++        completion_rms_bbox_pct=completion_rms(generated, reference, diagonal, seed=9911),
++        completion_rule="Existing symmetric surface RMS; 512 area-uniform points each direction; seed 9911")
++    if base_tokens is not None:
++        base = _triangles(base_tokens)
++        if base.shape != generated.shape or not np.isfinite(base).all():
++            raise ValueError("Base must be finite with the same ordered token shape")
++        result["nonwinning_displacement_vs_same_noise_base"] = dict(
++            excluding_independent_winners=_displacement(generated, base, closest, diagonal),
++            excluding_one_to_one_assignment=_displacement(generated, base, by_target, diagonal),
++            all_faces=_displacement(generated, base, [], diagonal))
++    return result
++
++
++def plot_fixed(outputs, targets, savepath):
++    """Plot fixed K=1/2 rows and Base/lambda5/lambda20 columns, one shared range.
++
++    outputs: {1: {'Base': array, 'lambda5': array, 'lambda20': array}, 2: ...}
++    targets: {1: [1,3,3], 2: [2,3,3]} (a two-element list is also accepted).
++    The caller selects the predeclared parent/noise, never a visually best case.
++    """
++    import matplotlib
++    matplotlib.use("Agg")
++    import matplotlib.pyplot as plt
++    from mpl_toolkits.mplot3d.art3d import Line3DCollection, Poly3DCollection
++
++    if not isinstance(targets, dict):
++        targets = {1: targets[0], 2: targets[1]}
++    columns = ("Base", "lambda5", "lambda20")
++    arrays = [_triangles(outputs[k][name]) for k in (1, 2) for name in columns]
++    arrays.extend(_triangles(targets[k]) for k in (1, 2))
++    finite_vertices = np.concatenate([a.reshape(-1, 3) for a in arrays])
++    finite_vertices = finite_vertices[np.isfinite(finite_vertices).all(axis=1)]
++    if not len(finite_vertices):
++        raise ValueError("Cannot plot a completely nonfinite collection")
++    low, high = finite_vertices.min(axis=0), finite_vertices.max(axis=0)
++    center = (low + high) / 2
++    half_extent = max(float((high - low).max()) * .55, 1e-3)
++    bounds = np.stack((center - half_extent, center + half_extent), axis=1)
++    fig = plt.figure(figsize=(14, 9), constrained_layout=True)
++    panels = []
++    for row, k in enumerate((1, 2)):
++        desired = _triangles(targets[k])
++        for column, name in enumerate(columns):
++            ax = fig.add_subplot(2, 3, row * 3 + column + 1, projection="3d")
++            tri = _triangles(outputs[k][name])
++            finite = np.isfinite(tri).all()
++            valid_tri = tri[np.isfinite(tri).all(axis=(1, 2))]
++            closed = np.concatenate((valid_tri, valid_tri[:, :1]), axis=1)
++            ax.add_collection3d(Line3DCollection(closed, colors="#687787", linewidths=.30, alpha=.38))
++            ax.scatter(valid_tri[:, :, 0].ravel(), valid_tri[:, :, 1].ravel(),
++                       valid_tri[:, :, 2].ravel(), s=.65, c="#65788a", alpha=.35)
++            chosen = []
++            if finite:
++                d, _, _ = exact_face_distances(tri, desired)
++                face_ids, target_ids = linear_sum_assignment(d)
++                chosen = face_ids[np.argsort(target_ids)].tolist()
++                best = tri[chosen]
++                ax.add_collection3d(Poly3DCollection(
++                    best, facecolors="#1ba3ba", edgecolors="#006782", linewidths=1.6, alpha=.45))
++                ax.scatter(best[:, :, 0].ravel(), best[:, :, 1].ravel(),
++                           best[:, :, 2].ravel(), s=12, c="#007e99")
++            ax.add_collection3d(Poly3DCollection(
++                desired, facecolors="#ff3030", edgecolors="#c80000", linewidths=2, alpha=.22))
++            ax.scatter(desired[:, :, 0].ravel(), desired[:, :, 1].ravel(),
++                       desired[:, :, 2].ravel(), s=28, c="#de1010", marker="x", depthshade=False)
++            ax.set_xlim(bounds[0]); ax.set_ylim(bounds[1]); ax.set_zlim(bounds[2])
++            ax.set_box_aspect((1, 1, 1)); ax.view_init(elev=22, azim=35)
++            ax.set_xlabel("x"); ax.set_ylabel("y"); ax.set_zlabel("z")
++            suffix = "" if finite else " [NONFINITE: finite faces only shown]"
++            label = name.replace("lambda", "lambda=")
++            ax.set_title(f"K={k} | {label}{suffix}")
++            panels.append(dict(k=k, column=name, assigned_highlight_faces=chosen,
++                               nonfinite=not finite))
++    fig.suptitle("Fixed parent / fixed noise | red: target; cyan: distinct best matches\n"
++                 "Identical camera and full shared bounds; no geometry repair or clipping", fontsize=13)
++    savepath = Path(savepath)
++    savepath.parent.mkdir(parents=True, exist_ok=True)
++    fig.savefig(savepath, dpi=180)
++    plt.close(fig)
++    return dict(path=str(savepath), panels=panels, shared_xyz_limits=bounds.tolist(),
++                camera=dict(elevation=22, azimuth=35),
++                extent_rule="All finite coordinates of all six outputs and both target sets; shared cubic bounds",
++                nonfinite_policy="Explicit panel annotation; show finite faces only; preserve original raw arrays")
++
++
++def cpu_fixture_checks():
++    """Small mathematical fixtures, with no official model or GPU calls."""
++    import json
++    import tempfile
++
++    a = np.asarray([[0., 0., 0.], [1., 0., 0.], [0., 1., 0.]])
++    b = a + np.asarray([0., 0., 2.])
++    c = a + np.asarray([3., 0., 0.])
++    generated = np.stack((a[[2, 0, 1]], b[[1, 2, 0]], c))
++    desired = np.stack((a, b))
++    diag = float(np.linalg.norm(np.ptp(generated.reshape(-1, 3), axis=0)))
++    pristine = generated.copy()
++    result = evaluate_output(generated, desired, generated, diag, generated)
++    assert result["independent_matching"]["selected_face_indices"] == [0, 1]
++    assert result["one_to_one_matching"]["aggregate_vertex_rms"] == 0
++    assert result["one_to_one_matching"]["thresholds"][-1]["all_targets_all_vertices_pass"]
++    assert result["interior_surface"]["rms_bbox_pct"] < 1e-12
++    assert result["completion_rms_bbox_pct"] < 1e-12
++    assert result["nonwinning_displacement_vs_same_noise_base"]["all_faces"]["vertex_rms"] == 0
++    assert np.array_equal(generated, pristine)
++
++    collision = evaluate_output(generated, np.stack((a, a)), generated, diag)
++    assert collision["independent_matching"]["has_collision"]
++    assert collision["independent_matching"]["collision_target_groups"] == [[0, 1]]
++    assert collision["independent_matching"]["aggregate_vertex_rms"] == 0
++    assert collision["one_to_one_matching"]["aggregate_vertex_rms"] > 0
++    assert not collision["one_to_one_matching"]["thresholds"][0]["all_targets_all_vertices_pass"]
++
++    shifted = generated.copy(); shifted[2] += np.asarray([.1, -.2, .3])
++    displacement = evaluate_output(shifted, desired, generated, diag, generated)
++    expected = float(np.linalg.norm([.1, -.2, .3]))
++    measured = displacement["nonwinning_displacement_vs_same_noise_base"]["excluding_one_to_one_assignment"]
++    assert measured["remaining_face_count"] == 1
++    assert abs(measured["vertex_rms"] - expected) < 1e-12
++    assert measured["unchanged_face_count"] == 0
++
++    translation = np.asarray([.03, -.04, .05])
++    single = evaluate_output((a + translation)[None], a[None], a[None], 1.)
++    assert abs(single["independent_matching"]["rows"][0]["vertex_rms"] - np.linalg.norm(translation)) < 1e-12
++    nan_output = generated.copy(); nan_output[0, 0, 0] = np.nan
++    nonfinite = evaluate_output(nan_output, desired, generated, diag)
++    assert nonfinite["status"] == "NONFINITE_OUTPUT"
++    assert nonfinite["quality"]["nan_count"] == 1
++    for value in (result, collision, displacement, single, nonfinite):
++        json.dumps(value, allow_nan=False)
++    with tempfile.TemporaryDirectory(prefix="softmatch_metrics_") as directory:
++        path = Path(directory) / "fixture.png"
++        figure = plot_fixed(
++            {k: {name: generated for name in ("Base", "lambda5", "lambda20")} for k in (1, 2)},
++            {1: a[None], 2: desired}, path)
++        assert path.is_file() and path.stat().st_size > 10000
++        assert len(figure["panels"]) == 6
++    return dict(status="PASS", tests=[
++        "six_permutation_exact_zero", "distinct_assignment_exact_zero",
++        "duplicate_target_collision_detected", "one_to_one_rejects_shared_exact_face",
++        "independent_interior_surface_zero", "original_completion_zero",
++        "same_noise_nonwinning_displacement", "known_translation_rms",
++        "nonfinite_is_explicit", "json_safe", "raw_arrays_unchanged",
++        "fixed_six_panel_png"], model_forwards=0, backward_calls=0, optimizer_updates=0)
++
++
++if __name__ == "__main__":
++    import json
++    print(json.dumps(cpu_fixture_checks(), sort_keys=True))
+diff --git a/experiments/mf_h1_local0/soft_matching_run.py b/experiments/mf_h1_local0/soft_matching_run.py
+new file mode 100644
+--- /dev/null
++++ b/experiments/mf_h1_local0/soft_matching_run.py
+@@ -0,0 +1,214 @@
++"""Bounded training-free triangle capture using the frozen official field only."""
++from .stable_runtime import configure_stable_runtime,stable_execution,assert_stable_runtime
++import argparse,copy,difflib,json,math,platform,subprocess,time,traceback
++from pathlib import Path
++import numpy as np
++import torch
++from .official_wrapper import load_official,state_sha256
++from .nxc112_run import PROJECT,REPO,EMA,EMA_SHA,BASE_SHA,atomic_json,file_record,protected_paths,frozen
++from .nxc112_evaluation import array_hash,_save_raw
++from .sample import euler_sample
++from .prompt_dataset import file_sha256
++
++LAMBDAS=(5.,20.)
++SEEDS=(9101,9102)
++MAX_FORWARDS=1000
++STEPS=50
++CODE_FILES=('soft_matching_energy.py','soft_matching_data.py','soft_matching_metrics.py','soft_matching_run.py','soft_matching_report.py')
++
++
++def schedule(maximum,k):
++    return 0. if k<=15 else float(maximum)*(k-15)/25 if k<40 else float(maximum)
++
++
++def small(value):
++    if torch.is_tensor(value):return value.detach().cpu().tolist()
++    if isinstance(value,dict):return {k:small(v) for k,v in value.items()}
++    if isinstance(value,(tuple,list)):return [small(v) for v in value]
++    if isinstance(value,np.ndarray):return value.tolist()
++    return value
++
++
++@torch.no_grad()
++def sample(base,z,targets,tau,maximum,counts):
++    from .soft_matching_energy import soft_matching_gradient,compact_matching_details
++    if z.dtype!=torch.float32 or z.shape!=(1,112,9):raise ValueError('Fixed real112 FP32 Gaussian required')
++    if targets is not None and targets.dtype!=torch.float32:raise ValueError('FP32 condition required')
++    frozen(base);before=counts['official_forward_attempts'];source=array_hash(z)
++    condition_hash=None if targets is None else array_hash(targets)
++    torch.cuda.synchronize();torch.cuda.reset_peak_memory_stats();tick=time.perf_counter()
++    state=z.clone();y=torch.tensor([112],device=z.device);mask=torch.ones((1,112),device=z.device,dtype=torch.bool)
++    path=[state[0].cpu().numpy().copy()];trace=[];grad_before=counts['geometry_gradient_attempts']
++    with stable_execution(base):
++        facts=assert_stable_runtime(base,coordinates=state)
++        for k in range(50):
++            t=torch.full((1,),k/50,device=z.device,dtype=torch.float32)
++            lam=schedule(maximum,k)
++            velocity=base(state,t,y=y,mask=mask).float()
++            entry=dict(k=k,t=k/50,lambda_value=lam,model_velocity_rms=float(velocity.square().mean().sqrt()))
++            if lam:
++                if targets is None:raise RuntimeError('Positive force needs provided triangles')
++                counts['geometry_gradient_attempts']+=1
++                gradient,details=soft_matching_gradient(state,targets,tau,mask=mask)
++                counts['geometry_gradient_completed']+=1
++                if gradient.dtype!=torch.float32 or gradient.requires_grad or gradient.grad_fn is not None:raise RuntimeError('Only detached FP32 geometry gradient allowed')
++                if not bool(torch.isfinite(gradient).all()):raise RuntimeError('Nonfinite external gradient; no clamp/retry')
++                force=gradient*lam;final_velocity=velocity-force
++                entry.update(geometry=compact_matching_details(details),gradient_rms=float(gradient.square().mean().sqrt()),
++                    force_rms=float(force.square().mean().sqrt()),gradient_dtype=str(gradient.dtype),
++                    force_to_model_rms=float(force.square().mean().sqrt())/max(entry['model_velocity_rms'],1e-30))
++            else:final_velocity=velocity
++            state=state+final_velocity*(1/50)
++            counts['euler_updates']+=1
++            if state.dtype!=torch.float32 or state.requires_grad or not bool(torch.isfinite(state).all()):raise RuntimeError('Invalid Euler state; stop, no repair')
++            trace.append(entry);path.append(state[0].cpu().numpy().copy())
++        assert_stable_runtime(base,coordinates=state)
++    torch.cuda.synchronize();seconds=time.perf_counter()-tick
++    assert array_hash(z)==source and (targets is None or array_hash(targets)==condition_hash)
++    assert counts['official_forward_attempts']-before==50
++    assert counts['geometry_gradient_attempts']-grad_before==(34 if maximum else 0)
++    assert all(p.grad is None for p in base.parameters())
++    counts['complete_rollouts']+=1
++    return state[0].cpu().numpy(),np.stack(path),dict(nfe=50,euler_updates=50,geometry_gradient_calls=counts['geometry_gradient_attempts']-grad_before,
++        lambda_max=maximum,tau=tau,seconds=seconds,peak_cuda_allocated=torch.cuda.max_memory_allocated(),runtime=facts,
++        trace=trace,noise_sha256=source,condition_sha256=condition_hash,input_unchanged=True,official_parameter_gradients_absent=True,
++        model_backward_calls=0,optimizer_updates=0,postprocessing=None)
++
++
++def main(output):
++    from .soft_matching_data import prepare_inputs
++    from .soft_matching_energy import run_cpu_tests
++    from .soft_matching_metrics import evaluate_output,plot_fixed,cpu_fixture_checks
++    out=Path(output).resolve()
++    if not out.is_relative_to(PROJECT/'outputs') or not out.name.startswith('soft_matching_'):raise ValueError('Use new separate output')
++    out.mkdir(exist_ok=True);result_path=out/'results.json'
++    if result_path.exists():raise FileExistsError('No overwrite or automatic repeat')
++    torch.set_num_threads(8);runtime=configure_stable_runtime()
++    protocol=dict(official_frozen_only=True,adapters_loaded=0,training_updates=0,backbone_updates=0,phase3=False,
++        seeds=list(SEEDS),parents=2,K=[1,2],lambda_max=[0,5,20],tau='3*(0.05*condition_parent_bbox_diagonal)^2 in original model-coordinate squared units',
++        distance='min over 6 target vertex permutations, sum of 3 squared Euclidean vertex distances',
++        energy='-tau*sum_k logsumexp_i(-D_ik/tau)',normalization='no energy normalization by N,K or bbox',
++        schedule='k<=15:0; 16<=k<40:lambda_max*(k-15)/25; k>=40:lambda_max',
++        steps=50,dt=.02,time='FP32 k/50 k0..49',N=112,y=112,mask='all true',face_cfg=1,
++        model_precision='stable original BF16 autocast, FP32 parameters',force_precision='FP32 with autocast disabled',
++        state_precision='FP32',gradient_target='detached current Xt only; no gradients through official field',
++        max_official_forwards=1000,formal_rollouts=18,diagnostic_rollouts=2,
++        exact_branches='lambda0 uses original model velocity and skips geometry autograd',
++        diagnostics='lambda0 vs official sampler bitwise; lambda5 first trajectory repeat bitwise',
++        selection='No model/configuration selection, no retuning after outputs',coordinate_repairs='NONE',
++        interpretation='Current-face soft capture with independent targets, not an injective assignment; inner permutation min is only piecewise smooth; finite Euler guidance does not guarantee exact coincidence.')
++    protocol_path=out/'protocol.json'
++    with protocol_path.open('x',encoding='utf-8') as stream:json.dump(protocol,stream,indent=2,allow_nan=False)
++    protocol_sha=file_sha256(protocol_path)
++    report=dict(status='RUNNING',active_stage='preflight',protocol=protocol,protocol_path=str(protocol_path),protocol_sha256=protocol_sha,
++        initial_runtime=runtime,outputs=[],diagnostics=[],counts=dict(official_forward_attempts=0,official_forward_returns=0,by_stage={},returns_by_stage={},
++            geometry_gradient_attempts=0,geometry_gradient_completed=0,model_backward_calls=0,euler_updates=0,complete_rollouts=0,
++            formal_rollouts=0,diagnostic_rollouts=0,optimizer_updates=0,backbone_updates=0,adapters_loaded=0),
++        environment=dict(torch=torch.__version__,python=platform.python_version(),numpy=np.__version__),timing={})
++    def write():atomic_json(result_path,report)
++    def progress(event):report['latest_progress']=event;write();print(json.dumps(event,allow_nan=False),flush=True)
++    write();base=None;arrays={};protected=[];started=time.perf_counter()
++    try:
++        report['cpu_tests']=run_cpu_tests()
++        if report['cpu_tests']['status']!='PASS':raise RuntimeError('Independent energy mathematics failed')
++        report['metric_cpu_tests']=cpu_fixture_checks()
++        report['development_cpu_test_runs']=dict(energy_evaluations=187,gradient_helper_calls=31,autograd_grad_calls=33,math_test_runs=2,metric_fixture_runs=1,metric_tests=12,official_forwards=0,model_backward_calls=0,optimizer_updates=0)
++        bank,audit=prepare_inputs(out);report['assets']=audit
++        assert audit['status']=='PASS' and set(bank['noises'])==set(SEEDS) and len(bank['cases'])==4
++        cases=[]
++        for parent in range(2):
++            group={item['K']:item for item in bank['cases'] if item['parent_index']==parent}
++            assert set(group)=={1,2}
++            first=group[1]
++            cases.append(dict(parent_index=parent,uid=first['parent_uid'],bbox_diagonal=first['bbox_diagonal'],
++                full_target=first['target'],targets={k:g['constraints'] for k,g in group.items()},checks={k:g['checks'] for k,g in group.items()}))
++        protected=sorted(p for p in set(protected_paths(out)+list(PROJECT.glob('*.py'))) if p.name!='soft_matching_report.py')
++        report['protected_before']={str(p):file_record(p) for p in protected}
++        if report['protected_before'][str(EMA)]['sha256']!=EMA_SHA:raise RuntimeError('Official EMA file changed')
++        base,loaded=load_official(EMA,REPO/'configs/snet/base-120m-ot-v-chair.yaml','cuda')
++        report['strict_load']=loaded;report['base_before']=frozen(base,True)
++        if any(layer._forward_hooks for layer in base.layers):raise RuntimeError('An adapter hook is installed')
++        report['environment'].update(gpu=torch.cuda.get_device_name(),gpu_memory_bytes=torch.cuda.get_device_properties(0).total_memory,
++            git_head=subprocess.check_output(['git','rev-parse','HEAD'],cwd=REPO,text=True).strip())
++        c=report['counts']
++        def count_before(module,args):
++            if c['official_forward_attempts']>=MAX_FORWARDS:raise RuntimeError('Hard 1000-forward budget exhausted')
++            c['official_forward_attempts']+=1;s=report['active_stage'];c['by_stage'][s]=c['by_stage'].get(s,0)+1
++        def count_after(module,args,value):
++            c['official_forward_returns']+=1;s=report['active_stage'];c['returns_by_stage'][s]=c['returns_by_stage'].get(s,0)+1
++        base.register_forward_pre_hook(count_before);base.register_forward_hook(count_after)
++        raw_dir=out/'raw';raw_dir.mkdir(exist_ok=False)
++        baselines={};all_generated={};figures={1:{},2:{}};figure_targets={}
++        # Two unique Base trajectories, shared by every geometry condition.
++        for seed in SEEDS:
++            report['active_stage']='Base';z=bank['noises'][seed].cuda()
++            raw,path,stats=sample(base,z,None,None,0.,c);baselines[seed]=raw
++            key=f'Base_seed{seed}';arrays[key]=raw;arrays[key+'_path']=path;c['formal_rollouts']+=1
++            report['outputs'].append(dict(key=key,model='Base',seed=seed,lambda_max=0,parent=None,K=None,sampling=stats))
++            if seed==SEEDS[0]:
++                report['active_stage']='zero_branch_diagnostic';c0=c['official_forward_attempts']
++                with stable_execution(base):
++                    value,official_stats=euler_sample(base,z,torch.tensor([112],device='cuda'),torch.ones((1,112),device='cuda',dtype=torch.bool),precision='bf16')
++                c['euler_updates']+=50;c['complete_rollouts']+=1;c['diagnostic_rollouts']+=1
++                raw_official=value[0].cpu().numpy();same=np.array_equal(raw,raw_official)
++                arrays['diagnostic_official_base_seed'+str(seed)]=raw_official
++                report['diagnostics'].append(dict(name='zero_force_matches_official_sampler',status='PASS' if same else 'FAIL',bitwise_equal=same,
++                    official_forwards=c['official_forward_attempts']-c0,sampling=official_stats))
++                if not same:raise RuntimeError('Zero guidance failed bitwise official sampler identity')
++            progress(dict(stage='Base',seed=seed,completed=c['complete_rollouts']))
++        # Full GT geometry is used only below by independent scoring, never by sample().
++        base_scores=[]
++        for case in cases:
++            parent=case['parent_index'];L=case['bbox_diagonal'];tau=3*(.05*L)**2
++            for K in (1,2):
++                targets=case['targets'][K];tc=torch.from_numpy(targets).to('cuda')
++                if parent==0:
++                    figures[K]['Base']=baselines[SEEDS[0]];figure_targets[K]=targets
++                for seed in SEEDS:
++                    base_metric=evaluate_output(baselines[seed],targets,case['full_target'],L,base_tokens=baselines[seed],check_points=case['checks'][K])
++                    base_scores.append(dict(parent=parent,uid=case['uid'],K=K,seed=seed,metrics=base_metric))
++                    for maximum in LAMBDAS:
++                        report['active_stage']='Guided';z=bank['noises'][seed].cuda()
++                        raw,path,stats=sample(base,z,tc,tau,maximum,c)
++                        key=f'P{parent}_K{K}_seed{seed}_lambda{int(maximum)}'
++                        arrays[key]=raw;arrays[key+'_path']=path;c['formal_rollouts']+=1
++                        score=evaluate_output(raw,targets,case['full_target'],L,base_tokens=baselines[seed],check_points=case['checks'][K])
++                        row=dict(key=key,model='guided',parent=parent,uid=case['uid'],K=K,seed=seed,lambda_max=maximum,tau=tau,
++                            metrics=score,sampling=stats,initial_noise_sha256=array_hash(bank['noises'][seed]),targets_sha256=array_hash(targets))
++                        report['outputs'].append(row);all_generated[(parent,K,seed,maximum)]=raw
++                        if parent==0 and seed==SEEDS[0]:figures[K]['lambda'+str(int(maximum))]=raw
++                        if parent==0 and K==1 and seed==SEEDS[0] and maximum==5.:
++                            report['active_stage']='guided_repeat_diagnostic'
++                            again,again_path,again_stats=sample(base,z,tc,tau,maximum,c);c['diagnostic_rollouts']+=1
++                            arrays['diagnostic_repeat_'+key]=again;arrays['diagnostic_repeat_'+key+'_path']=again_path
++                            same=np.array_equal(raw,again) and np.array_equal(path,again_path)
++                            report['diagnostics'].append(dict(name='same_input_guidance_repeat_all51states',status='PASS' if same else 'FAIL',
++                                bitwise_equal=same,sampling=again_stats,reference=key))
++                            if not same:raise RuntimeError('Geometry guidance is not repeatable')
++                        progress(dict(stage='Guided',parent=parent,K=K,seed=seed,lambda_max=maximum,completed=c['complete_rollouts']))
++        report['base_scores']=base_scores
++        report['raw']=_save_raw(raw_dir/'trajectories.npz',arrays)
++        report['active_stage']='offline_visualization';plot_fixed(figures,figure_targets,out/'fixed_parent0_seed9101.png')
++        report['figure']=dict(path=str(out/'fixed_parent0_seed9101.png'),sha256=file_sha256(out/'fixed_parent0_seed9101.png'),
++            fixed_selection='parent0,seed9101, both K, all registered settings; same camera and coordinate bounds')
++        assert c['official_forward_attempts']==1000 and c['official_forward_returns']==1000
++        assert c['formal_rollouts']==18 and c['diagnostic_rollouts']==2 and c['complete_rollouts']==20
++        assert c['geometry_gradient_attempts']==c['geometry_gradient_completed']==578 and c['euler_updates']==1000
++        report['base_after']=frozen(base,True)
++        report['protected_after']={str(p):file_record(p) for p in protected}
++        report['protected_unchanged']=report['protected_after']==report['protected_before']
++        if not report['protected_unchanged'] or file_sha256(protocol_path)!=protocol_sha:raise RuntimeError('Protected files/protocol changed')
++        report.update(status='PASS_EXECUTION',active_stage='complete',elapsed_seconds=time.perf_counter()-started)
++        write();progress(dict(stage='complete',status='PASS_EXECUTION',counts=c))
++    except BaseException as error:
++        report.update(status='STOPPED',error=repr(error),traceback=traceback.format_exc(),elapsed_seconds=time.perf_counter()-started)
++        if arrays:report['partial_raw']=_save_raw(out/'partial_raw.npz',arrays)
++        if base is not None:report['base_at_stop']=state_sha256(base)
++        if protected:
++            report['protected_after']={str(p):file_record(p) for p in protected}
++            report['protected_unchanged']=report['protected_after']==report['protected_before']
++        write();raise
++
++
++if __name__=='__main__':
++    p=argparse.ArgumentParser(description=__doc__);p.add_argument('--output',required=True);main(p.parse_args().output)
+diff --git a/experiments/mf_h1_local0/soft_matching_report.py b/experiments/mf_h1_local0/soft_matching_report.py
+new file mode 100644
+--- /dev/null
++++ b/experiments/mf_h1_local0/soft_matching_report.py
+@@ -0,0 +1,398 @@
++"""Offline-only summary and deliverable for the bounded soft-matching pilot.
++
++Reads recorded results. Never imports torch, invokes a model, chooses a new
++configuration, or changes inputs, geometry, protocol, or execution sources.
++"""
++from __future__ import annotations
++
++import argparse
++import difflib
++import hashlib
++import json
++import math
++from pathlib import Path
++import statistics
++import subprocess
++
++
++SOURCE_NAMES = (
++    "soft_matching_energy.py", "soft_matching_data.py", "soft_matching_metrics.py",
++    "soft_matching_run.py", "soft_matching_report.py")
++PRE_RUN_CPU_DEVELOPMENT = dict(
++    source="Developer-agent execution receipts before the formal run; disjoint from results.cpu_tests",
++    energy_evaluations=187, gradient_helper_calls=31, autograd_grad_calls=33,
++    metrics_fixture_tests=12, model_forwards=0, model_backward_calls=0,
++    optimizer_updates=0)
++
++
++def _sha(path):
++    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
++
++
++def _dist(values):
++    values = [float(value) for value in values if value is not None and math.isfinite(float(value))]
++    if not values:
++        return dict(n=0, mean=None, median=None, minimum=None, maximum=None)
++    return dict(n=len(values), mean=statistics.mean(values), median=statistics.median(values),
++                minimum=min(values), maximum=max(values))
++
++
++def _ratio_change(value, reference):
++    return None if value is None or reference is None or reference == 0 else 100 * (value - reference) / reference
++
++
++def _number(value, places=5):
++    return "N/A" if value is None else f"{value:.{places}f}"
++
++
++def _yes(value):
++    return "是" if value else "否"
++
++
++def _metrics_flat(row):
++    metric = row["metrics"]
++    independent, assigned = metric["independent_matching"], metric["one_to_one_matching"]
++    quality = metric["quality"]
++    displacement = metric.get("nonwinning_displacement_vs_same_noise_base")
++    displacement = None if displacement is None else displacement["excluding_one_to_one_assignment"]
++    return dict(
++        key=row.get("key", f"Base_P{row['parent']}_K{row['K']}_seed{row['seed']}"),
++        parent=int(row["parent"]), uid=row.get("uid"), K=int(row["K"]), seed=int(row["seed"]),
++        lambda_max=float(row.get("lambda_max", 0)), status=metric["status"],
++        bbox_diagonal=metric["bbox_diagonal"],
++        independent_vertex_rms_bbox_pct=None if independent is None else independent["aggregate_vertex_rms_bbox_pct"],
++        independent_max_vertex_error_bbox_pct=None if independent is None else independent["maximum_vertex_error_bbox_pct"],
++        independent_collision=None if independent is None else independent["has_collision"],
++        independent_face_indices=None if independent is None else independent["selected_face_indices"],
++        distinct_vertex_rms_bbox_pct=None if assigned is None else assigned["aggregate_vertex_rms_bbox_pct"],
++        distinct_max_vertex_error_bbox_pct=None if assigned is None else assigned["maximum_vertex_error_bbox_pct"],
++        distinct_face_indices=None if assigned is None else assigned["selected_face_indices"],
++        distinct_thresholds=[] if assigned is None else assigned["thresholds"],
++        independent_thresholds=[] if independent is None else independent["thresholds"],
++        interior_surface_rms_bbox_pct=None if metric["interior_surface"] is None else metric["interior_surface"]["rms_bbox_pct"],
++        completion_rms_bbox_pct=metric["completion_rms_bbox_pct"],
++        narrow_face_fraction=quality["min_angle_lt5_fraction"],
++        angles_p05=quality["angles_p05"], degenerate_fraction=quality["degenerate_fraction"],
++        nan_count=quality["nan_count"], inf_count=quality["inf_count"],
++        nonwinning_face_count=None if displacement is None else displacement["remaining_face_count"],
++        nonwinning_displacement_rms_bbox_pct=None if displacement is None else displacement["vertex_rms_bbox_pct"],
++        nonwinning_max_displacement_bbox_pct=None if displacement is None else displacement["max_vertex_displacement_bbox_pct"],
++        nonwinning_unchanged_fraction=None if displacement is None else displacement["unchanged_face_fraction"],
++        sampling_seconds=row.get("sampling", {}).get("seconds"),
++        peak_cuda_allocated=row.get("sampling", {}).get("peak_cuda_allocated"))
++
++
++def _trace_summary(row):
++    active = [entry for entry in row.get("sampling", {}).get("trace", []) if entry.get("lambda_value", 0) > 0]
++    if not active:
++        return None
++    previous = None
++    winner_changes = 0
++    collision_steps = 0
++    for entry in active:
++        geometry = entry.get("geometry", {})
++        winners = geometry.get("winning_faces")
++        if previous is not None and winners != previous:
++            winner_changes += 1
++        previous = winners
++        pairs = geometry.get("hard_winner_collision_pairs", [])
++        collision_steps += int(any(value > 0 for value in pairs))
++    return dict(
++        key=row["key"], active_force_steps=len(active), first_t=active[0]["t"], last_t=active[-1]["t"],
++        hard_winner_changes_between_active_steps=winner_changes,
++        steps_with_hard_winner_collision=collision_steps,
++        force_to_model_rms=_dist([entry.get("force_to_model_rms") for entry in active]),
++        final_pre_update_force_to_model_rms=active[-1].get("force_to_model_rms"),
++        final_pre_update_winning_faces=active[-1].get("geometry", {}).get("winning_faces"),
++        final_pre_update_winning_responsibility=active[-1].get("geometry", {}).get("winning_responsibility"),
++        final_pre_update_effective_face_count=active[-1].get("geometry", {}).get("assignment_effective_face_count"),
++        final_pre_update_closest_distance_sq=active[-1].get("geometry", {}).get("closest_distance_sq"),
++        trace_state_note="Trace k describes pre-update Xt at t=k/50; terminal metrics describe X1 after update49")
++
++
++def summarize(report):
++    raw_rows = [dict(row, lambda_max=0) for row in report.get("base_scores", [])]
++    raw_rows += [row for row in report.get("outputs", []) if row.get("model") == "guided" and "metrics" in row]
++    rows = [_metrics_flat(row) for row in raw_rows]
++    rows.sort(key=lambda row: (row["parent"], row["K"], row["lambda_max"], row["seed"]))
++    base_lookup = {(row["parent"], row["K"], row["seed"]): row for row in rows if row["lambda_max"] == 0}
++    scalar_fields = (
++        "independent_vertex_rms_bbox_pct", "independent_max_vertex_error_bbox_pct",
++        "distinct_vertex_rms_bbox_pct", "distinct_max_vertex_error_bbox_pct",
++        "interior_surface_rms_bbox_pct", "completion_rms_bbox_pct", "narrow_face_fraction",
++        "angles_p05", "degenerate_fraction", "nonwinning_displacement_rms_bbox_pct",
++        "nonwinning_max_displacement_bbox_pct", "nonwinning_unchanged_fraction", "sampling_seconds")
++    for row in rows:
++        base = base_lookup.get((row["parent"], row["K"], row["seed"]))
++        if base is not None:
++            row["change_vs_same_noise_base_pct"] = {
++                key: _ratio_change(row[key], base[key]) for key in (
++                    "distinct_vertex_rms_bbox_pct", "distinct_max_vertex_error_bbox_pct",
++                    "interior_surface_rms_bbox_pct", "completion_rms_bbox_pct")}
++    groups = []
++    for key in sorted(set((row["parent"], row["K"], row["lambda_max"]) for row in rows)):
++        selected = [row for row in rows if (row["parent"], row["K"], row["lambda_max"]) == key]
++        group = dict(parent=key[0], K=key[1], lambda_max=key[2], seeds=[row["seed"] for row in selected],
++                     n=len(selected), scalar_distributions={field: _dist([row[field] for row in selected]) for field in scalar_fields},
++                     independent_collision_cases=sum(row["independent_collision"] is True for row in selected),
++                     nan_count=sum(row["nan_count"] for row in selected), inf_count=sum(row["inf_count"] for row in selected))
++        group["distinct_capture_counts"] = [dict(
++            relative_bbox_threshold=threshold,
++            all_vertices_pass_count=sum(any(
++                item["relative_bbox_threshold"] == threshold and item["all_targets_all_vertices_pass"]
++                for item in row["distinct_thresholds"]) for row in selected),
++            rms_pass_count=sum(any(
++                item["relative_bbox_threshold"] == threshold and item["all_targets_rms_pass"]
++                for item in row["distinct_thresholds"]) for row in selected), denominator=len(selected))
++            for threshold in (1e-3, 1e-4, 1e-5)]
++        groups.append(group)
++    by_lambda = []
++    for maximum in (0, 5, 20):
++        selected = [row for row in rows if row["lambda_max"] == maximum]
++        if not selected:
++            continue
++        by_lambda.append(dict(
++            lambda_max=maximum, scored_cases=len(selected), K2_scored_cases=sum(row["K"] == 2 for row in selected),
++            distinct_capture_counts=[dict(
++                relative_bbox_threshold=threshold,
++                all_cases_pass_count=sum(any(item["relative_bbox_threshold"] == threshold and item["all_targets_all_vertices_pass"]
++                                             for item in row["distinct_thresholds"]) for row in selected),
++                K2_distinct_faces_all_vertices_pass_count=sum(any(item["relative_bbox_threshold"] == threshold and item["all_targets_all_vertices_pass"]
++                                             for item in row["distinct_thresholds"]) for row in selected if row["K"] == 2))
++                for threshold in (1e-3, 1e-4, 1e-5)],
++            matching_rms_improved_vs_base_count=sum(row.get("change_vs_same_noise_base_pct", {}).get("distinct_vertex_rms_bbox_pct", 0) < 0 for row in selected),
++            completion_rms_worsened_vs_base_count=sum((row.get("change_vs_same_noise_base_pct", {}).get("completion_rms_bbox_pct") or 0) > 0 for row in selected),
++            distinct_rms_bbox_pct=_dist([row["distinct_vertex_rms_bbox_pct"] for row in selected]),
++            distinct_max_vertex_bbox_pct=_dist([row["distinct_max_vertex_error_bbox_pct"] for row in selected]),
++            completion_change_vs_base_pct=_dist([row.get("change_vs_same_noise_base_pct", {}).get("completion_rms_bbox_pct") for row in selected]),
++            nonwinning_rms_bbox_pct=_dist([row["nonwinning_displacement_rms_bbox_pct"] for row in selected]),
++            nonwinning_unchanged_fraction=_dist([row["nonwinning_unchanged_fraction"] for row in selected])))
++    guided_outputs = [row for row in report.get("outputs", []) if row.get("model") == "guided"]
++    traces = [_trace_summary(row) for row in guided_outputs]
++    return dict(
++        schema="soft_matching_offline_summary_v1", execution_status=report["status"],
++        offline_model_forwards=0, offline_geometry_autograd_calls=0, offline_optimizer_updates=0,
++        per_case=rows, parent_K_setting_groups=groups, setting_summaries=by_lambda,
++        trace_summaries=[value for value in traces if value is not None],
++        timing_by_setting={str(maximum): _dist([row["sampling"]["seconds"] for row in report.get("outputs", [])
++                                               if row.get("lambda_max") == maximum and "seconds" in row.get("sampling", {})])
++                          for maximum in (0, 5, 20)},
++        peak_cuda_allocated_bytes=max((row.get("sampling", {}).get("peak_cuda_allocated", 0)
++                                      for row in report.get("outputs", [])), default=0),
++        pre_run_CPU_development_receipts=PRE_RUN_CPU_DEVELOPMENT,
++        formal_CPU_metric_fixture_count=len(report.get("metric_cpu_tests", {}).get("tests", [])),
++        all_logged_CPU_math_counts={key: PRE_RUN_CPU_DEVELOPMENT[key] + report.get("cpu_tests", {}).get("counts", {}).get(key, 0)
++                                    for key in ("energy_evaluations", "gradient_helper_calls", "autograd_grad_calls")},
++        fixed_example_late_increase_audit=dict(
++            key="P0_K1_seed9101_lambda20",
++            source="Independent math-agent NumPy six-permutation audit of the predeclared fixed figure example; no new model, autograd, update, or model selection",
++            audited_states=51, winner_change=dict(k=6, previous_face=108, next_face=96),
++            winner_face_after_k6_through_final=96,
++            minimum=dict(k=37, t=.74, D=.09290514134, vertex_rms_bbox_pct=2.425991),
++            strict_increase_every_step_k38_through_k50=True,
++            final=dict(k=50, t=1., D=.44911158426, vertex_rms_bbox_pct=5.333919),
++            final_D_over_minimum_D=4.8341,
++            trace_matches_independent_winner_for_all_k16_through_k49=True,
++            max_absolute_trace_distance_error_vs_numpy=6.68e-7,
++            final_trace=dict(k=49, t=.98, pre_update_D=.361736804),
++            added_model_forwards=0, added_geometry_autograd_calls=0, added_optimizer_updates=0,
++            limitation="Fixed winner still has late distance increase. Full winner-face velocity direction decomposition was not retained; model opposition is not uniquely established and discrete integration/path effects are not excluded."),
++        finite_sample_scope="Two existing real 112-face parents, two independent Gaussian noises, fixed K1/K2 constraints; feasibility pilot, not generalization",
++        exact_capture_rule="One-to-one matching, every target and every vertex within the stated fraction of GT bbox diagonal",
++        model_or_configuration_selected=False, further_model_calls_scheduled=False)
++
++
++def _table(headers, rows):
++    return "\n".join(["| " + " | ".join(headers) + " |", "| " + " | ".join("---" for _ in headers) + " |"] +
++                     ["| " + " | ".join(str(value) for value in row) + " |" for row in rows])
++
++
++def render_report(report, summary):
++    counts, protocol = report.get("counts", {}), report.get("protocol", {})
++    lines = ["# 冻结官方 MeshFlow：免训练三角片软匹配引导", "", f"执行状态：`{report['status']}`。本轮新增训练 **0**，仅使用冻结官方权重。", "",
++             "## 直接结论", ""]
++    successful = 0
++    for row in summary["setting_summaries"]:
++        if not row["lambda_max"]:
++            continue
++        threshold = row["distinct_capture_counts"][0]
++        successful += threshold["all_cases_pass_count"]
++        lines.append(f"- λ_max={row['lambda_max']}: 一对一全顶点误差 ≤10⁻³ bbox 为 **{threshold['all_cases_pass_count']}/{row['scored_cases']}**；"
++                     f"其中 K=2 为 **{threshold['K2_distinct_faces_all_vertices_pass_count']}/{row['K2_scored_cases']}**。"
++                     f"匹配 RMS 相对同噪声 Base 改善 {row['matching_rms_improved_vs_base_count']}/{row['scored_cases']}；"
++                     f"完整表面误差变差 {row['completion_rms_worsened_vs_base_count']}/{row['scored_cases']}。")
++    lines += ["", ("至少部分固定案例达到所列相对精度门限；这支持局部面片捕获的可行性，不保证其他输入、噪声或更严格精度。"
++                    if successful else "本轮没有在 10⁻³ bbox 全顶点、一对一门限下建立精确捕获。误差下降只能证明外力有吸引响应，不能表述为严丝合缝地包含目标面片。"), "",
++              "所有误差均为归一化模型坐标或 GT 包围盒对角线比例，没有物理米/微米标定。阈值10⁻³/10⁻⁴/10⁻⁵ bbox分别对应0.1%/0.01%/0.001% bbox。", "",
++              "## 固定执行配置与范围", "",
++              "2 个已有真实训练父对象，原始112面；K=1保留历史提示三角片，K=2按原输入面序追加第一个不同的有效面。提示选择不看模型输出。"
++              "新 Gaussian seed9101/9102，Base和所有提示/强度使用同一对应噪声；未做OT匹配。完整GT顶点未进入采样梯度或终点预测；"
++              "除提示C外，既有对象的bbox对角线元数据用于下述预定温度归一化。", "",
++              "原官方 BF16 autocast、FP32权重及积分状态；CUDA初始化前 CUBLAS_WORKSPACE_CONFIG=:4096:8，严格确定性、TF32关闭、SDPA math。"
++              "N=y=112、mask全有效、face CFG=1、50步Euler(dt=0.02)。采样未加载适配器，未投影、修补或重标定几何。", "",
++              "势能严格采用 E=-τΣ_k logΣ_i exp(-min_{π∈S3}Σ_a||x_ia-c_kπ(a)||²/τ)，不按N、K、bbox额外归一化。"
++              "τ=3(0.05×父对象bbox对角线)²。最终速度为 v_model−λ(t)∇_Xt E，梯度仅通过独立FP32当前坐标图，不穿过官方主干。", "",
++              "该bbox来自已有对象坐标/评估元数据（P0约7.2539、P1约6.0844），并非仅从C估计。"
++              "因此本轮是两个已知对象的小诊断，不是未知目标部署的尺度标定；所有相对精度阈值使用同一bbox。", "",
++              "强度仅预注册 λ_max=5/20：k≤15为0，16≤k<40线性爬升 λ_max(k−15)/25，k≥40保持最大值。"
++              "每条引导轨迹34次几何求导，最后实际评估t=0.98。没有结果后追加参数网格或挑选获胜强度。", ""]
++    parents = report.get("assets", {}).get("parents", [])
++    lines += [_table(["父对象", "UID", "bbox对角线", "面数"],
++                     [[row["parent_index"], row["parent_uid"], _number(row["bbox_diagonal"], 9), row["faces"]] for row in parents]), "",
++              "## 每条完整生成：匹配精度", "",
++              "下表均为 **% bbox**。独立RMS允许两个目标选同一面；一对一RMS使用SciPy匈牙利最小化ΣD，并固定不同输出面。"
++              "“max顶点”是该一对一匹配中所有目标/顶点的最大误差。阈值列要求所有顶点同时满足，不只检查平均RMS。", ""]
++    rows = summary["per_case"]
++    lines += [_table(["P", "K", "λ_max", "seed", "独立RMS", "独立max顶点", "独立碰撞", "一对一RMS", "一对一max顶点", "≤1e-3", "≤1e-4", "≤1e-5", "一对一面ID"],
++                     [[row["parent"], row["K"], int(row["lambda_max"]), row["seed"],
++                       _number(row["independent_vertex_rms_bbox_pct"]), _number(row["independent_max_vertex_error_bbox_pct"]), _yes(row["independent_collision"]),
++                       _number(row["distinct_vertex_rms_bbox_pct"]), _number(row["distinct_max_vertex_error_bbox_pct"]),
++                       *[_yes(item["all_targets_all_vertices_pass"]) for item in row["distinct_thresholds"]],
++                       str(row["distinct_face_indices"])] for row in rows]), "",
++              "所有目标的逐顶点误差、六排列索引、独立及一对一两套阈值均在 results.json 原始metrics中保留。", "",
++              "## 每组两噪声汇总", "",
++              "均值和范围仅覆盖两个预注册噪声，不能据此估计稳健性或泛化。下表仍为% bbox；变化比例在JSON中另按同噪声Base计算，未混淆比值均值与均值比值。", ""]
++    group_rows = []
++    for row in summary["parent_K_setting_groups"]:
++        d = row["scalar_distributions"]
++        rms, maximum = d["distinct_vertex_rms_bbox_pct"], d["distinct_max_vertex_error_bbox_pct"]
++        group_rows.append([row["parent"], row["K"], int(row["lambda_max"]),
++                           f"{_number(rms['mean'])} [{_number(rms['minimum'])}, {_number(rms['maximum'])}]",
++                           f"{_number(maximum['mean'])} [{_number(maximum['minimum'])}, {_number(maximum['maximum'])}]",
++                           _number(d["interior_surface_rms_bbox_pct"]["mean"]), _number(d["completion_rms_bbox_pct"]["mean"]),
++                           *[str(item["all_vertices_pass_count"]) + "/" + str(item["denominator"]) for item in row["distinct_capture_counts"]]])
++    lines += [_table(["P", "K", "λ_max", "一对一RMS均值[范围]", "max顶点均值[范围]", "内部surface均值", "完整surface均值", "≤1e-3", "≤1e-4", "≤1e-5"], group_rows), "",
++              "## 完整表面、窄长面与其他面变化", "",
++              "内部surface是独立内部检查点到输出三角表面的RMS，无法单独证明输出包含完整目标三角片。"
++              "完整surface沿用原对称表面RMS、每侧512个面积均匀采样点、seed9911。窄长面为最小角<5°的面比例；角p05为全部面角的第5百分位。"
++              "其他面位移按同噪声Base的原始面/顶点索引对应，排除一对一被捕获候选面，不进行重新匹配。", ""]
++    quality_rows = []
++    for row in rows:
++        quality_rows.append([row["parent"], row["K"], int(row["lambda_max"]), row["seed"],
++                             _number(row["interior_surface_rms_bbox_pct"]), _number(row["completion_rms_bbox_pct"]),
++                             _number(row.get("change_vs_same_noise_base_pct", {}).get("completion_rms_bbox_pct"), 2),
++                             _number(None if row["narrow_face_fraction"] is None else row["narrow_face_fraction"] * 100, 2),
++                             _number(row["angles_p05"], 3), _number(row["degenerate_fraction"], 6),
++                             f"{row['nan_count']}/{row['inf_count']}",
++                             _number(row["nonwinning_displacement_rms_bbox_pct"]),
++                             _number(None if row["nonwinning_unchanged_fraction"] is None else row["nonwinning_unchanged_fraction"] * 100, 2)])
++    lines += [_table(["P", "K", "λ_max", "seed", "内部surface%", "完整surface%", "完整误差ΔvsBase%", "窄长面%", "角p05°", "退化比例", "NaN/Inf", "其他面位移RMS%", "其他面完全未变%"], quality_rows), "",
++              "自交、水密、流形检查：均为 **NOT_RUN**。没有将未检查的拓扑宣称为有效或无缺陷。", "",
++              "## 捕获过程与数值边界", "",
++              "LSE只软化了面索引指派；内部六顶点排列仍使用硬min，因此在排列切换处仅分段光滑。"
++              "每个目标单独归一化，目标间没有一对一约束，可能同时吸引同一张面。即使本轮没有终点冲突，也不能推出一般情况下无冲突。", "",
++              "外力不是只作用于获胜面：所有责任权重非零的面均受影响，随后主干还会传播输入变化。因此“其余三角形正常流动/完全不变”须由上表位移判断。"
++              "有限λ、非零τ和50步Euler也不保证终点零误差：主干速度可与吸引力平衡，多面加权可产生竞争。这里把这些视为方法边界，不据此宣布已定位唯一失败根因。", ""]
++    concentrated = next((row for row in summary["trace_summaries"] if row["key"] == "P0_K1_seed9101_lambda20"), None)
++    concentrated_result = next((row for row in rows if row["key"] == "P0_K1_seed9101_lambda20"), None)
++    if concentrated is not None and concentrated_result is not None:
++        lines += ["例如 P0/K1/seed9101/λ20 的最后一次求导（t=0.98）赢家责任权重为 `" +
++                  str(concentrated["final_pre_update_winning_responsibility"]) + "`，有效面数为 `" +
++                  str(concentrated["final_pre_update_effective_face_count"]) + "`；终点一对一顶点RMS仍为 **" +
++                  _number(concentrated_result["distinct_vertex_rms_bbox_pct"]) + "% bbox**。"
++                  "因此不能仅用软指派扩散解释该残差；主干竞争和有限引导强度是合理机制解释，尚非已完成因果验证的结论。", ""]
++    lines += ["同一预固定图例的独立NumPy六排列审计显示：51个状态中赢家只在k=6从108切到96，随后至终点保持96；"
++              "k=37（t=0.74）距离D降至0.09290514134，顶点RMS为2.425991% bbox；k=38至50每步严格反增，"
++              "终点D=0.44911158426、RMS=5.333919% bbox（D约为最低点的4.8341倍）。"
++              "这直接说明固定赢家仍发生末期距离反增。全部34项有力trace的赢家与独立计算一致，D最大绝对差6.68e-7；"
++              "最后trace D=0.361736804对应k=49更新前，不能代替终点D。", "",
++              "未保存获胜面完整速度方向分解，不能将反增唯一归因于主干对抗；离散积分与路径因素尚未排除。"
++              "该固定例审计未追加模型前向、几何求导、训练更新或结果选例。", ""]
++    lines += [_table(["轨迹", "有力步", "硬赢家切换", "冲突步", "force/model RMS均值", "force/model最大", "末次force/model"],
++                     [[row["key"], row["active_force_steps"], row["hard_winner_changes_between_active_steps"],
++                       row["steps_with_hard_winner_collision"], _number(row["force_to_model_rms"]["mean"], 3),
++                       _number(row["force_to_model_rms"]["maximum"], 3), _number(row["final_pre_update_force_to_model_rms"], 3)]
++                      for row in summary["trace_summaries"]]), "",
++              "每步t、λ、力/模型速度RMS、最优面、顶点排列、责任权重或其紧凑摘要保存在 results.json → outputs[].sampling.trace。"
++              "trace的k=49描述t=0.98更新前状态；上面的最终匹配指标针对完成最后Euler更新后的X1，二者不混用。", "",
++              "## 实际调用、校验与保护", "",
++              _table(["项目", "实际次数"], [[key, counts.get(key, "未记录")] for key in (
++                  "official_forward_attempts", "official_forward_returns", "complete_rollouts", "formal_rollouts",
++                  "diagnostic_rollouts", "euler_updates", "geometry_gradient_attempts", "geometry_gradient_completed",
++                  "model_backward_calls", "optimizer_updates", "backbone_updates", "adapters_loaded")]), "",
++              "18条正式轨迹 = 2条Base + 16条引导。Base对2父对象×K1/K2×2噪声产生8条评分记录，属于复用评分，不是8条生成。"
++              "2条诊断为原官方采样器对照和首条λ=5的完整重复；两者计入1000次前向与20条完整生成。", "",
++              _table(["诊断", "状态", "逐位一致"], [[row["name"], row["status"], _yes(row.get("bitwise_equal"))] for row in report.get("diagnostics", [])]), "",
++              f"执行总耗时：{_number(report.get('elapsed_seconds'), 2)}秒。正式采样最大CUDA allocated：{summary['peak_cuda_allocated_bytes'] / 2**30:.3f} GiB。"
++              "采样计时含状态保存、梯度/轨迹统计及同步开销，不等同于移除诊断后的最快推理基准。"
++              "Base首条含冷启动且没有额外warmup；仅两条Base的均值不能与引导均值直接作加速比较，也不能据此宣称引导更快。"
++              "每条始终50次官方前向，引导另增加34次纯几何求导，没有主干反向。", "",
++              _table(["λ_max", "正式轨迹数", "秒/轨迹均值", "范围"], [[maximum, value["n"], _number(value["mean"], 3),
++                        f"{_number(value['minimum'], 3)}–{_number(value['maximum'], 3)}"]
++                        for maximum, value in summary["timing_by_setting"].items()]), "",
++              "预运行代理CPU开发检验累计：187次势能计算、31次几何梯度helper、33次autograd.grad、12项指标fixture；模型调用/更新为0。"
++              "这些计数与正式入口自己的CPU数学测试分开，不把CPU几何求导算成主干反向。", "",
++              "正式入口CPU数学测试：`" + json.dumps(report.get("cpu_tests", {}).get("counts", {}), ensure_ascii=False, sort_keys=True) + "`。", "",
++              f"正式入口另执行 {summary['formal_CPU_metric_fixture_count']} 项指标fixture，全部状态见 metric_cpu_tests。"
++              "合并已记录的开发与正式CPU数学调用：`" + json.dumps(summary["all_logged_CPU_math_counts"], sort_keys=True) + "`。"
++              "GPU采样的578次几何求导另列，主干反向始终0。", "",
++              f"旧资产/源码保护检查：`{report.get('protected_unchanged')}`；协议SHA256：`{report.get('protocol_sha256')}`。"
++              "官方文件、严格加载、主干前后状态哈希、每个保护文件的路径/SHA和当前环境详见results.json。", "",
++              "## 交付与下一步", "",
++              "- [结果与原始逐步trace](results.json)", "- [预注册配置](protocol.json)", "- [实际目标及固定噪声](inputs.npz)",
++              "- [完整轨迹原始输出](raw/trajectories.npz)：正式路径及引导重复保留51个状态，官方Base诊断另存终点；无后处理。",
++              "- [固定父0 / seed9101图](fixed_parent0_seed9101.png)：红色目标、青色一对一候选，K1/K2×Base/λ5/λ20，同相机和全输出共享范围。",
++              "- [本轮五个新增代码文件diff](code.diff)", "",
++              "![固定父0 / seed9101完整对照](fixed_parent0_seed9101.png)", "",
++              ("下一步若继续，宜先用固定精度和完整质量约束做一轮独立噪声复核；当前两个噪声不足以证明可靠捕获。"
++               if successful else "当前证据不支持把本设置交付为精确包含约束。若继续，应先定位有限外力下的残余误差、多目标竞争与表面质量代价，再决定是否值得扩大；本轮不自动更换方法或扩大搜索。"), "",
++              "已停止。没有自动选择λ、追加噪声、更新主干/适配器或启动下一阶段。", ""]
++    if report["status"] != "PASS_EXECUTION":
++        lines.insert(4, "**执行未完成；以下为已记录部分，不把预算目标写成实际完成。错误：** `" + str(report.get("error")) + "`")
++    return "\n".join(lines)
++
++
++def finalize(output):
++    out = Path(output).resolve()
++    project = Path(__file__).resolve().parent
++    if out.parent != project / "outputs" or not out.name.startswith("soft_matching_"):
++        raise ValueError("Only the explicitly isolated soft_matching output is writable")
++    results_path = out / "results.json"
++    report = json.loads(results_path.read_text(encoding="utf-8-sig"))
++    if report["status"] not in ("PASS_EXECUTION", "STOPPED"):
++        raise RuntimeError("Do not summarize while the model run is active")
++    protocol_before = _sha(out / "protocol.json")
++    if protocol_before != report["protocol_sha256"]:
++        raise RuntimeError("Frozen protocol hash mismatch")
++    summary = summarize(report)
++    diff = []
++    code_records = []
++    for name in SOURCE_NAMES:
++        source = project / name
++        content = source.read_bytes().decode("utf-8")
++        if not content.endswith("\n"):
++            raise RuntimeError("Expected newline-terminated source; refusing a byte-changing patch")
++        relative = "experiments/mf_h1_local0/" + name
++        diff.append("diff --git a/" + relative + " b/" + relative + "\n")
++        diff.append("new file mode 100644\n")
++        diff.extend(difflib.unified_diff([], content.splitlines(keepends=True), fromfile="/dev/null", tofile="b/" + relative))
++        code_records.append(dict(path=str(source), sha256=_sha(source), bytes=source.stat().st_size))
++    patch_path = out / "code.diff"
++    patch_path.write_bytes("".join(diff).encode("utf-8"))
++    checked = subprocess.run(["git", "apply", "--numstat", str(patch_path)], cwd=project.parents[1],
++                             text=True, capture_output=True, check=True)
++    reverse_checked = subprocess.run(["git", "apply", "--reverse", "--check", str(patch_path)],
++                                     cwd=project.parents[1], text=True, capture_output=True, check=True)
++    summary["code_delivery"] = dict(path=str(patch_path), sha256=_sha(patch_path), sources=code_records,
++                                    git_apply_numstat=checked.stdout.strip(), parsed=True,
++                                    git_apply_reverse_check_passed=reverse_checked.returncode == 0,
++                                    source_bytes_preserved="UTF-8 BOM and CRLF/LF preserved; reverse-check against actual execution source")
++    report["offline_summary"] = summary
++    report_path = out / "SOFT_MATCHING_REPORT.md"
++    report_path.write_text(render_report(report, summary), encoding="utf-8", newline="\n")
++    report["delivery"] = dict(report=dict(path=str(report_path), sha256=_sha(report_path)),
++                             code_diff=dict(path=str(patch_path), sha256=_sha(patch_path)),
++                             offline_only=True, model_calls=0, optimizer_updates=0)
++    temporary = out / "results.offline.tmp"
++    temporary.write_text(json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False) + "\n", encoding="utf-8")
++    temporary.replace(results_path)
++    if _sha(out / "protocol.json") != protocol_before:
++        raise AssertionError("Offline reporting changed protocol")
++    return dict(report=str(report_path), results=str(results_path), code_diff=str(patch_path),
++                status=report["status"], model_forwards=0, geometry_autograd_calls=0, optimizer_updates=0)
++
++
++if __name__ == "__main__":
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--output", required=True)
++    print(json.dumps(finalize(parser.parse_args().output), ensure_ascii=False, sort_keys=True))

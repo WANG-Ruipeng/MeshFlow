@@ -1,0 +1,2228 @@
+diff --git a/native_t1/model.py b/native_t1/model.py
+index 0447f1a..75cd3a4 100644
+--- a/native_t1/model.py
++++ b/native_t1/model.py
+@@ -174,7 +174,11 @@ class NativeInpaintingModel(nn.Module):
+         self.requires_grad_(self.experiment_trainable)
+         return self
+ 
+-    def forward(self, x, t, y, valid_mask=None, known_mask=None, *, observer=None):
++    def forward(self, x, t, y, valid_mask=None, known_mask=None, *, observer=None,
++                return_feature_layer=None):
++        # A reference to the actual block-9 output; never cast/detach the backbone path.
++        if return_feature_layer is not None and (type(return_feature_layer) is not int or return_feature_layer != 9):
++            raise ValueError('Only the predefined feature layer 9 is supported')
+         assert_native_runtime(self, coordinates=(x, t))
+         if x.ndim != 3 or x.shape[1:] != (112, 9):
+             raise ValueError('Native task requires x[B,112,9]')
+@@ -210,11 +214,18 @@ class NativeInpaintingModel(nn.Module):
+             observer(dict(site='embedding', hidden=hidden, role=role,
+                           known_mask=known_mask, valid_mask=valid_mask,
+                           face_time=face_time, c_free=c_free, c_known=c_known))
++        feature = None
+         for index, block in enumerate(self.backbone.layers, 1):
+             hidden = native_block_forward(
+                 block, hidden, c_free, c_known, known_mask, valid_mask,
+                 observer=observer, layer_index=index, face_time=face_time)
++            if return_feature_layer == index:
++                feature = hidden
+         result = native_final_forward(
+             self.backbone.final_layer, hidden, c_free, c_known, known_mask,
+             observer=observer, face_time=face_time)
++        if return_feature_layer is not None:
++            if feature is None:
++                raise RuntimeError('The requested ninth block was not executed')
++            return result.view(batch, faces, 9), feature
+         return result.view(batch, faces, 9)
+diff --git a/native_t1/geometry_representation.py b/native_t1/geometry_representation.py
+new file mode 100755
+index 0000000..6d11f46
+--- /dev/null
++++ b/native_t1/geometry_representation.py
+@@ -0,0 +1,279 @@
++"""Training-only analytic-geometry representation alignment.
++
++Targets are fixed descriptors of clean free GT faces. They are never generator
++inputs. P/S are separate auxiliary heads, never generator children or samplers.
++The input Geo encoder and its feature definition are not changed here.
++"""
++from __future__ import annotations
++import copy
++import hashlib
++import json
++import math
++from numbers import Integral
++
++import numpy as np
++import torch
++from torch import nn
++from torch.nn import functional as F
++
++FEATURE_LAYER = 9
++FEATURE_DIM = 13
++HIDDEN_DIM = 768
++HEAD_SEED = 20261001
++EPS = 1e-6
++GROUP_SLICES = {'centroid':slice(0,3), 'log_edges':slice(3,6),
++                'log_area':slice(6,7), 'normal_outer':slice(7,13)}
++FORMULA_SPEC = dict(version='analytic_geometry_representation_v1',
++    raw='centroid_xyz_sorted_edges_area_normal_outer_xx_yy_zz_xy_xz_yz',
++    canonical_order='stable_lexicographic_xyz', descriptor_dtype='CPU_float64',
++    length_log_floor=1e-8, area_log_floor=1e-12, true_degenerate_reject='zero_edge_or_area_le_zero',
++    groups=[['centroid',0,3],['log_edges',3,6],['log_area',6,7],['normal_outer',7,13]],
++    group_scale='centered_RMS_over_faces_and_group_dimensions', scale_floor=1e-6,
++    normalization='(r_g-mu_g)/(max(s_g,1e-6)*sqrt(d_g))', training_target_dtype='float32',
++    fit_K=[4,8,12], deduplication='parent_index_and_canonical_source_face_id',
++    angular_epsilon=1e-6, invalid_direction='norm_q_le_1e-6_excluded_from_angular_only')
++
++
++def _hash_json(value):
++    return hashlib.sha256(json.dumps(value,sort_keys=True,separators=(',',':'),allow_nan=False).encode()).hexdigest()
++
++
++def _hash_array(value):
++    a=np.ascontiguousarray(value)
++    h=hashlib.sha256();h.update(str(a.dtype).encode());h.update(str(a.shape).encode());h.update(a.tobytes())
++    return h.hexdigest()
++
++
++def _triangles(value):
++    a=np.asarray(value)
++    if a.ndim==2 and a.shape[1]==9:a=a.reshape(-1,3,3)
++    if a.ndim!=3 or a.shape[1:]!=(3,3) or len(a)==0 or a.dtype not in (np.float32,np.float64):
++        raise ValueError('Expected nonempty FP32/FP64 triangles[F,3,3] or [F,9]')
++    return a
++
++
++def _canonical(value):
++    a=_triangles(value)
++    order=np.lexsort((a[:,:,2],a[:,:,1],a[:,:,0]),axis=1)
++    return np.take_along_axis(a,order[:,:,None],axis=1)
++
++
++def descriptor13(triangles):
++    """Independent O(F) single-face formula; no adjacency, model, or autograd."""
++    a=_canonical(triangles).astype(np.float64)
++    if not np.isfinite(a).all():
++        bad=np.flatnonzero(~np.isfinite(a).all(axis=(1,2))).tolist()
++        raise ValueError('Nonfinite target triangle indices: '+str(bad))
++    vectors=np.stack((a[:,1]-a[:,0],a[:,2]-a[:,0],a[:,2]-a[:,1]),axis=1)
++    lengths=np.linalg.norm(vectors,axis=-1)
++    cross=np.cross(vectors[:,0],vectors[:,1])
++    twice_area=np.linalg.norm(cross,axis=-1);area=twice_area*.5
++    invalid=(lengths<=0).any(axis=1)|(area<=0)|~np.isfinite(lengths).all(axis=1)|~np.isfinite(area)
++    if invalid.any():
++        raise ValueError('Degenerate/nonfinite target triangle indices: '+str(np.flatnonzero(invalid).tolist()))
++    normal=cross/twice_area[:,None];nx,ny,nz=normal.T
++    outer=np.stack((nx*nx,ny*ny,nz*nz,nx*ny,nx*nz,ny*nz),axis=1)
++    raw=np.concatenate((a.mean(axis=1),np.sort(lengths,axis=1),area[:,None],outer),axis=1)
++    transformed=raw.copy()
++    transformed[:,3:6]=np.log(np.maximum(raw[:,3:6],1e-8))
++    transformed[:,6]=np.log(np.maximum(raw[:,6],1e-12))
++    if not np.isfinite(transformed).all():raise ValueError('Nonfinite transformed target descriptor')
++    return dict(raw=raw,transformed=transformed,length_floor_elements=int((raw[:,3:6]<1e-8).sum()),
++                area_floor_faces=int((raw[:,6]<1e-12).sum()),faces=len(a))
++
++
++def _normalize(transformed,groups):
++    result=np.empty_like(transformed,dtype=np.float64)
++    for name,sl in GROUP_SLICES.items():
++        info=groups[name]
++        result[:,sl]=(transformed[:,sl]-np.asarray(info['mean'],np.float64))/info['denominator']
++    return result
++
++
++class GeometryTargets:
++    """Frozen deduplicated training-face statistics and exact identity lookup."""
++    @classmethod
++    def from_archive(cls,archive):
++        cases=archive.cases
++        if {int(p) for p,k in cases if k in (4,8,12)}!={0,1}:
++            raise ValueError('The registered fit uses exactly training parents0/1')
++        unique={};case_counts=[]
++        for parent in (0,1):
++            for K in (4,8,12):
++                case=cases[parent,K]
++                ids=np.asarray(case.free_source_ids)
++                free=_triangles(case.free_target)
++                full=_triangles(case.full_target)
++                if (ids.ndim!=1 or len(ids)!=len(free) or ids.dtype.kind not in 'iu'
++                        or len(np.unique(ids))!=len(ids) or np.any(ids<0) or np.any(ids>=len(full))):
++                    raise ValueError('Invalid free source-face identities for '+str((parent,K)))
++                if free.dtype!=np.float32 or full.dtype!=np.float32 or free.tobytes()!=full[ids].tobytes():
++                    raise ValueError('Free GT does not exactly follow archived source faces: '+str((parent,K)))
++                for face,triangle in zip(ids,free):
++                    key=(parent,int(face));canonical=_canonical(triangle[None])[0].copy()
++                    if key in unique and unique[key].tobytes()!=canonical.tobytes():
++                        raise ValueError('Conflicting GT for deduplicated identity '+str(key))
++                    unique[key]=canonical
++                case_counts.append(dict(parent=parent,K=K,free_faces=len(ids)))
++        identities=sorted(unique)
++        triangles=np.stack([unique[key] for key in identities])
++        try:descriptors=descriptor13(triangles)
++        except ValueError as error:
++            raise ValueError(str(error)+'; ordered parent/source identities='+str(identities)) from error
++        r=descriptors['transformed'];groups={}
++        for name,sl in GROUP_SLICES.items():
++            part=r[:,sl];mean=part.mean(axis=0);scale=float(np.sqrt(np.mean((part-mean)**2)))
++            width=sl.stop-sl.start
++            groups[name]=dict(mean=mean.tolist(),centered_RMS=scale,dimension=width,
++                denominator=max(scale,1e-6)*math.sqrt(width),scale_floor_active=scale<1e-6)
++        q64=_normalize(r,groups);q=q64.astype(np.float32)
++        meta=dict(formula=dict(FORMULA_SPEC),fit_cases=case_counts,unique_faces=len(identities),
++            groups=groups,source_archive_sha256=getattr(archive,'sha256',None),
++            transformed_descriptor_sha256=_hash_array(r),normalized_target_sha256=_hash_array(q),
++            q_mean_FP64=q.astype(np.float64).mean(axis=0).tolist(),
++            q_variance_FP64=q.astype(np.float64).var(axis=0).tolist(),
++            length_floor_elements=descriptors['length_floor_elements'],area_floor_faces=descriptors['area_floor_faces'],
++            source_samples=[dict(parent=key[0],source_face_id=key[1],
++                canonical_triangle_sha256=_hash_array(unique[key]),q=q[i].tolist())
++                for i,key in enumerate(identities)])
++        meta['statistics_sha256']=_hash_json(meta)
++        return cls.from_metadata(meta)
++
++    @classmethod
++    def from_metadata(cls,metadata):
++        meta=copy.deepcopy(metadata)
++        digest=meta.pop('statistics_sha256',None)
++        if digest!=_hash_json(meta) or meta.get('formula')!=FORMULA_SPEC:
++            raise ValueError('Frozen target statistics hash or formula differs')
++        if type(meta.get('unique_faces')) is not int or meta['unique_faces']<=0:
++            raise ValueError('Empty target fit')
++        for name,sl in GROUP_SLICES.items():
++            item=meta['groups'][name];mean=np.asarray(item['mean'],np.float64)
++            if mean.shape!=(sl.stop-sl.start,) or not np.isfinite(mean).all():
++                raise ValueError('Invalid group mean')
++            scale=item['centered_RMS'];den=item['denominator']
++            if not np.isfinite(scale) or scale<0 or not np.isfinite(den) or den!=max(scale,1e-6)*math.sqrt(sl.stop-sl.start):
++                raise ValueError('Invalid frozen group scale')
++        obj=cls.__new__(cls);obj._lookup={}
++        for row in meta['source_samples']:
++            key=(row['parent'],row['source_face_id'])
++            q=np.asarray(row['q'],dtype=np.float32)
++            if key in obj._lookup or q.shape!=(13,) or not np.isfinite(q).all():
++                raise ValueError('Invalid frozen target identity/value')
++            q.setflags(write=False)
++            obj._lookup[key]=(q,row['canonical_triangle_sha256'])
++        if len(obj._lookup)!=meta['unique_faces']:raise ValueError('Target fit count differs')
++        if _hash_array(np.stack([obj._lookup[key][0] for key in sorted(obj._lookup)]))!=meta['normalized_target_sha256']:
++            raise ValueError('Frozen target tensor hash differs')
++        meta['statistics_sha256']=digest;obj._metadata=meta
++        return obj
++
++    def metadata(self):
++        return copy.deepcopy(self._metadata)
++
++    def for_sample(self,sample,device='cpu'):
++        """Match actual free slots after face/angle permutation; never inspect known Y."""
++        known=np.asarray(sample['known_mask']);valid=np.asarray(sample['valid_mask'])
++        ids=np.asarray(sample['source_face_ids']);y=np.asarray(sample['x1'])
++        if known.dtype!=bool or valid.dtype!=bool or known.ndim!=1 or valid.shape!=known.shape:
++            raise ValueError('Expected original boolean masks')
++        if np.any(known&~valid) or ids.shape!=known.shape or ids.dtype.kind not in 'iu':
++            raise ValueError('Invalid source face map or known mask')
++        if y.dtype!=np.float32 or y.shape!=(len(known),9):raise ValueError('Clean GT must be FP32[N,9]')
++        free=valid&~known
++        if not free.any():raise ValueError('No valid free targets')
++        parent=int(sample['parent_index']);free_ids=ids[free];triangles=_canonical(y[free])
++        values=[]
++        for face,triangle in zip(free_ids,triangles):
++            key=(parent,int(face))
++            if key not in self._lookup:raise ValueError('Target outside the registered training fit: '+str(key))
++            q,expected=self._lookup[key]
++            if _hash_array(triangle)!=expected:
++                raise ValueError('Actual free GT/source face mapping differs: '+str(key))
++            values.append(q)
++        q=np.stack(values).copy()
++        # The direction predicate is made on the actual FP32 training target.
++        target=torch.tensor(q,dtype=torch.float32,device=device)
++        angular_valid=torch.linalg.vector_norm(target,dim=-1)>EPS
++        count=int(angular_valid.sum())
++        return dict(q=target,angular_valid=angular_valid,free_count=len(q),angular_count=count,
++            invalid_angular_count=len(q)-count,source_face_ids=free_ids.astype(int).tolist(),
++            parent=parent,labels_sha256=_hash_array(q),statistics_sha256=self._metadata['statistics_sha256'],
++            target_requires_grad=False,known_targets_evaluated=0)
++
++
++class AuxiliaryHeads(nn.Module):
++    """Independent FP32 per-face P and optional S; never attached to generator."""
++    def __init__(self,use_scale,seed=HEAD_SEED,device='cpu'):
++        super().__init__()
++        if type(use_scale) is not bool or type(seed) is not int or not 0<=seed<2**63:
++            raise ValueError('Explicit scale switch and nonnegative integer seed required')
++        self.use_scale,self.seed=use_scale,seed
++        with torch.random.fork_rng(devices=[]):
++            torch.random.default_generator.manual_seed(seed)
++            kw=dict(device='cpu',dtype=torch.float32)
++            self.P=nn.Sequential(nn.LayerNorm(768,eps=1e-5,**kw),nn.Linear(768,256,**kw),
++                                 nn.SiLU(),nn.Linear(256,13,**kw))
++            self.S=nn.Sequential(nn.Linear(13,64,**kw),nn.SiLU(),nn.Linear(64,13,**kw)) if use_scale else None
++        self.to(device);self.eval()
++
++    def metadata(self):
++        return dict(schema='analytic_geometry_aux_heads_v1',use_scale=self.use_scale,seed=self.seed,
++            feature_layer=FEATURE_LAYER,feature_dim=13,hidden_dim=768,dtype='torch.float32',eps=EPS,
++            P_parameters=sum(p.numel() for p in self.P.parameters()),
++            S_parameters=0 if self.S is None else sum(p.numel() for p in self.S.parameters()),
++            total_parameters=sum(p.numel() for p in self.parameters()),normal_nonzero_initialization=True,
++            generator_child=False)
++
++    def forward(self,h9,valid_mask,known_mask):
++        if h9.ndim!=3 or h9.shape[-1]!=768 or h9.shape[1]%3:
++            raise ValueError('Expected actual H9[B,3N,768]')
++        batch,_,width=h9.shape;faces=h9.shape[1]//3
++        if (valid_mask.shape!=(batch,faces) or known_mask.shape!=valid_mask.shape
++                or valid_mask.dtype!=torch.bool or known_mask.dtype!=torch.bool
++                or valid_mask.device!=h9.device or known_mask.device!=h9.device):
++            raise ValueError('Expected colocated boolean face masks')
++        if bool((known_mask&~valid_mask).any()):raise ValueError('Known must be valid')
++        if any(p.dtype!=torch.float32 or p.device!=h9.device for p in self.parameters()):
++            raise ValueError('Auxiliary parameters must remain colocated FP32')
++        free=valid_mask&~known_mask
++        if not bool(free.any()):raise ValueError('No free feature faces')
++        with torch.autocast(device_type=h9.device.type,enabled=False):
++            face=h9.float().reshape(batch,faces,3,width).mean(dim=2)
++            selected=face[free]
++            z=self.P(selected);z_norm=F.normalize(z,dim=-1,eps=EPS)
++            q_hat=self.S(z_norm) if self.S is not None else None
++        return dict(z=z,z_norm=z_norm,q_hat=q_hat,H_face=selected)
++
++
++def _denominator(value,count,name):
++    if value is None:value=count
++    if isinstance(value,bool) or not isinstance(value,Integral) or value<count or value<=0:
++        raise ValueError(name+' must include all effective-batch eligible faces and be positive')
++    return int(value)
++
++
++def auxiliary_losses(predictions,q,*,angular_denominator=None,free_denominator=None):
++    """Unweighted losses. Effective-batch denominators are the caller's contract."""
++    z=predictions['z'];z_norm=predictions['z_norm'];q_hat=predictions['q_hat']
++    if q.shape!=z.shape or q.ndim!=2 or q.shape[-1]!=13 or q.dtype!=torch.float32 or q.device!=z.device:
++        raise ValueError('Expected colocated FP32 free q[F,13] matching P output')
++    if not bool(torch.isfinite(q).all()):raise ValueError('Nonfinite fixed target')
++    q=q.detach()
++    with torch.autocast(device_type=z.device.type,enabled=False):
++        target_norm=torch.linalg.vector_norm(q,dim=-1)
++        valid=target_norm>EPS;angular_count=int(valid.sum());free_count=len(q)
++        angular_den=_denominator(angular_denominator,angular_count,'Angular denominator')
++        free_den=_denominator(free_denominator,free_count,'Free-face denominator')
++        q_norm=F.normalize(q,dim=-1,eps=EPS)
++        cosine=(z_norm*q_norm).sum(-1)
++        angular_sum=(1-cosine[valid]).sum() if angular_count else z.sum()*0
++        angular=angular_sum/angular_den
++        error=None if q_hat is None else (q_hat-q).square()
++        scale_sum=None if error is None else error.sum()
++        scale=None if error is None else scale_sum/(13*free_den)
++    return dict(angular=angular,scale=scale,angular_sum=angular_sum,scale_sum=scale_sum,
++        angular_count=angular_count,invalid_angular_count=free_count-angular_count,free_count=free_count,
++        angular_denominator=angular_den,free_denominator=free_den,angular_valid=valid,
++        cosine=cosine,target_norm=target_norm,scale_squared_error=error,
++        group_scale_MSE=None if error is None else {name:error[:,sl].mean() for name,sl in GROUP_SLICES.items()})
+diff --git a/native_t1/representation_checkpoint.py b/native_t1/representation_checkpoint.py
+new file mode 100755
+index 0000000..d929c70
+--- /dev/null
++++ b/native_t1/representation_checkpoint.py
+@@ -0,0 +1,113 @@
++"""Explicit training schema and generator-only inference for representation pilot."""
++from .runtime import configure_stable_runtime
++from collections.abc import Mapping
++from pathlib import Path
++import torch
++from models.equidit import DiT
++from models.utils import get_embedder
++from .model import NativeInpaintingModel
++from .context_geometry import ContextGeometryEncoder, ENCODER_METADATA
++from .checkpoint import DEFAULT_CONFIG
++from .portable_checkpoint import _read_config, config_sha256
++from .artifacts import file_sha256,state_sha256
++
++SCHEMA='native_t1_geo_rep_training_v1'
++ARMS=('G0','G_Angular','G_AngularScale')
++INITIAL_SHA='c52e102530fe8d50d9f90e5d9df7a5dadff89655b792a019305d373cf83a0571'
++INITIAL_STATE='1742a8aad06ed082dd7d21f91829f88d3ef118e0cfcf1d3c4cd8a6c853b3bf4e'
++GENERATOR_PARAMETERS=130401155
++
++def cpu(value):
++    if torch.is_tensor(value): return value.detach().cpu()
++    if isinstance(value,dict): return {k:cpu(v) for k,v in value.items()}
++    if isinstance(value,list): return [cpu(v) for v in value]
++    if isinstance(value,tuple): return tuple(cpu(v) for v in value)
++    return value
++
++def validate(payload,config_path):
++    if not isinstance(payload,Mapping) or payload.get('schema')!=SCHEMA:
++        raise ValueError('Explicit representation training schema required')
++    arm=payload.get('arm')
++    if arm not in ARMS: raise ValueError('Unknown representation arm')
++    if payload.get('initial_checkpoint_sha256')!=INITIAL_SHA or payload.get('initial_state_sha256')!=INITIAL_STATE:
++        raise ValueError('Wrong authorized Geo2000 parent')
++    step=payload.get('additional_updates')
++    if step not in (250,500) or payload.get('cumulative_updates')!=2000+step:
++        raise ValueError('Unexpected saved update boundary')
++    if payload.get('feature_layer')!=9 or payload.get('method')!='analytic-geometry representation alignment pilot':
++        raise ValueError('Wrong representation identity')
++    if payload.get('optimizer_step_in_progress') is not False or payload.get('batch_in_progress') is not False:
++        raise ValueError('Incomplete update')
++    if payload.get('config_sha256')!=config_sha256(config_path):
++        raise ValueError('Configuration changed')
++    context=payload.get('context',{})
++    if context.get('context_mode')!='geo' or context.get('additional_parameters')!=149888:
++        raise ValueError('Wrong Geo identity')
++    if any(context.get(k)!=v for k,v in ENCODER_METADATA.items()):
++        raise ValueError('Input Geo formula changed')
++    state=payload.get('generator_state')
++    if not isinstance(state,Mapping) or not state or any(not isinstance(v,torch.Tensor) or v.dtype!=torch.float32 for v in state.values()):
++        raise ValueError('Complete FP32 generator state required')
++    if (payload.get('aux_projector_state') is None)!=(arm=='G0') or (payload.get('aux_scale_head_state') is None)!=(arm!='G_AngularScale'):
++        raise ValueError('Auxiliary head identity mismatch')
++    stream=payload['stream_state']
++    if (stream['seed'],stream['batch_index'],stream['sample_index'],stream['arm'])!=(1010,500+step,4000+8*step,'Native_correct'):
++        raise ValueError('Input stream progress differs')
++    return payload
++
++def save_training_checkpoint(path,model,heads,optimizer,stream,*,arm,step,stats,calibration,protocol_sha256,config_path=DEFAULT_CONFIG):
++    path=Path(path);path.parent.mkdir(parents=True,exist_ok=True)
++    temp=path.with_suffix('.pt.partial')
++    if path.exists() or temp.exists(): raise FileExistsError(path)
++    payload=dict(schema=SCHEMA,arm=arm,method='analytic-geometry representation alignment pilot',
++        generator_state=cpu(model.state_dict()),
++        aux_projector_state=None if heads is None else cpu(heads.P.state_dict()),
++        aux_scale_head_state=None if heads is None or heads.S is None else cpu(heads.S.state_dict()),
++        generator_state_sha256=state_sha256(model),
++        projector_state_sha256=None if heads is None else state_sha256(heads.P),
++        scale_state_sha256=None if heads is None or heads.S is None else state_sha256(heads.S),
++        context=model.context_encoder.metadata(),optimizer=cpu(optimizer.state_dict()),
++        target_description_and_statistics=stats,calibration=calibration,
++        feature_layer=9,ramp='min(additional_optimizer_step/50,1)',head_initialization_seed=20261001,
++        optimizer_reset_at_start=True,optimizer_step_in_progress=False,batch_in_progress=False,
++        stream_state=stream.state_dict(),initial_checkpoint_sha256=INITIAL_SHA,initial_state_sha256=INITIAL_STATE,
++        additional_updates=step,cumulative_updates=2000+step,protocol_sha256=protocol_sha256,
++        config_sha256=config_sha256(config_path))
++    validate(payload,config_path)
++    torch.save(payload,temp);temp.replace(path)
++    return dict(path=str(path.resolve()),bytes=path.stat().st_size,sha256=file_sha256(path),
++        state_sha256=payload['generator_state_sha256'],projector_sha256=payload['projector_state_sha256'],
++        scale_sha256=payload['scale_state_sha256'],cumulative_updates=2000+step,schema=SCHEMA)
++
++def load_representation_generator(path,config_path=DEFAULT_CONFIG,*,device='cuda'):
++    """Instantiate ONLY unchanged T1+Geo. No GT, P/S class or target computation."""
++    path=Path(path);payload=torch.load(path,map_location='cpu',weights_only=True,mmap=True)
++    validate(payload,config_path);config=_read_config(Path(config_path))
++    configure_stable_runtime()
++    with torch.device('meta'):
++        model=NativeInpaintingModel(DiT(**config),trainable=False)
++    model.context_encoder=ContextGeometryEncoder('geo',seed=payload['context']['initialization_seed'])
++    model.backbone.x_embedder.embed_fn,_=get_embedder(config['pe_freq'],input_dims=3)
++    keys=model.load_state_dict(payload['generator_state'],strict=True,assign=True)
++    actual=state_sha256(model)
++    if actual!=payload['generator_state_sha256'] or sum(p.numel() for p in model.parameters())!=GENERATOR_PARAMETERS:
++        raise ValueError('Generator tensor identity mismatch')
++    if any(not bool(torch.isfinite(v).all()) for v in model.state_dict().values()): raise ValueError('Nonfinite generator')
++    model.set_trainable(False).eval().to(device)
++    return model,dict(status='PASS',path=str(path.resolve()),sha256=file_sha256(path),schema=SCHEMA,
++        arm=payload['arm'],state_sha256=actual,strict=True,missing_keys=list(keys.missing_keys),
++        unexpected_keys=list(keys.unexpected_keys),parameters=GENERATOR_PARAMETERS,auxiliary_modules_constructed=0,
++        target_attributes_read_by_network=False,cumulative_updates=payload['cumulative_updates'])
++
++def load_auxiliary_heads(path,*,device='cuda'):
++    """Separate explicit training/teacher loader; never called by sampling."""
++    from .geometry_representation import AuxiliaryHeads
++    payload=torch.load(path,map_location='cpu',weights_only=True,mmap=True)
++    validate(payload,DEFAULT_CONFIG)
++    if payload['arm']=='G0': return None
++    heads=AuxiliaryHeads(use_scale=payload['arm']=='G_AngularScale',seed=payload['head_initialization_seed'],device=device)
++    heads.P.load_state_dict(payload['aux_projector_state'],strict=True)
++    if heads.S is not None: heads.S.load_state_dict(payload['aux_scale_head_state'],strict=True)
++    if state_sha256(heads.P)!=payload['projector_state_sha256'] or (heads.S is not None and state_sha256(heads.S)!=payload['scale_state_sha256']):
++        raise ValueError('Strict auxiliary reload differs')
++    return heads.eval()
+diff --git a/native_t1/representation_diagnostics.py b/native_t1/representation_diagnostics.py
+new file mode 100755
+index 0000000..deaed0f
+--- /dev/null
++++ b/native_t1/representation_diagnostics.py
+@@ -0,0 +1,420 @@
++"""Fixed teacher bank and H9-only diagnostics for analytic geometry alignment.
++
++Nothing runs at import. The caller owns model loading and the global forward
++ledger. This module counts its own phase calls, persists them serially, and
++never performs an optimizer step or scans whole-model parameter gradients.
++"""
++from .runtime import configure_stable_runtime
++from pathlib import Path
++import copy
++import hashlib
++import json
++import time
++import numpy as np
++import torch
++from .artifacts import atomic_json, file_sha256
++from .accounting import count_ot_calls
++from .data import load_archive, NativeTrainingStream, native_collate, model_inputs, array_hash, shared_sample_hash
++from .model import native_execution
++from .training import masked_fm_loss
++
++BANK_SCHEMA='native_t1_representation_teacher_bank_v1'
++TEACHER_SEED=20261002
++SHUFFLE_SEED=20261003
++TIMES=(.1,.3,.5,.7,.9)
++TEACHER_LABELS=('Geo_initial','common_aux_initial','G0','G_Angular','G_AngularScale')
++GROUPS={'centroid':slice(0,3),'log_edges':slice(3,6),'log_area':slice(6,7),'normal_outer':slice(7,13)}
++STATE_KEYS=('xt','x0','x1','u','t','y','known_mask','valid_mask','context','source_face_ids','corner_permutations','face_permutation','known_target_ids')
++
++
++def _save(r,out):
++    atomic_json(Path(out)/'results.json',r)
++
++
++def _seal(value):
++    return hashlib.sha256(json.dumps(value,sort_keys=True,separators=(',',':')).encode()).hexdigest()
++
++
++def _record(path):
++    path=Path(path).resolve()
++    return dict(path=str(path),sha256=file_sha256(path),bytes=path.stat().st_size)
++
++
++def _counts(r):
++    value=r.setdefault('diagnostic_counts',{})
++    for key in ('teacher_bank_OT_attempts','teacher_bank_OT_returns','calibration_forward_attempts','calibration_forward_returns',
++                'calibration_H9_grad_attempts','calibration_H9_grad_returns','teacher_forward_attempts','teacher_forward_returns'):
++        value.setdefault(key,0)
++    return value
++
++
++def _state_hash(sample):
++    return _seal({key:array_hash(np.asarray(sample[key])) for key in STATE_KEYS})
++
++
++def _state(base,t,*,parent,noise_index,pair_index,time_index):
++    sample={k:v.copy() if isinstance(v,np.ndarray) else copy.deepcopy(v) for k,v in base.items()}
++    sample['t']=np.asarray(t,dtype=np.float32)
++    sample['xt']=(np.float32(1)-sample['t'])*sample['x0']+sample['t']*sample['x1']
++    sample['xt'][sample['known_mask']]=sample['context'][sample['known_mask']]
++    sample.update(parent_index=parent,donor_index=parent,K=12,noise_index=noise_index,
++                  pair_index=pair_index,time_index=time_index,noise_seed=TEACHER_SEED,
++                  state_id=f'P{parent}_noise{noise_index}_t{time_index}')
++    sample['shared_input_sha256']=shared_sample_hash(sample)
++    sample['context_sha256']=array_hash(sample['context'])
++    sample['state_sha256']=_state_hash(sample)
++    return sample
++
++
++def _verify_bank(samples):
++    if len(samples)!=20:raise ValueError('Teacher bank requires20 fixed states.')
++    expected={(p,n,j) for p in (0,1) for n in (0,1) for j in range(5)}
++    if {(s['parent_index'],s['noise_index'],s['time_index']) for s in samples}!=expected:
++        raise ValueError('Teacher parent/noise/time identity differs.')
++    by_pair={}
++    for sample in samples:
++        if sample['K']!=12 or sample['xt'].shape!=(112,9) or sample['xt'].dtype!=np.float32:
++            raise ValueError('Teacher requires actual N112/K12 FP32 coordinates.')
++        if not bool(sample['valid_mask'].all()) or int(sample['known_mask'].sum())!=12:
++            raise ValueError('Teacher masks differ.')
++        if sample['t'].dtype!=np.float32 or sample['t'].item()!=np.float32(TIMES[sample['time_index']]).item():
++            raise ValueError('Teacher fixed time changed.')
++        if not np.isfinite(sample['xt']).all() or not np.array_equal(sample['xt'][sample['known_mask']],sample['context'][sample['known_mask']]):
++            raise ValueError('Teacher nonfinite state or changed C.')
++        actual=_state_hash(sample)
++        if actual!=sample['state_sha256']:raise ValueError('Teacher state array hash differs.')
++        pair=(sample['parent_index'],sample['noise_index'])
++        invariant={k:array_hash(sample[k]) for k in ('x0','x1','u','context','known_mask','source_face_ids','corner_permutations','face_permutation')}
++        if pair in by_pair and invariant!=by_pair[pair]:raise ValueError('Z/Y/C/permutations changed across teacher times.')
++        by_pair[pair]=invariant
++    return dict(status='PASS',pairs=4,states=20,times=list(TIMES),same_pair_Z_Y_C_and_permutations=True,
++                bank_state_sha256=_seal([s['state_sha256'] for s in samples]))
++
++
++def build_teacher_bank(r,out):
++    """Create four original OT pairs once using a dedicated private input stream.
++
++    Returns (20 sample dicts, audit). NativeTrainingStream._sample draws one
++    original random t per pair; that unused draw is recorded, then replaced by
++    the five registered t values. The formal training stream is never touched.
++    """
++    out=Path(out);path=out/'representation_teacher_bank.npz'
++    if path.exists() or r.get('teacher_bank'):raise RuntimeError('Teacher bank creation is one-shot; use load_teacher_bank to resume.')
++    counts=_counts(r);audit=dict(status='RUNNING',seed=TEACHER_SEED,OT_attempts=0,OT_returns=0,
++        formal_training_stream_advanced=False,model_forwards=0,optimizer_updates=0)
++    r['teacher_bank']=audit;_save(r,out);tick=time.perf_counter()
++    try:
++        asset=r['assets']['inputs'];archive=load_archive(asset['path'],asset['sha256'])
++        stream=NativeTrainingStream(archive,seed=TEACHER_SEED)
++        initial=stream.state_dict();arrays={};metadata=[];samples=[]
++        for pair_index,(parent,noise_index) in enumerate(((0,0),(0,1),(1,0),(1,1))):
++            local={}
++            try:
++                with count_ot_calls(local):base=stream._sample(parent,12)
++            finally:
++                attempted=local.get('OT_calls',0);returned=local.get('OT_returns',0)
++                counts['teacher_bank_OT_attempts']+=attempted;counts['teacher_bank_OT_returns']+=returned
++                audit['OT_attempts']+=attempted;audit['OT_returns']+=returned;_save(r,out)
++            array_keys=[];small={}
++            for key,value in base.items():
++                if isinstance(value,np.ndarray) or isinstance(value,np.generic):
++                    arrays[f'pair{pair_index}_{key}']=np.asarray(value);array_keys.append(key)
++                elif isinstance(value,(str,int,float,bool)) or value is None:small[key]=value
++                else:raise TypeError('Unexpected teacher sample field: '+key)
++            pair=dict(pair_index=pair_index,parent_index=parent,noise_index=noise_index,array_keys=array_keys,
++                metadata=small,unused_original_random_t=float(base['t']),
++                base_array_hashes={key:array_hash(arrays[f'pair{pair_index}_{key}']) for key in array_keys})
++            metadata.append(pair)
++            for j,t in enumerate(TIMES):
++                state=_state(base,t,parent=parent,noise_index=noise_index,pair_index=pair_index,time_index=j)
++                arrays['state_'+state['state_id']+'_xt']=state['xt']
++                samples.append(state)
++        if audit['OT_attempts']!=4 or audit['OT_returns']!=4:raise RuntimeError('Teacher bank exceeded4 original OT pairs.')
++        verified=_verify_bank(samples)
++        meta=dict(schema=BANK_SCHEMA,seed=TEACHER_SEED,input_sha256=archive.sha256,pairs=metadata,times=list(TIMES),
++            state_hashes={s['state_id']:s['state_sha256'] for s in samples},
++            private_stream_start_sha256=_seal(initial),private_stream_end_sha256=_seal(stream.state_dict()),
++            original_random_t='One private time draw per pair is unused; five fixed t values replace it.',
++            correspondence='Original nested OT reorders only Z; Y scale, face/corner ordering and source IDs are unchanged across times.')
++        arrays['metadata_json']=np.frombuffer(json.dumps(meta,sort_keys=True).encode('utf-8'),dtype=np.uint8)
++        temporary=path.with_suffix('.npz.partial')
++        if temporary.exists():raise FileExistsError(temporary)
++        with temporary.open('xb') as output:np.savez_compressed(output,**arrays)
++        temporary.replace(path)
++        audit.update(status='PASS',artifact=_record(path),input_sha256=archive.sha256,pairs=metadata,
++            state_hashes=meta['state_hashes'],verification=verified,private_stream_start_sha256=meta['private_stream_start_sha256'],
++            private_stream_end_sha256=meta['private_stream_end_sha256'],original_random_t=meta['original_random_t'],seconds=time.perf_counter()-tick)
++        _save(r,out)
++        return samples,audit
++    except BaseException as error:
++        audit.update(status='STOPPED',error=repr(error),seconds=time.perf_counter()-tick);_save(r,out);raise
++
++
++def load_teacher_bank(path,expected_sha256):
++    """Load exactly the saved20 states, with zero OT/model/RNG calls."""
++    path=Path(path)
++    if file_sha256(path)!=expected_sha256:raise ValueError('Frozen teacher archive hash changed.')
++    samples=[]
++    with np.load(path,allow_pickle=False) as saved:
++        meta=json.loads(saved['metadata_json'].tobytes().decode('utf-8'))
++        if meta.get('schema')!=BANK_SCHEMA or meta.get('seed')!=TEACHER_SEED or meta.get('times')!=list(TIMES):
++            raise ValueError('Teacher archive schema/seed/times differ.')
++        if len(meta['pairs'])!=4:raise ValueError('Teacher archive requires four OT pairs.')
++        for pair in meta['pairs']:
++            base=dict(pair['metadata']);index=pair['pair_index']
++            for key in pair['array_keys']:
++                value=saved[f'pair{index}_{key}'].copy()
++                if array_hash(value)!=pair['base_array_hashes'][key]:raise ValueError('Saved teacher base pair changed.')
++                base[key]=value
++            for j,t in enumerate(TIMES):
++                state=_state(base,t,parent=pair['parent_index'],noise_index=pair['noise_index'],pair_index=index,time_index=j)
++                if state['state_sha256']!=meta['state_hashes'][state['state_id']]:raise ValueError('Teacher reconstructed state differs.')
++                original=saved['state_'+state['state_id']+'_xt']
++                if state['xt'].tobytes()!=original.tobytes():raise ValueError('Saved FP32 teacher Xt was not reconstructed exactly.')
++                samples.append(state)
++    verified=_verify_bank(samples)
++    return samples,dict(status='PASS',artifact=_record(path),verification=verified,seed=TEACHER_SEED,
++        OT_attempts=0,OT_returns=0,model_forwards=0,formal_training_stream_advanced=False,source_metadata=meta)
++
++
++def _targets(provider,sample,device):
++    target=provider.for_sample(sample,device=device)
++    q=target['q']
++    if not isinstance(q,torch.Tensor) or q.dtype!=torch.float32 or q.requires_grad or q.shape!=(target['free_count'],13):
++        raise ValueError('Frozen free-target q[F,13] must be FP32 and gradient-free.')
++    if not bool(torch.isfinite(q).all()):raise ValueError('Nonfinite target descriptor.')
++    if target['angular_count']<1:raise ValueError('Sample has no valid Angular direction.')
++    return target
++
++
++def _feature_output(value):
++    if not isinstance(value,(tuple,list)) or len(value)!=2:raise ValueError('Expected generator (velocity,H9) return.')
++    velocity,h9=value
++    if h9.shape!=(1,336,768):raise ValueError('Expected true block9 corner hidden[1,336,768].')
++    return velocity.float(),h9
++
++
++def _lambdas(rows):
++    if len(rows)!=8:raise ValueError('Calibration requires eight individual samples.')
++    medians={key:float(np.median([row[key] for row in rows])) for key in ('g_FM','g_A','g_S')}
++    if any(not np.isfinite(v) or v<0 for v in medians.values()) or medians['g_A']<=0 or medians['g_S']<=0:
++        raise RuntimeError('Nonfinite or zero denominator in H9 gradient calibration; no fallback weight.')
++    result=dict(lambda_A=.05*medians['g_FM']/medians['g_A'],lambda_S=.05*medians['g_FM']/medians['g_S'])
++    if not all(np.isfinite(v) for v in result.values()):raise RuntimeError('Nonfinite calibrated lambda.')
++    return dict(**result,medians=medians,target_fraction=.05,
++        interpretation='Initial H9-only gradient norm calibration; neither a later-step guarantee nor a parameter-gradient ratio.')
++
++
++def calibrate(r,out,model,heads,samples,target_provider):
++    """Exactly8 model forwards and24 autograd.grad calls restricted to true H9.
++
++    samples must come from the caller's independent clone of the formal stream.
++    Each loss uses its own single-sample coordinate/valid-face denominator.
++    """
++    from .geometry_representation import auxiliary_losses
++    if r.get('calibration'):raise RuntimeError('Calibration is one-shot; no silent repeat or lambda search.')
++    if len(samples)!=8 or heads is None:raise ValueError('Eight cloned training samples and common full heads required.')
++    counts=_counts(r);audit=dict(status='RUNNING',rows=[],forward_attempts=0,forward_returns=0,H9_grad_attempts=0,H9_grad_returns=0,
++        optimizer_updates=0,parameter_backward_calls=0,gradient_scope='True corner H9 only; no model-parameter grad scan',
++        FM_normalization='Single sample own valid-free coordinate mean',
++        auxiliary_normalization='Single sample own valid Angular faces / own free faces x13 for Scale')
++    r['calibration']=audit;_save(r,out);tick=time.perf_counter()
++    try:
++        device=next(model.parameters()).device
++        for index,sample in enumerate(samples):
++            batch=native_collate([sample],device)
++            target=_targets(target_provider,sample,device)
++            with native_execution(model,coordinates=batch['xt']):
++                if audit['forward_attempts']>=8:raise RuntimeError('Calibration8-forward cap reached.')
++                audit['forward_attempts']+=1;counts['calibration_forward_attempts']+=1
++                velocity,h9=_feature_output(model(*model_inputs(batch),return_feature_layer=9))
++                audit['forward_returns']+=1;counts['calibration_forward_returns']+=1
++                if not h9.requires_grad:raise RuntimeError('H9 was detached or captured without autograd.')
++                fm=masked_fm_loss(velocity,batch['u'],batch['valid_mask'],batch['known_mask'])
++                with torch.autocast(device_type=device.type,enabled=False):
++                    predictions=heads(h9,batch['valid_mask'],batch['known_mask'])
++                    terms=auxiliary_losses(predictions,target['q'])
++                if terms['scale'] is None:raise RuntimeError('Calibration requires the full common P/S initialization.')
++                norms={};loss_values={}
++                for j,(name,loss) in enumerate((('FM',fm),('A',terms['angular']),('S',terms['scale']))):
++                    if not bool(torch.isfinite(loss)):raise RuntimeError('Nonfinite calibration loss.')
++                    if audit['H9_grad_attempts']>=24:raise RuntimeError('Calibration24-H9-grad cap reached.')
++                    audit['H9_grad_attempts']+=1;counts['calibration_H9_grad_attempts']+=1
++                    grad,=torch.autograd.grad(loss,(h9,),retain_graph=j<2,create_graph=False,allow_unused=False)
++                    audit['H9_grad_returns']+=1;counts['calibration_H9_grad_returns']+=1
++                    if not bool(torch.isfinite(grad).all()):raise RuntimeError('Nonfinite true-H9 gradient.')
++                    norms['g_'+name]=float(torch.linalg.vector_norm(grad.detach().double()))
++                    loss_values['L_'+name]=float(loss.detach())
++                    del grad
++            audit['rows'].append(dict(sample_index=index,parent_index=int(sample['parent_index']),K=int(sample['K']),t=float(sample['t']),
++                shared_input_sha256=sample['shared_input_sha256'],context_sha256=sample['context_sha256'],labels_sha256=target['labels_sha256'],
++                free_count=target['free_count'],angular_count=target['angular_count'],invalid_angular_count=target['invalid_angular_count'],
++                H9_shape=list(h9.shape),H9_dtype=str(h9.dtype),**norms,**loss_values))
++            del velocity,h9,fm,predictions,terms,loss,batch,target
++            _save(r,out)
++        if (audit['forward_returns'],audit['H9_grad_returns'])!=(8,24):raise RuntimeError('Calibration call budget incomplete.')
++        audit.update(status='PASS',**_lambdas(audit['rows']),seconds=time.perf_counter()-tick)
++        _save(r,out);return audit
++    except BaseException as error:
++        audit.update(status='STOPPED',error=repr(error),seconds=time.perf_counter()-tick);_save(r,out);raise
++
++def _array_statistics(value):
++    """Read-only FP64 reductions of an already computed FP32 head output."""
++    value=np.asarray(value,dtype=np.float64)
++    if value.ndim!=2 or value.shape[1]!=13 or not np.isfinite(value).all():
++        raise ValueError('Descriptor diagnostics require finite [F,13] arrays.')
++    variance=value.var(axis=0,ddof=0)
++    return dict(face_count=len(value),mean_by_dimension=value.mean(axis=0).tolist(),
++        variance_by_dimension=variance.tolist(),mean_variance=float(variance.mean()),
++        group_mean_variance={name:float(variance[sl].mean()) for name,sl in GROUPS.items()},
++        norm_mean=float(np.linalg.norm(value,axis=1).mean()),
++        norm_min=float(np.linalg.norm(value,axis=1).min()),norm_max=float(np.linalg.norm(value,axis=1).max()),
++        variance_denominator='F (population variance across this sample free faces)')
++
++
++def _auxiliary_scores(predictions,q):
++    from .geometry_representation import auxiliary_losses
++    terms=auxiliary_losses(predictions,q)
++    values=dict(Angular_loss=float(terms['angular']),
++        Angular_cosine=float(terms['cosine'][terms['angular_valid']].mean()),
++        free_count=terms['free_count'],angular_count=terms['angular_count'],invalid_angular_count=terms['invalid_angular_count'],
++        Scale_MSE='NOT_APPLIED' if terms['scale'] is None else float(terms['scale']),
++        Scale_group_MSE='NOT_APPLIED' if terms['group_scale_MSE'] is None else {key:float(value) for key,value in terms['group_scale_MSE'].items()})
++    numbers=[values['Angular_loss'],values['Angular_cosine']]
++    if isinstance(values['Scale_MSE'],float):numbers.extend([values['Scale_MSE'],*values['Scale_group_MSE'].values()])
++    if not np.isfinite(numbers).all():raise RuntimeError('Nonfinite teacher auxiliary score.')
++    return values
++
++
++def _constant_scores(q,metadata):
++    mean=np.asarray(metadata['q_mean_FP64'],dtype=np.float64)
++    if mean.shape!=(13,) or not np.isfinite(mean).all():raise ValueError('Frozen training descriptor mean is missing or nonfinite.')
++    constant=torch.as_tensor(mean.astype(np.float32),device=q.device)
++    error=(q-constant).square()
++    return dict(source='Frozen training-only deduplicated q mean; never estimated from teacher states.',
++        training_statistics_sha256=metadata['statistics_sha256'],value_FP64=mean.tolist(),
++        Scale_MSE=float(error.mean()),Scale_group_MSE={name:float(error[:,sl].mean()) for name,sl in GROUPS.items()},
++        Angular_cosine='NOT_APPLIED_NEAR_ZERO_CENTERED_MEAN',prediction_variance=0.0)
++
++
++def _shuffle_permutation(faces,state_index):
++    # Keep an unbiased permutation, including its chance fixed points.
++    return np.random.RandomState(SHUFFLE_SEED+state_index).permutation(faces).astype(np.int64)
++
++
++def teacher_evaluate(r,out,model,heads,bank,target_provider,*,label,shuffle_targets=False):
++    """Score a frozen 20-state bank once, with no autograd or optimizer updates.
++
++    Auxiliary endpoints optionally rescore exactly the same head predictions
++    against one private, fixed permutation of the sample's targets. This adds
++    no model or head forward. It is correspondence sensitivity, not a trained
++    negative control. G0 never receives auxiliary heads.
++    """
++    if label not in TEACHER_LABELS:raise ValueError('Unregistered teacher model label.')
++    if label in r.setdefault('teacher',{}):raise RuntimeError('Teacher label was already attempted; no automatic rerun.')
++    without_heads=label in ('Geo_initial','G0')
++    if without_heads!=(heads is None):raise ValueError('G0/Geo_initial must have no auxiliary heads; other labels require their own heads.')
++    if shuffle_targets and label not in ('G_Angular','G_AngularScale'):
++        raise ValueError('Target shuffling is reserved for the two trained auxiliary endpoints.')
++    if heads is not None:
++        if (label=='G_Angular')!=(heads.S is None):raise ValueError('Auxiliary head architecture differs from registered teacher label.')
++        if any(module.training for module in heads.modules()):raise ValueError('Teacher auxiliary heads must be eval.')
++    verification=_verify_bank(bank);counts=_counts(r);device=next(model.parameters()).device
++    metadata=target_provider.metadata()
++    audit=dict(status='RUNNING',model=label,phase='initial' if label in ('Geo_initial','common_aux_initial') else 'endpoint',
++        cumulative_updates=2000 if label in ('Geo_initial','common_aux_initial') else 2500,
++        auxiliary_status='NOT_APPLIED' if without_heads else 'APPLIED_READ_ONLY',
++        role='Shared initial P/S diagnostic, not a G0 auxiliary score.' if label=='common_aux_initial' else label,
++        bank_state_sha256=verification['bank_state_sha256'],training_statistics_sha256=metadata['statistics_sha256'],
++        rows=[],forward_attempts=0,forward_returns=0,head_forward_count=0,autograd_calls=0,optimizer_updates=0,
++        loss_normalization='Own-sample free-coordinate FM mean; own valid-face Angular mean; own free-face x13 Scale mean.',
++        statistical_reductions='Heads/losses FP32; saved prediction population variances use read-only CPU FP64 reductions.',
++        shuffled_targets=bool(shuffle_targets),shuffled_targets_are_a_trained_negative_control=False)
++    r['teacher'][label]=audit;_save(r,out);tick=time.perf_counter()
++    try:
++        for index,sample in enumerate(bank):
++            batch=native_collate([sample],device)
++            if not np.array_equal(batch['xt'][0].detach().cpu().numpy(),sample['xt']):
++                raise RuntimeError('Actual teacher coordinates differ from the frozen bank.')
++            target=_targets(target_provider,sample,device)
++            with torch.no_grad(),native_execution(model,coordinates=batch['xt']):
++                if audit['forward_attempts']>=20 or counts['teacher_forward_attempts']>=100:
++                    raise RuntimeError('Registered teacher forward cap reached.')
++                audit['forward_attempts']+=1;counts['teacher_forward_attempts']+=1
++                if without_heads:
++                    velocity=model(*model_inputs(batch)).float();h9=None
++                else:
++                    velocity,h9=_feature_output(model(*model_inputs(batch),return_feature_layer=9))
++                audit['forward_returns']+=1;counts['teacher_forward_returns']+=1
++                fm=masked_fm_loss(velocity,batch['u'],batch['valid_mask'],batch['known_mask'])
++                if not bool(torch.isfinite(fm)):raise RuntimeError('Nonfinite teacher FM loss.')
++                row=dict(model=label,phase=audit['phase'],cumulative_updates=audit['cumulative_updates'],
++                    state_id=sample['state_id'],state_sha256=sample['state_sha256'],parent_index=int(sample['parent_index']),
++                    noise_index=int(sample['noise_index']),time_index=int(sample['time_index']),t=float(sample['t']),
++                    shared_input_sha256=sample['shared_input_sha256'],context_sha256=sample['context_sha256'],labels_sha256=target['labels_sha256'],
++                    FM_velocity_MSE=float(fm),free_count=target['free_count'],angular_count=target['angular_count'],
++                    invalid_angular_count=target['invalid_angular_count'],auxiliary_status=audit['auxiliary_status'])
++                if without_heads:
++                    row.update(Angular_loss='NOT_APPLIED',Angular_cosine='NOT_APPLIED',Scale_MSE='NOT_APPLIED',
++                        Scale_group_MSE='NOT_APPLIED',prediction_statistics='NOT_APPLIED',target_statistics='NOT_APPLIED',
++                        constant_baseline='NOT_APPLIED',shuffled_target='NOT_APPLIED')
++                else:
++                    with torch.autocast(device_type=device.type,enabled=False):
++                        predictions=heads(h9,batch['valid_mask'],batch['known_mask']);audit['head_forward_count']+=1
++                        row.update(_auxiliary_scores(predictions,target['q']))
++                        row['prediction_statistics']={name:'NOT_APPLIED' if predictions[name] is None else _array_statistics(predictions[name].cpu().numpy())
++                            for name in ('z','z_norm','q_hat')}
++                        row['target_statistics']=_array_statistics(target['q'].cpu().numpy())
++                        row['constant_baseline']=_constant_scores(target['q'],metadata)
++                        if shuffle_targets:
++                            permutation=_shuffle_permutation(target['free_count'],index)
++                            shuffled=target['q'][torch.as_tensor(permutation,device=device)]
++                            row['shuffled_target']=dict(status='READ_ONLY_SAME_PREDICTION',seed=SHUFFLE_SEED+index,
++                                permutation_sha256=array_hash(permutation),fixed_point_count=int((permutation==np.arange(len(permutation))).sum()),
++                                added_model_forwards=0,added_head_forwards=0,**_auxiliary_scores(predictions,shuffled))
++                        else:row['shuffled_target']='NOT_RUN'
++                    del predictions
++            audit['rows'].append(row);del batch,target,velocity,h9,fm;_save(r,out)
++        if audit['forward_returns']!=20:raise RuntimeError('Teacher bank evaluation incomplete.')
++        audit.update(status='PASS',seconds=time.perf_counter()-tick);_save(r,out);return audit
++    except BaseException as error:
++        audit.update(status='STOPPED',error=repr(error),seconds=time.perf_counter()-tick);_save(r,out);raise
++
++
++def run_cpu_tests():
++    """Bounded pure-NumPy schema/math fixtures; no real data, model, OT or grads."""
++    rows=[dict(g_FM=float(i),g_A=float(i*2),g_S=float(i*4)) for i in range(1,9)]
++    calibrated=_lambdas(rows)
++    assert calibrated['lambda_A']==.025 and calibrated['lambda_S']==.0125
++    rejected=False
++    try:_lambdas([dict(g_FM=1.,g_A=0.,g_S=1.) for _ in range(8)])
++    except RuntimeError:rejected=True
++    assert rejected
++    samples=[]
++    for pair_index,(parent,noise_index) in enumerate(((0,0),(0,1),(1,0),(1,1))):
++        x0=(np.arange(1008,dtype=np.float32).reshape(112,9)/1024+pair_index)
++        x1=x0+np.float32(.125);known=np.arange(112)<12
++        context=np.zeros_like(x0);context[known]=np.float32(pair_index+.5)
++        x0[known]=0;x1[known]=0
++        base=dict(x0=x0,x1=x1,u=x1-x0,t=np.asarray(.25,dtype=np.float32),y=np.asarray(112,dtype=np.int64),
++            known_mask=known,valid_mask=np.ones(112,dtype=bool),context=context,
++            free_gaussian_before_OT=x0[~known].reshape(100,3,3).astype(np.float64),
++            free_noise_after_OT=x0[~known].reshape(100,3,3).astype(np.float64),
++            free_target_before_OT=(x1[~known].reshape(100,3,3)/2).astype(np.float64),
++            source_face_ids=np.arange(112,dtype=np.int64),corner_permutations=np.tile(np.arange(3,dtype=np.int64),(112,1)),
++            face_permutation=np.arange(112,dtype=np.int64),known_target_ids=np.where(known,np.arange(112),-1).astype(np.int64))
++        for j,t in enumerate(TIMES):samples.append(_state(base,t,parent=parent,noise_index=noise_index,pair_index=pair_index,time_index=j))
++    checked=_verify_bank(samples);assert checked['pairs']==4 and checked['states']==20
++    tampered=copy.deepcopy(samples);tampered[1]['x0'][20,0]+=np.float32(.125)
++    tampered[1]['state_sha256']=_state_hash(tampered[1]);rejected=False
++    try:_verify_bank(tampered)
++    except ValueError:rejected=True
++    assert rejected
++    permutation=_shuffle_permutation(100,3)
++    assert np.array_equal(np.sort(permutation),np.arange(100)) and np.array_equal(permutation,_shuffle_permutation(100,3))
++    values=np.arange(52,dtype=np.float32).reshape(4,13)
++    statistics=_array_statistics(values)
++    assert np.array_equal(statistics['variance_by_dimension'],np.var(values.astype(np.float64),axis=0))
++    return dict(status='PASS',fixtures=6,checks=['lambda_median_ratio','zero_denominator_rejected','twenty_state_pair_invariants',
++        'changed_pair_noise_rejected','private_shuffle_reproducible','population_variance'],
++        model_forwards=0,OT_calls=0,autograd_calls=0,optimizer_updates=0,real_data_reads=0)
+\ No newline at end of file
+diff --git a/native_t1/representation_evaluation.py b/native_t1/representation_evaluation.py
+new file mode 100755
+index 0000000..90e4337
+--- /dev/null
++++ b/native_t1/representation_evaluation.py
+@@ -0,0 +1,255 @@
++"""Fixed-bank, read-only full CPU evaluation of analytic geometry representation alignment.
++
++The old complete evaluator is called unchanged. No model, sampling, training,
++OT, autograd, geometry repair, or output-based patch selection occurs here.
++"""
++from __future__ import annotations
++import csv
++import hashlib
++import json
++from pathlib import Path
++import re
++import time
++import numpy as np
++
++from experiments.mf_h1_local0.a_then_fc_evaluation import scalar_metrics, _counts, _summary, AREA_METRIC
++from experiments.mf_h1_local0.t1_gated_factorial_evaluation import QUALITY_METRICS
++from experiments.mf_h1_local0.t1_native_confirmation_evaluation import (
++    score_output, audit_context, cross_binding, summarize_values, concentration,
++    PROTOCOL as ORIGINAL_METRIC_PROTOCOL,
++)
++
++REPO = Path(__file__).resolve().parents[1]
++MODELS = ("Geo_initial", "G0", "G_Angular", "G_AngularScale")
++PAIRINGS = (("G0", "Geo_initial"), ("G_Angular", "G0"), ("G_AngularScale", "G_Angular"), ("G_AngularScale", "G0"))
++SEEDS = tuple(range(9901, 9909))
++EXPECTED_BANK_SHA = "2a27cf5d576272947b6944f71b7f17ab32ca1489d43d267204303c114a82248e"
++PARENT_UIDS = ("2af09bd8df40506c9e646678ef50aa3d", "5b0e833cf2ea465e42bd82e95587d8af")
++ERROR_METRIC = "remainder_symmetric_RMS_bbox_pct"
++PROTOCOL = dict(original_metric_protocol=ORIGINAL_METRIC_PROTOCOL,
++    model_order=list(MODELS), pairings=[f"{a}_minus_{b}" for a,b in PAIRINGS],
++    pair_sign="candidate minus reference; lower error/count and higher coverage/angle/binding are favorable",
++    method="analytic-geometry representation alignment pilot; no external teacher, topology guarantee, or method reproduction claim",
++    patches="Original patch0 and frozen additional patches1/2 are separate; never pool them or claim new-parent generalization",
++    reference="All saved reference points are verified bitwise against the unchanged scorer before any endpoint scoring",
++    binding="Four cells use the identical fixed 100 free slots and target banks; positive binding was already established",
++    automatic_winner="NOT_DEFINED", geometry_repair="NONE")
++
++
++def _path(value):
++    p = Path(value)
++    if p.exists(): return p
++    text = str(value).replace(chr(92), "/")
++    if len(text)>2 and text[1]==":": return Path("/mnt/"+text[0].lower()+text[2:])
++    if text.startswith("/mnt/") and len(text)>7: return Path(text[5].upper()+":"+text[6:])
++    return p
++
++
++def _sha(path):
++    h=hashlib.sha256()
++    with Path(path).open("rb") as stream:
++        for chunk in iter(lambda:stream.read(1024*1024),b""): h.update(chunk)
++    return h.hexdigest()
++
++
++def _array_hash(value):
++    value=np.ascontiguousarray(value)
++    return hashlib.sha256(str((value.dtype,value.shape)).encode()+value.tobytes()).hexdigest()
++
++
++def _write(path,value):
++    path=Path(path)
++    with path.open("x",encoding="utf-8") as stream:
++        json.dump(value,stream,ensure_ascii=False,indent=2,allow_nan=False)
++    return dict(path=str(path.resolve()),sha256=_sha(path),bytes=path.stat().st_size)
++
++
++def audit_seeds(seeds, out):
++    """Read semantic seed records and seed/noise filenames, not metric digits."""
++    tick=time.perf_counter(); seeds=tuple(int(s) for s in seeds)
++    if len(seeds)!=8 or len(set(seeds))!=8: raise ValueError("Eight distinct registered seeds required")
++    roots=[REPO/"native_t1/runs",REPO/"experiments/mf_h1_local0/outputs",REPO/"output"]
++    excluded=_path(out).resolve(); wanted=set(seeds); hits=[]; files=0; documents=0
++    field=re.compile(r'"([^"\n]*(?:seed|seeds))"\s*:\s*(\[[^\]]*\]|-?\d+)',re.I)
++    for root in roots:
++        if not root.is_dir(): continue
++        for p in root.rglob("*"):
++            if not p.is_file() or p.resolve().is_relative_to(excluded): continue
++            files+=1
++            for match in re.finditer(r"(?:seed|noise)[_-]?(\d+)",p.name,re.I):
++                if int(match.group(1)) in wanted: hits.append(dict(path=str(p),kind="filename",seed=int(match.group(1))))
++            if p.suffix.lower() not in (".json",".jsonl"): continue
++            documents+=1
++            text=p.read_text(encoding="utf-8-sig")
++            for match in field.finditer(text):
++                value=json.loads(match.group(2)); values=value if isinstance(value,list) else [value]
++                for seed in values:
++                    if type(seed) is int and seed in wanted:
++                        hits.append(dict(path=str(p),kind="semantic_seed_field",field=match.group(1),seed=seed))
++    return dict(status="PASS" if not hits else "FAIL_SEED_PREVIOUSLY_RECORDED",seeds=list(seeds),
++        roots=[str(p) for p in roots],excluded_current_run=str(excluded),files_examined=files,
++        json_documents_examined=documents,hits=hits,seconds=time.perf_counter()-tick,
++        scope="Recorded seed fields / seed-noise filenames; hashes and numerical metrics are not seed evidence",
++        model_calls=0,geometry_calls=0,optimizer_updates=0)
++
++
++def load_bank(path, expected_sha=EXPECTED_BANK_SHA):
++    """Read the unchanged SHA-pinned bank through the frozen offline helper."""
++    from experiments.mf_h1_local0.tgeo_m10_evaluation import load_bank as original
++    return original(path,expected_sha)
++
++
++def _input_audit(bank,patch,ledger):
++    from experiments.mf_h1_local0.tgeo_m10_evaluation import _input_audit as original
++    return original(bank,patch,ledger)
++
++
++def _seed_map(seeds):
++    seeds=tuple(map(int,seeds))
++    if len(seeds)!=8 or len(set(seeds))!=8: raise ValueError("Require eight distinct original-patch seeds")
++    return {0:seeds,1:seeds[:2],2:seeds[:2]}
++
++
++def aggregate_results(rows,seeds=SEEDS):
++    """Only scalar arithmetic; no geometry calls, no pooling across patches."""
++    rows=list(rows); by_patch=_seed_map(seeds)
++    expected={(m,p,j,s) for m in MODELS for p in (0,1) for j,ss in by_patch.items() for s in ss}
++    index={(r["model"],int(r["parent"]),int(r["patch"]),int(r["seed"])):r for r in rows}
++    if set(index)!=expected or len(rows)!=len(expected) or any(int(r.get("K",12))!=12 for r in rows):
++        raise ValueError("Require complete unique 96-row registered matrix")
++    result=dict(schema="geometry_rep_alignment_summary_v1",patches={},original_patch="0",new_patches=["1","2"],
++        protocol=PROTOCOL,geometry_calls=0,model_calls=0)
++    for patch,ss in by_patch.items():
++        block=dict(patch=patch,seeds=list(ss),patch_group="original" if patch==0 else "new",models={},paired={},bindings=[])
++        for model in MODELS:
++            group=dict(parents={},binding={})
++            for parent in (0,1):
++                values=[dict(seed=s,**index[model,parent,patch,s].get("scalars",scalar_metrics(index[model,parent,patch,s]["metrics"]))) for s in ss]
++                if any(r[AREA_METRIC] is None for r in values): raise ValueError("Full scorer area diagnostic missing")
++                names=[k for k in values[0] if k!="seed"]
++                stats={k:_summary(values,k) for k in names}
++                group["parents"][str(parent)]=dict(per_seed=values,metrics=stats,worst_RMS=stats[ERROR_METRIC]["worst"])
++            binding=[dict(seed=s,**cross_binding(index[model,0,patch,s]["metrics"],index[model,1,patch,s]["metrics"])) for s in ss]
++            block["bindings"].extend(dict(model=model,patch=patch,seed=b["seed"],K=12,metrics=b) for b in binding)
++            group["binding"]=dict(per_seed=binding,metrics={k:summarize_values(binding,k,higher_better=True) for k in ("Delta0","Delta1","B")},
++                both_positive_count=sum(b["both_directions_positive"] for b in binding),concentration=concentration(binding))
++            block["models"][model]=group
++        for candidate,reference in PAIRINGS:
++            pair=dict(candidate=candidate,reference=reference,parents={},binding={},equal_new_update_budget=reference!="Geo_initial")
++            for parent in ("0","1"):
++                old=block["models"][reference]["parents"][parent]["per_seed"]
++                new=block["models"][candidate]["parents"][parent]["per_seed"]
++                values=[dict(seed=a["seed"],**{k:b[k]-a[k] if b[k] is not None and a[k] is not None else None for k in a if k!="seed"}) for a,b in zip(old,new)]
++                names=[k for k in values[0] if k!="seed"]; counts={k:_counts(values,k) for k in names}
++                pair["parents"][parent]=dict(per_seed_candidate_minus_reference=values,
++                    metrics={k:_summary(values,k) for k in names},improvement_counts=counts,
++                    remainder_better_count=counts[ERROR_METRIC]["better"],remainder_tie_count=counts[ERROR_METRIC]["tie"],
++                    remainder_worse_count=counts[ERROR_METRIC]["worse"],
++                    tradeoffs=[dict(seed=v["seed"],remainder_RMS_change=v[ERROR_METRIC],
++                        quality_metrics_increased=[k for k in QUALITY_METRICS if v.get(k) is not None and v[k]>0]) for v in values])
++            old=block["models"][reference]["binding"]["per_seed"]; new=block["models"][candidate]["binding"]["per_seed"]
++            binding=[dict(seed=a["seed"],**{k:b[k]-a[k] for k in ("Delta0","Delta1","B")}) for a,b in zip(old,new)]
++            pair["binding"]=dict(per_seed_candidate_minus_reference=binding,metrics={k:summarize_values(binding,k,higher_better=True) for k in ("Delta0","Delta1","B")},
++                higher_B_count=sum(b["B"]>0 for b in binding),concentration=concentration(binding))
++            block["paired"][f"{candidate}_minus_{reference}"]=pair
++        result["patches"][str(patch)]=block
++    json.dumps(result,allow_nan=False)
++    return result
++
++
++def evaluate(r,out):
++    """Score every registered endpoint once and save full independent audits."""
++    from experiments.mf_h1_local0.native_inpainting_metrics import array_sha
++    from experiments.mf_h1_local0.guided_native_geometry_audit import _sha_array
++    tick=time.perf_counter(); out=_path(out); rows=list(r["generated"])
++    by_patch=_seed_map(SEEDS)
++    expected={(m,p,j,s) for m in MODELS for p in (0,1) for j,ss in by_patch.items() for s in ss}
++    actual={(x["model"],int(x["parent"]),int(x["patch"]),int(x["seed"])) for x in rows}
++    if actual!=expected or len(rows)!=96: raise ValueError("Incomplete registered generated matrix")
++    record=r["assets"]["evaluation_inputs"]; banks=load_bank(record["path"],record["sha256"])
++    audit_dir=out/"audit"
++    audit_dir.mkdir(exist_ok=False)
++    counts=dict(model_calls=0,geometry_autograd_calls=0,optimizer_updates=0,OT_calls=0,repairs=0)
++    input_records=[]
++    for patch,bank in banks.items():
++        bank["input_topology"]=_input_audit(bank,patch,counts)
++        bank["context_audits"]={p:audit_context(bank["cases_by_key"][p,12]["constraints"],bank["cases_by_key"][p,12]["bbox_diagonal"],counts) for p in (0,1)}
++        input_records.append(_write(audit_dir/f"input_patch{patch}.json",dict(patch=patch,input_topology=bank["input_topology"],context_audits=bank["context_audits"],reference_audit=bank["reference_audit"])))
++    full_rows=[]; compact=[]
++    for number,row in enumerate(rows,1):
++        start=time.perf_counter(); p=int(row["parent"]); patch=int(row["patch"]); seed=int(row["seed"])
++        bank=banks[patch]; raw_path=_path(row["raw_path"])
++        if _sha(raw_path)!=row["raw_sha256"]: raise ValueError("Raw file identity changed")
++        with np.load(raw_path,allow_pickle=False) as raw:
++            output=raw["output"].copy(); path=raw["path"].copy()
++        C=bank["cases_by_key"][p,12]["constraints"]
++        if output.dtype!=np.float32 or output.size!=112*9 or path.dtype!=np.float32 or path.size!=51*112*9:
++            raise ValueError("Raw endpoint/51-state FP32 shape differs")
++        output=output.reshape(112,3,3); path=path.reshape(51,112,3,3)
++        if not np.isfinite(path).all() or output.tobytes()!=path[-1].tobytes() or any(state[:12].tobytes()!=C.tobytes() for state in path):
++            raise ValueError("Nonfinite, endpoint mismatch, or immutable C changed")
++        metrics=score_output(output,bank,p,ledger=counts)
++        for target in (0,1):
++            prefix=f"parent{target}_patch{patch}_"
++            if metrics["remainder"]["cross"][target]["target_sample_sha256"]!=array_sha(bank["arrays"][prefix+"pairwise_target_points"]):
++                raise ValueError("Actual scoring target512 differs from frozen reference")
++            if metrics["common_unknown_R12"]["cross"][target]["target_point_sha256"]!=array_sha(bank["arrays"][prefix+"coverage_points"]):
++                raise ValueError("Actual coverage target512 differs from frozen reference")
++        prefix=f"parent{p}_patch{patch}_"; boundary=metrics["guided_geometry_audit"]["boundary"]
++        if boundary["point_sha256"]!=_sha_array(bank["arrays"][prefix+"boundary_points"]) or boundary["weight_sha256"]!=_sha_array(bank["arrays"][prefix+"boundary_weights"]):
++            raise ValueError("Actual Gamma samples/weights differ from frozen reference")
++        identity=dict(model=row["model"],parent=p,patch=patch,patch_group="original" if patch==0 else "new",seed=seed,K=12,raw_path=str(raw_path),raw_sha256=row["raw_sha256"])
++        values=scalar_metrics(metrics)
++        if values[AREA_METRIC] is None: raise ValueError("Unchanged scorer omitted free area")
++        duration=time.perf_counter()-start
++        artifact=_write(audit_dir/f'{row["model"]}_P{p}_patch{patch}_seed{seed}.json',dict(**identity,metrics=metrics,scoring_seconds=duration))
++        full_rows.append(dict(**identity,metrics=metrics,scalars=values))
++        compact.append(dict(**identity,scalars=values,metrics_path=artifact["path"],metrics_sha256=artifact["sha256"],metrics_bytes=artifact["bytes"],scoring_seconds=duration,
++            C_all51_bitwise=True,all_coordinates_finite=True,total_faces=112,free_faces=100))
++        print(json.dumps(dict(event="offline_score",completed=number,total=96,**identity,seconds=duration)),flush=True)
++    summary=aggregate_results(full_rows,SEEDS)
++    csv_path=out/"compact_per_output.csv"
++    scalar_names=list(compact[0]["scalars"])
++    with csv_path.open("x",encoding="utf-8",newline="") as stream:
++        writer=csv.DictWriter(stream,fieldnames=["model","parent","patch","patch_group","seed","K"]+scalar_names+["raw_path","metrics_path"])
++        writer.writeheader()
++        for row in compact: writer.writerow({**{k:row[k] for k in ("model","parent","patch","patch_group","seed","K","raw_path","metrics_path")},**row["scalars"]})
++    r["scores"]=compact; r["summary"]=summary
++    r["evaluation_ledger"]=dict(status="PASS",counts=counts,seconds=time.perf_counter()-tick,scored_outputs=96,
++        input_audits=input_records,reference_archive=record,complete_pairs_per_output=dict(CF=1200,FF=4950,CC_cached=66),
++        immutable_context_audits=6,generated_topology_audits=96,all_reference_hashes_verified=True,
++        compact_csv=dict(path=str(csv_path.resolve()),sha256=_sha(csv_path),bytes=csv_path.stat().st_size),
++        scope="Static independent full CF/FF plus cached CC; exact FP32 source/inherited topology. No repair/model/OT/autograd.",
++        exact_predicate_certification="NOT_RUN",continuous_collision_safety="NOT_RUN")
++    return r["evaluation_ledger"]
++
++
++def run_cpu_tests():
++    """Minimal saved-scalar fixtures only; no geometry or model calls."""
++    rows=[]
++    for patch,seeds in _seed_map(SEEDS).items():
++        for model in MODELS:
++            for parent in (0,1):
++                for n,seed in enumerate(seeds):
++                    own={"Geo_initial":10.,"G0":9.,"G_Angular":8.,"G_AngularScale":7.}[model]+n*.125
++                    cross=[dict(symmetric_rms_bbox_pct=own+(0 if p==parent else 2.),predicted_to_target_rms_bbox_pct=own,target_to_predicted_rms_bbox_pct=own) for p in (0,1)]
++                    common=[dict(rms_bbox_pct=own+(0 if p==parent else 2.),fraction_target_points_within_1pct_bbox=.5) for p in (0,1)]
++                    metrics=dict(K=12,variant="raw",parent_index=parent,remainder=dict(own=cross[parent],cross=cross),whole=dict(surface=cross[parent]),
++                        common_unknown_R12=dict(own=common[parent],cross=common),t1_native_confirmation=dict(free_shape_quality=dict(total_area=3.+n*.25)))
++                    rows.append(dict(model=model,parent=parent,patch=patch,seed=seed,K=12,metrics=metrics))
++    result=aggregate_results(rows)
++    assert len(rows)==96 and sum(len(x["bindings"]) for x in result["patches"].values())==48
++    for patch,count in (("0",8),("1",2),("2",2)):
++        for name,value in (("G0_minus_Geo_initial",-1.),("G_Angular_minus_G0",-1.),("G_AngularScale_minus_G_Angular",-1.),("G_AngularScale_minus_G0",-2.)):
++            group=result["patches"][patch]["paired"][name]["parents"]["0"]
++            assert np.isclose(group["metrics"][ERROR_METRIC]["mean"],value,rtol=0,atol=1e-12)
++            assert group["remainder_better_count"]==count
++            assert group["improvement_counts"][AREA_METRIC]["better"] is None
++    for bad in (rows[:-1],rows+[rows[0]],[dict(row,patch=9) if i==0 else row for i,row in enumerate(rows)]):
++        try: aggregate_results(bad)
++        except ValueError: pass
++        else: raise AssertionError("Incomplete/duplicate/wrong-patch matrix accepted")
++    a=np.array([0,0,0,0,100,100,100,100]); b=np.array([0,0,100,100,100,100,100,100])
++    assert summarize_values([dict(seed=s,value=float(x)) for s,x in zip(SEEDS,b-a)],"value")["median"]==0
++    assert np.median(b)-np.median(a)==50
++    return dict(status="PASS",checks=6,model_calls=0,geometry_calls=0,autograd_calls=0,optimizer_updates=0)
+diff --git a/native_t1/representation_pilot.py b/native_t1/representation_pilot.py
+new file mode 100755
+index 0000000..34ae275
+--- /dev/null
++++ b/native_t1/representation_pilot.py
+@@ -0,0 +1,507 @@
++"""Run the fixed analytic-geometry representation alignment pilot explicitly."""
++from .runtime import configure_stable_runtime
++import argparse,ast,copy,gc,hashlib,io,json,random,subprocess,time,traceback,types
++from pathlib import Path
++import numpy as np
++import torch
++from .artifacts import atomic_json,file_sha256,state_sha256,array_hash
++from .checkpoint import DEFAULT_CONFIG
++from .geometry_checkpoint import load_geometry_checkpoint,validate_geometry_checkpoint
++from .portable_checkpoint import config_sha256
++from .representation_checkpoint import (ARMS,SCHEMA,INITIAL_SHA,INITIAL_STATE,GENERATOR_PARAMETERS,
++    save_training_checkpoint,load_representation_generator,load_auxiliary_heads)
++from .data import load_archive,NativeTrainingStream,native_collate,model_inputs
++from .model import native_execution
++from .training import masked_fm_loss
++from .sampling import make_noise,clamped_sample,new_counts
++from .accounting import count_ot_calls
++
++REPO=Path(__file__).resolve().parents[1]
++PACKAGE=Path(__file__).resolve().parent
++INITIAL=PACKAGE/'runs/geometry_context_revised_20260930_153000/T_geo/additional_step500_cumulative_step2000.pt'
++INPUTS=REPO/'output/t1_publish_20260930/chair_n112.npz'
++INPUT_SHA='7059671d55f2f3be8777d13e02a62255d8a0c0c7c1c1c5b4f3b24357091ba6fc'
++BANK=PACKAGE/'runs/geometry_context_revised_20260930_153000/registration/evaluation_inputs.npz'
++BANK_SHA='2a27cf5d576272947b6944f71b7f17ab32ca1489d43d267204303c114a82248e'
++HEAD='5ef35b421ad00ccd3a97867ce0e33e5f77f65b1c'
++MODELS=('Geo_initial',)+ARMS
++SEEDS=tuple(range(9901,9909))
++LOG_STEPS=(1,10,50,100,250,500)
++
++def record(path):
++    p=Path(path)
++    return dict(path=str(p.resolve()),sha256=file_sha256(p),bytes=p.stat().st_size)
++def seal(value):
++    return hashlib.sha256(json.dumps(value,sort_keys=True,separators=(',',':')).encode()).hexdigest()
++def write(r,out): atomic_json(Path(out)/'results.json',r)
++def event(name,**kw): print(json.dumps(dict(event=name,**kw),allow_nan=False),flush=True)
++def release():
++    gc.collect()
++    if torch.cuda.is_initialized(): torch.cuda.empty_cache()
++def sources():
++    files=list(PACKAGE.glob('*.py'))+list((REPO/'models').glob('*.py'))+[DEFAULT_CONFIG,REPO/'utils/ot_utils.py']
++    files=[p for p in files if p.name!='representation_report.py']
++    # Independent scoring code is also frozen for this run.
++    files+=list((REPO/'experiments/mf_h1_local0').glob('*.py'))
++    return {str(p):record(p) for p in files}
++def verify(r):
++    assert seal(r['protocol'])==r['protocol_sha256']
++    for p,info in r['execution_sources'].items():
++        if file_sha256(p)!=info['sha256']: raise RuntimeError('Execution source changed: '+p)
++    for name,info in r['assets'].items():
++        if isinstance(info,dict) and 'path' in info and 'sha256' in info:
++            if file_sha256(info['path'])!=info['sha256']: raise RuntimeError('Asset changed: '+name)
++def attach_ledger(model,r):
++    def pre(module,args,kwargs):
++        c=r['counts'];stage=r['active_stage']
++        if c['model_forward_attempts']>=17112: raise RuntimeError('Hard forward cap17112')
++        c['model_forward_attempts']+=1;c['forward_by_stage'][stage]=c['forward_by_stage'].get(stage,0)+1
++        if stage.startswith('sampling_') and kwargs.get('return_feature_layer') is not None:
++            raise RuntimeError('Sampling must not request a training feature')
++    def post(module,args,result): r['counts']['model_forward_returns']+=1
++    model.register_forward_pre_hook(pre,with_kwargs=True);model.register_forward_hook(post)
++def initial_model(r,trainable=False):
++    model,audit=load_geometry_checkpoint(INITIAL)
++    if audit['checkpoint_sha256']!=INITIAL_SHA or audit['state_sha256']!=INITIAL_STATE: raise RuntimeError('Wrong initial model')
++    model.set_trainable(trainable).eval();attach_ledger(model,r)
++    return model,audit
++def endpoint(r,arm,*,with_heads=False):
++    info=r['arms'][arm]['checkpoints']['500']
++    if file_sha256(info['path'])!=info['sha256']: raise RuntimeError('Endpoint hash differs')
++    model,audit=load_representation_generator(info['path'])
++    if audit['state_sha256']!=info['state_sha256']: raise RuntimeError('Endpoint state differs')
++    attach_ledger(model,r)
++    heads=load_auxiliary_heads(info['path']) if with_heads else None
++    return model,heads,audit
++def stream_for(r):
++    archive=load_archive(INPUTS,INPUT_SHA);stream=NativeTrainingStream(archive,seed=1010)
++    stream.load_state_dict(copy.deepcopy(r['stream_start']))
++    if seal(stream.state_dict())!=r['protocol']['training']['initial_stream_sha256']: raise RuntimeError('Stream mismatch')
++    return stream
++def targets_for(r):
++    from .geometry_representation import GeometryTargets
++    targets=GeometryTargets.from_archive(load_archive(INPUTS,INPUT_SHA))
++    if seal(targets.metadata())!=r['target_metadata_sha256']: raise RuntimeError('Frozen target statistics changed')
++    return targets
++
++def initialize(out):
++    if out.exists(): raise FileExistsError(out)
++    current=subprocess.check_output(['git','rev-parse','HEAD'],cwd=REPO,text=True).strip()
++    if current!=HEAD: raise RuntimeError('Unexpected baseline HEAD')
++    from .representation_evaluation import audit_seeds,load_bank
++    from .geometry_representation import GeometryTargets,AuxiliaryHeads
++    seed_audit=audit_seeds(SEEDS,out)
++    if seed_audit['status']!='PASS': raise RuntimeError('Evaluation seeds previously used; register replacement before generation')
++    assets=dict(initial=record(INITIAL),inputs=record(INPUTS),evaluation_inputs=record(BANK),config=record(DEFAULT_CONFIG))
++    if (assets['initial']['sha256'],assets['inputs']['sha256'],assets['evaluation_inputs']['sha256'])!=(INITIAL_SHA,INPUT_SHA,BANK_SHA):
++        raise RuntimeError('Fixed asset identity mismatch')
++    payload=torch.load(INITIAL,map_location='cpu',weights_only=True,mmap=True)
++    validate_geometry_checkpoint(payload,config_sha256(DEFAULT_CONFIG))
++    if payload['model_state_sha256']!=INITIAL_STATE or payload['cumulative_updates']!=2000: raise RuntimeError('Wrong Geo state')
++    stream=copy.deepcopy(payload['stream_state']);del payload
++    if (stream['seed'],stream['batch_index'],stream['sample_index'],stream['arm'])!=(1010,500,4000,'Native_correct'):
++        raise RuntimeError('Saved stream identity differs')
++    archive=load_archive(INPUTS,INPUT_SHA);targets=GeometryTargets.from_archive(archive)
++    metadata=targets.metadata();banks=load_bank(BANK,BANK_SHA)
++    out.mkdir(parents=True);(out/'raw').mkdir();(out/'source').mkdir()
++    original=subprocess.check_output(['git','show',HEAD+':native_t1/model.py'],cwd=REPO)
++    (out/'source/original_model.py').write_bytes(original)
++    atomic_json(out/'target_statistics.json',metadata)
++    protocol=dict(method='analytic-geometry representation alignment pilot',head=HEAD,
++        references=['https://arxiv.org/html/2604.04050v1','https://arxiv.org/html/2507.07982v2'],
++        reference_scope='Training feature alignment and direction/full-descriptor-magnitude inspiration only; no pretrained teacher, CKA or topology guarantee',
++        training=dict(arms=list(ARMS),updates_each=500,total_update_cap=1500,initial_cumulative_updates=2000,
++        final_cumulative_updates=2500,initial_stream_sha256=seal(stream),seed=1010,
++        effective_batch=8,microbatch=1,K=[4,8,12],lr=1e-5,betas=[.9,.95],weight_decay=0.,generator_clip=1.,auxiliary_clip=1.,
++        optimizer='fresh AdamW separate parameter groups; no momentum restoration',feature_layer=9,head_seed=20261001,
++        ramp='min(s/50,1)',all_flow_times=True,FM='original free-coordinate denominator',FC=False,FF=False,
++        checkpoint_steps=[250,500],log_steps=list(LOG_STEPS),no_scheduler=True,no_new_EMA=True),
++        calibration=dict(effective_batch=8,clone_formal_stream=True,model_forwards=8,H9_autograd_grad_calls=24,
++            lambda_A='.05*median(gFM)/median(gA)',lambda_S='.05*median(gFM)/median(gS)',runs=1),
++        teacher=dict(seed=20261002,parents=2,K=12,noises_each=2,t=[.1,.3,.5,.7,.9],
++            OT_calls=4,states=20,planned_forwards=100),
++        evaluation=dict(seeds=list(SEEDS),patches=[0,1,2],original_patch_seeds=list(SEEDS),
++            other_patch_seeds=list(SEEDS[:2]),models=list(MODELS),formal_rollouts=96,replay_cap=4,planned_replays=1,
++            steps=50,N=112,K=12,free=100,guidance=False,postprocessing=False),
++        budgets=dict(generator_updates=1500,training_forwards=12000,training_backwards=12000,
++            gates_forwards=4,gates_parameter_backwards=1,gates_autograd_grad=1,
++            calibration_forwards=8,calibration_H9_autograd_grad=24,teacher_forwards=100,
++            formal_rollouts=96,max_extra_rollouts=4,max_model_forwards=17112),
++        comparisons=['G0-Geo_initial','G_Angular-G0','G_AngularScale-G_Angular','G_AngularScale-G0'],
++        limitations='Two trained parents; fixed already observed patches; one training stream; Scale also adds supervision strength; no mismatch teacher or external encoder',
++        stop='No extension, layer/weight search, M10, new architecture or Phase3')
++    r=dict(status='INITIALIZED',started_utc=time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),
++        protocol=protocol,protocol_sha256=seal(protocol),assets=assets,stream_start=stream,
++        target_metadata_sha256=seal(metadata),target_statistics=metadata,seed_audit=seed_audit,
++        baseline_inheritance=dict(old_BF16_permutation_failure='PRESERVED_NOT_RETESTED_OR_RELABELLED',
++            no_tolerance_change=True,new_feature_gates='same input old/default/feature/repeat exact'),
++        counts=dict(model_forward_attempts=0,model_forward_returns=0,forward_by_stage={},
++            backward_attempts=0,backward_returns=0,optimizer_step_attempts=0,optimizer_updates=0,
++            training_OT_calls=0,training_OT_returns=0,gate_OT_calls=0,gate_OT_returns=0,
++            gate_autograd_grad_attempts=0,gate_autograd_grad_returns=0,
++            sampling_forward_attempts=0,sampling_forward_returns=0,rollout_attempts=0,
++            complete_rollouts=0,formal_rollouts=0,replay_rollouts=0,euler_updates=0),
++        arms={},generated=[],replays=[],sampling_attempts=[],gates={},teacher={},timing={},
++        execution_sources=sources(),public_git_status_at_registration=subprocess.check_output(['git','-c','core.autocrlf=true','status','--short'],cwd=REPO,text=True),
++        environment=dict(python=__import__('platform').python_version(),torch=torch.__version__,cuda=torch.version.cuda,
++            GPU=subprocess.check_output(['nvidia-smi','--query-gpu=name,driver_version,memory.total,memory.used','--format=csv,noheader'],text=True).strip()))
++
++    r['initial_workspace_audit']=dict(head_before_edits=HEAD,git_status_before_edits='',
++        applicable_AGENTS_found=[],checked_paths=['E:/AGENTS.md','E:/MeshFlow/AGENTS.md',
++        'E:/MeshFlow/experiments/AGENTS.md','E:/MeshFlow/experiments/mf_h1_local0/AGENTS.md','E:/MeshFlow/native_t1/AGENTS.md'],
++        descendant_AGENTS_rg_search='No matches',reset_clean_commit_push_performed=False)
++    r['gates']['CPU']=dict(status='PASS',geometry_pytest_tests=9,geometry_pytest_seconds=1.91,
++        command='python -B -m pytest native_t1/tests/test_geometry_representation.py -q -p no:cacheprovider',
++        test_source=record(PACKAGE/'tests/test_geometry_representation.py'),
++        independent_geometry_fixture_checks=9,diagnostic_fixture_checks=6,evaluation_scalar_checks=6,
++        report_schema_checks=5,official_model_forwards=0,OT_calls=0,optimizer_updates=0,
++        small_geometry_CPU_autograd_calls=10,
++        development_failures=['Evaluation bank SHA copied incorrectly initially; rejected before scoring and corrected to frozen source SHA',
++            'Diagnostic synthetic fixture initially lacked raw Gaussian hash fields; corrected without real-data/model/OT calls'])
++    np.savez_compressed(out/'evaluation_noise.npz',**{f'noise_seed{s}':make_noise(s).numpy() for s in SEEDS})
++    r['assets']['evaluation_noise']=record(out/'evaluation_noise.npz')
++    r['assets']['target_statistics']=record(out/'target_statistics.json')
++    r['assets']['original_model']=record(out/'source/original_model.py')
++    atomic_json(out/'protocol.json',protocol);write(r,out)
++    return r
++
++def magnitude(values):
++    vals=[v.detach().float() for v in values if v is not None]
++    if not vals:return dict(RMS=0.,L2=0.,nonzero=0,numel=0,finite=True)
++    n=sum(v.numel() for v in vals);s=sum(float(v.square().sum()) for v in vals)
++    return dict(RMS=(s/n)**.5,L2=s**.5,nonzero=sum(int(torch.count_nonzero(v)) for v in vals),
++        numel=n,finite=all(bool(torch.isfinite(v).all()) for v in vals))
++
++def gates(r,out,targets,samples):
++    from .geometry_representation import AuxiliaryHeads,auxiliary_losses
++    from . import model as native_module
++    tick=time.perf_counter();r['active_stage']='gates'
++    model,loaded=initial_model(r,True);heads=AuxiliaryHeads(use_scale=True,device='cuda')
++    before=state_sha256(model);batch=native_collate([samples[0]],'cuda');label=targets.for_sample(samples[0],device='cuda')
++    old_ast=ast.parse((out/'source/original_model.py').read_text())
++    cls=next(n for n in old_ast.body if isinstance(n,ast.ClassDef) and n.name=='NativeInpaintingModel')
++    method=copy.deepcopy(next(n for n in cls.body if isinstance(n,ast.FunctionDef) and n.name=='forward'))
++    space=dict(vars(native_module));exec(compile(ast.fix_missing_locations(ast.Module(body=[method],type_ignores=[])),'<registered_original_forward>','exec'),space)
++    actual=model.forward
++    model.forward=types.MethodType(space['forward'],model)
++    try:
++        with torch.no_grad(),native_execution(model,coordinates=batch['xt']): old=model(*model_inputs(batch))
++    finally:model.forward=actual
++    with torch.no_grad(),native_execution(model,coordinates=batch['xt']): default=model(*model_inputs(batch))
++    observed={}
++    def observer(row):
++        if row.get('site')=='block' and row.get('layer')==10: observed['h10_input']=row['hidden']
++    with native_execution(model,coordinates=batch['xt']):
++        velocity,h9=model(*model_inputs(batch),return_feature_layer=9,observer=observer)
++        if observed['h10_input'] is not h9: raise RuntimeError('Captured feature is not exact layer10 input')
++        pred=heads(h9,batch['valid_mask'],batch['known_mask'])
++        losses=auxiliary_losses(pred,label['q'],angular_denominator=label['angular_count'],free_denominator=label['free_count'])
++        selected=[h9,next(heads.P.parameters()),next(heads.S.parameters()),
++            next(model.backbone.layers[8].mlp.parameters()),next(model.backbone.layers[9].mlp.parameters())]
++        r['counts']['gate_autograd_grad_attempts']+=1
++        grads=torch.autograd.grad(losses['scale'],selected,retain_graph=True,allow_unused=True)
++        r['counts']['gate_autograd_grad_returns']+=1
++        if any(v is None or not bool(torch.isfinite(v).all()) or not bool(torch.count_nonzero(v)) for v in grads[:4]) or grads[4] is not None:
++            raise RuntimeError('Scale gradient routing differs from H9 readout')
++        model.zero_grad(set_to_none=True);heads.zero_grad(set_to_none=True)
++        r['counts']['backward_attempts']+=1;(losses['angular']+losses['scale']).backward();r['counts']['backward_returns']+=1
++    if any(p.grad is not None for layer in model.backbone.layers[9:] for p in layer.parameters()):
++        raise RuntimeError('Auxiliary-only gradient reached downstream layer')
++    up=magnitude(p.grad for layer in model.backbone.layers[:9] for p in layer.parameters())
++    if not up['finite'] or up['nonzero']==0: raise RuntimeError('No finite upstream auxiliary gradient')
++    with torch.no_grad(),native_execution(model,coordinates=batch['xt']): repeat,hrepeat=model(*model_inputs(batch),return_feature_layer=9)
++    if not all(torch.equal(old,v) for v in (default,velocity,repeat)) or not torch.equal(h9,hrepeat):
++        raise RuntimeError('Feature readout changed or destabilized original velocity')
++    if label['q'].requires_grad or batch['x1'].requires_grad: raise RuntimeError('GT labels accepted gradients')
++    if state_sha256(model)!=before: raise RuntimeError('Zero-update gate changed model')
++    buffer=io.BytesIO();torch.save(heads.state_dict(),buffer);buffer.seek(0)
++    check=AuxiliaryHeads(use_scale=True,device='cuda');check.load_state_dict(torch.load(buffer,weights_only=True),strict=True)
++    if state_sha256(check)!=state_sha256(heads): raise RuntimeError('Auxiliary serialization differs')
++    r['gates']['GPU']=dict(status='PASS',forwards=4,parameter_backwards=1,scale_autograd_grad_calls=1,
++        original_default_feature_repeat_bitwise=True,true_H9_is_layer10_input=True,H9_shape=list(h9.shape),
++        H9_dtype=str(h9.dtype),upstream_auxiliary_gradient=up,downstream_auxiliary_gradient_absent=True,
++        scale_routes=[magnitude([g]) for g in grads],GT_gradient_absent=True,
++        generator_unchanged=True,auxiliary_strict_roundtrip=True,loaded=loaded)
++    del model,heads,check,pred,losses,h9,hrepeat,velocity,old,default,repeat,grads,selected,observed
++    release();r['timing']['gates_seconds']=time.perf_counter()-tick;write(r,out)
++
++def preflight(r,out):
++    from .representation_diagnostics import build_teacher_bank,calibrate,teacher_evaluate
++    from .geometry_representation import AuxiliaryHeads
++    if r['status']!='INITIALIZED':raise RuntimeError('Preflight cannot repeat')
++    verify(r);targets=targets_for(r);stream=stream_for(r);ot={}
++    try:
++        with count_ot_calls(ot):samples=stream.next_effective_batch()
++    finally:
++        r['counts']['gate_OT_calls']+=ot.get('OT_calls',0);r['counts']['gate_OT_returns']+=ot.get('OT_returns',0);write(r,out)
++    gates(r,out,targets,samples)
++    r['active_stage']='calibration';model,_=initial_model(r,True);heads=AuxiliaryHeads(use_scale=True,device='cuda')
++    audit=calibrate(r,out,model,heads,samples,targets)
++    r['calibration']=audit;write(r,out)
++    del model,heads;release()
++    bank,bank_audit=build_teacher_bank(r,out)
++    r['teacher_bank']=bank_audit;r['assets']['teacher_bank']=bank_audit['artifact'];write(r,out)
++    r['active_stage']='teacher_Geo_initial';model,_=initial_model(r)
++    r['teacher']['Geo_initial']=teacher_evaluate(r,out,model,None,bank,targets,label='Geo_initial')
++    heads=AuxiliaryHeads(use_scale=True,device='cuda')
++    r['active_stage']='teacher_common_aux_initial'
++    r['teacher']['common_aux_initial']=teacher_evaluate(r,out,model,heads,bank,targets,label='common_aux_initial')
++    del model,heads;release()
++    r['status']='PREFLIGHT_PASS';write(r,out);event('preflight_pass',counts=r['counts'],calibration=r['calibration'])
++
++def make_optimizer(model,heads):
++    gen=list(model.parameters());aux=[] if heads is None else list(heads.parameters())
++    if len({id(p) for p in gen+aux})!=len(gen+aux) or not all(p.requires_grad and p.dtype==torch.float32 for p in gen+aux):
++        raise RuntimeError('Optimizer must own each trainable FP32 parameter once')
++    if sum(p.numel() for p in gen)!=GENERATOR_PARAMETERS:raise RuntimeError('Generator parameters missing')
++    groups=[dict(params=gen,name='generator')]
++    if aux:groups.append(dict(params=aux,name='auxiliary'))
++    opt=torch.optim.AdamW(groups,lr=1e-5,betas=(.9,.95),weight_decay=0.)
++    if [id(p) for g in opt.param_groups for p in g['params']]!=[id(p) for p in gen+aux]:
++        raise RuntimeError('Optimizer ownership mismatch')
++    return opt,gen,aux
++
++def save_at_step(r,out,arm,step,model,heads,optimizer,stream,result):
++    before_rng=torch.get_rng_state().clone();cuda_rng=[x.clone() for x in torch.cuda.get_rng_state_all()]
++    before_stream=seal(stream.state_dict());tick=time.perf_counter()
++    info=save_training_checkpoint(out/arm/f'additional_step{step}_cumulative_step{2000+step}.pt',
++        model,heads,optimizer,stream,arm=arm,step=step,stats=r['target_statistics'],calibration=r['calibration'],
++        protocol_sha256=r['protocol_sha256'])
++    if not torch.equal(before_rng,torch.get_rng_state()) or before_stream!=seal(stream.state_dict()) or any(not torch.equal(a,b) for a,b in zip(cuda_rng,torch.cuda.get_rng_state_all())):
++        raise RuntimeError('Saving advanced a random stream')
++    info.update(seconds=time.perf_counter()-tick,save_rng_unchanged=True)
++    result['checkpoints'][str(step)]=info;write(r,out)
++
++def train_arm(r,out,targets,arm):
++    from .geometry_representation import AuxiliaryHeads,auxiliary_losses
++    if arm not in ARMS or arm in r['arms'] or r['status']!='PREFLIGHT_PASS':raise RuntimeError('No training retries or extra arms')
++    verify(r);r['active_stage']=arm+'_training'
++    result=dict(status='STARTING',completed_updates=0,optimizer_step_attempts=0,batch_in_progress=False,
++        optimizer_step_in_progress=False,stream_audits=[],diagnostics=[],checkpoints={},training_seconds=0.,
++        OT_calls=0,OT_returns=0,peak_cuda_allocated=0)
++    r['arms'][arm]=result;write(r,out)
++    model=heads=optimizer=None;gen=[];aux=[]
++    try:
++        model,loaded=initial_model(r,True)
++        heads=None if arm=='G0' else AuxiliaryHeads(use_scale=arm=='G_AngularScale',device='cuda')
++        init_state=state_sha256(model)
++        p_init=None if heads is None else state_sha256(heads.P)
++        if init_state!=INITIAL_STATE:raise RuntimeError('Unequal initial generator')
++        if arm=='G_AngularScale' and p_init!=r['arms']['G_Angular']['initial_projector_sha256']:
++            raise RuntimeError('Projection head initializations differ')
++        stream=stream_for(r);optimizer,gen,aux=make_optimizer(model,heads)
++        initial_input_state=seal(stream.state_dict())
++        result.update(status='RUNNING',load=loaded,initial_state_sha256=init_state,initial_projector_sha256=p_init,
++            initial_stream_sha256=initial_input_state,parameters=sum(p.numel() for p in gen),generator_parameters=sum(p.numel() for p in gen),
++            auxiliary_parameters=sum(p.numel() for p in aux),Geo_parameters=sum(p.numel() for p in model.context_encoder.parameters()),
++            fresh_optimizer=True,optimizer_owned_parameters=sum(p.numel() for p in gen+aux))
++        start_counts=dict(r['counts'])
++        lambda_a=r['calibration']['lambda_A'];lambda_s=r['calibration']['lambda_S']
++        observed={'role':{'role_embedding':model.role_embedding},
++            'input_geo':dict(model.context_encoder.named_parameters()),
++            'backbone_input':{'weight':model.backbone.x_embedder.mlp[0].weight},
++            'backbone_output':{'weight':model.backbone.final_layer.linear.weight}}
++        if heads is not None:
++            observed['P']=dict(heads.P.named_parameters())
++            if heads.S is not None:observed['S']=dict(heads.S.named_parameters())
++        for step in range(1,501):
++            if r['counts']['optimizer_step_attempts']>=1500:raise RuntimeError('1500 update cap')
++            tick=time.perf_counter();torch.cuda.reset_peak_memory_stats();result['batch_in_progress']=True;ot={}
++            try:
++                with count_ot_calls(ot):samples=stream.next_effective_batch()
++            finally:
++                for suffix in ('calls','returns'):
++                    value=ot.get('OT_'+suffix,0);r['counts']['training_OT_'+suffix]+=value;result['OT_'+suffix]+=value
++            labels=[targets.for_sample(s,device='cuda') for s in samples]
++            audit=dict(step=step,batch_index=stream.batch_index,sample_index=stream.sample_index,
++                shared=[s['shared_input_sha256'] for s in samples],C=[s['context_sha256'] for s in samples],
++                target_labels=[x['labels_sha256'] for x in labels],parents=[s['parent_index'] for s in samples],
++                K=[s['K'] for s in samples],t=[float(s['t']) for s in samples],stream_sha256=seal(stream.state_dict()))
++            if arm!='G0' and audit!=r['arms']['G0']['stream_audits'][step-1]:
++                raise RuntimeError('Object/K/C/Y/Gaussian/OT/t/mask/permutation mismatch')
++            if (stream.batch_index,stream.sample_index)!=(500+step,4000+8*step):raise RuntimeError('Input stream progress differs')
++            nfree=sum(v['free_count'] for v in labels);nangular=sum(v['angular_count'] for v in labels)
++            if nangular<=0:raise RuntimeError('Entire effective batch has undefined Angular labels')
++            fm_den=9*nfree
++            if fm_den not in (7524,7452,7488):raise RuntimeError('FM denominator changed')
++            ramp=min(step/50.,1.);sparse=step in LOG_STEPS
++            optimizer.zero_grad(set_to_none=True)
++            sums=dict(FM=0.,Angular=0.,Scale=0.,weighted_Angular=0.,weighted_Scale=0.,total=0.)
++            outputs=[]
++            for sample,label in zip(samples,labels):
++                batch=native_collate([sample],'cuda')
++                with native_execution(model,coordinates=batch['xt']) as runtime:
++                    if heads is None:
++                        velocity=model(*model_inputs(batch)).float();pred=None
++                    else:
++                        velocity,h9=model(*model_inputs(batch),return_feature_layer=9);velocity=velocity.float()
++                        pred=heads(h9,batch['valid_mask'],batch['known_mask'])
++                    fm=masked_fm_loss(velocity,batch['u'],batch['valid_mask'],batch['known_mask'],denominator=fm_den)
++                    terms=None if heads is None else auxiliary_losses(pred,label['q'],angular_denominator=nangular,free_denominator=nfree)
++                    wa=0. if terms is None else ramp*lambda_a*terms['angular']
++                    ws=0. if terms is None or terms['scale'] is None else ramp*lambda_s*terms['scale']
++                    total=fm+wa+ws
++                    if not bool(torch.isfinite(total)):raise RuntimeError('Nonfinite loss; no retry/fallback')
++                    r['counts']['backward_attempts']+=1;total.backward();r['counts']['backward_returns']+=1
++                if sparse:
++                    sums['FM']+=float(fm.detach());sums['total']+=float(total.detach())
++                    if terms is not None:
++                        sums['Angular']+=float(terms['angular'].detach());sums['weighted_Angular']+=float(wa.detach())
++                        if terms['scale'] is not None:
++                            sums['Scale']+=float(terms['scale'].detach());sums['weighted_Scale']+=float(ws.detach())
++                        outputs.append({k:pred[k].detach().cpu() for k in ('z','z_norm','q_hat') if pred.get(k) is not None})
++            if sparse:
++                before={group:{n:p.detach().clone() for n,p in params.items()} for group,params in observed.items()}
++                gradients={group:magnitude(p.grad for p in params.values()) for group,params in observed.items()}
++                if not all(g['finite'] for g in gradients.values()):raise RuntimeError('Nonfinite group gradient')
++            gen_norm=float(torch.nn.utils.clip_grad_norm_(gen,1.,error_if_nonfinite=True))
++            aux_norm=None if not aux else float(torch.nn.utils.clip_grad_norm_(aux,1.,error_if_nonfinite=True))
++            result['optimizer_step_in_progress']=True;result['optimizer_step_attempts']+=1;r['counts']['optimizer_step_attempts']+=1
++            optimizer.step();torch.cuda.synchronize()
++            result['completed_updates']+=1;r['counts']['optimizer_updates']+=1;result['optimizer_step_in_progress']=False
++            if not bool(torch.stack([torch.isfinite(p).all() for p in gen+aux]).all()):raise RuntimeError('Nonfinite parameter after update')
++            result['batch_in_progress']=False;result['stream_audits'].append(audit)
++            if sparse:
++                updates={group:magnitude(p.detach()-before[group][n] for n,p in params.items()) for group,params in observed.items()}
++                stats={}
++                for key in ('z','z_norm','q_hat'):
++                    chunks=[v[key] for v in outputs if key in v]
++                    if chunks:
++                        values=torch.cat(chunks,0).float()
++                        stats[key]=dict(norm_mean=float(values.norm(dim=-1).mean()),variance_mean=float(values.var(dim=0,unbiased=False).mean()),
++                            element_RMS=float(values.square().mean().sqrt()),count=len(values),finite=bool(torch.isfinite(values).all()))
++                result['diagnostics'].append(dict(step=step,cumulative_step=2000+step,losses=sums,
++                    Angular_status='NOT_APPLIED' if heads is None else 'APPLIED',Scale_status='APPLIED' if arm=='G_AngularScale' else 'NOT_APPLIED',
++                    ramp=ramp,lambda_A=lambda_a if heads is not None else None,lambda_S=lambda_s if arm=='G_AngularScale' else None,
++                    free_face_denominator=nfree,angular_denominator=nangular,undefined_angular_faces=nfree-nangular,
++                    generator_grad_norm_before_clip=gen_norm,auxiliary_grad_norm_before_clip=aux_norm,
++                    gradients=gradients,parameter_updates=updates,prediction_statistics=stats,runtime=runtime))
++                del before
++            result['training_seconds']+=time.perf_counter()-tick
++            result['peak_cuda_allocated']=max(result['peak_cuda_allocated'],torch.cuda.max_memory_allocated())
++            if step in (250,500):save_at_step(r,out,arm,step,model,heads,optimizer,stream,result)
++            if step%25==0 or sparse:
++                write(r,out);event('training',arm=arm,additional_step=step,total_updates=r['counts']['optimizer_updates'],seconds=result['training_seconds'])
++        for key in ('model_forward_attempts','model_forward_returns','backward_attempts','backward_returns'):
++            if r['counts'][key]-start_counts[key]!=4000:raise RuntimeError('Per-arm model call count differs')
++        if result['completed_updates']!=500 or result['OT_calls']!=4000 or result['OT_returns']!=4000:
++            raise RuntimeError('Per-arm budget incomplete')
++        result.update(status='PASS',final_state_sha256=state_sha256(model),final_stream_state=stream.state_dict())
++        verify(r);write(r,out)
++    except BaseException as error:
++        result.update(status='STOPPED',error=repr(error),traceback=traceback.format_exc(),automatic_retry=False)
++        write(r,out);raise
++    finally:
++        if optimizer is not None:optimizer.zero_grad(set_to_none=True)
++        model=heads=optimizer=None;gen.clear();aux.clear()
++        if 'observed' in locals():observed.clear()
++        release()
++
++def teacher_endpoints(r,out):
++    from .representation_diagnostics import load_teacher_bank,teacher_evaluate
++    targets=targets_for(r);bank_info=r['teacher_bank']['artifact']
++    bank=load_teacher_bank(bank_info['path'],bank_info['sha256'])
++    if isinstance(bank,tuple):bank=bank[0]
++    for arm in ARMS:
++        r['active_stage']='teacher_'+arm
++        model,heads,loaded=endpoint(r,arm,with_heads=True)
++        r['teacher'][arm]=teacher_evaluate(r,out,model,heads,bank,targets,label=arm,shuffle_targets=heads is not None)
++        r['teacher'][arm]['checkpoint_load']=loaded
++        del model,heads;release();write(r,out)
++    r['status']='TEACHER_PASS';write(r,out)
++
++def sample_one(r,out,model,name,parent,patch,seed,noise,C,reference=None):
++    c=r['counts']
++    if c['rollout_attempts']>=100:raise RuntimeError('96formal+4extra hard rollout cap')
++    c['rollout_attempts']+=1;write(r,out);sc=new_counts()
++    try: raw,path,stats=clamped_sample(model,torch.from_numpy(noise.copy()).cuda(),torch.from_numpy(C.copy()).cuda(),sc)
++    finally:
++        c['sampling_forward_attempts']+=sc['model_forward_attempts'];c['sampling_forward_returns']+=sc['model_forward_returns']
++        c['complete_rollouts']+=sc['complete_rollouts'];c['euler_updates']+=sc['euler_updates']
++        r['sampling_attempts'].append(dict(model=name,parent=parent,patch=patch,seed=seed,replay=reference is not None,counts=sc));write(r,out)
++    if not np.array_equal(path[:,:12].view(np.uint32),np.broadcast_to(C.reshape(1,12,9),(51,12,9)).copy().view(np.uint32)):
++        raise RuntimeError('C changed in51 states')
++    if not np.array_equal(path[0,12:].view(np.uint32),noise[0,12:].view(np.uint32)):raise RuntimeError('Initial freeGaussian changed')
++    row=dict(model=name,parent=parent,patch=patch,seed=seed,K=12,phase='new_noise_confirmation',sampling=stats,
++        C_all51_bitwise=True,noise_sha256=array_hash(noise),output_sha256=array_hash(raw),path_sha256=array_hash(path),
++        auxiliary_modules_constructed=0,auxiliary_calls=0,feature_return_requests=0)
++    if reference is not None:
++        with np.load(reference['raw_path']) as old:
++            if old['path'].tobytes()!=path.tobytes() or old['output'].tobytes()!=raw.tobytes():raise RuntimeError('Reload/replay differs')
++        row.update(reference_path=reference['raw_path'],all51_bitwise_equal=True)
++        r['replays'].append(row);c['replay_rollouts']+=1
++    else:
++        target=out/'raw'/f'{name}_P{parent}_patch{patch}_seed{seed}.npz'
++        if target.exists():raise FileExistsError(target)
++        np.savez_compressed(target,output=raw,path=path,initial_gaussian=noise)
++        row.update(raw_path=str(target),raw_sha256=file_sha256(target));r['generated'].append(row);c['formal_rollouts']+=1
++    write(r,out);event('sample',model=name,formal=c['formal_rollouts'],replays=c['replay_rollouts'])
++    return row
++
++def sampling(r,out):
++    from .representation_evaluation import load_bank
++    if r['generated'] or r['replays']:raise RuntimeError('No automatic sampling reruns')
++    banks=load_bank(BANK,BANK_SHA)
++    with np.load(r['assets']['evaluation_noise']['path']) as f:noises={s:f[f'noise_seed{s}'].copy() for s in SEEDS}
++    tick=time.perf_counter()
++    for name in MODELS:
++        r['active_stage']='sampling_'+name
++        if name=='Geo_initial':model,loaded=initial_model(r)
++        else:model,heads,loaded=endpoint(r,name)
++        # Prove no auxiliary module exists in inference model and defaults are used.
++        if any(n.startswith(('P.','S.','aux')) for n,_ in model.named_parameters()):raise RuntimeError('Auxiliary head entered inference')
++        before=state_sha256(model)
++        for patch in (0,1,2):
++            for parent in (0,1):
++                for seed in (SEEDS if patch==0 else SEEDS[:2]):
++                    sample_one(r,out,model,name,parent,patch,seed,noises[seed],banks[patch]['cases_by_key'][parent,12]['constraints'])
++        if state_sha256(model)!=before:raise RuntimeError('Sampling changed generator state')
++        del model;release()
++        if name=='G_AngularScale':
++            # A genuinely fresh strict generator-only load for the one registered replay.
++            model,heads,loaded=endpoint(r,name)
++            ref=next(x for x in r['generated'] if (x['model'],x['parent'],x['patch'],x['seed'])==(name,0,0,SEEDS[0]))
++            sample_one(r,out,model,name,0,0,SEEDS[0],noises[SEEDS[0]],banks[0]['cases_by_key'][0,12]['constraints'],reference=ref)
++            del model;release()
++    if (r['counts']['formal_rollouts'],r['counts']['replay_rollouts'])!=(96,1):raise RuntimeError('Incomplete matrix')
++    r['timing']['sampling_total_seconds']=time.perf_counter()-tick
++    r['timing']['model_sampling_seconds']=sum(row['sampling']['seconds'] for row in r['generated']+r['replays'])
++    r['status']='SAMPLING_PASS';write(r,out)
++
++def main(argv=None):
++    parser=argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('--out',type=Path,required=True)
++    parser.add_argument('--phase',required=True,choices=('preflight','train','teacher','sample','evaluate','report'))
++    args=parser.parse_args(argv);out=args.out.resolve();r=None
++    try:
++        if args.phase=='preflight':r=initialize(out);preflight(r,out)
++        else:
++            r=json.loads((out/'results.json').read_text());verify(r)
++            if args.phase=='train':
++                if r['status']!='PREFLIGHT_PASS':raise RuntimeError('Training only after preflight, no retry')
++                targets=targets_for(r)
++                for arm in ARMS:train_arm(r,out,targets,arm)
++                r['status']='TRAINING_PASS';write(r,out)
++            elif args.phase=='teacher':
++                if r['status']!='TRAINING_PASS':raise RuntimeError('Teacher endpoints after full fixed training')
++                teacher_endpoints(r,out)
++            elif args.phase=='sample':
++                if r['status']!='TEACHER_PASS':raise RuntimeError('Sample after fixed endpoint teacher diagnostics')
++                sampling(r,out)
++            elif args.phase=='evaluate':
++                if r['status']!='SAMPLING_PASS':raise RuntimeError('Score only completed matrix')
++                from .representation_evaluation import evaluate
++                r['active_stage']='offline_evaluation';write(r,out);tick=time.perf_counter()
++                evaluate(r,out);r['timing']['offline_evaluation_seconds']=time.perf_counter()-tick
++                r['status']='PASS_EXECUTION';write(r,out)
++            else:
++                if r['status']!='PASS_EXECUTION':raise RuntimeError('Report after completed execution')
++                from .representation_report import write_report
++                r['report']=write_report(r,out);write(r,out)
++    except BaseException as error:
++        if r is not None:
++            r.update(status='STOPPED',error=repr(error),traceback=traceback.format_exc(),automatic_retry=False)
++            write(r,out)
++        raise
++
++if __name__=='__main__':main()
+diff --git a/native_t1/representation_report.py b/native_t1/representation_report.py
+new file mode 100755
+index 0000000..098ebf8
+--- /dev/null
++++ b/native_t1/representation_report.py
+@@ -0,0 +1,354 @@
++"""Presentation of saved analytic-geometry representation alignment results.
++
++Consumes scalar records and untouched raw arrays for fixed-view figures only.
++No model, auxiliary head, OT, autograd or geometry scoring is invoked here.
++"""
++from __future__ import annotations
++import hashlib
++import json
++from pathlib import Path
++import time
++import numpy as np
++
++MODELS=("Geo_initial","G0","G_Angular","G_AngularScale")
++PAIRINGS=(("G0","Geo_initial"),("G_Angular","G0"),("G_AngularScale","G_Angular"),("G_AngularScale","G0"))
++SEEDS=tuple(range(9901,9909))
++FREE="remainder_symmetric_RMS_bbox_pct"
++TO="free_to_R12_RMS_bbox_pct"
++FROM="R12_to_free_RMS_bbox_pct"
++GAMMA="boundary_RMS_bbox_pct"
++P95="boundary_p95_bbox_pct"
++COVER="boundary_coverage_fraction"
++CF="CF_proper_affected_free_fraction"
++FF="FF_illegal_pair_count"
++LABELS={FREE:"自由面对称RMS (% L)",TO:"free→目标 RMS (% L)",FROM:"目标→free RMS (% L)",
++    "fixed_R12_coverage_RMS_bbox_pct":"固定目标点→free RMS (% L)",
++    "fixed_R12_coverage_within_1pct_fraction":"固定目标1%L内覆盖",
++    GAMMA:"Gamma RMS (% L)",P95:"Gamma p95 (% L)",COVER:"Gamma覆盖",
++    "whole_symmetric_RMS_bbox_pct":"完整表面对称RMS (% L)",
++    CF:"CF穿刺free比例","CF_proper_pair_count":"CF穿刺pair数",FF:"FF非法pair数",
++    "CF_coplanar_pair_count":"CF共面重叠pair数","FF_coplanar_pair_count":"FF共面重叠pair数",
++    "free_minimum_angle_lt5_fraction":"最小角<5°比例","free_q_gt10_fraction":"q>10比例",
++    "free_total_surface_area":"free总面积（无好坏方向）"}
++SURFACE=(FREE,TO,FROM,"fixed_R12_coverage_RMS_bbox_pct","fixed_R12_coverage_within_1pct_fraction",GAMMA,P95,COVER,"whole_symmetric_RMS_bbox_pct")
++QUALITY=(CF,"CF_proper_pair_count",FF,"CF_coplanar_pair_count","FF_coplanar_pair_count","free_minimum_angle_lt5_fraction","free_q_gt10_fraction","free_total_surface_area")
++
++
++def _fmt(v):
++    if v is None:return "NOT_RECORDED"
++    if isinstance(v,bool):return str(v)
++    if isinstance(v,(int,np.integer)):return str(int(v))
++    if isinstance(v,(float,np.floating)):
++        if not np.isfinite(v):return "NONFINITE"
++        return f"{v:.5g}"
++    if isinstance(v,(dict,list)):v=json.dumps(v,ensure_ascii=False,separators=(",",":"))
++    return str(v).replace("|",chr(92)+"|").replace(chr(10)," ")
++
++
++def _table(headers,rows):
++    return ["| "+" | ".join(headers)+" |","| "+" | ".join("---" for _ in headers)+" |"]+[
++        "| "+" | ".join(_fmt(x) for x in row)+" |" for row in rows]
++
++
++def _record(path):
++    path=Path(path).resolve()
++    return dict(path=str(path),sha256=hashlib.sha256(path.read_bytes()).hexdigest(),bytes=path.stat().st_size)
++
++
++def _dist(value):
++    if not value or not value.get("finite_count"):return "NOT_RECORDED"
++    worst=value.get("worst")
++    if isinstance(worst,dict):worst=worst.get("value")
++    return " / ".join(_fmt(value.get(k)) for k in ("mean","median"))+" / "+("N/A" if worst is None else _fmt(worst))
++
++
++def _paired_cell(block,key):
++    d=block.get("metrics",{}).get(key,{})
++    c=block.get("improvement_counts",{}).get(key,{})
++    return _dist(d)+f"; {c.get('better','?')}/{c.get('available','?')}"
++
++
++def _rows(r):
++    if r.get("status")!="PASS_EXECUTION":raise ValueError("Report requires completed execution")
++    expected={(m,p,j,s) for m in MODELS for p in (0,1) for j in (0,1,2) for s in (SEEDS if j==0 else SEEDS[:2])}
++    def identity(x):return x["model"],int(x["parent"]),int(x["patch"]),int(x["seed"])
++    rows=r.get("scores",[]); generated=r.get("generated",[])
++    if len(rows)!=96 or len(generated)!=96 or {identity(x) for x in rows}!=expected or {identity(x) for x in generated}!=expected:
++        raise ValueError("Expected exact96 model-parent-patch-seed rows")
++    raw={identity(x):x for x in generated}
++    for row in rows:
++        if row["patch_group"]!=("original" if row["patch"]==0 else "new"):raise ValueError("Patch group differs")
++        if Path(row["raw_path"]).resolve()!=Path(raw[identity(row)]["raw_path"]).resolve():raise ValueError("Score/raw identity differs")
++        if any(row.get("scalars",{}).get(k) is None or not np.isfinite(row["scalars"][k]) for k in (FREE,TO,FROM,GAMMA,P95,COVER)):
++            raise ValueError("Required saved geometric score missing")
++    if set(r.get("summary",{}).get("patches",{}))!={"0","1","2"}:raise ValueError("Separate patch summaries missing")
++    return rows
++
++
++def _figures(r,out):
++    import matplotlib
++    matplotlib.use("Agg")
++    import matplotlib.pyplot as plt
++    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
++    selected={(x["model"],x["parent"],x["patch"]):x for x in r["generated"] if x["seed"]==SEEDS[0]}
++    if len(selected)!=24:raise ValueError("Fixed first-noise plot matrix incomplete")
++    arrays={}
++    for key,row in selected.items():
++        if _record(row["raw_path"])["sha256"]!=row["raw_sha256"]:raise ValueError("Raw plot file changed")
++        with np.load(row["raw_path"],allow_pickle=False) as z:value=z["output"].copy()
++        if value.dtype!=np.float32 or value.size!=112*9 or not np.isfinite(value).all():raise ValueError("Raw plot geometry invalid")
++        arrays[key]=value.reshape(112,3,3)
++    bounds={}
++    for parent in (0,1):
++        points=np.concatenate([v.reshape(-1,3) for (m,p,j),v in arrays.items() if p==parent])
++        lo=points.min(0);hi=points.max(0);bounds[parent]=((lo+hi)/2,max(float((hi-lo).max())*.55,1e-6))
++    records=[]
++    for patch in (0,1,2):
++        fig=plt.figure(figsize=(15,13))
++        for parent in (0,1):
++            for free_only in (False,True):
++                for col,model in enumerate(MODELS):
++                    v=arrays[model,parent,patch]; ax=fig.add_subplot(4,4,(2*parent+int(free_only))*4+col+1,projection="3d")
++                    ax.add_collection3d(Poly3DCollection(v[12:],facecolors="#7eabc7",edgecolors="#405266",linewidths=.24,alpha=.9))
++                    if not free_only:ax.add_collection3d(Poly3DCollection(v[:12],facecolors="#f0a348",edgecolors="#804800",linewidths=.5,alpha=1.))
++                    center,radius=bounds[parent]
++                    ax.set_xlim(center[0]-radius,center[0]+radius);ax.set_ylim(center[1]-radius,center[1]+radius);ax.set_zlim(center[2]-radius,center[2]+radius)
++                    ax.set_box_aspect((1,1,1));ax.set_proj_type("ortho");ax.view_init(elev=20,azim=-55);ax.set_axis_off()
++                    ax.set_title(f"P{parent} | {model} | {'free100' if free_only else 'full112'}",fontsize=9)
++        fig.suptitle(f"Fixed seed{SEEDS[0]} | patch{patch} | raw full/free, no repair\nIdentical per-parent bounds across all three patches",fontsize=12)
++        fig.subplots_adjust(left=.01,right=.99,bottom=.005,top=.94,wspace=.01,hspace=.06)
++        path=Path(out)/f"comparison_seed{SEEDS[0]}_patch{patch}_full_free.png"
++        if path.exists():raise FileExistsError(path)
++        fig.savefig(path,dpi=170,facecolor="white");plt.close(fig)
++        records.append(dict(**_record(path),patch=patch,seed=SEEDS[0],panels=16,visual_review="PENDING_CALLER_REVIEW"))
++    return records
++
++
++def _facts(summary):
++    lines=[]
++    for candidate,reference in PAIRINGS:
++        for patch in (0,1,2):
++            block=summary["patches"][str(patch)]["paired"][candidate+"_minus_"+reference]
++            text=[]
++            for parent in ("0","1"):
++                q=block["parents"][parent]; d=q["metrics"]; c=q["improvement_counts"]
++                text.append(f"P{parent} RMS均差{_fmt(d[FREE]['mean'])}（改善{c[FREE]['better']}/{c[FREE]['available']}）、Gamma均差{_fmt(d[GAMMA]['mean'])}、覆盖均差{_fmt(d[COVER]['mean'])}、CF比例均差{_fmt(d[CF]['mean'])}、FF均差{_fmt(d[FF]['mean'])}")
++            lines.append(f"{candidate}−{reference} / patch{patch}："+"；".join(text)+"。")
++    return lines
++
++
++def _json_scalar_table(mapping):
++    return [[k,v] for k,v in mapping.items() if not isinstance(v,(dict,list))]
++
++
++def _loader_commands(r):
++    """Independent POSIX processes; pass each checkpoint as a quoted argv."""
++    import shlex
++    program = ("import sys; from native_t1.representation_checkpoint import load_representation_generator; "
++               "model, audit = load_representation_generator(sys.argv[1], device='cuda'); print(audit)")
++    return [(model,shlex.join(["python","-c",program,str(r["arms"][model]["checkpoints"]["500"]["path"])]))
++            for model in MODELS[1:]]
++
++
++def render_report(r,figures=()):
++    rows=_rows(r); summary=r["summary"]; protocol=r.get("protocol",{}); arms=r.get("arms",{})
++    if any(arms.get(m,{}).get("completed_updates")!=500 or arms[m].get("status")!="PASS" for m in MODELS[1:]):
++        raise ValueError("Three fixed500-update endpoints required")
++    lines=["# GEOMETRY_REP_ALIGNMENT_REPORT","","方法身份：**analytic-geometry representation alignment pilot**。本轮新增三臂各500次生成器更新，共1500次；相同T_geo累计2000步起点，终点累计2500步。", "",
++        "借鉴 [TORA](https://arxiv.org/html/2604.04050v1) 的训练期中间特征监督与 [Geometry Forcing](https://arxiv.org/html/2507.07982v2) 的方向/幅值对齐思路；未复现完整方法、Uni3D/VGGT教师或CKA。教师是固定解析GT几何描述，无外部教师权重。", ""]
++    questions=("方向对齐是否改善同预算纯FM？","加Scale是否进一步受益或引入代价？","属性学习的改善是否进入完整生成？","原片尾部、新片覆盖与Gamma是否改善？","推理是否仍是原A+Geo、50次前向且无需教师？","当前值得保留哪一臂，哪些结论仍不成立？")
++    interpretation=r.get("interpretation",{});answers=interpretation.get("answers",[])
++    for i,q in enumerate(questions):
++        answer=answers.get(str(i+1)) if isinstance(answers,dict) else answers[i] if i<len(answers) else None
++        lines += [f"{i+1}. **{q}** "+(str(answer) if answer is not None else "尚未登记综合解释；下列完整生成配对表是证据，不自动据单一均值选赢家。"),""]
++    if interpretation.get("next_step"):lines += [str(interpretation["next_step"]),""]
++    lines += ["## 设计、对应与解释边界","",
++        "G0只训练原masked FM；G_Angular加投影头P的描述方向监督；G_AngularScale再加S的完整13维幅值恢复。Angular是描述向量方向，不是直接网格法向角；Scale不是只预测缩放、边长或面积。",
++        "读取第9个block完成、真正送入第10层的corner hidden；辅助分支单独FP32转换和三角角均值，不替换主干BF16 hidden。解析目标来自干净GT自由面，源ID仅用于监督对应。输入Geo特征与权重含义未改。",
++        "三臂恢复同一seed1010输入流，fresh AdamW，effective8/micro1，原FM逐自由坐标分母。辅助损失用整批自由面分母，Scale再除13；生成器/辅助头分别clip1。辅助预热按新增optimizer步min(s/50,1)，不是Flow时间门控。",
++        "G_AngularScale−G_Angular同时增加监督项与总辅助强度，不能单独归因幅值机制。无错配教师训练臂、无外部3D教师、无独立训练seed复现。额外片和完整父对象以前见过，只有本轮噪声新增；不是新对象泛化。",""]
++    streams=[arms[m].get("stream_audits",[]) for m in MODELS[1:]]
++    lines += [f"500步输入流逐条相同：{len(streams[0])==500 and streams[0]==streams[1]==streams[2]}。",
++        "旧BF16主干面重排FAIL沿用baseline inheritance边界，未改容差或重新声称已修复。新增特征返回/标签/梯度/保存重载门禁单独记录。",""]
++    lines += _table(["臂","新增更新","生成器参数","辅助参数","训练秒"],[[m,arms[m].get("completed_updates"),arms[m].get("generator_parameters",arms[m].get("parameters")),arms[m].get("auxiliary_parameters"),arms[m].get("training_seconds")] for m in MODELS[1:]])
++    lines += ["","## 零更新标定与冻结目标","","量级标定读真实H9的梯度，最多8次前向与24次autograd.grad；零更新不等于零反向。lambda在看生成结果前固定，两辅助臂共享lambda_A。初始化的5%隐藏梯度目标不是全模型参数梯度保证，也不是后续每步保证。",""]
++    calibration=r.get("calibration",{})
++    lines += _table(["标定记录","值"],_json_scalar_table(calibration)) if isinstance(calibration,dict) else ["标定记录见results.json引用。"]
++    lines += [""]+_table(["样本","父","K","t","g_FM(H9)","g_A(H9)","g_S(H9)","L_FM","L_A","L_S"],
++        [[v.get(k) for k in ("sample_index","parent_index","K","t","g_FM","g_A","g_S","L_FM","L_A","L_S")] for v in calibration.get("rows",[])])+[""]
++    medians=calibration.get("gradient_medians",calibration.get("medians",{}))
++    lines += [f"H9范数中位数：{_fmt(medians)}。单状态标定使用自身损失分母；正式训练使用effective8累计分母，不能将其称为一个完整训练batch的梯度重放。", "",
++        "冻结目标统计、去重训练父对象/源面身份、样本hash及每个g_FM/g_A/g_S/t保留在results.json或其calibration/target-statistics引用；不从生成输出拟合统计。",""]
++    stats=r.get("target_statistics",{})
++    lines += [f"统计去重自由面数：{_fmt(stats.get('unique_faces'))}；统计SHA256：{_fmt(stats.get('statistics_sha256'))}。",""]
++    lines += _table(["描述组","维数","逐维mu","中心RMS s","归一化分母"],[[name,v.get("dimension"),v.get("mean"),v.get("centered_RMS"),v.get("denominator")] for name,v in stats.get("groups",{}).items()])+[""]
++    lines += _training_section(r)+[""]
++    lines += ["## 原始完整生成：分patch与父对象","","每格为“均值 / 输出中位 / 最差”。RMS、Gamma为% bbox对角线；coverage与质量比例为0–1。面积无改善方向。原片每父8噪声，额外每片每父仅2噪声；两额外片从不混成4个独立噪声。",""]
++    for patch in (0,1,2):
++        block=summary["patches"][str(patch)]
++        lines += [f"### patch{patch}（{'原片，n=8/父' if patch==0 else '既有额外片，n=2/父'}）",""]
++        lines += _table(["父","表面/接口指标",*MODELS],[[p,LABELS[k],*[_dist(block["models"][m]["parents"][p]["metrics"].get(k,{})) for m in MODELS]] for p in ("0","1") for k in SURFACE])
++        lines += [""]+_table(["父","质量指标",*MODELS],[[p,LABELS[k],*[_dist(block["models"][m]["parents"][p]["metrics"].get(k,{})) for m in MODELS]] for p in ("0","1") for k in QUALITY])+[""]
++    lines += ["## 同输入配对效果","","差=候选−参考；每格为“配对差均值 / 配对差中位 / 最差配对差；改善数/n”。先按同parent/patch/seed形成差，再求中位，绝不相减边际中位。未删除任何坏seed、未构造总分。",""]
++    for candidate,reference in PAIRINGS:
++        name=candidate+"_minus_"+reference
++        lines += [f"### {candidate} − {reference}",""]
++        lines += _table(["patch","父","自由RMS","free→目标","目标→free","Gamma RMS","Gamma p95","Gamma覆盖","CF比例","FF非法对"],[[j,p,*[_paired_cell(summary["patches"][str(j)]["paired"][name]["parents"][p],k) for k in (FREE,TO,FROM,GAMMA,P95,COVER,CF,FF)]] for j in (0,1,2) for p in ("0","1")])+[""]
++    lines += ["## 逐seed与绑定","","紧凑逐输出CSV保留全部指标；JSON保留全部配对差及极端seed。以下列出三项增量的RMS逐seed差，正值为变差。",""]
++    for patch in (0,1,2):
++        block=summary["patches"][str(patch)]
++        names=[a+"_minus_"+b for a,b in PAIRINGS[1:]]
++        lines += _table(["patch","父","seed","Angular−G0","AngularScale−Angular","AngularScale−G0"],[[patch,p,seed,*[next(v[FREE] for v in block["paired"][name]["parents"][p]["per_seed_candidate_minus_reference"] if v["seed"]==seed) for name in names]] for p in ("0","1") for seed in block["seeds"]])+[""]
++    binding=[]
++    for j in (0,1,2):
++        for m in MODELS:
++            b=summary["patches"][str(j)]["models"][m]["binding"]
++            binding.append([j,m,*[_dist(b["metrics"][k]) for k in ("Delta0","Delta1","B")],b["both_positive_count"]])
++    lines += _table(["patch","模型","Delta0","Delta1","B","双向正次数"],binding)+["","绑定四格E00/E01/E10/E11及每seed均保留在summary.patches；固定100个free槽不重新匹配。正向绑定不是辅助loss的新成功判据，C精确保持来自clamping。",""]
++    lines += ["## Teacher诊断：属性学习与完整生成分开","","G0没有训练辅助头，属性指标NOT_APPLIED，不能给它随机头后据此宣称其表示更差。辅助臂自己的头预测更准不等于主干更通用。错配标签评分只是同一预测的只读对应敏感性检查。",""]
++    lines += _teacher_section(r)
++    lines += ["","## 实际执行、审计与资产","","模型/训练、H9标定梯度、teacher、采样、CPU审计及绘图分别计账；预算不是实际调用次数。",""]
++    lines += _table(["总账字段","实际值"],_json_scalar_table(r.get("counts",{})))+[""]
++    lines += _table(["诊断调用","实际值"],_json_scalar_table(r.get("diagnostic_counts",{})))+[""]
++    lines += _table(["阶段耗时秒","实际值"],_json_scalar_table(r.get("timing",{})))+[""]
++    lines += _table(["新增门禁","记录"],[[key,value.get("status") if isinstance(value,dict) else value] for key,value in r.get("gates",{}).items()])+[""]
++    infer=[]
++    for model in MODELS:
++        generated=[x for x in r["generated"] if x["model"]==model]
++        attempts=[x for x in r.get("sampling_attempts",[]) if x["model"]==model and not x.get("replay")]
++        infer.append([model,len(generated),sum(x.get("counts",{}).get("model_forward_attempts",0) for x in attempts),
++            sum(x.get("counts",{}).get("model_forward_returns",0) for x in attempts),
++            sum(x.get("auxiliary_modules_constructed",0) for x in generated),sum(x.get("auxiliary_calls",0) for x in generated),
++            all(x.get("C_all51_bitwise") is True for x in generated)])
++    lines += _table(["正式采样模型","完整输出","前向尝试","前向返回","P/S构造合计","P/S调用","C全部51态恒定"],infer)+[""]
++    ledger=r.get("evaluation_ledger",{})
++    lines += _table(["离线审计","实际值"],[[k,ledger.get(k)] for k in ("status","scored_outputs","seconds","complete_pairs_per_output","counts","all_reference_hashes_verified")])+[""]
++    numeric=["nan_coordinate_count","inf_coordinate_count","free_near_degenerate_count","free_exact_zero_area_count","CF_unresolved_or_degenerate_pair_count","FF_unresolved_or_degenerate_pair_count","exact_C_free_shared_edge_count","C_inherited_nonmanifold_vertex_count","new_free_related_nonmanifold_vertex_count"]
++    lines += _table(["诊断（输出计数求和）",*MODELS],[[k,*[sum(x["scalars"][k] for x in rows if x["model"]==m and x["scalars"].get(k) is not None) if any(x["model"]==m and x["scalars"].get(k) is not None for x in rows) else "NOT_RECORDED" for m in MODELS]] for k in numeric])+["",
++        "完整独立CF/FF静态判交按旧阈值，CC按固定上下文缓存；精确FP32索引区分输入继承与free相关异常。计数求和不是源缺陷去重；当前绕序不等于不可重定向。未检出相交、自由描述学习或FF减少均不是水密/共享连接保证。精确谓词与连续碰撞安全NOT_RUN。",""]
++    lines += _table(["臂/步","checkpoint","bytes","文件SHA256","生成器state SHA256"],[[m+"/"+step,cp.get("path"),cp.get("bytes"),cp.get("sha256",cp.get("checkpoint_sha256")),cp.get("generator_state_sha256",cp.get("state_sha256"))] for m in MODELS[1:] for step,cp in arms[m].get("checkpoints",{}).items()])+[""]
++    lines += _table(["输入资产","路径","bytes","SHA256"],[[key,r["assets"][key].get("path"),r["assets"][key].get("bytes"),r["assets"][key].get("sha256")] for key in ("initial","inputs","evaluation_inputs","evaluation_noise","target_statistics") if key in r.get("assets",{})])+[""]
++    lines += [f"协议SHA256：{_fmt(r.get('protocol_sha256'))}；源码版本/修改与冻结记录见protocol、execution_sources及code.diff，未重置或提交仓库。", ""]
++    lines += ["严格推理加载：从已激活MeshFlow环境的WSL仓库根目录逐条执行。每条命令启动独立进程，仅加载一臂原T1+Geo，打印严格加载审计后退出；不构造P/S，也不启动采样。", "", "```bash"]
++    for model,command in _loader_commands(r):
++        lines += [f"# {model}",command]
++    lines += ["```",""]
++    lines += ["## 固定首噪声图","","预定seed9901，patch0/1/2各16格；四模型同父对象使用跨三图共同范围、同视角。仅原始FP32 full112/free100，不参考输出改选seed、片或相机。",""]
++    for figure in figures:lines += [f"![seed9901 patch{figure['patch']} full/free]({Path(figure['path']).name})",""]
++    lines += ["达到预算后停止，不自动延长、调lambda、换层、加入CKA/M10或进入下一阶段。若没有收益，仅限本次解析教师、固定第9层与500步预算未建立增量；不否定其他外部教师或表示对齐方案。",""]
++    return chr(10).join(lines)
++
++
++def _get(value,*keys):
++    for key in keys:
++        if not isinstance(value,dict):return None
++        value=value.get(key)
++    return value
++
++
++def _mean(rows,*keys):
++    values=[_get(row,*keys) for row in rows]
++    valid=[float(v) for v in values if isinstance(v,(int,float)) and not isinstance(v,bool) and np.isfinite(v)]
++    if not valid:return "NOT_APPLIED" if any(v=="NOT_APPLIED" for v in values) else None
++    if len(valid)!=len(values):raise ValueError("Partially missing teacher values; do not silently change denominator")
++    return float(np.mean(valid))
++
++
++def _training_section(r):
++    records=[(m,d) for m in MODELS[1:] for d in r["arms"][m].get("diagnostics",[])]
++    lines=["## 预定训练日志与实际更新","","仅step1/10/50/100/250/500的不同训练batch日志；不据此宣布收敛，也不将辅助loss下降替代完整生成。G0辅助项NOT_APPLIED；Angular臂Scale为NOT_APPLIED。",""]
++    lines += _table(["臂","步","FM","Angular","Scale","实际加权Angular","实际加权Scale","总loss","ramp","gen裁剪前L2","aux裁剪前L2"],[
++        [m,d["step"],d.get("losses",{}).get("FM"),d.get("losses",{}).get("Angular") if m!="G0" else "NOT_APPLIED",
++         d.get("losses",{}).get("Scale") if m=="G_AngularScale" else "NOT_APPLIED",
++         d.get("losses",{}).get("weighted_Angular") if m!="G0" else "NOT_APPLIED",
++         d.get("losses",{}).get("weighted_Scale") if m=="G_AngularScale" else "NOT_APPLIED",d.get("losses",{}).get("total"),d.get("ramp"),
++         d.get("generator_grad_norm_before_clip"),d.get("auxiliary_grad_norm_before_clip") if m!="G0" else "NOT_APPLIED"] for m,d in records])+[""]
++    lines += _table(["臂","步","组","梯度RMS","更新RMS","梯度非零数","更新非零数","均有限"],[
++        [m,d["step"],name,v.get("RMS"),d.get("parameter_updates",{}).get(name,{}).get("RMS"),v.get("nonzero"),
++         d.get("parameter_updates",{}).get(name,{}).get("nonzero"),v.get("finite") and d.get("parameter_updates",{}).get(name,{}).get("finite")]
++        for m,d in records for name,v in d.get("gradients",{}).items() if name in ("input_geo","P","S")])+[""]
++    lines += _table(["臂","步","预测","平均向量范数","均维方差","元素RMS","自由面数"],[
++        [m,d["step"],name,v.get("norm_mean"),v.get("variance_mean"),v.get("element_RMS"),v.get("count")]
++        for m,d in records for name,v in d.get("prediction_statistics",{}).items()])+[""]
++    lines += ["role/主干输入/输出组的完整梯度与更新亦保留在原始日志。辅助loss对第10–12层没有直接梯度符合第9层读出设计；这些层仍由FM训练。"]
++    return lines
++
++
++def _teacher_section(r):
++    """Read existing fixed-state diagnostics; no model or loss recomputation."""
++    teacher=r.get("teacher",{})
++    labels=("Geo_initial","common_aux_initial","G0","G_Angular","G_AngularScale")
++    if not teacher:return ["Teacher汇总尚未登记：NOT_RECORDED。"]
++    lines=["每个(parent,t)格是两份固定OT噪声的均值；同一对只做一次OT、复用五个t。五时间格是诊断网格，不是训练logit-normal分布期望。common_aux_initial是单独标记的共同初始P/S，绝不当作G0。",""]
++    prepared={}
++    for label in labels:
++        group=teacher.get(label,{})
++        rows=group.get("rows",[]) if isinstance(group,dict) else []
++        if len(rows)!=20 or group.get("status")!="PASS":raise ValueError("Missing fixed20-state teacher records: "+label)
++        prepared[label]=rows
++    table=[]
++    for parent in (0,1):
++        for ti,t in enumerate((.1,.3,.5,.7,.9)):
++            for label in labels:
++                selected=[x for x in prepared[label] if x["parent_index"]==parent and x["time_index"]==ti]
++                if len(selected)!=2:raise ValueError("Teacher parent/time pairing missing")
++                table.append([parent,t,label,_mean(selected,"FM_velocity_MSE"),_mean(selected,"Angular_cosine"),_mean(selected,"Scale_MSE")])
++    lines += _table(["父","t","模型/头身份","FM速度MSE","Angular cosine","Scale MSE"],table)+[""]
++    scale=[]
++    for parent in (0,1):
++        for ti,t in enumerate((.1,.3,.5,.7,.9)):
++            for label in ("common_aux_initial","G_AngularScale"):
++                selected=[x for x in prepared[label] if x["parent_index"]==parent and x["time_index"]==ti]
++                scale.append([parent,t,label,*[_mean(selected,"Scale_group_MSE",key) for key in ("centroid","log_edges","log_area","normal_outer")],
++                    _mean(selected,"constant_baseline","Scale_MSE"),_mean(selected,"prediction_statistics","q_hat","mean_variance"),
++                    _mean(selected,"target_statistics","mean_variance")])
++    lines += ["Scale组内误差各按自身维数平均；常量基线用冻结训练描述均值，未按teacher目标重新拟合。方差用于检查近常量预测，不是几何质量评分。",""]
++    lines += _table(["父","t","头身份","质心MSE","log边长MSE","log面积MSE","法向外积MSE","常量基线全MSE","q_hat均维方差","q均维方差"],scale)+[""]
++    comparison=[]
++    for parent in (0,1):
++        for ti,t in enumerate((.1,.3,.5,.7,.9)):
++            for label in ("G_Angular","G_AngularScale"):
++                selected=[x for x in prepared[label] if x["parent_index"]==parent and x["time_index"]==ti]
++                comparison.append([parent,t,label,_mean(selected,"Angular_cosine"),_mean(selected,"shuffled_target","Angular_cosine"),
++                    _mean(selected,"Scale_MSE"),_mean(selected,"shuffled_target","Scale_MSE")])
++    lines += ["同一预测对同样本内打乱目标的评分：不新运行网络、不训练错配对照。Angular只有P，Scale相关项NOT_APPLIED。",""]
++    lines += _table(["父","t","臂","正确cosine","打乱cosine","正确Scale MSE","打乱Scale MSE"],comparison)
++    return lines
++
++
++def write_report(r,out):
++    tick=time.perf_counter();out=Path(out).resolve();rows=_rows(r)
++    for row in rows:
++        if _record(row["metrics_path"])["sha256"]!=row["metrics_sha256"]:raise ValueError("Saved metric artifact changed")
++    figures=_figures(r,out);text=render_report(r,figures)
++    path=out/"GEOMETRY_REP_ALIGNMENT_REPORT.md"
++    if path.exists():raise FileExistsError(path)
++    path.write_text(text,encoding="utf-8")
++    return dict(status="PASS",report=_record(path),figures=figures,source=_record(__file__),seconds=time.perf_counter()-tick,
++        model_forwards=0,model_backwards=0,optimizer_updates=0,OT_calls=0,geometry_rescoring=0,
++        figure_seed=SEEDS[0],visual_review="PENDING_CALLER_REVIEW")
++
++
++def run_cpu_tests():
++    """Five presentation/schema checks from synthetic saved scalars only."""
++    assert _fmt(None)=="NOT_RECORDED" and _fmt(0.)=="0"
++    d=dict(finite_count=2,mean=2.,median=2.,worst=dict(seed=1,value=3.))
++    assert _dist(d)=="2 / 2 / 3"
++    d["worst"]=None
++    assert _dist(d)=="2 / 2 / N/A"
++    rows=[]
++    for model in MODELS:
++        for parent in (0,1):
++            for patch in (0,1,2):
++                for seed in (SEEDS if patch==0 else SEEDS[:2]):
++                    rows.append(dict(model=model,parent=parent,patch=patch,seed=seed,
++                        patch_group="original" if patch==0 else "new",raw_path=f"/fixture/{model}_{parent}_{patch}_{seed}.npz",
++                        scalars={k:1. for k in (FREE,TO,FROM,GAMMA,P95,COVER)}))
++    fake=dict(status="PASS_EXECUTION",scores=rows,generated=rows,summary=dict(patches={str(j):{} for j in (0,1,2)}))
++    assert len(_rows(fake))==96
++    for bad in (dict(fake,scores=rows[:-1]),dict(fake,status="TRAINING")):
++        try:_rows(bad)
++        except ValueError:pass
++        else:raise AssertionError("Partial/uncompleted report input accepted")
++    return dict(status="PASS",checks=5,model_calls=0,geometry_calls=0,autograd_calls=0,
++        real_assets_read=0,figures_rendered=0)
+diff --git a/native_t1/tests/test_geometry_representation.py b/native_t1/tests/test_geometry_representation.py
+new file mode 100755
+index 0000000..c553ed2
+--- /dev/null
++++ b/native_t1/tests/test_geometry_representation.py
+@@ -0,0 +1,221 @@
++"""Small CPU-only tests; no official model, OT, optimizer, or CUDA execution."""
++import ast
++import copy
++import itertools
++from pathlib import Path
++from types import SimpleNamespace
++import unittest
++
++import numpy as np
++import torch
++from torch.nn import functional as F
++from native_t1.context_geometry import face_geometry, FORMULA_ATOL, FORMULA_RTOL
++from native_t1.geometry_representation import (
++    descriptor13, GeometryTargets, AuxiliaryHeads, auxiliary_losses, GROUP_SLICES,
++)
++
++COUNTS=dict(descriptor_calls=0,legacy_geometry_calls=0,target_fit_calls=0,target_lookup_calls=0,
++            auxiliary_head_forwards=0,CPU_autograd_grad_calls=0,official_model_forwards=0,
++            OT_calls=0,optimizer_updates=0)
++
++
++def describe(x):
++    COUNTS['descriptor_calls']+=1
++    return descriptor13(x)
++
++
++def fit(archive):
++    COUNTS['target_fit_calls']+=1
++    return GeometryTargets.from_archive(archive)
++
++
++def lookup(targets,sample):
++    COUNTS['target_lookup_calls']+=1
++    return targets.for_sample(sample)
++
++
++def heads_forward(heads,h,valid,known):
++    COUNTS['auxiliary_head_forwards']+=1
++    return heads(h,valid,known)
++
++
++def grad(*args,**kwargs):
++    COUNTS['CPU_autograd_grad_calls']+=1
++    return torch.autograd.grad(*args,**kwargs)
++
++
++def archive_fixture():
++    cases={}
++    for parent in (0,1):
++        triangles=[]
++        for face in range(16):
++            size=np.float32(.25+face/32)
++            origin=np.asarray([face/8,parent/2,face/16],np.float32)
++            triangles.append(origin+np.asarray([[0,0,0],[size,0,0],[0,size*1.5,0]],np.float32))
++        full=np.stack(triangles).reshape(16,9)
++        for K in (4,8,12):
++            free=np.arange(K,16,dtype=np.int64)
++            cases[parent,K]=SimpleNamespace(full_target=full,free_target=full[free],free_source_ids=free)
++    return SimpleNamespace(cases=cases,sha256='a'*64)
++
++
++def sample_fixture(archive,parent=0):
++    full=archive.cases[parent,4].full_target
++    order=np.asarray([7,0,15,2,9,1,8,3,4,14,5,13,6,12,10,11])
++    known=order<4
++    triangles=full[order].reshape(16,3,3).copy()
++    for i in range(16):triangles[i]=triangles[i,list(tuple(itertools.permutations(range(3)))[i%6])]
++    y=triangles.reshape(16,9);y[known]=np.nan
++    return dict(parent_index=parent,source_face_ids=order,x1=y,known_mask=known,valid_mask=np.ones(16,bool))
++
++
++class GeometryRepresentationTests(unittest.TestCase):
++    def test_single_face_formula_S3_face_order_and_no_adjacency(self):
++        c=np.asarray([[[0,0,0],[1,.2,.1],[.1,1,.3]],[[2,1,0],[2.7,1.1,.2],[2.1,1.8,.7]]],np.float32)
++        raw=describe(c)
++        for order in itertools.permutations(range(3)):
++            actual=describe(c[:,order,:])
++            np.testing.assert_array_equal(actual['raw'],raw['raw'])
++            np.testing.assert_array_equal(actual['transformed'],raw['transformed'])
++        np.testing.assert_array_equal(describe(c[::-1].copy())['raw'],raw['raw'][::-1])
++        COUNTS['legacy_geometry_calls']+=1
++        original,_,_=face_geometry(torch.from_numpy(c))
++        np.testing.assert_allclose(raw['raw'],original.numpy(),atol=FORMULA_ATOL,rtol=FORMULA_RTOL)
++        independent=[]
++        for tri in c.astype(np.float64):
++            cross=np.cross(tri[1]-tri[0],tri[2]-tri[0]);area=np.linalg.norm(cross)/2
++            nx,ny,nz=cross/(2*area)
++            independent.append(np.r_[tri.mean(0),sorted(np.linalg.norm(tri[i]-tri[j]) for i,j in ((0,1),(0,2),(1,2))),area,
++                                       nx*nx,ny*ny,nz*nz,nx*ny,nx*nz,ny*nz])
++        np.testing.assert_allclose(raw['raw'],independent,atol=1e-12,rtol=1e-12)
++
++    def test_true_degenerate_rejected_but_log_floor_not_geometry_repair(self):
++        for c in (np.zeros((1,3,3),np.float32),np.full((1,3,3),np.nan,np.float32),
++                  np.asarray([[[0,0,0],[1,0,0],[2,0,0]]],np.float32)):
++            with self.assertRaises(ValueError):describe(c)
++        small=describe(np.asarray([[[0,0,0],[1e-8,0,0],[0,1e-8,0]]],np.float32))
++        self.assertEqual(small['area_floor_faces'],1)
++        self.assertGreater(small['raw'][0,6],0)
++        self.assertEqual(small['transformed'][0,6],np.log(1e-12))
++
++    def test_deduplicated_FP64_statistics_and_metadata_roundtrip(self):
++        archive=archive_fixture();targets=fit(archive);meta=targets.metadata()
++        self.assertEqual(meta['unique_faces'],24)
++        self.assertEqual(sum(v['free_faces'] for v in meta['fit_cases']),48)
++        all_faces=np.concatenate([archive.cases[p,4].free_target for p in (0,1)])
++        r=describe(all_faces)['transformed']
++        for name,sl in GROUP_SLICES.items():
++            mu=r[:,sl].mean(0);scale=np.sqrt(np.mean((r[:,sl]-mu)**2));width=sl.stop-sl.start
++            np.testing.assert_array_equal(meta['groups'][name]['mean'],mu)
++            self.assertEqual(meta['groups'][name]['centered_RMS'],scale)
++            self.assertEqual(meta['groups'][name]['denominator'],max(scale,1e-6)*np.sqrt(width))
++        self.assertTrue(meta['groups']['normal_outer']['scale_floor_active'])
++        restored=GeometryTargets.from_metadata(meta)
++        self.assertEqual(restored.metadata(),meta)
++        bad=copy.deepcopy(meta);bad['groups']['centroid']['mean'][0]+=1
++        with self.assertRaises(ValueError):GeometryTargets.from_metadata(bad)
++        self.assertEqual(targets.metadata(),meta)
++
++    def test_actual_slot_mapping_S3_known_placeholders_and_no_target_grad(self):
++        archive=archive_fixture();targets=fit(archive);sample=sample_fixture(archive)
++        q=lookup(targets,sample)
++        self.assertEqual(q['free_count'],12);self.assertEqual(q['known_targets_evaluated'],0)
++        self.assertFalse(q['q'].requires_grad)
++        meta=targets.metadata();by_id={v['source_face_id']:v['q'] for v in meta['source_samples'] if v['parent']==0}
++        np.testing.assert_array_equal(q['q'].numpy(),np.asarray([by_id[i] for i in sample['source_face_ids'][~sample['known_mask']]],np.float32))
++        reordering=np.arange(16)[::-1]
++        permuted={k:(v[reordering].copy() if isinstance(v,np.ndarray) else v) for k,v in sample.items()}
++        actual=lookup(targets,permuted)
++        np.testing.assert_array_equal(actual['q'].numpy(),q['q'].numpy()[::-1])
++        bad=copy.deepcopy(sample);bad['x1'][0,0]+=.01
++        with self.assertRaises(ValueError):lookup(targets,bad)
++        padded=copy.deepcopy(sample);padded['valid_mask'][0]=False;padded['x1'][0]=np.nan
++        self.assertEqual(lookup(targets,padded)['free_count'],11)
++
++    def test_projector_initialization_matches_and_preserves_RNG(self):
++        before=torch.get_rng_state().clone()
++        angular=AuxiliaryHeads(False);both=AuxiliaryHeads(True)
++        self.assertTrue(torch.equal(before,torch.get_rng_state()))
++        self.assertIsNone(angular.S)
++        for name,value in angular.P.state_dict().items():self.assertTrue(torch.equal(value,both.P.state_dict()[name]))
++        self.assertGreater(int(torch.count_nonzero(angular.P[-1].weight)),0)
++        self.assertEqual(angular.metadata()['P_parameters'],201741)
++        self.assertEqual(both.metadata()['S_parameters'],1741)
++        self.assertEqual(both.metadata()['total_parameters'],203482)
++        again=AuxiliaryHeads(True);again.load_state_dict(both.state_dict(),strict=True)
++        for name,value in both.state_dict().items():self.assertTrue(torch.equal(value,again.state_dict()[name]))
++
++    def test_FP32_pooling_scattered_masks_and_head_face_permutation(self):
++        heads=AuxiliaryHeads(True)
++        h=torch.linspace(-2,2,1*18*768).reshape(1,18,768).to(torch.bfloat16)
++        known=torch.tensor([[True,False,True,False,False,True]])
++        valid=torch.tensor([[True,True,True,True,False,True]])
++        with torch.autocast('cpu',dtype=torch.bfloat16):actual=heads_forward(heads,h,valid,known)
++        expected=h.float().reshape(1,6,3,768).mean(2)[valid&~known]
++        self.assertTrue(torch.equal(actual['H_face'],expected))
++        self.assertEqual(actual['z'].dtype,torch.float32);self.assertEqual(actual['q_hat'].dtype,torch.float32)
++        order=torch.tensor([5,3,0,4,1,2]);hp=h.reshape(1,6,3,768)[:,order][:,:,[2,0,1]].reshape_as(h)
++        other=heads_forward(heads,hp,valid[:,order],known[:,order])
++        torch.testing.assert_close(other['z'],actual['z'].flip(0),atol=2e-6,rtol=2e-5)
++
++    def test_angular_scale_gradients_and_detached_GT(self):
++        heads=AuxiliaryHeads(True)
++        h=torch.linspace(-1,1,18*768).reshape(1,18,768).clone().requires_grad_()
++        known=torch.tensor([[True,False,True,False,False,False]]);valid=torch.ones_like(known)
++        predictions=heads_forward(heads,h,valid,known)
++        q=torch.linspace(-.8,.9,4*13).reshape(4,13).clone().requires_grad_()
++        losses=auxiliary_losses(predictions,q)
++        variables=(h,heads.P[1].weight,heads.S[0].weight,q)
++        angular=grad(losses['angular'],variables,retain_graph=True,allow_unused=True)
++        scale=grad(losses['scale'],variables,allow_unused=True)
++        self.assertIsNone(angular[2]);self.assertIsNone(angular[3]);self.assertIsNone(scale[3])
++        for collection in (angular[:2],scale[:3]):
++            for value in collection:self.assertTrue(bool(torch.isfinite(value).all()));self.assertGreater(float(value.norm()),0)
++        mask=known[:,:,None,None].expand(1,6,3,768).reshape_as(h)
++        self.assertTrue(torch.equal(scale[0][mask],torch.zeros_like(scale[0][mask])))
++
++    def test_loss_oracle_zero_direction_and_full_batch_denominators(self):
++        q=torch.zeros(2,13);q[0,0]=1
++        z=q.clone().requires_grad_();normalized=F.normalize(z,dim=-1,eps=1e-6)
++        p=dict(z=z,z_norm=normalized,q_hat=q.clone())
++        out=auxiliary_losses(p,q)
++        self.assertEqual(out['angular_count'],1);self.assertEqual(out['invalid_angular_count'],1)
++        self.assertEqual(float(out['angular']),0);self.assertEqual(float(out['scale']),0)
++        zeros=torch.zeros_like(q)
++        with self.assertRaises(ValueError):auxiliary_losses(p,zeros)
++        local=auxiliary_losses(p,zeros,angular_denominator=3,free_denominator=8)
++        g,=grad(local['angular'],(z,))
++        self.assertTrue(torch.equal(g,torch.zeros_like(g)))
++        z=torch.linspace(-1,2,36*13).reshape(36,13).clone().requires_grad_()
++        q=torch.cos(torch.arange(36*13,dtype=torch.float32)).reshape(36,13);q[0]=0
++        norm=F.normalize(z,dim=-1,eps=1e-6);p=dict(z=z,z_norm=norm,q_hat=norm*.7+.2)
++        full=auxiliary_losses(p,q);terms=[];start=0
++        for size in range(1,9):
++            stop=start+size
++            terms.append(auxiliary_losses({k:v[start:stop] for k,v in p.items()},q[start:stop],
++                         angular_denominator=35,free_denominator=36))
++            start=stop
++        angular=sum(v['angular'] for v in terms);scale=sum(v['scale'] for v in terms)
++        torch.testing.assert_close(angular,full['angular'],atol=1e-7,rtol=1e-6)
++        torch.testing.assert_close(scale,full['scale'],atol=1e-7,rtol=1e-6)
++        a,=grad(full['angular']+full['scale'],(z,),retain_graph=True)
++        b,=grad(angular+scale,(z,))
++        torch.testing.assert_close(a,b,atol=1e-7,rtol=1e-6)
++        with self.assertRaises(ValueError):auxiliary_losses(p,q,angular_denominator=34,free_denominator=36)
++        with self.assertRaises(ValueError):auxiliary_losses(p,q,angular_denominator=35,free_denominator=35)
++
++    def test_feature_api_static_reference_capture_not_a_new_model_input(self):
++        source=Path(__file__).parents[1]/'model.py'
++        tree=ast.parse(source.read_text(encoding='utf-8-sig'))
++        cls=next(v for v in tree.body if isinstance(v,ast.ClassDef) and v.name=='NativeInpaintingModel')
++        forward=next(v for v in cls.body if isinstance(v,ast.FunctionDef) and v.name=='forward')
++        self.assertEqual([v.arg for v in forward.args.kwonlyargs],['observer','return_feature_layer'])
++        self.assertIsNone(forward.args.kw_defaults[-1].value)
++        captures=[v for v in ast.walk(forward) if isinstance(v,ast.Assign) and any(isinstance(t,ast.Name) and t.id=='feature' for t in v.targets)]
++        self.assertEqual(len(captures),2)
++        self.assertTrue(any(isinstance(v.value,ast.Name) and v.value.id=='hidden' for v in captures))
++        # Real-model bitwise/reference-pointer and upstream gradient gates are
++        # deliberately owned by the separately counted GPU preflight.
++
++
++if __name__=='__main__':unittest.main()

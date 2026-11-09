@@ -1,0 +1,908 @@
+--- /dev/null
++++ b/experiments/mf_h1_local0/jedge5_solver_pilot/evaluation.py
+@@ -0,0 +1,215 @@
++"""CPU-only, unchanged independent scoring for the fixed solver pilot."""
++from __future__ import annotations
++from pathlib import Path
++import argparse,csv,time
++import numpy as np
++from experiments.mf_h1_local0.jedge5_diagnosis.common import (
++    ROOT,load_cases,read_json,write_json,file_sha256,EVALUATION_SHA,ASSETS,array_hash)
++from experiments.mf_h1_local0.jedge5_diagnosis import scoring as archived
++
++OLD=ROOT/'native_t1/runs/jedge5_diagnosis_20261002_102215'
++DEFAULT=ROOT/'native_t1/runs/jedge5_solver_pilot_20261002_121000'
++CASE_SPECS=((0,10401),(0,10402),(4,10401),(4,10402))
++METHODS={'E_quad50':(50,50),'Midpoint25':(25,50),'Heun25':(25,50),'Heun50':(50,100)}
++DISPLAY=('Euler50','E_quad50','Midpoint25','Heun25','Euler100','Heun50')
++J_FILE_SHA='cc7a248fa9a8570059f225cd1c313f21f08585925407a79418df6d63c9cae0e9'
++KEYS=('remainder_symmetric_RMS_bbox_pct','free_to_R12_RMS_bbox_pct','R12_to_free_RMS_bbox_pct',
++      'boundary_RMS_bbox_pct','boundary_p95_bbox_pct','boundary_coverage_fraction',
++      'FF_illegal_pair_count','CF_proper_pair_count','CF_proper_affected_free_fraction',
++      'free_minimum_angle_lt5_fraction','free_q_gt10_fraction','free_total_surface_area')
++
++
++def own_out(value):
++    out=Path(value).resolve()
++    if out.parent!=ROOT/'native_t1/runs' or not out.name.startswith('jedge5_solver_pilot_'):
++        raise ValueError('Only this isolated pilot run is writable')
++    return out
++
++
++def initialize(out):
++    import fcntl
++    folder=out/'registration';folder.mkdir(parents=True,exist_ok=True)
++    with (folder/'scoring_init.lock').open('a+') as lock:
++        fcntl.flock(lock,fcntl.LOCK_EX)
++        source=OLD/'registration/static_context_audit.json';cache=folder/'static_context_audit.json'
++        if not cache.exists():cache.write_bytes(source.read_bytes())
++        if file_sha256(cache)!=file_sha256(source):raise ValueError('Archived CC cache changed')
++        banks=archived.banks_with_context_audit(out)
++        record=dict(status='PASS',CC_source=str(source),CC_sha256=file_sha256(source),new_CC_audits=0,
++            scorer_sha256=file_sha256(archived.REFERENCE/'evaluation.py'),
++            original_scorer_module_sha256=file_sha256(Path(archived.__file__)),
++            evaluation_inputs_sha256=EVALUATION_SHA,model_forwards=0,
++            CPU_scheduling='One thread per process; initialization lock only. No cross-run global CPU lock was found or claimed.')
++        if not (folder/'scoring_identity.json').exists():write_json(folder/'scoring_identity.json',record)
++    return banks
++
++
++def score_cli(out,case_id):
++    import torch
++    torch.set_num_threads(1)
++    if torch.cuda.is_initialized():raise RuntimeError('CPU scoring must not initialize CUDA')
++    out=own_out(out);case_id=int(case_id)
++    patch,seed=CASE_SPECS[case_id];source=out/f'raw/case{case_id}/results.json'
++    generated=read_json(source)
++    if generated['status']!='PASS':raise ValueError('Complete successful worker required')
++    rows=generated['rows']
++    if len(rows)!=4 or {x['method'] for x in rows}!=set(METHODS):raise ValueError('Require exactly four registered methods')
++    folder=out/f'scores/case{case_id}';folder.mkdir(parents=True,exist_ok=True)
++    dest=folder/'results.json'
++    if dest.exists():raise FileExistsError(dest)
++    banks=initialize(out);case=load_cases()[0,patch];tick=time.perf_counter();ledger={};saved=[]
++    result=dict(status='RUNNING',case_id=case_id,parent=0,patch=patch,seed=seed,rows=saved,ledger=ledger,
++        model_forwards=0,optimizer_updates=0,OT_calls=0,repairs=0,source_sha256=file_sha256(source))
++    write_json(dest,result)
++    try:
++        for method in METHODS:
++            row=next(x for x in rows if x['method']==method);steps,nfe=METHODS[method]
++            for k,want in dict(parent=0,patch=patch,seed=seed,precision='bf16',model='J',nfe=nfe,
++                model_state_sha256=ASSETS['J']['state'],model_file_sha256=J_FILE_SHA).items():
++                if row[k]!=want:raise ValueError(f'{method} identity mismatch {k}')
++            path=Path(row['path']);path=path if path.is_absolute() else out/path;path=path.resolve()
++            if out not in path.parents or file_sha256(path)!=row['sha256']:raise ValueError('Raw path/hash mismatch')
++            with np.load(path,allow_pickle=False) as z:
++                raw=z['raw'].copy().reshape(112,3,3);states=z['states'].copy().reshape(-1,112,3,3);C=z['C'].copy().reshape(12,3,3)
++            if raw.dtype!=np.float32 or states.dtype!=np.float32 or C.dtype!=np.float32:raise ValueError('Non-FP32 geometry')
++            if len(states)!=steps+1 or not np.isfinite(states).all():raise ValueError('Incomplete/nonfinite states')
++            if states[-1].tobytes()!=raw.tobytes() or C.tobytes()!=case['C'].tobytes():raise ValueError('Endpoint/context identity mismatch')
++            if any(s[:12].tobytes()!=C.tobytes() for s in states):raise ValueError('C changed at a state')
++            old_noise_path=OLD/f'A/J/J_P0_patch{patch}_seed{seed}_bf16_Euler50.npz'
++            with np.load(old_noise_path,allow_pickle=False) as old:initial=old['states'][0].reshape(112,3,3)
++            if states[0].tobytes()!=initial.tobytes():raise ValueError('Initial C/free Gaussian differs from paired baseline')
++            before=raw.tobytes();ts=time.perf_counter();metrics,scalars=archived.score_one(raw,banks[patch],0,patch,ledger)
++            if raw.tobytes()!=before:raise ValueError('Offline evaluator mutated geometry')
++            detail=folder/(method+'.json');write_json(detail,metrics)
++            saved.append(dict(row,case_id=case_id,steps=steps,scalars=scalars,
++                cross_remainder=metrics['remainder']['cross'],metric_path=str(detail.relative_to(out)),metric_sha256=file_sha256(detail),
++                scoring_seconds=time.perf_counter()-ts,C_saved_states_bitwise=True,topology='NOT_RUN'))
++            result['completed']=len(saved);result['seconds']=time.perf_counter()-tick;write_json(dest,result)
++            print('score',case_id,method,'PASS',flush=True)
++        if torch.cuda.is_initialized():raise RuntimeError('CPU score initialized CUDA')
++        result['status']='PASS'
++    except BaseException as exc:
++        result['status']='FAIL';result['error']=repr(exc);raise
++    finally:
++        result['seconds']=time.perf_counter()-tick;write_json(dest,result)
++    return result
++
++
++def baseline_rows():
++    source=OLD/'scores/A_J/results.json';record=read_json(source)
++    state=read_json(OLD/'A/J/results.json')
++    if state['status']!='PASS' or state['state_after']!=ASSETS['J']['state']:raise ValueError('Baseline model identity mismatch')
++    rows=[]
++    for cid,(patch,seed) in enumerate(CASE_SPECS):
++        for nfe in (50,100):
++            r=next(x for x in record['rows'] if x['parent']==0 and x['patch']==patch and x['seed']==seed and x['nfe']==nfe and x['precision']=='bf16')
++            path=Path(r['path']);path=path if path.is_absolute() else OLD/path
++            if file_sha256(path)!=r['sha256']:raise ValueError('Reused baseline raw hash changed')
++            detail=OLD/r['score_path'];metrics=read_json(detail)
++            rows.append(dict(model='J',method=f'Euler{nfe}',case_id=cid,parent=0,patch=patch,seed=seed,
++                nfe=nfe,steps=nfe,precision='bf16',model_state_sha256=ASSETS['J']['state'],model_file_sha256=J_FILE_SHA,
++                path=str(path),sha256=r['sha256'],scalars=r['scalars'],metric_path=str(detail),metric_sha256=file_sha256(detail),
++                baseline_scores_source_sha256=file_sha256(source),reused=True,topology='NOT_RUN',cross_remainder=metrics['remainder']['cross']))
++    return rows
++
++
++def write_csv(path,rows):
++    with Path(path).open('w',encoding='utf-8',newline='') as f:
++        w=csv.DictWriter(f,fieldnames=list(rows[0]));w.writeheader();w.writerows(rows)
++
++
++def aggregate(out):
++    out=own_out(out);rows=baseline_rows();new=0;ledger={};timing=[]
++    for cid in range(4):
++        r=read_json(out/f'scores/case{cid}/results.json')
++        if r['status']!='PASS' or len(r['rows'])!=4:raise ValueError('Complete fixed score matrix required')
++        rows.extend(r['rows']);new+=len(r['rows']);timing.append(dict(case_id=cid,seconds=r['seconds']))
++        for k,v in r['ledger'].items():ledger[k]=ledger.get(k,0)+v
++    rows.sort(key=lambda r:(r['case_id'],DISPLAY.index(r['method'])))
++    allnames=sorted(rows[0]['scalars']);by={(r['case_id'],r['method']):r for r in rows};comparisons=[]
++    for cid in range(4):
++        for candidate,baseline in (('E_quad50','Euler50'),('Midpoint25','Euler50'),('Heun25','Euler50'),('Heun50','Euler100')):
++            a,b=by[cid,candidate],by[cid,baseline]
++            if a['nfe']!=b['nfe']:raise AssertionError('Unequal-NFE comparison')
++            changes={k:(a['scalars'][k]-b['scalars'][k]) if a['scalars'].get(k) is not None and b['scalars'].get(k) is not None else None for k in allnames}
++            comparisons.append(dict(case_id=cid,parent=0,patch=a['patch'],seed=a['seed'],candidate=candidate,baseline=baseline,nfe=a['nfe'],differences=changes))
++    macros={}
++    for group,cids in (('normal_patch0',[0,1]),('sensitive_patch4',[2,3]),('all_selected',[0,1,2,3])):
++        macros[group]={}
++        for candidate in METHODS:
++            rr=[r for r in comparisons if r['case_id'] in cids and r['candidate']==candidate]
++            macros[group][candidate]={k:dict(mean_delta=float(np.mean([x['differences'][k] for x in rr])),
++                median_paired_delta=float(np.median([x['differences'][k] for x in rr])),
++                negative_count=sum(x['differences'][k]<0 for x in rr),positive_count=sum(x['differences'][k]>0 for x in rr),count=len(rr))
++                for k in allnames if all(x['differences'][k] is not None and isinstance(x['differences'][k],(int,float)) for x in rr)}
++    folder=out/'evaluation';folder.mkdir(exist_ok=True)
++    write_csv(folder/'per_output.csv',[dict(case_id=r['case_id'],parent=0,patch=r['patch'],seed=r['seed'],method=r['method'],nfe=r['nfe'],**r['scalars']) for r in rows])
++    write_csv(folder/'paired_equal_NFE.csv',[dict(**{k:v for k,v in r.items() if k!='differences'},**r['differences']) for r in comparisons])
++    result=dict(status='PASS',rows=rows,comparisons=comparisons,macro_differences=macros,ledger=ledger,new_scored_outputs=new,
++        reused_baselines=8,model_forwards=0,optimizer_updates=0,scoring_worker_seconds=timing,
++        evaluation_inputs_sha256=EVALUATION_SHA,scoring_version_sha256=file_sha256(archived.REFERENCE/'evaluation.py'),
++        caveat='All cases are preselected observed contexts/noises on P0. Equal-NFE comparisons only. Heun50 uses 100 NFE, not 50. Differences are descriptive, not convergence or generalization proof. No topology certification or repair.')
++    write_json(folder/'results.json',result);plot_outputs(out,rows);print('aggregate PASS',flush=True)
++    return result
++
++
++def plot_outputs(out,rows):
++    """Show GT coverage at fixed original query positions; never hide absent regions."""
++    import matplotlib;matplotlib.use('Agg')
++    import matplotlib.pyplot as plt
++    from matplotlib.colors import PowerNorm
++    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
++    from experiments.mf_h1_local0.jedge5_blackbox.geometry import attribution
++    folder=out/'evaluation';cases=load_cases();raws={};coverage={};ledger=[]
++    # Small CPU-only directional-query export; original score formula is independently reconciled.
++    for r in rows:
++        path=Path(r['path']);path=path if path.is_absolute() else out/path
++        if file_sha256(path)!=r['sha256']:raise ValueError('Raw changed before plotting')
++        with np.load(path,allow_pickle=False) as z:raw=z['raw'].copy().reshape(112,3,3)
++        arrays,summary=attribution(raw,cases[0,r['patch']]);key=(r['case_id'],r['method']);raws[key]=raw;coverage[key]=arrays
++        if not np.isclose(summary['symmetric_RMS_bbox_pct'],r['scalars']['remainder_symmetric_RMS_bbox_pct'],atol=1e-12,rtol=1e-12):raise ValueError('Plot sample/score reconciliation failed')
++        np.savez_compressed(folder/f"case{r['case_id']}_{r['method']}_directional_queries.npz",**arrays)
++        ledger.append(dict(case_id=r['case_id'],method=r['method'],nfe=r['nfe'],precision=r['precision'],raw_sha256=r['sha256'],
++            model_state_sha256=r['model_state_sha256'],C_sha256=array_hash(cases[0,r['patch']]['C']),
++            target_points_sha256=array_hash(arrays['target_points']),GT_to_free_RMS_bbox_pct=summary['backward_RMS_bbox_pct']))
++    pts=np.concatenate([v.reshape(-1,3) for v in raws.values()]+[cases[0,0]['full'].reshape(-1,3)])
++    center=(pts.max(0)+pts.min(0))/2;radius=np.ptp(pts,axis=0).max()*.54
++    vmax=max(float(a['target_squared_distances'].max()/cases[0,CASE_SPECS[cid][0]]['bbox']**2*1e4) for (cid,m),a in coverage.items())
++    norm=PowerNorm(.35,vmin=0,vmax=vmax)
++    for cid,(patch,seed) in enumerate(CASE_SPECS):
++        fig=plt.figure(figsize=(21,11));case=cases[0,patch];L=case['bbox']
++        for col,method in enumerate(DISPLAY):
++            row=next(r for r in rows if r['case_id']==cid and r['method']==method);tri=raws[cid,method];a=coverage[cid,method]
++            for view in range(3):
++                ax=fig.add_subplot(3,6,view*6+col+1,projection='3d')
++                if view<2:
++                    ax.add_collection3d(Poly3DCollection(tri[12:],facecolors=(.70,.72,.77,.95),edgecolors=(.2,.2,.2,.3),linewidths=.25))
++                    if view==0:ax.add_collection3d(Poly3DCollection(tri[:12],facecolors=(.2,.7,.9,.85),edgecolors='teal',linewidths=.4))
++                else:
++                    target=case['free'].reshape(100,3,3);q=a['target_points'];d2=a['target_squared_distances']/L**2*1e4
++                    ax.add_collection3d(Poly3DCollection(target,facecolors=(.7,.7,.7,.04),edgecolors=(.3,.3,.3,.12),linewidths=.3))
++                    ax.scatter(q[:,0],q[:,1],q[:,2],c=d2,cmap='viridis',norm=norm,s=8,depthshade=False,edgecolors='none')
++                    ax.add_collection3d(Poly3DCollection(case['C'],facecolors=(.2,.7,.9,.1),edgecolors='cyan',linewidths=.3))
++                ax.set(xlim=(center[0]-radius,center[0]+radius),ylim=(center[1]-radius,center[1]+radius),zlim=(center[2]-radius,center[2]+radius))
++                ax.set_box_aspect((1,1,1));ax.view_init(elev=20,azim=-55,vertical_axis='y');ax.set_axis_off()
++                if view==0:ax.set_title(f"{method} ({row['nfe']} NFE)\nRMS {row['scalars']['remainder_symmetric_RMS_bbox_pct']:.3f}%",fontsize=10)
++                if col==0:ax.text2D(-.05,.5,('Full','Free only','GT coverage')[view],transform=ax.transAxes,rotation=90,va='center',fontsize=11)
++        fig.suptitle(f'JEdge5 / BF16 / P0 patch {patch} / seed {seed}: same noise, fixed view and ranges',fontsize=14)
++        fig.subplots_adjust(left=.025,right=.94,top=.93,bottom=.02,wspace=0,hspace=.02)
++        bar=fig.add_axes([.955,.1,.01,.25]);fig.colorbar(plt.cm.ScalarMappable(norm=norm,cmap='viridis'),cax=bar,label='GT coverage point distance^2 [(% bbox)^2]')
++        fig.savefig(folder/f'case{cid}_comparison.png',dpi=160);plt.close(fig)
++    write_json(folder/'plot_manifest.json',dict(status='PASS',rows=ledger,extra_model_forwards=0,
++        directional_surface_query_reconstructions=len(rows),points_each_direction=512,
++        sampler='Exact original RandomState(9911), independently reconciled to all 24 original scores',
++        camera=dict(elevation=20,azimuth=-55,vertical_axis='y',center=center.tolist(),radius=float(radius)),
++        coverage_color=dict(transform='PowerNorm gamma=.35',minimum=0,maximum=vmax,units='squared percent bbox; pointwise, weight 1/512 in RMS score'),
++        note='Full/free shapes and GT missing-region heatmaps; no GT correspondence enters generation. Fixed shared range across all four cases.'))
++
++
++def main():
++    p=argparse.ArgumentParser();p.add_argument('--out',type=Path,default=DEFAULT);p.add_argument('--case',type=int,choices=range(4));p.add_argument('--aggregate',action='store_true');a=p.parse_args()
++    if a.aggregate:aggregate(a.out)
++    elif a.case is not None:score_cli(a.out,a.case)
++    else:p.error('--case or --aggregate required')
++
++if __name__=='__main__':main()
+--- /dev/null
++++ b/experiments/mf_h1_local0/jedge5_solver_pilot/final_audit.py
+@@ -0,0 +1,164 @@
++"""File/array/ledger audit only: no torch, model, integration or scoring imports."""
++import argparse,difflib,hashlib,json,math,os,subprocess,time
++from pathlib import Path
++import numpy as np
++ROOT=Path(__file__).resolve().parents[3]
++DEFAULT=ROOT/'native_t1/runs/jedge5_solver_pilot_20261002_121000'
++METHODS={'E_quad50':(50,50),'Midpoint25':(25,50),'Heun25':(25,50),'Heun50':(50,100)}
++NULL_KEYS={'exact_C_free_shared_edge_count','new_free_related_nonmanifold_vertex_count','exact_C_free_shared_vertex_count','C_inherited_nonmanifold_vertex_count','C_current_winding_conflict_count','free_related_current_winding_conflict_count','shared_edge_component_count','exact_index_boundary_edge_count','exact_index_overincident_edge_count'}
++
++def pathof(value,base=ROOT):
++    s=str(value).replace('\\','/')
++    if os.name!='nt' and len(s)>2 and s[1:3]==':/':s='/mnt/'+s[0].lower()+'/'+s[3:]
++    if os.name=='nt' and s.startswith('/mnt/'):s=s[5].upper()+':/'+s[7:]
++    p=Path(s);return (p if p.is_absolute() else base/p).resolve()
++
++def save(path,value):
++    temp=path.with_suffix(path.suffix+'.tmp');temp.write_text(json.dumps(value,indent=2,allow_nan=False)+'\n',encoding='utf-8');os.replace(temp,path)
++
++def ah(a):
++    a=np.ascontiguousarray(a);h=hashlib.sha256(str((str(a.dtype),tuple(a.shape))).encode());h.update(a.tobytes());return h.hexdigest()
++
++def bits(a,b):return a.dtype==b.dtype and a.shape==b.shape and a.tobytes()==b.tobytes()
++
++def sealed_out(value):
++    out=pathof(value)
++    if out.parent!=ROOT/'native_t1/runs' or not out.name.startswith('jedge5_solver_pilot_'):raise ValueError('Isolated solver run required')
++    return out
++
++def refresh_manifest(out):
++    out=sealed_out(out)
++    if not (out/'final_audit.json').exists():raise ValueError('Final audit required before artifact manifest')
++    files=[]
++    for p in sorted(out.rglob('*')):
++        if p.is_file() and p.name!='manifest.json' and p.suffix not in ('.tmp','.lock'):
++            h=hashlib.sha256()
++            with p.open('rb') as f:
++                for block in iter(lambda:f.read(8*1024*1024),b''):h.update(block)
++            files.append(dict(path=p.relative_to(out).as_posix(),sha256=h.hexdigest(),bytes=p.stat().st_size))
++    record=dict(status='PASS',timestamp=time.time(),files=files,excluded_self='manifest.json',pending_root_deliverables=[n for n in ('SOLVER_PILOT_REPORT.md','results.json') if not (out/n).exists()],scientific_calls=0)
++    save(out/'manifest.json',record);return record
++
++def run(value):
++    out=sealed_out(value);tick=time.perf_counter();files={};checks=0;npz_reads=0
++    for n in ('final_audit.json','case_identity_manifest.json','code.diff'):
++        if (out/n).exists():raise FileExistsError(out/n)
++    def check(ok,label):
++        nonlocal checks
++        checks+=1
++        if not bool(ok):raise AssertionError(label)
++    def sha(value):
++        p=pathof(value)
++        if str(p) not in files:
++            h=hashlib.sha256()
++            with p.open('rb') as f:
++                for block in iter(lambda:f.read(8*1024*1024),b''):h.update(block)
++            files[str(p)]=dict(sha256=h.hexdigest(),bytes=p.stat().st_size)
++        return files[str(p)]['sha256']
++    def read(p):sha(p);return json.loads(pathof(p).read_text(encoding='utf-8-sig'))
++    def arrays(p):
++        nonlocal npz_reads
++        npz_reads+=1;sha(p)
++        with np.load(pathof(p),allow_pickle=False) as z:return {k:z[k].copy() for k in z.files}
++    # Fail before creating audit artifacts if the final matrix is not ready.
++    workers=[read(out/f'raw/case{i}/results.json') for i in range(4)]
++    scored=[read(out/f'scores/case{i}/results.json') for i in range(4)]
++    evaluation=read(out/'evaluation/results.json');plot=read(out/'evaluation/plot_manifest.json')
++    check(all(r['status']=='PASS' for r in workers+scored+[evaluation,plot]),'All scientific writers completed PASS')
++    report=dict(status='RUNNING',started_timestamp=time.time())
++    try:
++        protocol=read(out/'registration/protocol.json');fixture=read(out/'registration/sampler_cpu_tests.json');scorer=read(out/'registration/scoring_identity.json')
++        check(protocol['status']=='FROZEN' and protocol['expected_actual_model_forwards']==1000 and protocol['max_new_full_trajectories']==16,'Registered budget')
++        check([(c['case_id'],c['parent'],c['patch'],c['seed']) for c in protocol['cases']]==[(0,0,0,10401),(1,0,0,10402),(2,0,4,10401),(3,0,4,10402)],'Registered cases')
++        check(sha(protocol['checkpoint'])==protocol['checkpoint_file_sha256'],'J checkpoint file unchanged; no tensor reload')
++        for p,h in protocol['protected'].items():check(sha(ROOT/p)==h,'Public source protected '+p)
++        head=subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip();check(head==protocol['source_HEAD'],'HEAD unchanged')
++        check(fixture['status']=='PASS' and fixture['tests_run']==6 and fixture['CUDA_initialized'] is False,'CPU fixtures passed')
++        fc=fixture['counts'];check(fc['CPU_mock_forward_attempts']==752 and fc['CPU_mock_forward_returns']==751 and fc['CPU_mock_complete_rollouts']==12 and fc['expected_rejections']==4,'Mock attempts/returns including intentional failure')
++        check(all(fc[k]==0 for k in ('real_model_forwards','model_backwards','optimizer_updates','OT_calls','geometry_autograd_calls')),'Fixtures added zero real model calls')
++        for p,h in fixture['sources'].items():check(sha(p)==h,'Fixture/sampler source unchanged')
++        totals={};lockrows=[];identities=[];references={};newrows={}
++        expected=dict(model_forward_attempts=250,model_forward_returns=250,accepted_steps=150,full_rollout_attempts=4,complete_rollouts=4,sampling_failures=0,model_backward_calls=0,optimizer_updates=0,geometry_gradient_calls=0,OT_calls=0,postprocessing_repairs=0)
++        for cid,w in enumerate(workers):
++            case=protocol['cases'][cid];check(w['case_id']==cid and len(w['rows'])==4 and {r['method'] for r in w['rows']}==set(METHODS),'Four methods per case')
++            check(w['counts']==expected,'Exact per-worker budget')
++            for k,v in w['counts'].items():totals[k]=totals.get(k,0)+v
++            ident=w['identity'];check(ident['strict'] is True and ident['missing_keys']==ident['unexpected_keys']==[] and ident['state_sha256']==w['final_model_state_sha256']==protocol['model_state_sha256'],'Strict unchanged model state')
++            check(ident['checkpoint_sha256']==protocol['checkpoint_file_sha256'] and ident['cumulative_updates']==3000 and ident['trainable_parameters']==0 and ident['training_objective']['name']=='edge5','Frozen J3000 identity')
++            check(w['lock_path']==protocol['gpu_dispatch']['lock'] and w['lock_inode']>0 and w['lock_owner_pid']>0 and w['CUDA_initialized_before_locked_runtime'] is False and w['lock_held_until_process_exit'] is True,'Lock-before-CUDA runtime facts')
++            lockrows.append(dict(case_id=cid,inode=w['lock_inode'],pid=w['lock_owner_pid'],acquired=w['lock_acquired_timestamp'],last_snapshot=max(s['timestamp'] for s in w['resource_snapshots']),wait_seconds=w['lock_wait_seconds']))
++            check(sha(case['first_velocity_source'])==case['first_velocity_source_sha256'],'Blackbox reference file unchanged');ref=arrays(case['first_velocity_source']);references[cid]=ref
++            for row in w['rows']:
++                method=row['method'];steps,nfe=METHODS[method];p=pathof(row['path'],out);check(out in p.parents and sha(p)==row['sha256'],'New raw file identity');z=arrays(p);a=row['audit']
++                check(row['case_id']==cid and row['parent']==0 and row['patch']==case['patch'] and row['seed']==case['seed'] and row['model']=='J' and row['precision']=='bf16' and row['nfe']==nfe,'Row registered identity')
++                check(row['model_state_sha256']==protocol['model_state_sha256'] and row['model_file_sha256']==protocol['checkpoint_file_sha256'],'Row model hashes')
++                for k,shape in dict(raw=(112,9),states=(steps+1,112,9),C=(12,3,3),stage_states=(nfe,112,9),stage_velocities=(nfe,112,9)).items():check(z[k].shape==shape and z[k].dtype==np.float32 and np.isfinite(z[k]).all(),'Finite FP32 '+k)
++                C=z['C'].reshape(12,9);check(bits(z['raw'],z['states'][-1]) and bits(z['C'],ref['C'].reshape(12,3,3)) and bits(z['states'][0],ref['states'][0].reshape(112,9)),'Endpoint/C/initial identity')
++                for k in ('states','stage_states'):check(bits(z[k][:,:12].copy(),np.broadcast_to(C,z[k][:,:12].shape).copy()),'C bitwise in every accepted/stage state')
++                check(bits(z['stage_velocities'][0],ref['velocities'][0].reshape(112,9)) and ah(z['stage_velocities'][0])==case['first_velocity_sha256']==a['first_stage_velocity_sha256'] and row['first_velocity_matches_archive'] is True,'Independent old t0 velocity bitwise')
++                check(ah(z['C'])==case['C_sha256']==row['C_sha256'] and ah(z['states'][0])==case['initial_state_sha256']==row['initial_state_sha256'] and a['noise_sha256']==row['noise_sha256']==case['noise_sha256'],'Array and recorded noise hashes')
++                check(a['model_forward_attempts']==a['model_forward_returns']==nfe and a['known_accepted_all_bitwise'] and a['known_stages_all_bitwise'] and not a['known_velocity_applied'] and a['inputs_unchanged'] and not a['cpu_mock'],'Recorded sampler gate')
++                rt=a['runtime'];check(rt['deterministic_algorithms'] and not rt['deterministic_warn_only'] and rt['cublas_workspace_config']==':4096:8' and not rt['tf32_matmul'] and not rt['tf32_cudnn'] and rt['sdpa_math_enabled'] and rt['cuda_autocast_enabled'] and rt['cuda_autocast_dtype']=='torch.bfloat16' and rt['parameter_dtype']=='torch.float32' and not rt['gradient_enabled'] and a['integration_dtype']=='torch.float32' and a['actual_velocity_dtypes']==['torch.bfloat16'],'Actual stable BF16/FP32 runtime')
++                ideal=[(k/steps)**2 if method=='E_quad50' else k/steps for k in range(steps+1)];times=[];kinds=[]
++                for k in range(steps):
++                    times.append(ideal[k]);kinds.append('start')
++                    if method!='E_quad50':times.append((ideal[k]+ideal[k+1])*.5 if method=='Midpoint25' else ideal[k+1]);kinds.append('midpoint' if method=='Midpoint25' else 'Heun_predictor')
++                check(bits(z['accepted_times_FP32'],np.asarray(ideal,np.float32)) and bits(z['stage_times_FP32'],np.asarray(times,np.float32)) and bits(z['step_sizes_FP32'],np.asarray(np.diff(ideal),np.float32)) and z['stage_kind'].tolist()==kinds,'Actual registered grid/stages')
++                check(a['actual_endpoint_t1_forward_calls']==int(method.startswith('Heun')),'Heun actual final t=1 call')
++                check(bits(z['stage_states'][z['stage_kind']=='start'],z['states'][:-1]),'First stage equals accepted starting state')
++                identities.append(dict(case_id=cid,method=method,nfe=nfe,path=row['path'],sha256=row['sha256'],C_sha256=row['C_sha256'],noise_sha256=row['noise_sha256'],initial_state_sha256=row['initial_state_sha256'],first_velocity_sha256=case['first_velocity_sha256'],accepted_states=steps+1,stage_states=nfe,C_all_bitwise=True));newrows[cid,method]=row
++        lockrows.sort(key=lambda r:r['acquired']);check(len({r['inode'] for r in lockrows})==1 and len({r['pid'] for r in lockrows})==4,'Four PIDs shared one lock inode')
++        check(all(b['acquired']>=a['last_snapshot'] for a,b in zip(lockrows,lockrows[1:])),'Observed lock intervals nonoverlapping')
++        check(len(list((out/'raw').rglob('*.npz')))==16,'No extra new replay/partial NPZ')
++        reference=ROOT/'native_t1/runs/edge_factorial_20261001_123000/source_snapshot/experiments/mf_h1_local0/edge_factorial_pilot/evaluation.py'
++        check(scorer['status']=='PASS' and sha(reference)==scorer['scorer_sha256'] and sha(ROOT/'experiments/mf_h1_local0/jedge5_diagnosis/scoring.py')==scorer['original_scorer_module_sha256'],'Original scorer sources unchanged')
++        check(scorer['new_CC_audits']==0 and sha(scorer['CC_source'])==sha(out/'registration/static_context_audit.json')==scorer['CC_sha256'],'Exact reused CC cache')
++        check(len(evaluation['rows'])==24 and evaluation['new_scored_outputs']==16 and evaluation['reused_baselines']==8 and evaluation['model_forwards']==evaluation['optimizer_updates']==0,'24-row CPU evaluation')
++        check(evaluation['scoring_version_sha256']==scorer['scorer_sha256'] and evaluation['evaluation_inputs_sha256']==scorer['evaluation_inputs_sha256'],'Scorer/input version identity')
++        by={};scored_by={};ledger={};oldroot=pathof(protocol['baseline_archive']);old=read(oldroot/'scores/A_J/results.json');reused=[]
++        for cid,s in enumerate(scored):
++            check(s['completed']==4 and len(s['rows'])==4 and s['source_sha256']==sha(out/f'raw/case{cid}/results.json'),'Scoring completed and bound to raw record')
++            check(all(s[k]==0 for k in ('model_forwards','optimizer_updates','OT_calls','repairs')),'No model/OT/repair in CPU scoring')
++            for k,v in s['ledger'].items():ledger[k]=ledger.get(k,0)+v
++            for row in s['rows']:scored_by[cid,row['method']]=row
++        keys=set(evaluation['rows'][0]['scalars']);check(len(keys)==54,'54 scalar fields')
++        for row in evaluation['rows']:
++            cid,method=row['case_id'],row['method'];check((cid,method) not in by,'Unique evaluation identity');by[cid,method]=row
++            check(set(row['scalars'])==keys and row['topology']=='NOT_RUN','Consistent metric schema and explicit topology NOT_RUN')
++            for k,v in row['scalars'].items():
++                if k in NULL_KEYS:check(v is None or v=='NOT_RUN','Unrun topology field '+k)
++                else:check(isinstance(v,(int,float)) and math.isfinite(v) and v>=-1e-12 and (not k.endswith('_fraction') or v<=1+1e-12),'Finite/range scalar '+k)
++            check(sha(pathof(row['path'],out))==row['sha256'] and sha(pathof(row['metric_path'],out))==row['metric_sha256'],'Evaluation raw/detail SHA')
++            if method in METHODS:check(row==scored_by[cid,method] and all(row[k]==v for k,v in newrows[cid,method].items()),'New scoring exactly copies runtime identity')
++            else:
++                nfe=50 if method=='Euler50' else 100;check(method in ('Euler50','Euler100') and row['reused'] and row['nfe']==nfe,'Only Euler50/100 baseline reused')
++                matches=[x for x in old['rows'] if x['parent']==0 and x['patch']==row['patch'] and x['seed']==row['seed'] and x['nfe']==nfe and x['precision']=='bf16'];check(len(matches)==1 and matches[0]['scalars']==row['scalars'] and matches[0]['sha256']==row['sha256'],'Old scalars/raw reused unchanged')
++                z=arrays(pathof(row['path'],out));states=z['states'].reshape(-1,112,9);indices=z['state_indices'];check(len(indices)==len(states) and int(indices[0])==0 and int(indices[-1])==nfe and np.all(np.diff(indices)>0),'Archived baseline saved-state indices; sparse archive allowed');check(bits(states[0],references[cid]['states'][0].reshape(112,9)) and bits(states[-1],z['raw'].reshape(112,9)) and np.isfinite(states).all(),'Reused baseline initial/final state')
++                check(bits(states[:,:12].copy(),np.broadcast_to(z['C'].reshape(12,9),states[:,:12].shape).copy()),'Reused baseline C bits');reused.append(dict(case_id=cid,method=method,path=row['path'],sha256=row['sha256']))
++        check(set(by)=={(i,m) for i in range(4) for m in (*METHODS,'Euler50','Euler100')} and ledger==evaluation['ledger'],'Complete fixed evaluation matrix and summed ledger')
++        comp=evaluation['comparisons'];check(len(comp)==16 and len({(x['case_id'],x['candidate']) for x in comp})==16,'16 unique paired comparisons')
++        for c in comp:
++            baseline='Euler100' if c['candidate']=='Heun50' else 'Euler50';a,b=by[c['case_id'],c['candidate']],by[c['case_id'],baseline]
++            check(c['baseline']==baseline and c['nfe']==a['nfe']==b['nfe'],'Equal NFE including Heun50=100')
++            check(c['differences']=={k:a['scalars'][k]-b['scalars'][k] if k not in NULL_KEYS else None for k in keys},'Per-case signed differences exact')
++        for group,ids in (('normal_patch0',[0,1]),('sensitive_patch4',[2,3]),('all_selected',[0,1,2,3])):
++            for method in METHODS:
++                rr=[r for r in comp if r['case_id'] in ids and r['candidate']==method];want={}
++                for k in keys-NULL_KEYS:
++                    v=[r['differences'][k] for r in rr];want[k]=dict(mean_delta=float(np.mean(v)),median_paired_delta=float(np.median(v)),negative_count=sum(x<0 for x in v),positive_count=sum(x>0 for x in v),count=len(v))
++                check(evaluation['macro_differences'][group][method]==want,'Paired macro mean/median/count exact')
++        check(plot['extra_model_forwards']==0 and plot['directional_surface_query_reconstructions']==24 and plot['points_each_direction']==512 and len(plot['rows'])==24,'Plot-only 24 CPU query reconstructions separately recorded')
++        save(out/'case_identity_manifest.json',dict(status='PASS',registered=protocol['cases'],fresh=identities,reused=reused,checkpoint_file_sha256=protocol['checkpoint_file_sha256'],model_state_sha256=protocol['model_state_sha256']))
++        chunks=[]
++        for p in sorted(Path(__file__).parent.glob('*.py')):
++            s=''.join(difflib.unified_diff([],p.read_text(encoding='utf-8-sig').splitlines(keepends=True),fromfile='/dev/null',tofile='b/'+p.relative_to(ROOT).as_posix()));chunks.append(s if s.endswith('\n') else s+'\n')
++        (out/'code.diff').write_text(''.join(chunks),encoding='utf-8',newline='')
++        report.update(status='PASS',HEAD=head,actual_sampling_counts=dict(totals,replays=0),CPU_fixture_counts=fc,CPU_fixture_reruns=0,GPU_dispatch=dict(actual_processes=4,simultaneous_workers=1,lock_intervals=lockrows,note='Recorded intervals and same inode support serial GPU execution; exact process exit timestamps were not recorded. This audit never opens the lock.'),evaluation=dict(new_scores=16,reused_scores=8,scalar_fields=54,NOT_RUN_fields=sorted(NULL_KEYS),scoring_ledger=ledger,plot_query_reconstructions=24,equal_NFE_pairs=16),state_hash_evidence='Worker strict-load and before/after hashes; audit hashes checkpoint file without torch.load.',code_diff_sha256=sha(out/'code.diff'))
++    except BaseException as exc:report.update(status='FAIL',error=repr(exc));raise
++    finally:
++        report.update(checks=checks,seconds=time.perf_counter()-tick,verified_files=files,audit_counts=dict(model_constructions=0,model_forwards=0,backwards=0,optimizer_updates=0,OT_calls=0,geometry_scoring_calls=0,autograd_calls=0,NPZ_reads=npz_reads,unique_hashed_files=len(files),hashed_bytes=sum(v['bytes'] for v in files.values())));save(out/'final_audit.json',report)
++    refresh_manifest(out);return report
++
++def main():
++    p=argparse.ArgumentParser(description=__doc__);p.add_argument('--out',type=Path,default=DEFAULT);p.add_argument('--refresh-manifest',action='store_true');a=p.parse_args();r=refresh_manifest(a.out) if a.refresh_manifest else run(a.out);print(json.dumps({k:r[k] for k in ('status','checks','seconds') if k in r}),flush=True)
++if __name__=='__main__':main()
+--- /dev/null
++++ b/experiments/mf_h1_local0/jedge5_solver_pilot/registration.py
+@@ -0,0 +1,39 @@
++"""Single-model four-case solver comparison, fixed before model calls."""
++from pathlib import Path
++import subprocess,time
++import numpy as np
++from experiments.mf_h1_local0.jedge5_diagnosis.common import ROOT,ASSETS,load_cases,noise_bank,read_json,write_json,file_sha256,array_hash
++OLD=ROOT/'native_t1/runs/jedge5_diagnosis_20261002_102215'
++BLACKBOX=ROOT/'native_t1/runs/jedge5_blackbox_20261002_113600'
++OUT=ROOT/'native_t1/runs/jedge5_solver_pilot_20261002_121000'
++GPU_LOCK='/tmp/wrp_meshflow_jedge5_diag_gpu0.lock'
++CASES=[dict(case_id=i,parent=0,patch=p,seed=s) for i,(p,s) in enumerate([(0,10401),(0,10402),(4,10401),(4,10402)])]
++METHODS={'E_quad50':dict(nfe=50,intervals=50,grid='t[k]=(k/50)^2'),'Midpoint25':dict(nfe=50,intervals=25,grid='uniform'),'Heun25':dict(nfe=50,intervals=25,grid='uniform'),'Heun50':dict(nfe=100,intervals=50,grid='uniform')}
++
++def main():
++    dest=OUT/'registration/protocol.json'
++    if dest.exists():raise FileExistsError(dest)
++    cases=load_cases();noises=noise_bank(OLD);items=[]
++    for item in CASES:
++        c=cases[item['parent'],item['patch']]
++        oldkey=f"J_P0_patch{item['patch']}_seed{item['seed']}_bf16_Euler50"
++        observer=BLACKBOX/'trajectories/J'/(oldkey+'.npz')
++        with np.load(observer) as z:expected_v_hash=array_hash(z['velocities'][0]);initial_hash=array_hash(z['states'][0])
++        items.append(dict(**item,C_sha256=array_hash(c['C']),noise_sha256=array_hash(noises[item['seed']]),GT_free_sha256=array_hash(c['free']),
++            first_velocity_source=str(observer),first_velocity_source_sha256=file_sha256(observer),first_velocity_sha256=expected_v_hash,initial_state_sha256=initial_hash))
++    public=[ROOT/'native_t1'/p for p in ['model.py','context_geometry.py','sampling.py','runtime.py','objectives.py','losses/edge.py']]
++    protocol=dict(status='FROZEN',registered_timestamp=time.time(),user_scope='Zero training solver verification; at most16 new full trajectories, no guidance/CFG/training arms.',
++        model='J',checkpoint=str(ASSETS['J']['path']),checkpoint_file_sha256=file_sha256(ASSETS['J']['path']),model_state_sha256=ASSETS['J']['state'],
++        cases=items,methods=METHODS,precision='bf16_forward_FP32_parameters_and_integration',expected_actual_model_forwards=1000,
++        max_new_full_trajectories=16,new_optimizer_updates=0,extra_full_replays=0,seed_changes=0,
++        C_policy='Known coordinates clamped in every accepted and every stage state; raw known-slot model velocity not integrated.',
++        endpoint_policy='Heun evaluates t=1 for final corrector, no endpoint clipping or dropped stage. Midpoint25 latest t=.98. All finite checks fail closed.',
++        initial_velocity_gate='Each new rollout first model call at same original noise/C/t0 must equal archived BF16 raw velocity bitwise; no extra call.',
++        comparisons=['E_quad50/Midpoint25/Heun25 versus archived BF16 Euler50 at50 NFE','Heun50 versus archived BF16 Euler100 at100 NFE'],
++        decision='Report per-case remainder symmetric/bidirectional RMS, Gamma RMS/p95/coverage, FF/CF, area and angle quality together; no adaptive tuning after results, no universal superiority claim from four development cases.',
++        protected={str(p.relative_to(ROOT)):file_sha256(p) for p in public},source_HEAD=subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip(),
++        gpu_dispatch=dict(lock=GPU_LOCK,workers=1,scope='CUDA init before exclusive shared flock is forbidden; one process per case, all4 solvers, release at process exit.',headroom_MiB=2048,conservative_increment_MiB=1536),
++        other_windows=dict(A='FP32 RK4/Dopri5 reference, not these BF16 methods',B='FP32 local Euler step doubling and Euler100 suffixes, not these full methods'),
++        no_GT_to_sampler=True,postprocessing=False,loss_computation_at_inference=False,baseline_archive=str(OLD))
++    write_json(dest,protocol);print('REGISTERED 16 full / 1000 F / 0 updates',flush=True)
++if __name__=='__main__':main()
+--- /dev/null
++++ b/experiments/mf_h1_local0/jedge5_solver_pilot/report.py
+@@ -0,0 +1,119 @@
++"""Frozen solver pilot summary; no model or scoring calls."""
++from pathlib import Path
++import json
++from .registration import OUT,ASSETS
++from experiments.mf_h1_local0.jedge5_diagnosis.common import read_json,write_json,file_sha256
++
++def tab(head,rows):
++    return '\n'.join(['| '+' | '.join(head)+' |','| '+' | '.join(['---']*len(head))+' |']+['| '+' | '.join(map(str,r))+' |' for r in rows])
++
++def main():
++    ev=read_json(OUT/'evaluation/results.json');assert ev['status']=='PASS'
++    rows=ev['rows'];by={(r['case_id'],r['method']):r for r in rows};methods=['Euler50','E_quad50','Midpoint25','Heun25','Euler100','Heun50']
++    def metric(cid,m,k):return by[cid,m]['scalars'][k]
++    rms='remainder_symmetric_RMS_bbox_pct';p95='boundary_p95_bbox_pct';ff='FF_illegal_pair_count';cf='CF_proper_pair_count'
++    rt=tab(['方法','NFE','patch0/10401','patch0/10402','patch4/10401','patch4/10402'],[[m,by[0,m]['nfe']]+[f'{metric(c,m,rms):.4f}' for c in range(4)] for m in methods])
++    qt=tab(['方法','p4/10401 Γp95','p4/10402 Γp95','p4/10401 FF','p4/10402 FF','p4/10401 CF','p4/10402 CF'],[[m,f'{metric(2,m,p95):.4f}',f'{metric(3,m,p95):.4f}',metric(2,m,ff),metric(3,m,ff),metric(2,m,cf),metric(3,m,cf)] for m in methods])
++    oldgeom=read_json(OUT.parent/'jedge5_blackbox_20261002_113600/geometry/endpoint_results.json');gt={r['seed']:r['GT_free_total_area'] for r in oldgeom['rows'] if r['patch']==4}
++    at=tab(['方法','10401 free→R12','10401 R12→free','10401面积比','10402 free→R12','10402 R12→free','10402面积比'],[[m]+sum(([f"{metric(c,m,'free_to_R12_RMS_bbox_pct'):.4f}",f"{metric(c,m,'R12_to_free_RMS_bbox_pct'):.4f}",f"{100*metric(c,m,'free_total_surface_area')/gt[by[c,m]['seed']]:.2f}%"] for c in (2,3)),[]) for m in methods])
++    cvt=tab(['方法','10401 Γ覆盖@0.001L','10402 Γ覆盖@0.001L','10401 CF受影响free','10402 CF受影响free'],[[m]+[f"{100*metric(c,m,k):.2f}%" for k in ('boundary_coverage_fraction','CF_proper_affected_free_fraction') for c in (2,3)] for m in methods])
++    workers=[read_json(OUT/f'raw/case{i}/results.json') for i in range(4)];assert all(w['status']=='PASS' for w in workers)
++    timing=dict(shared_lock_wait_seconds=sum(w['lock_wait_seconds'] for w in workers),GPU_worker_wall_excluding_lock_seconds=sum(w['seconds'] for w in workers),
++        saved_rollout_wall_seconds=sum(r['wall_seconds'] for w in workers for r in w['rows']),
++        model_cuda_event_seconds=sum(r['audit']['model_forward_cuda_event_seconds'] for w in workers for r in w['rows']),
++        CPU_scoring_seconds=sum(x['seconds'] for x in ev['scoring_worker_seconds']),
++        note='GPU lock waits excluded from worker walls. CPU scoring overlapped GPU work. Per-phase walls and CUDA events are not additive and are not isolated hardware benchmarking.')
++    findings=dict(best_followup_candidates=['Midpoint25','E_quad50'],default_changed=False,
++        interpretation='Case-specific zero-training gains at equal NFE, with quality tradeoffs. No claim of stiffness diagnosis, convergence, unseen-case generalization, or solved topology.',
++        Midpoint25=dict(patch4_RMS_before=[metric(c,'Euler50',rms) for c in (2,3)],patch4_RMS_after=[metric(c,'Midpoint25',rms) for c in (2,3)],
++            patch4_FF_before=[metric(c,'Euler50',ff) for c in (2,3)],patch4_FF_after=[metric(c,'Midpoint25',ff) for c in (2,3)],
++            normal_FF_before=[metric(c,'Euler50',ff) for c in (0,1)],normal_FF_after=[metric(c,'Midpoint25',ff) for c in (0,1)]),
++        E_quad50=dict(patch4_RMS_after=[metric(c,'E_quad50',rms) for c in (2,3)],FF_improvements_all_selected=sum(metric(c,'E_quad50',ff)<metric(c,'Euler50',ff) for c in range(4))),
++        Heun25='Not retained as preferred pilot: patch4/10401 is worse than Euler50, normal-case FF/CF deteriorate.',
++        Heun50='100 NFE; partial gains versus Euler100, but not a uniform win and not a 50-NFE method.')
++    result=dict(status='PASS_EXECUTION',final_audit='final_audit.json',scope='User-selected zero-training solver verification only',
++        actual_new_full_generations=sum(w['counts']['complete_rollouts'] for w in workers),actual_model_forwards=sum(w['counts']['model_forward_returns'] for w in workers),
++        model_forward_attempts=sum(w['counts']['model_forward_attempts'] for w in workers),optimizer_updates=0,model_backward_calls=0,OT_calls=0,
++        failed_model_calls=0,extra_replays=0,geometry_guidance_calls=0,shared_GPU_lock='/tmp/wrp_meshflow_jedge5_diag_gpu0.lock',maximum_concurrent_GPU_workers=1,
++        model_state_sha256=ASSETS['J']['state'],findings=findings,timing=timing,
++        source_evaluation=dict(path='evaluation/results.json',sha256=file_sha256(OUT/'evaluation/results.json')),
++        artifacts=dict(per_output='evaluation/per_output.csv',paired='evaluation/paired_equal_NFE.csv',identity='case_identity_manifest.json',code_diff='code.diff',raw='raw/',plots='evaluation/case0_comparison.png through case3_comparison.png'))
++    assert result['actual_new_full_generations']==16 and result['actual_model_forwards']==1000
++    write_json(OUT/'results.json',result)
++    report=f'''# JEdge5：固定预算、零训练求解器验证
++
++本轮得到实际的零训练改善，但没有得到一个在所有指标上获胜的求解器。相同50 NFE下，Midpoint25在两个异常案例恢复了更多未知区域覆盖；非均匀Euler50也显著改善，且四例FF相交数均减少。正常案例和CF接口仍存在代价，公共默认采样器未改。
++
++## 合同与实现
++
++用户明确选择“先零训练求解器验证，最多16条新生成”。因此只运行4个预选P0案例（patch0/4 × seed10401/10402）与4个固定方法，不训练，不实现CFG/面积引导，不添加loss。共同模型是JEdge5累计3000，state SHA `{ASSETS['J']['state']}`，同C、同原始自由Gaussian；GT只用于离线评分。
++
++- E_quad50：Euler50，t_k=(k/50)^2，50次前向。首dt=.0004、末dt=.0396，**前密后疏**，没有额外末期加密。
++- Midpoint25：25个均匀区间，每区间起点和中点各1次前向，共50 NFE，最后查询t=.98。
++- Heun25：25个均匀区间，每区间起点和预测终点各1次前向，共50 NFE。
++- Heun50：50个均匀区间，共100 NFE；两种Heun都真实执行最后t=1的校正前向，没有截断或省略。
++
++前向BF16、参数和积分FP32；严格确定性、TF32关闭、SDPA math。C在全部接受状态和中间阶段逐位固定，raw已知槽速度不施加到C。所有16条首速度与旧档同t=0查询逐位相同，参数前后hash一致。CPU解析线性ODE夹具的Heun25/50误差比约3.946；这仅验证公式，不证明BF16神经速度场中的二阶收敛。
++
++复用旧BF16 Euler50/100的8条结果，不重新生成对照。50 NFE三候选只与Euler50作主要配对；Heun50与Euler100配对。没有重复另外两个窗口的全FP32 RK4/Dopri5或局部步长误差矩阵。
++
++## 剩余几何：完整生成结果
++
++排除C的剩余对称RMS，单位% bbox，越小越好。全部开发案例均保留。
++
++{rt}
++
++Midpoint25把patch4的10401从4.2320%降至0.8285%，10402从5.0320%降至1.0038%；后者已明显优于旧Euler100的3.5470%，而只用50 NFE。E_quad50对应0.3335%/1.7067%，10401更好、10402不如Midpoint。Heun25在10401上反而从4.2320%恶化到5.4866%，说明“名义二阶必然更好”不成立。
++
++两个正常patch0的Midpoint RMS分别增加约0.0017和0.0044个百分点；E_quad分别+0.0271和-0.0029个百分点。不能只报异常案例恢复而省略正常例变化。
++
++## 覆盖恢复与面积
++
++以下两方向仍使用原独立评价器的固定面积采样，面积比=生成free总表面积/GT未知部分总表面积。面积比用于离线解释，从未输入求解器。
++
++{at}
++
++10402的Midpoint25把覆盖方向RMS从5.9455%降到0.4255%，面积比从62.33%回到约98.25%。这次没有增加面积监督或几何外力，已经能恢复大部分覆盖。因此“观测到小面积”本身不能证明模型因Edge而主动缩面积作弊。面积恢复也不等于拓扑合法；仍须检查接口和相交。
++
++下图按同相机/范围展示六方法的完整输出、free-only和真实GT未知区域覆盖热图。底排保留未被生成表面覆盖的目标区域，固定色阶，原512个GT查询点，不用逐面RMS相加替代总体指标。
++
++![10402 完整输出与覆盖](evaluation/case3_comparison.png)
++
++[10401同口径图](evaluation/case2_comparison.png)；[正常10401](evaluation/case0_comparison.png)；[正常10402](evaluation/case1_comparison.png)。
++
++## 接口和相交：真实代价
++
++Gamma p95单位% bbox；FF为非法free-free pair数，CF为proper known-free穿刺pair数。完整Γ RMS、所有coverage阈值、共面/未决分类等54项原标量全部保留在逐输出表。
++
++{qt}
++
++{cvt}
++
++Midpoint25在两个异常例把FF从151/141降到56/62，Gamma p95从8.1584/9.2485降到0.4084/2.1364。但CF pair都从2增加到7，受影响free比例也增加；正常两例FF从63/52升到85/65。它改善了异常覆盖与很多自由相交，却没有形成全面无代价的改善。
++
++E_quad50在四例均降低FF，异常例为41/111；10402的Gamma尾部仍有4.9025%，覆盖不及Midpoint。其正常10401 CF由0变2，亦非全指标支配。
++
++Heun25在正常例FF均升到105，CF升到24/26，并使异常10401严重恶化，本轮不把它作为优先候选。Heun50用100 NFE，在10402相对Euler100改善，但10401 FF增加、正常例多项质量退化；不能称作更便宜或全面更好的方案。
++
++各方法仍有非法相交，没有水密、流形或零自交保证。正式拓扑认证未执行，标NOT_RUN；原评价器已有的局部FF/CF/共面/退化、精确共边及输入C异常统计仍保留。所有新输出NaN/Inf均为0，数值执行失败0，不代表全部几何指标过关。
++
++## 解释与下一步边界
++
++这轮支持“采样离散方案是可用干预方向”，尤其Midpoint25与E_quad50。尚不能反推出唯一病因是Edge向心力，不能把质量更好等同于更接近精确ODE解，也不能把Heun的变化单独归因于t=1查询；求解公式、阶段状态与时间位置同时不同。
++
++现有证据优先保留Midpoint25和E_quad50作为实验候选：前者在两个异常例覆盖更均衡，后者四例FF均下降。两者只经过一个父对象、两个已观察patch和两个seed，未验证新对象/新上下文；不替换公共Euler50默认、不启动训练侧修复，不从这里自动扩展矩阵。
++
++CFG需要与训练方式匹配；当前官方面数CFG不等同于Native几何上下文CFG。部署也不知道完整GT面积，因此不能直接将其用于推理面积Guidance。总面积增大不保证铺到缺失区域，训练期几何链式因子也不能解释成采样当步外力。上述方向本轮未执行。
++
++## 计账、资源与交付
++
++实际16条新完整生成、1000/1000次模型前向返回；0优化器更新、0模型反向、0OT、0几何Guidance、0额外完整重放。另有CPU解析mock测试752次调用尝试/751次返回（含一次预设失败），与真实模型预算分列。16份NPZ保存接受状态、全部stage状态/速度/时间，便于追溯。
++
++每个case在CUDA初始化前获得同一共享锁 `/tmp/wrp_meshflow_jedge5_diag_gpu0.lock`，每次独占1个GPU worker；使用不提前关闭的OS文件描述符，进程退出才释放。没有因显存空余绕过其他窗口。每次获取锁前后记录显存、GPU利用率、进程、CPU/RAM；保留2GiB余量，CPU单线程评分与GPU工作重叠，未停止其他窗口。
++
++四worker锁等待共{timing['shared_lock_wait_seconds']:.3f}s；扣除等锁后的worker墙钟合计{timing['GPU_worker_wall_excluding_lock_seconds']:.3f}s，其中16条采样墙钟合计{timing['saved_rollout_wall_seconds']:.3f}s；离线正式几何评分{timing['CPU_scoring_seconds']:.3f}s。绘图距离复算与正式评分单独登记，重叠时间不能相加当端到端耗时；采样事件计时不是独占硬件benchmark。
++
++交付：[结果JSON](results.json)、[24行逐输出表](evaluation/per_output.csv)、[相同NFE配对差](evaluation/paired_equal_NFE.csv)、[身份与hash](case_identity_manifest.json)、[代码diff](code.diff)、[最终审计](final_audit.json)。官方权重、维护模型、历史输出及公共实现均未修改；没有新增或复制checkpoint。到此停止。
++'''
++    (OUT/'SOLVER_PILOT_REPORT.md').write_text(report,encoding='utf-8');print('REPORT READY')
++if __name__=='__main__':main()
+--- /dev/null
++++ b/experiments/mf_h1_local0/jedge5_solver_pilot/sampler.py
+@@ -0,0 +1,173 @@
++"""Four preregistered fixed solvers; deterministic BF16 model, FP32 coordinates.
++
++No adaptive method, extra prediction, GT, guidance, repair, OT or training.
++CPU mocks are explicit and cannot be selected as a CUDA fallback.
++"""
++from native_t1.runtime import configure_stable_runtime
++from native_t1.model import native_execution
++from native_t1.artifacts import array_hash
++from contextlib import nullcontext
++import time
++import numpy as np
++import torch
++
++METHODS={
++    'E_quad50':dict(solver='Euler',intervals=50,nfe=50,grid='quadratic'),
++    'Midpoint25':dict(solver='Midpoint',intervals=25,nfe=50,grid='uniform'),
++    'Heun25':dict(solver='Heun',intervals=25,nfe=50,grid='uniform'),
++    'Heun50':dict(solver='Heun',intervals=50,nfe=100,grid='uniform')}
++TIME_POLICY='Ideal grid t_k=(k/M)^2 or k/M in Python FP64; each t and interval dt independently casts to FP32 as used in model/integration. Midpoint uses ideal (t_k+t_k+1)/2. No time accumulation.'
++
++
++def new_counts():
++    return dict(model_forward_attempts=0,model_forward_returns=0,accepted_steps=0,
++        full_rollout_attempts=0,complete_rollouts=0,sampling_failures=0,
++        model_backward_calls=0,optimizer_updates=0,geometry_gradient_calls=0,OT_calls=0,postprocessing_repairs=0)
++
++
++def _bits_equal(a,b):
++    return a.dtype==b.dtype and a.shape==b.shape and torch.equal(a.contiguous().view(torch.int32),b.contiguous().view(torch.int32))
++
++
++def _validate(model,noise,C,method,cpu_mock):
++    if method not in METHODS:raise ValueError('Only four registered solver methods are supported')
++    if not isinstance(cpu_mock,bool):raise ValueError('cpu_mock must be an explicit boolean')
++    if noise.dtype!=torch.float32 or noise.shape!=(1,112,9):raise ValueError('Original FP32 [1,112,9] noise required')
++    if C.dtype!=torch.float32 or C.shape not in ((12,3,3),(12,9)):raise ValueError('Original FP32 K12 condition required')
++    parameters=list(model.parameters());device='cpu' if cpu_mock else 'cuda'
++    if noise.device.type!=device or C.device!=noise.device or any(p.device!=noise.device for p in parameters):
++        raise ValueError('Explicit CPU mock or real CUDA inputs required; no automatic device fallback')
++    if not parameters or any(p.dtype!=torch.float32 or p.requires_grad or p.grad is not None for p in parameters):
++        raise RuntimeError('Frozen FP32 parameters without stored gradients required')
++    if getattr(model,'experiment_trainable',True) or any(m.training for m in model.modules()):raise RuntimeError('Eval frozen model required')
++    if not bool(torch.isfinite(noise).all() and torch.isfinite(C).all()):raise FloatingPointError('Nonfinite input')
++
++
++def _validate_velocity(velocity,state,cpu_mock):
++    if not isinstance(velocity,torch.Tensor) or velocity.shape!=state.shape or velocity.device!=state.device or velocity.requires_grad:
++        raise RuntimeError('Invalid model velocity shape/device/gradient graph')
++    expected=torch.float32 if cpu_mock else torch.bfloat16
++    if velocity.dtype!=expected:raise RuntimeError(f'Expected actual {expected} velocity; no precision fallback')
++    if not bool(torch.isfinite(velocity).all()):raise FloatingPointError('Nonfinite model velocity')
++
++
++@torch.no_grad()
++def sample(model,noise,C,method,counts=None,cpu_mock=False):
++    """Return raw[112,9], accepted states[M+1,112,9], JSON audit plus audit['_arrays'].
++
++    Pop `_arrays` and save it with the result NPZ. It contains every actual
++    pre-forward stage state, returned velocity (FP32 export), and actual time.
++    The first stage velocity is the original t=0 model call, with no extra call.
++    """
++    _validate(model,noise,C,method,cpu_mock)
++    if not cpu_mock:configure_stable_runtime()
++    spec=METHODS[method];M=spec['intervals'];NFE=spec['nfe']
++    if counts is None:counts=new_counts()
++    for k in new_counts():counts.setdefault(k,0)
++    counts['full_rollout_attempts']+=1
++    initial_attempts=counts['model_forward_attempts'];initial_returns=counts['model_forward_returns']
++    noise_before=array_hash(noise);condition_before=array_hash(C);condition=C.reshape(12,9)
++    state=noise.clone();state[:,:12]=condition[None]
++    known=torch.zeros((1,112),dtype=torch.bool,device=noise.device);known[:,:12]=True
++    valid=torch.ones_like(known);y=torch.tensor([112],device=noise.device)
++    ideal=[(k/M)**2 if spec['grid']=='quadratic' else k/M for k in range(M+1)]
++    stage_states=[];stage_velocities=[];stage_times=[];stage_intervals=[];stage_kinds=[]
++    accepted=[];events=[];returned_dtypes=[];checks=0
++    host_seconds=sync_seconds=copy_seconds=0.;tick=time.perf_counter()
++    def sync():
++        nonlocal sync_seconds
++        if not cpu_mock:
++            s=time.perf_counter();torch.cuda.synchronize(noise.device);sync_seconds+=time.perf_counter()-s
++    def exported(value):
++        nonlocal copy_seconds
++        s=time.perf_counter();v=value.detach().float()[0].cpu().numpy().copy();copy_seconds+=time.perf_counter()-s
++        return v
++    def assert_C(value):
++        nonlocal checks
++        checks+=1
++        if value.dtype!=torch.float32 or not _bits_equal(value[0,:12],condition):raise RuntimeError('Stage/accepted condition changed bits')
++        if not bool(torch.isfinite(value).all()):raise FloatingPointError('Nonfinite stage/accepted state')
++    def advance(base,velocity,dt):
++        value=base.clone()
++        value[:,12:]=base[:,12:]+velocity[:,12:]*dt
++        value[:,:12]=condition[None]
++        assert_C(value)
++        return value
++    def forward(value,ideal_time,interval,kind):
++        nonlocal host_seconds
++        if counts['model_forward_attempts']-initial_attempts>=NFE:raise RuntimeError('Per-rollout NFE cap exceeded')
++        assert_C(value)
++        t=torch.full((1,),ideal_time,dtype=torch.float32,device=noise.device)
++        stage_states.append(exported(value));stage_times.append(float(np.float32(ideal_time)))
++        stage_intervals.append(interval);stage_kinds.append(kind)
++        if not cpu_mock:
++            if not torch.is_autocast_enabled('cuda') or torch.get_autocast_dtype('cuda')!=torch.bfloat16:
++                raise RuntimeError('Real forward lost BF16 autocast; no fallback')
++            begin,end=torch.cuda.Event(enable_timing=True),torch.cuda.Event(enable_timing=True);begin.record()
++        s=time.perf_counter();counts['model_forward_attempts']+=1
++        velocity=model(value,t,y,valid,known)
++        counts['model_forward_returns']+=1;host_seconds+=time.perf_counter()-s
++        if not cpu_mock:end.record();events.append((begin,end))
++        _validate_velocity(velocity,value,cpu_mock);returned_dtypes.append(str(velocity.dtype))
++        v=velocity.float();stage_velocities.append(exported(v));return v
++    sync()
++    if not cpu_mock:torch.cuda.reset_peak_memory_stats(noise.device)
++    assert_C(state);accepted.append(exported(state))
++    context=nullcontext(dict(cpu_mock=True,native_precision='FP32 analytic mock only')) if cpu_mock else native_execution(model,coordinates=(state,condition),autocast=True)
++    try:
++        with context as runtime:
++            for k in range(M):
++                t0,t1=ideal[k],ideal[k+1];dt=t1-t0
++                v1=forward(state,t0,k,'start')
++                if spec['solver']=='Euler':
++                    updated=advance(state,v1,dt)
++                elif spec['solver']=='Midpoint':
++                    midpoint=advance(state,v1,dt*.5)
++                    v2=forward(midpoint,(t0+t1)*.5,k,'midpoint')
++                    updated=advance(state,v2,dt)
++                else:
++                    predictor=advance(state,v1,dt)
++                    # Including the final t=1 model evaluation, without shortcuts.
++                    v2=forward(predictor,t1,k,'Heun_predictor')
++                    updated=advance(state,(v1+v2)*.5,dt)
++                state=updated;counts['accepted_steps']+=1;accepted.append(exported(state))
++        sync()
++        if counts['model_forward_attempts']-initial_attempts!=NFE or counts['model_forward_returns']-initial_returns!=NFE:
++            raise RuntimeError('Actual NFE differs from fixed solver contract')
++        if array_hash(noise)!=noise_before or array_hash(C)!=condition_before:raise RuntimeError('Input noise/condition mutated')
++        states=np.stack(accepted);coords=np.stack(stage_states);velocities=np.stack(stage_velocities)
++        ref=condition.cpu().numpy()
++        if not np.array_equal(states[:,:12].view(np.uint32),np.broadcast_to(ref,states[:,:12].shape).copy().view(np.uint32)):
++            raise RuntimeError('Exported accepted C bits changed')
++        if not np.array_equal(coords[:,:12].view(np.uint32),np.broadcast_to(ref,coords[:,:12].shape).copy().view(np.uint32)):
++            raise RuntimeError('Exported stage C bits changed')
++        counts['complete_rollouts']+=1
++        aux=dict(stage_states=coords,stage_velocities=velocities,stage_times_FP32=np.asarray(stage_times,np.float32),
++            accepted_times_FP32=np.asarray(ideal,np.float32),step_sizes_FP32=np.asarray(np.diff(ideal),np.float32),
++            stage_interval=np.asarray(stage_intervals,np.int64),stage_kind=np.asarray(stage_kinds,dtype='U16'))
++        audit=dict(method=method,solver=spec['solver'],intervals=M,nfe=NFE,precision='bf16' if not cpu_mock else 'CPU_mock_FP32',
++            time_policy=TIME_POLICY,ideal_accepted_times=ideal,actual_accepted_times_FP32=aux['accepted_times_FP32'].tolist(),
++            actual_stage_times_FP32=stage_times,actual_step_sizes_FP32=aux['step_sizes_FP32'].tolist(),
++            actual_endpoint_t1_forward_calls=sum(t==1. for t in stage_times),
++            model_forward_attempts=NFE,model_forward_returns=NFE,accepted_states=M+1,recorded_stage_states=NFE,
++            runtime=runtime,actual_velocity_dtypes=sorted(set(returned_dtypes)),integration_dtype='torch.float32',
++            known_accepted_all_bitwise=True,known_stages_all_bitwise=True,known_check_count=checks,
++            known_predicted_velocity_may_be_nonzero=True,known_velocity_applied=False,
++            inputs_unchanged=True,noise_sha256=noise_before,condition_sha256=condition_before,
++            first_stage_velocity_sha256=array_hash(velocities[0]),
++            total_faces=112,known_faces=12,free_faces=100,seconds=time.perf_counter()-tick,
++            model_forward_host_seconds=host_seconds,model_forward_cuda_event_seconds=None if cpu_mock else sum(a.elapsed_time(b) for a,b in events)/1000,
++            explicit_cuda_synchronize_seconds=sync_seconds,stage_and_state_CPU_copy_seconds=copy_seconds,
++            peak_cuda_allocated=0 if cpu_mock else torch.cuda.max_memory_allocated(noise.device),
++            peak_cuda_reserved=0 if cpu_mock else torch.cuda.max_memory_reserved(noise.device),
++            timing_note='Host/CUDA/sync/copy timings can overlap; not additive. Peak includes resident model.',
++            model_backwards=0,optimizer_updates=0,OT_calls=0,geometry_gradient_calls=0,postprocessing=None,cpu_mock=cpu_mock,
++            _arrays=aux)
++        return states[-1].copy(),states,audit
++    except BaseException as exc:
++        counts['sampling_failures']+=1
++        exc.partial_states=np.stack(accepted)
++        exc.partial_stage_states=np.stack(stage_states) if stage_states else np.empty((0,112,9),np.float32)
++        exc.partial_stage_velocities=np.stack(stage_velocities) if stage_velocities else np.empty((0,112,9),np.float32)
++        exc.partial_stage_times_FP32=np.asarray(stage_times,np.float32)
++        raise
+--- /dev/null
++++ b/experiments/mf_h1_local0/jedge5_solver_pilot/test_sampler.py
+@@ -0,0 +1,97 @@
++"""Bounded CPU fixtures. No real MeshFlow model, CUDA, OT or training."""
++from native_t1.runtime import configure_stable_runtime
++import math,time,json,hashlib
++from pathlib import Path
++import numpy as np
++import torch
++from .sampler import sample,new_counts,METHODS,_validate_velocity
++
++
++class AnalyticModel(torch.nn.Module):
++    def __init__(self,kind,C,fail_on=None):
++        super().__init__();self.anchor=torch.nn.Parameter(torch.zeros(()),requires_grad=False)
++        self.experiment_trainable=False;self.kind=kind;self.C=C.reshape(12,9).clone();self.fail_on=fail_on;self.calls=0;self.times=[]
++        self.eval()
++    def forward(self,x,t,y,valid,known):
++        self.calls+=1;self.times.append(float(t[0]))
++        assert x.dtype==t.dtype==torch.float32
++        assert y.tolist()==[112] and valid.all() and known[:,:12].all() and not known[:,12:].any()
++        assert torch.equal(x[0,:12].view(torch.int32),self.C.view(torch.int32))
++        if self.calls==self.fail_on:raise RuntimeError('fixture injected model failure')
++        v=torch.ones_like(x)*.75 if self.kind=='constant' else x.clone() if self.kind=='linear' else torch.ones_like(x)*t[0]
++        v[:,:12]=123. # The solver must ignore raw known-slot velocity, not require zero.
++        return v
++
++
++def run_cpu_tests():
++    torch.set_num_threads(1);tick=time.perf_counter()
++    counts=dict(real_model_forwards=0,model_backwards=0,optimizer_updates=0,OT_calls=0,geometry_autograd_calls=0,
++                CPU_mock_forward_attempts=0,CPU_mock_forward_returns=0,CPU_mock_complete_rollouts=0,expected_rejections=0)
++    rows=[];C=torch.arange(108,dtype=torch.float32).reshape(12,3,3)/100.;C[0,0,0]=-0.
++    noise=torch.ones((1,112,9),dtype=torch.float32)
++    linear_errors={}
++    for kind in ('constant','linear','time'):
++        for method,spec in METHODS.items():
++            model=AnalyticModel(kind,C);ledger=new_counts();n0=noise.clone();c0=C.clone()
++            raw,path,audit=sample(model,noise,C,method,counts=ledger,cpu_mock=True)
++            counts['CPU_mock_forward_attempts']+=ledger['model_forward_attempts'];counts['CPU_mock_forward_returns']+=ledger['model_forward_returns']
++            counts['CPU_mock_complete_rollouts']+=ledger['complete_rollouts']
++            assert ledger['model_forward_attempts']==ledger['model_forward_returns']==model.calls==spec['nfe']
++            assert path.shape==(spec['intervals']+1,112,9)
++            assert audit['known_stages_all_bitwise'] and audit['known_accepted_all_bitwise']
++            assert np.all(audit['_arrays']['stage_velocities'][:,:12]==123.)
++            assert torch.equal(noise.view(torch.int32),n0.view(torch.int32)) and torch.equal(C.view(torch.int32),c0.view(torch.int32))
++            assert audit['actual_endpoint_t1_forward_calls']==(1 if spec['solver']=='Heun' else 0)
++            assert len(audit['actual_stage_times_FP32'])==spec['nfe']
++            value=float(raw[12,0]);error=None
++            ideal=np.asarray(audit['ideal_accepted_times']);h=np.diff(ideal)
++            if kind=='constant':assert abs(value-1.75)<3e-6
++            elif kind=='time':
++                expected=1+(.5-.5*float(np.sum(h*h)) if spec['solver']=='Euler' else .5)
++                assert abs(value-expected)<3e-6
++            else:
++                error=abs(value-math.e);linear_errors[method]=error
++                discrete=float(np.prod(1+h)) if spec['solver']=='Euler' else float(np.prod(1+h+.5*h*h))
++                assert abs(value-discrete)<3e-6
++            rows.append(dict(kind=kind,method=method,calls=model.calls,endpoint=value,linear_exact_error=error,
++                actual_final_forward_time=model.times[-1],endpoint_t1_calls=audit['actual_endpoint_t1_forward_calls']))
++    # Observed Heun25 -> Heun50 order on the same x'=x analytic ODE.
++    ratio=linear_errors['Heun25']/linear_errors['Heun50'];assert 3.5<ratio<4.5
++    assert abs(linear_errors['Midpoint25']-linear_errors['Heun25'])<3e-6
++    # Fixed arithmetic first-order witness for the quadratic Euler mesh. No model calls.
++    euler_exact=[]
++    for M in (25,50,100):
++        h=np.diff((np.arange(M+1,dtype=np.float64)/M)**2)
++        euler_exact.append(abs(float(np.prod(1+h))-math.e))
++    assert 1.8<euler_exact[0]/euler_exact[1]<2.2 and 1.8<euler_exact[1]/euler_exact[2]<2.2
++    # Error bookkeeping includes a returned first stage and a failed second stage.
++    ledger=new_counts();model=AnalyticModel('constant',C,fail_on=2)
++    try:sample(model,noise,C,'Heun25',counts=ledger,cpu_mock=True)
++    except RuntimeError as e:
++        assert 'fixture injected' in str(e);assert len(e.partial_states)==1
++        assert len(e.partial_stage_states)==2 and len(e.partial_stage_velocities)==1
++    else:raise AssertionError('Expected deliberate CPU mock failure')
++    assert ledger['model_forward_attempts']==2 and ledger['model_forward_returns']==1 and ledger['complete_rollouts']==0 and ledger['sampling_failures']==1
++    counts['CPU_mock_forward_attempts']+=2;counts['CPU_mock_forward_returns']+=1;counts['expected_rejections']+=1
++    # CPU inputs must never implicitly become the production BF16 CUDA path.
++    for action in (lambda:sample(AnalyticModel('constant',C),noise,C,'Heun25',cpu_mock=False),
++                   lambda:sample(AnalyticModel('constant',C),noise,C,'RK45',cpu_mock=True),
++                   lambda:_validate_velocity(torch.zeros_like(noise),noise,cpu_mock=False)):
++        try:action()
++        except (ValueError,RuntimeError):counts['expected_rejections']+=1
++        else:raise AssertionError('Expected fail-closed rejection')
++    assert not torch.cuda.is_initialized()
++    return dict(status='PASS',tests_run=6,fixture_groups=['constant all4','linear all4 and order','time-dependent all4',
++        'C stage preservation and input identity','failure attempt/return accounting','no silent precision/device fallback'],
++        rows=rows,Heun_order_error_ratio=ratio,quadratic_Euler_FP64_discrete_errors=euler_exact,
++        counts=counts,CUDA_initialized=False,seconds=time.perf_counter()-tick,
++        note='12 successful analytic CPU mock trajectories, one intentionally failed mock. FP64 arithmetic order witness does not call a model. No real model constructed.')
++
++
++if __name__=='__main__':
++    import argparse
++    p=argparse.ArgumentParser();p.add_argument('--record',required=True);a=p.parse_args();path=Path(a.record)
++    if path.exists():raise FileExistsError(path)
++    r=run_cpu_tests();r['sources']={str(x):hashlib.sha256(x.read_bytes()).hexdigest() for x in (Path(__file__),Path(__file__).with_name('sampler.py'))}
++    path.parent.mkdir(parents=True,exist_ok=True);path.write_text(json.dumps(r,indent=2,allow_nan=False)+'\n')
++    print(json.dumps(r),flush=True)
+--- /dev/null
++++ b/experiments/mf_h1_local0/jedge5_solver_pilot/worker.py
+@@ -0,0 +1,80 @@
++"""An exclusive shared GPU lock precedes torch and CUDA initialization."""
++import argparse,fcntl,json,os,time,subprocess,threading,traceback
++from pathlib import Path
++
++def snapshot():
++    def cmd(args):
++        p=subprocess.run(args,capture_output=True,text=True);return dict(returncode=p.returncode,stdout=p.stdout.strip(),stderr=p.stderr.strip())
++    return dict(timestamp=time.time(),gpu=cmd(['nvidia-smi','--query-gpu=name,memory.total,memory.used,memory.free,utilization.gpu','--format=csv,noheader,nounits']),
++        processes=cmd(['nvidia-smi','--query-compute-apps=pid,process_name,used_memory','--format=csv']),cpu_cores=os.cpu_count(),load=os.getloadavg(),
++        memory={s.split(':')[0]:s.split(':')[1].strip() for s in Path('/proc/meminfo').read_text().splitlines() if s.startswith(('MemTotal:','MemAvailable:','SwapFree:'))})
++
++def save_json(path,value):
++    tmp=path.with_suffix('.json.tmp');tmp.write_text(json.dumps(value,indent=2,allow_nan=False,default=str)+'\n');os.replace(tmp,path)
++
++def main():
++    p=argparse.ArgumentParser();p.add_argument('--case',type=int,required=True,choices=range(4));a=p.parse_args()
++    root=Path(__file__).resolve().parents[3];out=root/'native_t1/runs/jedge5_solver_pilot_20261002_121000'
++    folder=out/'raw'/f'case{a.case}';folder.mkdir(parents=True,exist_ok=False);dest=folder/'results.json'
++    info=dict(status='WAITING_LOCK',case_id=a.case,rows=[],resource_snapshots=[snapshot()],counts={},lock_path='/tmp/wrp_meshflow_jedge5_diag_gpu0.lock')
++    save_json(dest,info)
++    # Raw OS descriptor is deliberately not closed until process exit, so no second worker overlaps CUDA teardown.
++    lock_fd=os.open(info['lock_path'],os.O_RDWR);waiting=time.perf_counter();print('WAIT_LOCK case',a.case,flush=True)
++    fcntl.flock(lock_fd,fcntl.LOCK_EX)
++    info['lock_inode']=os.fstat(lock_fd).st_ino
++    info['lock_owner_pid']=os.getpid()
++    info['lock_wait_seconds']=time.perf_counter()-waiting;info['lock_acquired_timestamp']=time.time();info['resource_snapshots'].append(snapshot())
++    free=float(info['resource_snapshots'][-1]['gpu']['stdout'].split(',')[3]);total=float(info['resource_snapshots'][-1]['gpu']['stdout'].split(',')[1])
++    if free<1536+max(2048,total*.1):
++        info['status']='RESOURCE_BLOCKED';save_json(dest,info);return
++    os.environ['CUBLAS_WORKSPACE_CONFIG']=':4096:8'
++    from native_t1.runtime import configure_stable_runtime
++    import numpy as np
++    import torch
++    from native_t1.artifacts import array_hash,state_sha256,file_sha256
++    from experiments.mf_h1_local0.jedge5_diagnosis.common import load_model,load_cases,noise_bank,read_json
++    from .registration import OUT,OLD,CASES,METHODS
++    from .sampler import sample,new_counts
++    assert not torch.cuda.is_initialized();info['CUDA_initialized_before_locked_runtime']=False
++    counts=new_counts();info['counts']=counts;info['status']='RUNNING';save_json(dest,info)
++    stop=threading.Event()
++    def monitor():
++        while not stop.wait(2):info['resource_snapshots'].append(snapshot())
++    thread=threading.Thread(target=monitor,daemon=True);thread.start();start=time.perf_counter();model=None
++    try:
++        configure_stable_runtime();torch.set_num_threads(1);protocol=read_json(OUT/'registration/protocol.json')
++        case=protocol['cases'][a.case];c=load_cases()[case['parent'],case['patch']];bank=noise_bank(OLD)
++        if file_sha256(Path(protocol['checkpoint']))!=protocol['checkpoint_file_sha256']:raise ValueError('Checkpoint file changed')
++        tick=time.perf_counter();model,identity=load_model('J');info['load_seconds']=time.perf_counter()-tick;info['identity']=identity
++        if identity['state_sha256']!=protocol['model_state_sha256']:raise ValueError('State identity')
++        noise=bank[case['seed']].clone().cuda();C=torch.from_numpy(c['C'].copy()).cuda()
++        with np.load(case['first_velocity_source']) as z:expected_v=z['velocities'][0].copy()
++        if file_sha256(Path(case['first_velocity_source']))!=case['first_velocity_source_sha256']:raise ValueError('Reference velocity archive changed')
++        for method in METHODS:
++            before=counts.copy();tick=time.perf_counter()
++            raw,states,audit=sample(model,noise,C,method,counts=counts)
++            extra=audit.pop('_arrays');v0=extra['stage_velocities'][0]
++            path=folder/(method+'.npz')
++            with path.open('xb') as stream:np.savez_compressed(stream,raw=raw,states=states,C=c['C'],**extra)
++            parity=v0.dtype==expected_v.dtype and np.array_equal(v0.view(np.uint32),expected_v.view(np.uint32))
++            row=dict(method=method,model='J',parent=case['parent'],patch=case['patch'],seed=case['seed'],case_id=a.case,precision='bf16',nfe=METHODS[method]['nfe'],
++                path=str(path.relative_to(out)),sha256=file_sha256(path),model_state_sha256=identity['state_sha256'],model_file_sha256=protocol['checkpoint_file_sha256'],
++                C_sha256=array_hash(c['C']),noise_sha256=array_hash(noise),initial_state_sha256=array_hash(states[0]),first_velocity_matches_archive=parity,audit=audit,wall_seconds=time.perf_counter()-tick)
++            info['rows'].append(row);save_json(dest,info)
++            if not parity:raise RuntimeError('First field call no longer matches original BF16 source')
++            print('COMPLETE',a.case,method,'nfe',row['nfe'],'seconds',round(row['wall_seconds'],3),flush=True)
++        info['final_model_state_sha256']=state_sha256(model)
++        if info['final_model_state_sha256']!=protocol['model_state_sha256']:raise RuntimeError('Frozen model changed')
++        if counts['model_forward_attempts']!=250 or counts['model_forward_returns']!=250:raise RuntimeError('Case budget')
++        info['status']='PASS'
++    except BaseException as exc:
++        info['status']='STOPPED';info['error']=dict(message=repr(exc),traceback=traceback.format_exc())
++        if hasattr(exc,'partial_states'):np.savez_compressed(folder/'failed_partial.npz',states=exc.partial_states)
++        raise
++    finally:
++        stop.set();thread.join(timeout=5);info['seconds']=time.perf_counter()-start
++        info['resource_snapshots'].append(snapshot());info['lock_held_until_process_exit']=True;save_json(dest,info)
++        if model is not None:del model
++        torch.cuda.empty_cache()
++        # Do not unlock explicitly while CUDA process/context may still exist.
++if __name__=='__main__':main()

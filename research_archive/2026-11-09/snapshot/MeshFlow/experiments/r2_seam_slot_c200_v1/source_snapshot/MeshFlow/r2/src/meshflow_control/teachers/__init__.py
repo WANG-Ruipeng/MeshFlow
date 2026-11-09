@@ -1,0 +1,1 @@
+"""Explicit training-only frozen teachers; inference has no dependency here."""

@@ -1,0 +1,223 @@
+"""One verified official Bench D0, then unchanged anchor-safe GEO_C/export.
+
+This independent pilot adapter never changes the maintained Chair loader.
+All registered RAWs must exist before the first denoiser call. Incomplete model
+attempts are stopped, not silently replayed; saved proposals can finish on CPU.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+import time
+import traceback
+
+import numpy as np
+from r2.pilots.seam_slot_c200_v1 import common as C
+
+VERSION = 'bench_single_official_D0_anchor_GEO_source_v1'
+ARMS = ('PLAIN', 'SEAM')
+ROOT = C.ROOT / 'experiments/r2_bench_control_transfer_v1'
+D0 = C.ROOT / 'checkpoints/official_bench_denoiser/0021000.pt'
+D0_SHA = '67765c728c503b61c21624c05997ea026c9de486d1529052fafa134be3336b14'
+D0_BYTES = 7289979546
+
+
+def save_npz(path, arrays):
+    path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        raise RuntimeError('Refusing overwrite: ' + str(path))
+    tmp = path.with_name(path.name + '.partial')
+    with tmp.open('wb') as handle:
+        np.savez_compressed(handle, **arrays)
+        handle.flush(); os.fsync(handle.fileno())
+    os.replace(tmp, path)
+
+
+def event(path, kind, **fields):
+    with Path(path).open('a', encoding='utf-8') as handle:
+        handle.write(json.dumps(C.clean(dict(utc=C.utc(), event=kind, **fields))) + '\n')
+
+
+def load_bench_denoiser(checkpoint=D0, device='cuda'):
+    """Strict Bench EMA load using identical audited architecture/runtime."""
+    os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
+    import torch
+    from meshflow_control import denoise_model as D
+    path = C.resolve(checkpoint).resolve(strict=True)
+    before = (path.stat().st_size, path.stat().st_mtime_ns)
+    if before[0] != D0_BYTES or C.sha(path) != D0_SHA:
+        raise ValueError('Bench D0 size/SHA mismatch; no Chair fallback')
+    source = D._source_identity(); runtime = D.configure_runtime()
+    target = torch.device(device)
+    if target.type not in ('cpu', 'cuda'):
+        raise ValueError('Unsupported device')
+    if target.type == 'cuda' and not torch.cuda.is_bf16_supported():
+        raise RuntimeError('Bench D0 requires BF16')
+    checkpoint_object = torch.load(path, map_location='cpu', weights_only=True, mmap=True)
+    config = checkpoint_object['config']; model_config, data = config['model'], config['data']
+    kwargs = dict(hidden_dim=model_config['hidden_dim'], num_layers=model_config['num_layers'],
+        num_heads=model_config['num_heads'], latent_channels=model_config['latent_channels'],
+        decoder_type=model_config['decoder_type'], num_bins=data['num_bins'],
+        use_rmsnorm=model_config['use_rms'], face_bin=model_config['face_bin'],
+        use_identity_encoder=model_config['use_identity_encoder'], fixed_std=model_config['fixed_std'])
+    if kwargs != D.INIT_KWARGS or '02828884' not in str(data['data_path']):
+        raise ValueError('Official checkpoint does not match expected Bench configuration')
+    original = checkpoint_object['ema']
+    state = {key.removeprefix('module.'): value for key, value in original.items()}
+    if len(state) != len(original) or len(state) != D.EXPECTED_STATE_KEYS:
+        raise ValueError('Unexpected EMA keys/prefix collision')
+    if any(not isinstance(value, torch.Tensor) or value.dtype != torch.float32 for value in state.values()):
+        raise ValueError('EMA must contain FP32 tensors')
+    with torch.random.fork_rng(devices=[]):
+        model = D.AutoencoderKL(**kwargs)
+    model.load_state_dict(state, strict=True)
+    parameters = sum(parameter.numel() for parameter in model.parameters())
+    if parameters != D.EXPECTED_PARAMETERS or len(model.state_dict()) != D.EXPECTED_STATE_KEYS:
+        raise ValueError('Bench architecture parameter/key count differs')
+    model.eval().requires_grad_(False); attention_count = 0
+    for module in model.modules():
+        if isinstance(module, D.SelfAttention):
+            if module.dropout != 0 or module.causal:
+                raise ValueError('Unexpected stochastic/causal attention')
+            module.mixed_precision = 'fp32'; attention_count += 1
+    if attention_count != 24:
+        raise ValueError('Expected 24 decoder attention layers')
+    model = model.to(target)
+    if any(p.dtype != torch.float32 for p in model.parameters()):
+        raise ValueError('D0 parameters must stay FP32')
+    if (path.stat().st_size, path.stat().st_mtime_ns) != before:
+        raise ValueError('D0 checkpoint changed during load')
+    identity = dict(status='PASS', category='Bench', synset='02828884',
+        checkpoint_path=str(path), checkpoint_sha256=D0_SHA, checkpoint_bytes=D0_BYTES,
+        state_branch='ema', parameters=parameters, state_keys=len(state), init_kwargs=kwargs,
+        coordinate_scale=D.SCALE, precision='BF16 forward; FP32 parameters/residual/scaling/output',
+        attention_backend='pytorch-sdpa/math', runtime=runtime, source=source,
+        loader_sha256=C.sha(__file__), config=config)
+    model._meshflow_denoiser_identity = identity
+    D._assert_runtime()
+    return model, identity
+
+
+def verify_raw_barrier(root):
+    manifest = C.read(root / 'evaluation_inputs/manifest.json')
+    receipts = []
+    for arm in ARMS:
+        done = C.read(root / 'evaluation' / arm / 'raw_complete.json')
+        if done['status'] != 'COMPLETE' or done['outputs'] != len(manifest['requests']):
+            raise ValueError('Incomplete RAW arm')
+        for q in manifest['requests']:
+            folder = root/'evaluation'/arm/q['request_id']/'raw'
+            receipt = C.read(folder/'receipt.json')
+            if (receipt['status'] != 'COMPLETE' or receipt['arm'] != arm or
+                receipt['request_id'] != q['request_id'] or receipt['generator_forwards'] != 50 or
+                receipt['raw_sha256'] != C.sha(folder/'raw.npz')):
+                raise ValueError('RAW barrier identity mismatch')
+            receipts.append(folder/'receipt.json')
+    return manifest, receipts
+
+
+def run(root, arm, checkpoint=D0):
+    if arm not in ARMS:
+        raise ValueError('Unknown arm')
+    root = C.resolve(root); manifest, barrier = verify_raw_barrier(root)
+    out = root/'evaluation'/arm; final_receipt = out/'post_complete.json'
+    if final_receipt.exists():
+        previous = C.read(final_receipt)
+        for path, digest in previous['files'].items():
+            if C.sha(path) != digest:
+                raise ValueError('Completed POST receipt changed')
+        return previous
+    stage = out/('postprocess_attempt_' + str(time.time_ns())); stage.mkdir()
+    C.write(stage/'all_RAW_barrier.json', dict(status='PASS', RAW=len(barrier),
+        files={str(p): C.sha(p) for p in barrier}))
+    pending = []
+    for q in manifest['requests']:
+        dest = out/q['request_id']/'post'
+        if (dest/'receipt.json').exists():
+            r = C.read(dest/'receipt.json')
+            if r['post_sha256'] != C.sha(dest/'post.npz'):
+                raise ValueError('Saved POST changed')
+        else:
+            if dest.exists() and (not (dest/'proposal_receipt.json').exists() or (dest/'geometry_attempt.json').exists()):
+                raise RuntimeError('Unresolved D0/geometry attempt; explicit audit required: '+str(dest))
+            pending.append(q)
+    need_model = any(not (out/q['request_id']/'post/proposal_receipt.json').exists() for q in pending)
+    model = None; calls = count = 0; tick = time.perf_counter()
+    try:
+        from meshflow_control.geo_io import write_indexed_ply
+        from r2.pilots.seam_slot_c200_v1.postprocess import geometry_from_proposal
+        if need_model:
+            C.write(stage/'resources_before.json', C.resources())
+            model, identity = load_bench_denoiser(checkpoint)
+            C.write(stage/'model_identity.json', identity)
+            C.write(stage/'resources_resident.json', C.resources())
+        for q in pending:
+            raw_dir = out/q['request_id']/'raw'; dest = out/q['request_id']/'post'
+            raw = C.arrays(raw_dir/'raw.npz'); source = C.arrays(raw_dir/'source_condition.npz')
+            if not dest.exists():
+                dest.mkdir(); C.write(dest/'attempt.json', dict(arm=arm, request=q,
+                    raw_sha256=C.sha(raw_dir/'raw.npz'), D0_checkpoint_sha256=D0_SHA,
+                    D0_budget=1, GEO_budget=1, schema=VERSION))
+            if (dest/'proposal_receipt.json').exists():
+                r = C.read(dest/'proposal_receipt.json')
+                if r['raw_sha256'] != C.sha(raw_dir/'raw.npz') or r['proposal_sha256'] != C.sha(dest/'proposal.npz'):
+                    raise ValueError('Saved D0 proposal identity differs')
+                proposal = C.arrays(dest/'proposal.npz')['official_unconstrained_proposal']
+            else:
+                import torch
+                from meshflow_control.denoise_model import predict_proposal
+                torch.cuda.synchronize(); torch.cuda.reset_peak_memory_stats(); start = time.perf_counter()
+                event(dest/'calls.jsonl', 'D0_FORWARD_STARTED', budget=1)
+                proposal = predict_proposal(model, raw['raw'])
+                torch.cuda.synchronize(); calls += 1
+                event(dest/'calls.jsonl', 'D0_FORWARD_RETURNED', seconds=time.perf_counter()-start)
+                save_npz(dest/'proposal.npz', dict(official_unconstrained_proposal=proposal))
+                C.write(dest/'proposal_receipt.json', dict(status='COMPLETE', D0_forwards=1,
+                    raw_sha256=C.sha(raw_dir/'raw.npz'), proposal_sha256=C.sha(dest/'proposal.npz'),
+                    official_checkpoint_sha256=D0_SHA, seconds=time.perf_counter()-start,
+                    peak_allocated_bytes=torch.cuda.max_memory_allocated(), peak_reserved_bytes=torch.cuda.max_memory_reserved(),
+                    peak_scope='One D0 forward including resident model; not complete process VRAM'))
+            C.write(dest/'geometry_attempt.json', dict(utc=C.utc(), calls=1))
+            pre, canonical, post, geometry, oriented, anchors = geometry_from_proposal(raw, proposal, source)
+            save_npz(dest/'pre_geo.npz', dict(output=pre, C=raw['raw'][:int(raw['known_faces'])],
+                known_faces=raw['known_faces'], raw_anchor_ids=raw['raw_anchor_ids'], raw_seam_slot_mask=raw['raw_seam_slot_mask']))
+            save_npz(dest/'post_canonical.npz', canonical); save_npz(dest/'post.npz', post)
+            write_indexed_ply(dest/'post.ply', post['vertices'], post['faces'])
+            C.write(dest/'geometry.json', dict(stats=geometry['stats'], face_records=geometry['face_records']))
+            C.write(dest/'anchor_identity.json', anchors)
+            C.write(dest/'source_restoration.json', oriented['restoration_summary'])
+            orient = oriented['orientation_result']
+            C.write(dest/'orientation.json', dict(summary=orient['summary'], components=orient['component_rows'], edges=orient['edge_rows']))
+            files = {str(p): C.sha(p) for p in dest.iterdir() if p.is_file()}
+            C.write(dest/'receipt.json', dict(status='COMPLETE', schema=VERSION, arm=arm,
+                request_id=q['request_id'], condition_id=q['condition_id'], post_sha256=C.sha(dest/'post.npz'),
+                raw_sha256=C.sha(raw_dir/'raw.npz'), official_D0_sha256=D0_SHA, D0_forwards=1,
+                GEO_calls=1, source_labels_read=False, anchors=anchors, files=files))
+            count += 1
+            print(json.dumps(dict(stage='POST', arm=arm, request_id=q['request_id'], completed=count)), flush=True)
+        receipts = [out/q['request_id']/'post/receipt.json' for q in manifest['requests']]
+        result = dict(status='COMPLETE', arm=arm, outputs=len(receipts), new_D0_forwards=calls,
+            new_GEO_calls=count, seconds=time.perf_counter()-tick, files={str(p): C.sha(p) for p in receipts})
+        C.write(final_receipt, result); C.write(stage/'resources_finished.json', C.resources())
+        return result
+    except BaseException as exc:
+        C.write(stage/'failure.json', dict(status='BLOCKED', error=repr(exc), traceback=traceback.format_exc(),
+            returned_D0_calls=calls, completed_outputs=count, no_automatic_retry=True))
+        raise
+    finally:
+        if model is not None:
+            import torch
+            del model; torch.cuda.empty_cache()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--root', default=str(ROOT)); parser.add_argument('--arm', choices=ARMS, required=True)
+    parser.add_argument('--checkpoint', default=str(D0)); args = parser.parse_args()
+    print(json.dumps(C.clean(run(args.root, args.arm, args.checkpoint))))
+
+
+if __name__ == '__main__':
+    main()

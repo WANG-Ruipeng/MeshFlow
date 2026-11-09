@@ -1,0 +1,655 @@
+--- /dev/null
++++ r2/pilots/bench_trajectory_diagnostic_v1/analyze.py (final)
+@@ -0,0 +1,88 @@
++"""CPU-only complete numeric collection; no reranking or new model calls."""
++from .common import *
++import numpy as np,collections,math
++from .geometry import roles,projection,shape
++
++def main():
++    out=OUT/'analysis_full';done=out/'numeric_complete.json'
++    if done.exists():verify(read(done)['files']);return
++    qs=read(OUT/'evaluation/score_registrations/COMMON.json')['requests'];qby={q['request_id']:q for q in qs}
++    def readcsv(p):return list(csv.DictReader(p.open(encoding='utf-8-sig')))
++    fixed=[];paired=[];endpoints=[];checks=[];response=[]
++    for q in [q for q in qs if q['split']=='CURRENT_TRAIN']:
++        rid=q['request_id'];s=arrays(q['fixed_sample_npz']);masks=roles(s)
++        for t in manifest()['times']:
++            pred={m:arrays(OUT/'execution'/m/'fixed'/rid/f'prediction_t{t}.npz') for m in LABELS}
++            assert np.array_equal(pred['COMMON']['x'],pred['USER']['x'])
++            for m in LABELS:
++                x,v=pred[m]['x'],pred[m]['v'];row=dict(label=m,request_id=rid,parent_id=q['parent_id'],part=q['part_type'],t=t,**projection(x,v,s))
++                for r,mask in masks.items():
++                    row[r+'_velocity_mse']=float(np.mean((v[mask]-s['u'][mask])**2)) if mask.any() else None
++                row.update({'truth_'+k:a for k,a in projection(x,s['u'],s).items() if k.endswith('derivative')});fixed.append(row)
++                err=(x+(1-t)*v-s['x1'])[masks['all']];identity=(1-t)*(v-s['u'])[masks['all']]
++                checks.append(dict(request_id=rid,label=m,t=t,endpoint_identity_max_error=float(np.abs(err-identity).max())))
++            for r,mask in masks.items():
++                if not mask.any():continue
++                a=float(np.mean((pred['COMMON']['v'][mask]-s['u'][mask])**2));b=float(np.mean((pred['USER']['v'][mask]-s['u'][mask])**2))
++                paired.append(dict(request_id=rid,parent_id=q['parent_id'],part=q['part_type'],t=t,region=r,scalar_denominator=int(mask.sum()*3),COMMON_MSE=a,USER_MSE=b,delta_MSE=b-a,ratio=b/a if a else None))
++        for start in manifest()['continuations']:
++            tr=arrays(OUT/'execution/USER/fixed'/rid/f'continuation_t{start}.npz');p=tr['states'];v=tr['velocities']
++            for stage,i in [('START',0),('END',len(p)-1)]:
++                row=dict(request_id=rid,parent_id=q['parent_id'],part=q['part_type'],start_t=start,stage=stage,**shape(p[i],s),**projection(p[i],np.zeros_like(p[i]),s))
++                endpoints.append(row)
++    csvwrite(out/'fixed_state_full.csv',fixed);csvwrite(out/'fixed_state_paired.csv',paired);csvwrite(out/'continuation_start_end.csv',endpoints);csvwrite(out/'endpoint_identity_check.csv',checks)
++    for q in qs[::2]:
++        rid=q['request_id'];lay=arrays(OUT/'layouts'/q['condition_id']/'layout.npz')
++        for t in manifest()['response_times']:
++            banks={m:arrays(OUT/'execution'/m/'response'/rid/f'response_t{t}.npz') for m in LABELS}
++            assert np.array_equal(banks['COMMON']['Cminus'],banks['USER']['Cminus']) and np.array_equal(banks['COMMON']['Cplus'],banks['USER']['Cplus'])
++            den=float(np.sqrt(np.mean((banks['COMMON']['Cplus']-banks['COMMON']['Cminus'])**2)))
++            for r,mask in roles(lay).items():
++                if not mask.any():continue
++                d={m:(banks[m]['vplus']-banks[m]['vminus'])[mask].astype(float) for m in LABELS}
++                norm={m:float(np.linalg.norm(d[m])) for m in LABELS}
++                response.append(dict(request_id=rid,condition_id=q['condition_id'],split=q['split'],part=q['part_type'],t=t,region=r,C_delta_RMS=den,
++                    COMMON_response=float(np.sqrt(np.mean(d['COMMON']**2))/den),USER_response=float(np.sqrt(np.mean(d['USER']**2))/den),
++                    response_direction_cosine=float(np.sum(d['COMMON']*d['USER'])/(norm['COMMON']*norm['USER'])) if norm['COMMON']*norm['USER'] else None,
++                    scalar_denominator=int(mask.sum()*3)))
++    csvwrite(out/'response_paired.csv',response)
++    metrics=[]
++    for label in LABELS:
++        for q in qs:
++            for stage in ('RAW','BASE_POST','CLEAN_FINAL_POST'):
++                p=OUT/'evaluation/scores'/label/q['request_id']/'RAW/row.json' if stage=='RAW' else OUT/'cpu'/label/q['request_id']/stage/'scores/row.json'
++                r=read(p);r.update(label=label,stage=stage,part=q['part_type']);metrics.append(r)
++    csvwrite(out/'per_output_all_metrics.csv',metrics)
++    keys=['CF_illegal_affected_free_fraction','FF_illegal_affected_free_fraction','ConflictCov_C','free_minimum_angle_lt5_fraction','nonmanifold_edges','hinge_diag_isolated_1face_edge_components','C_F_valid_edge_count','free_only_reached_bulk_area_fraction','actual_free_faces','deleted_free_faces']
++    grouped=[]
++    for label in LABELS:
++        for split in ('CURRENT_TRAIN','DEV'):
++            for stage in ('RAW','BASE_POST','CLEAN_FINAL_POST'):
++                rr=[r for r in metrics if r['label']==label and r['split']==split and r['stage']==stage];row=dict(label=label,split=split,stage=stage,outputs=len(rr))
++                for k in keys:
++                    values=[r[k] for r in rr if isinstance(r.get(k),(int,float))];row[k]=float(np.mean(values)) if values else None;row[k+'__n']=len(values)
++                row['bulk_reach_ge30_count']=sum(r.get('free_only_reached_bulk_area_fraction',0)>=.3 for r in rr if isinstance(r.get('free_only_reached_bulk_area_fraction'),(int,float)))
++                grouped.append(row)
++    csvwrite(out/'summary_by_split_stage.csv',grouped)
++    # Frozen request pairing preserves every metric; no favorable-metric selection.
++    idx={(r['label'],r['request_id'],r['stage']):r for r in metrics};pr=[]
++    for q in qs:
++        for stage in ('RAW','BASE_POST','CLEAN_FINAL_POST'):
++            a,b=idx['COMMON',q['request_id'],stage],idx['USER',q['request_id'],stage];r=dict(request_id=q['request_id'],split=q['split'],part=q['part_type'],stage=stage)
++            for k in a:
++                if isinstance(a[k],(int,float)) and not isinstance(a[k],bool) and isinstance(b.get(k),(int,float)):
++                    r[k+'__COMMON']=a[k];r[k+'__USER']=b[k];r[k+'__delta']=b[k]-a[k]
++            pr.append(r)
++    csvwrite(out/'per_request_metric_deltas.csv',pr)
++    ledger=[]
++    for label in LABELS:
++        ee=[json.loads(x) for x in (OUT/'execution'/label/'calls.jsonl').read_text().splitlines()]
++        for kind in sorted({e['kind'] for e in ee}):
++            a=[e for e in ee if e['kind']==kind];ledger.append(dict(label=label,kind=kind,started=sum(e['stage']=='STARTED' for e in a),returned=sum(e['stage']=='RETURNED' for e in a)))
++    csvwrite(out/'forward_budget.csv',ledger)
++    assert sum(r['returned'] for r in ledger)==2382 and all(r['started']==r['returned'] for r in ledger)
++    save(done,dict(status='COMPLETE',generator_returned=2382,head_calls=4,D0_calls=sum(read(OUT/'evaluation'/l/'post_complete_full.json')['new_D0_forwards'] for l in LABELS),
++        model_updates=0,full_metrics=len(metrics),fixed_paired=len(paired),response_paired=len(response),max_endpoint_identity_error=max(x['endpoint_identity_max_error'] for x in checks),
++        files={str(p):sha(p) for p in out.glob('*.csv')}))
++    print('NUMERIC_COMPLETE',len(metrics),2382)
++if __name__=='__main__':main()
+--- /dev/null
++++ r2/pilots/bench_trajectory_diagnostic_v1/closeout.py (final)
+@@ -0,0 +1,124 @@
++"""CPU-only final delivery and read-only recovery verification."""
++import os
++os.environ['CUDA_VISIBLE_DEVICES']=''
++from .common import *
++from .final_tables import rows
++import argparse,shutil,difflib,zipfile
++import numpy as np
++
++def put_text(p,text):
++    if p.exists():assert p.read_text(encoding='utf-8')==text,p
++    else:p.write_text(text,encoding='utf-8')
++
++def verify_complete():
++    if not (OUT/'COMPLETE.json').exists():
++        raise RuntimeError('Final closeout missing. No model dispatch; complete pending CPU review/report explicitly.')
++    c=read(OUT/'COMPLETE.json');verify(c['files'])
++    delivery=read(OUT/'delivery_hashes.json');verify(delivery['files'])
++    verify(manifest()['files'])
++    print(json.dumps(dict(status='COMPLETE_VERIFIED',generator_returned=c['generator_returned'],D0_calls=c['D0_calls'],
++        training_updates=0,new_model_calls=0,verified_delivery_files=len(delivery['files']),zip_bytes=c['zip_bytes'])))
++
++def main():
++    p=argparse.ArgumentParser();p.add_argument('--verify-only',action='store_true');a=p.parse_args()
++    if a.verify_only or (OUT/'COMPLETE.json').exists():verify_complete();return
++    reg=manifest();verify(reg['files']);verify(read(OUT/'layouts/complete.json')['files'])
++    numeric=read(OUT/'analysis_full/numeric_complete.json');verify(numeric['files'])
++    assert numeric['generator_returned']==2382 and numeric['D0_calls']==32 and numeric['model_updates']==0
++    assert numeric['max_endpoint_identity_error']<1e-6
++    metrics=rows(OUT/'analysis_full/per_output_all_metrics.csv')
++    assert len(metrics)==96 and all(r['C_preserved_exact']=='True' for r in metrics)
++    review=read(OUT/'visual_review/complete.json');verify(review['files'])
++    assert review['main_cells']==64 and review['total_distinct_reviewed_pages']==40
++    stage=read(OUT/'stage_audit/complete.json');verify(stage['files'])
++    functional=read(OUT/'weights/functional/complete.json');verify(functional['files'])
++    assert len(rows(OUT/'weights/functional/delta_W_h.csv'))==1320
++    requests=read(OUT/'evaluation_inputs/manifest.json')['requests'];records=[]
++    d0_calls=0
++    for label in LABELS:
++        assert read(OUT/'execution'/label/'complete.json')['status']=='COMPLETE'
++        for q in requests:
++            root=OUT/'evaluation'/label/q['request_id'];post=read(root/'post/receipt.json')
++            verify(post['files']);assert post['D0_forwards']==1
++            assert sha(root/'raw/raw.npz')==post['raw_sha256']
++            assert (OUT/'cpu'/label/q['request_id']/'CLEAN_FINAL_POST/post.npz').exists()
++            d0_calls+=post['D0_forwards']
++            tr=arrays(root/'raw/trajectory.npz')
++            assert tr['states'].shape[0]==51 and tr['velocities'].shape[0]==50
++            layout=arrays(OUT/'layouts'/q['condition_id']/'layout.npz');fixed=layout['anchor_ids']>=0
++            assert np.all(tr['states'][:,fixed]==tr['states'][0,fixed][None])
++            records.append(dict(label=label,request_id=q['request_id'],trajectory_states=51,velocities=50,
++                C_and_anchor_all_states_exact=True,raw_sha256=post['raw_sha256'],post_sha256=post['post_sha256']))
++    assert d0_calls==32
++    csvwrite(OUT/'analysis_full/final_trajectory_integrity.csv',records)
++    # Snapshot recovery-era source separately; do not overwrite original frozen snapshots.
++    source=Path(__file__).parent;frozen=read(OUT/'source_hashes.json')['files'];changes=[]
++    for name,old in frozen.items():
++        new=sha(name)
++        if old!=new:
++            assert Path(name).is_relative_to(source),(name,'protected external dependency changed')
++            if Path(name).name=='gpu.py':
++                assert read(OUT/'recovery_dispatch.json')['source_hashes'][name]==new
++                reason='Already recorded before recovered dispatch: exception-only partial trajectory saving; integration/forward unchanged'
++            else:
++                assert Path(name).name=='resume.py',(name,'scientific implementation changed')
++                reason='Read-only guard for completed task; no change to inference implementation'
++            changes.append(dict(path=name,before=old,after=new,reason=reason))
++    save(OUT/'rollback_gate.json',dict(status='NOT_TRIGGERED',calls=0,
++        reason='C sensitivity and static/local functional weight changes do not isolate a specific adverse module; no module sweep'))
++    save(OUT/'final_integrity.json',dict(status='PASS',protected_registered_files=len(reg['files']),
++        trajectories=32,three_stage_scores=96,C_all_scored_outputs_exact=True,source_changes=changes,
++        generator_returned=2382,D0_calls=32,head_calls=4,training_updates=0,
++        original_CUDA_failure='Preserved; cause UNKNOWN; explicit2-call replay counted',
++        I_status_counts={s:sum(r['ConflictCov_C_status']==s for r in metrics) for s in ('PASS','LOW_SUPPORT')}))
++    oldreport=OUT/'REPORT.md';history=OUT/'REPORT_PARTIAL_20261022.md';final=OUT/'REPORT_FINAL.md'
++    if not history.exists():shutil.copy2(oldreport,history)
++    shutil.copyfile(final,oldreport)
++    snapshot=OUT/'source_snapshot_final';diff=[]
++    for f in sorted(source.iterdir()):
++        if f.suffix not in ('.py','.ps1'):continue
++        rel=f.relative_to(ROOT);dest=snapshot/rel;dest.parent.mkdir(parents=True,exist_ok=True)
++        if dest.exists():assert sha(f)==sha(dest)
++        else:shutil.copy2(f,dest)
++        old=OUT/'source_snapshot'/f.name
++        before=old.read_text(encoding='utf-8').splitlines(True) if old.exists() else []
++        diff.extend(difflib.unified_diff(before,f.read_text(encoding='utf-8').splitlines(True),
++            fromfile=str(rel)+' (initial snapshot)' if old.exists() else '/dev/null',tofile=str(rel)+' (final)'))
++    put_text(OUT/'code.diff',''.join(diff))
++    events=OUT/'engineering_events.jsonl'
++    if 'CPU_CLOSEOUT_CORRECTIONS' not in events.read_text(encoding='utf-8'):
++        event(events,kind='CPU_CLOSEOUT_CORRECTIONS',pandas_missing='one failed table invocation; replaced by stdlib/numpy; no installation',
++            source_guard='One closeout stopped on known recovery-era exception saver. Verified exact recovery hash and inspected diff before allowing; no model replay.',
++            resource_metadata='inherited GPU_computation:false is not execution truth; ledgers record actual GPU calls',
++            missing_backbone_MLP_activations='NA hook name mismatch; no new forward',new_model_calls=0)
++    if 'MINI_PACKAGE_SCOPE_CORRECTION' not in events.read_text(encoding='utf-8'):
++        event(events,kind='MINI_PACKAGE_SCOPE_CORRECTION',first_zip_bytes=11313871,
++            action='Preserved incomplete packaging attempt; exclude verbose pair detector JSON caches from mini ZIP only. All CSV and local source pair evidence retained.',new_model_calls=0)
++    # Hash human-readable deliverables and exact source snapshots. Heavy arrays stay in
++    # existing input/receipt inventories; no duplicate model weights are packaged.
++    small=[]
++    for folder in ('analysis_full','visual_review','layouts','weights','source_reference','stage_audit','source_snapshot_final','scoring_source_snapshot'):
++        for f in (OUT/folder).rglob('*'):
++            if f.is_file() and f.suffix in ('.csv','.json','.py','.ps1','.md','.png'):
++                small.append(f)
++    for folder in ('main',):small.extend((OUT/'gallery_full'/folder).glob('*.png'))
++    small.extend(OUT/'gallery_full'/f for f in ('index.html','complete_main_COMMON_USER.json','complete_oracle_continuation.json'))
++    small.extend(OUT/f for f in ('REPORT.md','REPORT_FINAL.md','DELIVERY_INDEX.md','registration.json','selection.json',
++        'source_hashes.json','recovery_authorization.json','recovery_dispatch.json','engineering_events.jsonl','rollback_gate.json','final_integrity.json','code.diff'))
++    small=sorted(set(small));assert all(f.exists() for f in small)
++    save(OUT/'delivery_hashes.json',dict(status='FROZEN',files={str(f):sha(f) for f in small},
++        heavy_assets='Original checkpoint and input hashes in registration; RAW/D0/POST files in per-request receipts; no weights in mini package'))
++    zpath=OUT/'BENCH_TRAJECTORY_DIAGNOSTIC_REVIEW.zip'
++    packaged=[f for f in small if not (f.name=='pairs.json' or f.name.endswith('_pairs.json'))]
++    with zipfile.ZipFile(zpath,'w',compression=zipfile.ZIP_DEFLATED,compresslevel=6) as z:
++        for f in packaged+[OUT/'delivery_hashes.json']:z.write(f,f.relative_to(OUT).as_posix())
++        z.writestr('PACKAGE_SCOPE.txt','Small evidence package: report, complete numeric CSVs, actual review,16 main pages and code. Verbose pair-detector JSON caches, large raw arrays, checkpoints, oracle/continuation/five-stage images remain at local paths. Full gallery index has local-only links to those pages. Delivery hash list also covers local-only evidence. No model weights included.\n')
++    assert zpath.stat().st_size<10_000_000,('review zip exceeds10MB',zpath.stat().st_size)
++    save(OUT/'COMPLETE.json',dict(status='COMPLETE',experiment='R2_BENCH_TRAJECTORY_DIAGNOSTIC_V1',
++        generator_returned=2382,core_useful_calls=2380,replayed_returned_calls=2,D0_calls=32,head_calls=4,training_updates=0,
++        raw_outputs=32,score_rows=96,rendered_pages=64,actual_reviewed_pages=40,module_rollback='NOT_TRIGGERED',
++        zip_bytes=zpath.stat().st_size,files={str(f):sha(f) for f in (OUT/'delivery_hashes.json',zpath,OUT/'final_integrity.json')},
++        lifecycle='Fixed diagnosis complete; no automatic training, new sampling, cleanup, default switch, commit or push'))
++    verify_complete()
++
++if __name__=='__main__':main()
+--- /dev/null
++++ r2/pilots/bench_trajectory_diagnostic_v1/final_tables.py (final)
+@@ -0,0 +1,64 @@
++"""CPU-only final aggregations; no new detector, query, or model call."""
++from .common import *
++from collections import defaultdict
++import numpy as np
++
++def rows(path):
++    return list(csv.DictReader(path.open(encoding='utf-8-sig')))
++
++def grouped(data, keys):
++    groups=defaultdict(list)
++    for r in data: groups[tuple(r[k] for k in keys)].append(r)
++    return groups
++
++def main():
++    d=OUT/'analysis_full/summaries'
++    continuous=rows(OUT/'stage_audit/continuous_stage_pairs.csv')
++    result=[]
++    for key,rr in sorted(grouped(continuous,['label','split','stage']).items()):
++        result.append(dict(zip(['label','split','stage'],key))|dict(outputs=len(rr),**{
++            k:float(np.mean([float(r[k]) for r in rr])) for k in (
++                'free_area','C_corner_RMS_displacement','CF_illegal_pairs','FF_illegal_pairs',
++                'CF_affected_free_fraction','FF_affected_free_fraction')}))
++    csvwrite(d/'continuous_stage_summary.csv',result)
++    result=[]
++    for key,rr in sorted(grouped(rows(OUT/'stage_audit/pair_transitions.csv'),['label','split','transition','kind']).items()):
++        result.append(dict(zip(['label','split','transition','kind'],key))|dict(outputs=len(rr),**{
++            k:sum(int(r[k]) for r in rr) for k in ('old','new','retained','removed','added')}))
++    csvwrite(d/'pair_transition_summary.csv',result)
++    survival=rows(OUT/'stage_audit/GEO_face_survival.csv')
++    result=[]
++    for key,rr in sorted(grouped(survival,['label','split','reason']).items()):
++        result.append(dict(zip(['label','split','reason'],key))|dict(faces=len(rr),**{
++            k:sum(float(r[k]) for r in rr) for k in ('RAW_area','D0_area','PRE_GEO_area')}))
++    csvwrite(d/'GEO_reason_summary.csv',result)
++    result=[]
++    for key,rr in sorted(grouped(survival,['label','request_id','split','part']).items()):
++        kept=[r for r in rr if r['kept']=='True'];deleted=[r for r in rr if r['kept']=='False']
++        raw=sum(float(r['RAW_area']) for r in rr);d0=sum(float(r['D0_area']) for r in rr);pre=sum(float(r['PRE_GEO_area']) for r in rr)
++        result.append(dict(zip(['label','request_id','split','part'],key))|dict(
++            free_faces=len(rr),kept=len(kept),deleted=len(deleted),RAW_area=raw,D0_area=d0,PRE_GEO_area=pre,
++            D0_over_RAW_area=d0/raw,deleted_pre_area=sum(float(r['PRE_GEO_area']) for r in deleted),
++            deleted_pre_area_fraction=sum(float(r['PRE_GEO_area']) for r in deleted)/pre,
++            deleted_D0_area=sum(float(r['D0_area']) for r in deleted),deleted_RAW_area=sum(float(r['RAW_area']) for r in deleted)))
++    csvwrite(d/'GEO_survival_per_request.csv',result)
++    aggregate=[]
++    for key,rr in sorted(grouped(result,['label','split']).items()):
++        aggregate.append(dict(zip(['label','split'],key))|dict(outputs=len(rr),**{
++            k:float(np.mean([r[k] for r in rr])) for k in ('free_faces','kept','deleted','RAW_area','D0_area','PRE_GEO_area','D0_over_RAW_area','deleted_pre_area','deleted_pre_area_fraction','deleted_RAW_area')}))
++    csvwrite(d/'GEO_survival_summary.csv',aggregate)
++    allmetrics=rows(OUT/'analysis_full/per_output_all_metrics.csv')
++    keys=['CF_illegal_affected_free_fraction','FF_illegal_affected_free_fraction','ConflictCov_C',
++        'free_minimum_angle_lt5_fraction','nonmanifold_edges','hinge_diag_isolated_1face_edge_components',
++        'C_F_valid_edge_count','free_only_reached_bulk_area_fraction','actual_free_faces','deleted_free_faces']
++    parents=[]
++    for key,rr in sorted(grouped(allmetrics,['label','split','parent_id','part','stage']).items()):
++        parents.append(dict(zip(['label','split','parent_id','part','stage'],key))|dict(outputs=len(rr),**{
++            k:float(np.mean([float(r[k]) for r in rr])) for k in keys}))
++    csvwrite(d/'per_parent_stage.csv',parents)
++    spectra=rows(OUT/'weights/exact_selected_spectra.csv')
++    csvwrite(d/'weight_spectra_compact.csv',[{k:v for k,v in r.items() if k!='singular_values_json'} for r in spectra])
++    print(json.dumps(dict(continuous=rows(d/'continuous_stage_summary.csv'),pairs=rows(d/'pair_transition_summary.csv'),
++        survival=aggregate,reasons=rows(d/'GEO_reason_summary.csv')),ensure_ascii=False))
++
++if __name__=='__main__':main()
+--- /dev/null
++++ r2/pilots/bench_trajectory_diagnostic_v1/finish.ps1 (final)
+@@ -0,0 +1,4 @@
++$ErrorActionPreference = 'Stop'
++# Read-only final verification. Does not resume models, score meshes, or train.
++wsl -d Ubuntu --cd /mnt/e/MeshFlow -- /mnt/e/MeshFlow-Control-artifacts/venv/bin/python -B -m r2.pilots.bench_trajectory_diagnostic_v1.closeout --verify-only
++if ($LASTEXITCODE -ne 0) { throw "Bench diagnostic verification failed: $LASTEXITCODE" }
+--- /dev/null
++++ r2/pilots/bench_trajectory_diagnostic_v1/functional.py (final)
+@@ -0,0 +1,31 @@
++"""CPU direct delta-W action on saved identical COMMON activations, no forward."""
++import os
++os.environ['CUDA_VISIBLE_DEVICES']=''
++from .common import *
++import torch,numpy as np
++
++def main():
++    out=OUT/'weights/functional';done=out/'complete.json'
++    if done.exists():verify(read(done)['files']);return
++    torch.set_num_threads(2);reg=manifest();tick=time.perf_counter();paths=sorted((OUT/'execution/COMMON/fixed').glob('*/activations_*.npz'))
++    assert len(paths)==40,'Require40 fixed-state activation banks'
++    states={label:torch.load(p,map_location='cpu',weights_only=True,mmap=True)['generator_state'] for label,p in reg['checkpoints'].items()};base=states['COMMON'];rows=[]
++    save(out/'resources.json',resources())
++    for path in paths:
++        hbank=arrays(path)
++        for name,values in hbank.items():
++            key=name+'.weight';h=torch.from_numpy(values);w0=base[key].float();b0=base.get(name+'.bias');y0=h@w0.T
++            if b0 is not None:y0+=b0
++            for label in ('A','COVERAGE','USER'):
++                dy=h@(states[label][key].float()-w0).T
++                if b0 is not None:dy+=states[label][name+'.bias']-b0
++                rows.append(dict(label=label,module=name,request_id=path.parent.name,t=float(path.stem.split('_t')[1]),rows=len(h),
++                    h_RMS=float(h.square().mean().sqrt()),base_output_RMS=float(y0.square().mean().sqrt()),delta_output_RMS=float(dy.square().mean().sqrt()),
++                    delta_over_base=float(dy.norm()/y0.norm()) if float(y0.norm()) else None,
++                    input_scope='same COMMON activations, deterministic stride max64; mixed roles; direct local action including bias, not propagated attribution'))
++    csvwrite(out/'delta_W_h.csv',rows)
++    save(done,dict(status='COMPLETE',activation_banks=len(paths),rows=len(rows),seconds=time.perf_counter()-tick,model_calls=0,
++        files={str(out/'delta_W_h.csv'):sha(out/'delta_W_h.csv')},activation_hashes={str(p):sha(p) for p in paths},
++        caveat='Sampled real h; no per-role CKA or causal module localization claimed'))
++    print('FUNCTIONAL_COMPLETE',len(rows),flush=True)
++if __name__=='__main__':main()
+--- /dev/null
++++ r2/pilots/bench_trajectory_diagnostic_v1/gallery_full.py (final)
+@@ -0,0 +1,76 @@
++"""Fixed-camera CPU galleries of all completed, saved diagnostic outputs."""
++import os
++os.environ['CUDA_VISIBLE_DEVICES']=''
++from .common import *
++import numpy as np,html,argparse,concurrent.futures,multiprocessing
++from r2.pilots.chair_multipart_seam_v1 import gallery as G
++from r2.pilots.seam_slot_c200_v1.generate import raw_arrays
++from r2.pilots.bench_parts_convergence_v1 import data as B
++C,D,H=G.C,G.D,G.H
++
++def frame(q):
++    src=arrays(OUT/'source_reference'/q['condition_id']/'source.npz');k=q['K'];c=src['output'][:k]
++    if q['split']=='DEV':
++        old=read(ROOT/'experiments/r2_bench_parts_convergence_v1/gallery/NATIVE_S21000__SEAM_S21000_full/definition.json')
++        return old['bounds'][q['condition_id']],old['depth_bounds'][q['condition_id']],c
++    g=dict(C=c,F=src['output'][k:],C_original=c,tri=src['output']);bounds=H.bounds_for_condition([g],None,C.L)
++    pts=src['output'].reshape(-1,3);center=(pts.min(0)+pts.max(0))/2
++    span=max(np.ptp((pts-center)@D.basis(az,23),axis=0)[:2].max() for az in (-60,120))*1.25
++    return bounds,dict(center=center.tolist(),span=float(span)),c
++
++def cells(q,kind):
++    rid=q['request_id'];k=q['K'];result=[]
++    if kind=='main':
++        for label in LABELS:
++            for stage,p in [('RAW',OUT/'evaluation'/label/rid/'raw/raw.npz'),('FINAL',OUT/'cpu'/label/rid/'CLEAN_FINAL_POST/post.npz')]:
++                result.append((label+' '+stage,arrays(p),[p]))
++    elif kind in LABELS:
++        base=OUT/'evaluation'/kind/rid;raw=arrays(base/'raw/raw.npz');source=arrays(q['source_npz']);lay=arrays(OUT/'layouts'/q['condition_id']/'layout.npz')
++        result.append((kind+' RAW',raw,[base/'raw/raw.npz']))
++        for stage,key,p in [('D0 proposal (C movable)','official_unconstrained_proposal',base/'post/proposal.npz'),('PRE_GEO (anchors restored)','output',base/'post/pre_geo.npz')]:
++            bank=arrays(p);tri=bank[key].copy()
++            # Reorder only the C corners for display; no geometry is transformed.
++            perm=np.asarray(source['C_source_corner_permutations']) if 'C_source_corner_permutations' in source else None
++            if perm is not None:tri[:k]=np.take_along_axis(tri[:k],np.argsort(perm,axis=1)[...,None],axis=1)
++            display={**raw,'output':tri};result.append((stage,display,[p]))
++        for stage,p in [('GEO',base/'post/post.npz'),('FINAL',OUT/'cpu'/kind/rid/'CLEAN_FINAL_POST/post.npz')]:result.append((stage,arrays(p),[p]))
++    elif kind=='oracle':
++        p=OUT/'evaluation/USER'/rid/'raw/raw.npz';o=OUT/'execution/USER/fixed'/rid/'oracle_raw.npz'
++        src=OUT/'source_reference'/q['condition_id']/'source.npz'
++        result=[('SOURCE: one completion',arrays(src),[src]),('USER production layout',arrays(p),[p]),('USER source layout'+(' (same)' if not o.exists() else ''),arrays(o if o.exists() else p),[o if o.exists() else p])]
++    elif kind=='continuation':
++        s=arrays(q['fixed_sample_npz']);core=arrays(q['inference_npz']);case=arrays(q['case_path']);source=arrays(q['source_npz'])
++        lay=B.inference_layout(core['C_vertices'],core['C_faces_original'],core['C_faces_model'],q['N'],case['occupied_labels'].astype(bool));inv=np.argsort(s['face_permutation'])
++        for t in manifest()['continuations']:
++            p=OUT/'execution/USER/fixed'/rid/f'continuation_t{t}.npz';tr=arrays(p)
++            for stage,i in [('START',0),('END',-1)]:
++                arr=raw_arrays(tr['states'][i][inv],lay,case['occupied_labels'].astype(np.float32),source)
++                result.append((f't={t} '+stage,arr,[p]))
++    return result
++
++def one(job):
++    q,kind=job;rid=q['request_id'];dest=OUT/'gallery_full'/kind;dest.mkdir(parents=True,exist_ok=True);png=dest/(rid+'.png')
++    if png.with_suffix('.json').exists():return read(png.with_suffix('.json'))
++    bounds,depth,c=frame(q);cc=cells(q,kind);k=q['K'];plt=H._mpl();fig=plt.figure(figsize=(4.5*len(cc),12),dpi=100,facecolor='white')
++    grid=fig.add_gridspec(4,len(cc),top=.92,bottom=.06,hspace=.28,wspace=.18);info=[]
++    for col,(label,mesh,paths) in enumerate(cc):
++        tri,role=G.roles(mesh,k);g=dict(C=tri[:k],F=tri[k:],C_original=c,tri=tri);scopes=[]
++        for r,az in enumerate((-60,120)):
++            raster,scope=G.role_raster(tri,role,k,D.basis(az,23),np.array(depth['center']),depth['span']);ax=fig.add_subplot(grid[r,col]);ax.imshow(raster);ax.axis('off');ax.set_title(label+f' | {az}',fontsize=9);scopes.append(scope)
++        for r,view in [(2,'front'),(3,'side')]:
++            ax=fig.add_subplot(grid[r,col]);H.draw_section(ax,g,np.flatnonzero(role[k:]=='SEAM'),bounds,C.L,view,1);ax.set_title(label+' | '+view,fontsize=9)
++        info.append(dict(label=label,files={str(p):sha(p) for p in paths},scopes=scopes))
++    fig.suptitle(rid+'\n'+q['split']+' '+q['part_type']+f' | K={k} N={q["N"]} | '+kind,fontsize=10)
++    fig.text(.5,.02,'Blue C / orange seam / gray bulk / green bridge. Fixed scale and sections; section endpoints do not prove cracks. Source-informed diagnostics are not deployable generation.',ha='center',fontsize=8)
++    fig.savefig(png);plt.close(fig)
++    rec=dict(request_id=rid,kind=kind,split=q['split'],part=q['part_type'],path=str(png),sha256=sha(png),bounds=bounds,depth=depth,cells=info)
++    save(png.with_suffix('.json'),rec);print('RENDERED',kind,rid,flush=True);return rec
++
++def main():
++    p=argparse.ArgumentParser();p.add_argument('--kinds',nargs='+',default=['main','COMMON','USER','oracle','continuation']);p.add_argument('--workers',type=int,default=2);a=p.parse_args()
++    qs=read(OUT/'evaluation_inputs/manifest.json')['requests'];jobs=[(q,k) for k in a.kinds for q in qs if k not in ('oracle','continuation') or q['split']=='CURRENT_TRAIN']
++    with concurrent.futures.ProcessPoolExecutor(max_workers=a.workers,mp_context=multiprocessing.get_context('spawn')) as pool:pages=list(pool.map(one,jobs))
++    dest=OUT/'gallery_full';save(dest/('complete_'+'_'.join(a.kinds)+'.json'),dict(status='RENDERED',pages=len(pages),model_calls=0,workers=a.workers))
++    allpages=[read(p) for k in ('main','COMMON','USER','oracle','continuation') for p in sorted((dest/k).glob('*.json'))]
++    (dest/'index.html').write_text('<meta charset="utf-8"><h1>Bench trajectory: complete saved evidence</h1><p>Fixed cameras / sections. Nonblind AI_PROXY review recorded separately.</p>'+''.join('<p>'+html.escape(p['kind']+' '+p['request_id'])+'</p><a href="'+p['kind']+'/'+Path(p['path']).name+'"><img loading="lazy" style="width:100%" src="'+p['kind']+'/'+Path(p['path']).name+'"></a>' for p in allpages),encoding='utf-8')
++if __name__=='__main__':main()
+--- r2/pilots/bench_trajectory_diagnostic_v1/gpu.py (initial snapshot)
++++ r2/pilots/bench_trajectory_diagnostic_v1/gpu.py (final)
+@@ -82,8 +82,12 @@
+         return out
+     def rollout(self,x,s,start,kind,rid):
+         path=[x.copy()];vel=[];fixed=s['anchor_ids']>=0;original=x[fixed].copy()
+-        for step in range(round(start*50),50):
+-            v=self.forward(x,step/50,s,kind,rid);vel.append(v);x=x+np.float32(.02)*v;x[fixed]=original;path.append(x.copy())
++        try:
++            for step in range(round(start*50),50):
++                v=self.forward(x,step/50,s,kind,rid);vel.append(v);x=x+np.float32(.02)*v;x[fixed]=original;path.append(x.copy())
++        except BaseException:
++            array_file(self.attempt/'partial_trajectories'/f'{kind}_{rid}_start{start}.npz',dict(states=np.stack(path),velocities=np.stack(vel) if vel else np.empty((0,*x.shape),np.float32)))
++            raise
+         assert all(np.array_equal(p[fixed],original) for p in path)
+         return np.stack(path),np.stack(vel)
+     def run(self):
+--- r2/pilots/bench_trajectory_diagnostic_v1/resume.py (initial snapshot)
++++ r2/pilots/bench_trajectory_diagnostic_v1/resume.py (final)
+@@ -3,12 +3,20 @@
+ import argparse,subprocess
+ 
+ def main():
++    # Finalized experiments are read-only. Old recovery flags must never replay them.
++    if (OUT/'COMPLETE.json').exists():
++        from .closeout import verify_complete
++        verify_complete();return
++    if all((OUT/'execution'/label/'complete.json').exists() for label in LABELS):
++        print('All registered model calls are complete. No GPU replay. Use closeout --verify-only after final review.');return
+     p=argparse.ArgumentParser();p.add_argument('--gpu-recovered',action='store_true');p.add_argument('--allow-two-forward-replay',action='store_true');a=p.parse_args()
+     if not(a.gpu_recovered and a.allow_two_forward_replay):
+         print('BLOCKED: no model calls. GPU health must be restored and the logged2-call replay explicitly allowed. Completed12 outputs stay cached.');return
+     # Bounded health query. No synthetic CUDA probe, driver reset or training.
+     status=subprocess.run(['nvidia-smi','--query-gpu=name,memory.total,memory.used,memory.free,utilization.gpu','--format=csv,noheader,nounits'],capture_output=True,text=True,timeout=10)
+     if status.returncode:raise RuntimeError(status.stderr)
++    verify(manifest()['files'])
++    verify(read(OUT/'layouts/complete.json')['files'])
+     events=[json.loads(x) for x in (OUT/'execution/COMMON/calls.jsonl').read_text().splitlines()]
+     broken=read(OUT/'evaluation_inputs/manifest.json')['requests'][12]['request_id']
+     calls=[x for x in events if x['request_id']==broken]
+@@ -20,6 +28,10 @@
+         expected_total_generator_calls=2382,core_max=2480,source_layout_identical_skips=100))
+     marker=OUT/'gpu_dispatch_blocked.json'
+     if marker.exists():marker.rename(OUT/'gpu_dispatch_blocked_history.json')
++    save(OUT/'recovery_dispatch.json',dict(resources=resources(),gpu_workers=1,cpu_threads_per_GPU_worker=1,
++        rationale='Observed prior device/NVML failure has unknown cause. Serial recovery isolates model loading and execution; CPU analysis may overlap. No inference batch/precision/solver change.',
++        authorization='User 2026-10-22: continue; previous message disclosed lost2 forwards and remaining fixed experiment',
++        source_hashes={str(p):sha(p) for p in Path(__file__).parent.glob('*.py')}))
+     # Conservative serial recovery; no simultaneous loading after observed device failure.
+     for label in LABELS:subprocess.run([sys.executable,'-B','-m','r2.pilots.bench_trajectory_diagnostic_v1.gpu',label],check=True)
+     for label in LABELS:
+--- /dev/null
++++ r2/pilots/bench_trajectory_diagnostic_v1/review.py (final)
+@@ -0,0 +1,88 @@
++"""Persist actual non-blind AI_PROXY image observations, not metric-derived labels.
++
++All main, oracle and continuation pages were opened and inspected in this session.
++Only the eight explicitly listed five-stage pages receive stage-specific reviews.
++"""
++from .common import *
++
++# Values were transcribed after actual two-camera and two-section inspection.
++# Each entry: COMMON adoption, USER adoption, COMMON note, USER note, final cost.
++OBS={
++('35948e',0):('NO','NO','灰座板位于蓝色座面上方，C单独悬在座下。','仍重新生成更高的灰座板，C未成为实际座面。','高度错层在RAW已经存在，FINAL没有修好。'),
++('35948e',1):('YES','YES','蓝C处于座面，靠背和两侧支撑围绕其组织。','蓝C用作座面，座背与两端支撑关系合理。','局部缝隙和表面变薄仍在；主体关系保持。'),
++('943dde',0):('PARTIAL','YES','蓝C大致处于背部，灰主体的座背位置及覆盖与C不完全协调。','蓝C作为外背板，前方座面、内侧背条和端架组织更协调。','背条间有缝隙；不能将所有内侧灰背条都当成非法重复。'),
++('943dde',1):('PARTIAL','PARTIAL','蓝色背板位于生成座面下方，更像侧裙。未输入用途标签，不能仅因不是靠背判定所有完成无效。','C仍处于座下侧裙位置，没有复现n0的靠背组织。','USER的灰座面和支撑在D0后明显变细、缺失；COMMON主体相对完整。'),
++('bf504b',0):('NO','YES','较小灰长椅在蓝L形支撑内部/旁侧，蓝支撑大幅外露。','灰主体沿蓝L形侧支撑的尺度与位置形成座面及端架。','USER主体保留，局部细条和缝隙仍可见。'),
++('bf504b',1):('NO','YES','蓝L形支撑与较小灰长椅位置不相容，未承担合理支撑用途。','蓝L形支撑与新生成的较大主体对应。','USER宏观支撑关系保持，不能由外观认证无自交。'),
++('838c48',0):('PARTIAL','YES','C上表面部分采用，但蓝腿与灰支撑错位，灰条横过顶面。','组合C的上表面和腿部被同时利用，主体组织更连贯。','USER最终结构保持，局部侧面纹理/薄片不能忽略。'),
++('838c48',1):('PARTIAL','YES','顶部C部分采用，蓝腿仍落在另一些灰支撑内部，侧壳倾斜。','顶部和对应腿部关系合理，围绕组合C完成主体。','USER后处理没有明显毁掉宏观关系。'),
++('5dda4e',0):('NO','NO','灰座面在C下方，蓝座板上浮。','增加靠背但灰座面仍远低于C，蓝C不能自然成为座面。','USER支脚出现明显三角缺口；后处理未恢复座面用途。'),
++('5dda4e',1):('NO','NO','灰座面在C上方，C没有被采用为座面。','灰座面低于C，C位于高处；错层方向改变但未解决。','USER腿/支撑变细，部分只剩短条。'),
++('9d5608',0):('UNCERTAIN','PARTIAL','薄C位于靠背上沿附近，局部是否真正参与结构不能仅凭图确认。','蓝色薄顶条与灰背板上沿之间可见间隔。','USER细腿变薄；薄顶条语义有歧义，不按来源款式唯一判定。'),
++('9d5608',1):('PARTIAL','PARTIAL','灰双层箱形主体在C附近，C不明显成为预登记靠背上沿。','蓝顶条位于灰靠背上方，仍有可见间隔。','没有足够视觉证据升级为明确采用；不把不同款式本身判坏。'),
++('2d1e5',0):('NO','NO','灰箱形主体包住蓝L形支撑，C没有成为主体的外侧支撑。','同样出现包住C的灰箱壳，C处于主体内部。','箱形款式本身允许；问题是蓝支撑与主体的空间关系。'),
++('2d1e5',1):('NO','NO','较高灰靠背及灰座面与蓝L支撑错位。','蓝L形C仍在灰主体上部/内部，未合理参与支撑。','后处理没有修复宏观错位。'),
++('f495bd',0):('PARTIAL','PARTIAL','蓝座板上方/下方存在另层灰座板，蓝中腿没有被合理利用。','RAW座面较靠近C，但仍有重层，蓝中腿未与灰主体协调。','USER灰座面和中部支撑在D0后明显变薄/丢失，最终主要剩C与端片。'),
++('f495bd',1):('PARTIAL','PARTIAL','灰条跨过蓝上表面，蓝中腿未清楚接入主体。','顶部有部分采用，但中央蓝腿和非对称灰支撑未协调。','两模型均变薄；USER仍有非对称附加支撑。'),
++}
++
++def note(q):
++    return next(v for (prefix,n),v in OBS.items() if q['parent_id'].startswith(prefix) and int(q['noise_index'])==n)
++
++def main():
++    requests=read(OUT/'evaluation_inputs/manifest.json')['requests'];d=OUT/'visual_review';rr=[]
++    for q in requests:
++        rid=q['request_id'];a,b,c,u,cost=note(q);im=OUT/'gallery_full/main'/f'{rid}.png'
++        assert im.exists()
++        for label,adoption,explanation in [('COMMON',a,c),('USER',b,u)]:
++            for stage in ('RAW','CLEAN_FINAL_POST'):
++                compromised=label=='USER' and stage=='CLEAN_FINAL_POST' and (rid.startswith('943dde') and int(q['noise_index'])==1 or rid.startswith('f495bd') and int(q['noise_index'])==0)
++                rr.append(dict(request_id=rid,parent_id=q['parent_id'],part=q['part_type'],split=q['split'],noise_index=q['noise_index'],label=label,stage=stage,
++                    reviewer='AI_PROXY',blind=False,review_session_date='2026-10-22',C_adoption=adoption,
++                    body_completeness='COMPROMISED' if compromised else 'BROADLY_PRESENT_WITH_LOCAL_DEFECTS',
++                    observation=explanation,stage_note=cost if stage!='RAW' else '用途与位置按RAW单独评阅；不由POST合法边倒推。',
++                    exact_connectivity='NOT_CERTIFIED_BY_IMAGE',image=str(im.relative_to(OUT)),image_sha256=sha(im)))
++    assert len(rr)==64
++    csvwrite(d/'main.csv',rr)
++    oracle=[];continuation=[]
++    for q in requests:
++        if q['split']!='CURRENT_TRAIN':continue
++        rid=q['request_id'];adoption=note(q)[1];im=OUT/'gallery_full/oracle'/f'{rid}.png'
++        exact=rid.startswith('943dde')
++        oracle.append(dict(request_id=rid,reviewer='AI_PROXY',blind=False,production_adoption=adoption,source_layout_adoption=adoption,
++            source_layout_same=exact,observation='布局相同，复用同一RAW；不计新增生成。' if exact else '增加/改变橙色seam和局部侧面，没有新增宏观明确采用请求；来源布局不是可部署结果。',
++            image=str(im.relative_to(OUT)),image_sha256=sha(im)))
++        im=OUT/'gallery_full/continuation'/f'{rid}.png'
++        for t in (.5,.8,.94):
++            continuation.append(dict(request_id=rid,start_t=t,reviewer='AI_PROXY',blind=False,
++                start_observation={.5:'已有目标信息，但角点仍明显噪声分裂。',.8:'主体已经可辨，仍有噪声扭曲。',.94:'主体与C关系已接近来源，细条仍有扰动。'}[t],
++                end_observation='座背/支撑/组合的宏观关系维持或恢复；局部条纹、缝隙仍有，不认证无相交或拓扑完整。',
++                new_macro_collapse_observed=False,source_informed=True,generation_success='NA_SOURCE_INFORMED',
++                image=str(im.relative_to(OUT)),image_sha256=sha(im)))
++    csvwrite(d/'source_layout.csv',oracle);csvwrite(d/'continuation.csv',continuation)
++    stage_notes={
++        '35948e':'RAW已出现灰座面高于蓝C。D0移动C但未消除错层，恢复C使间隔重新显露；不能归因于GEO单一步骤。',
++        '943dde':'n1的C处于座下。COMMON仍保持较完整灰主体；USER的灰座面/细腿在D0提议阶段已明显变薄，PRE/GEO没有恢复。',
++        '5dda4e':'RAW已经错层。USER在D0提议中支脚出现缺口/变薄，后续保留；COMMON同样未解决C用途。',
++        'f495bd':'RAW已有重层和中腿关系问题。USER的座板/中部灰支撑在D0提议阶段明显收缩；恢复C后蓝表面重新出现，不能误算为灰bulk恢复。'
++    }
++    stages=[]
++    for q in requests:
++        key=next((k for k in stage_notes if q['parent_id'].startswith(k)),None)
++        if key is None or int(q['noise_index'])!=(1 if key=='943dde' else 0):continue
++        for label in LABELS:
++            im=OUT/'gallery_full'/label/(q['request_id']+'.png')
++            stages.append(dict(request_id=q['request_id'],label=label,reviewer='AI_PROXY',blind=False,
++                stages='RAW|D0_PROPOSAL|PRE_GEO|GEO|FINAL',observation=stage_notes[key],
++                selection='targeted stage attribution after full RAW/FINAL review; not a prevalence sample',
++                image=str(im.relative_to(OUT)),image_sha256=sha(im)))
++    assert len(stages)==8
++    csvwrite(d/'targeted_stages.csv',stages)
++    save(d/'complete.json',dict(status='COMPLETE',reviewer='AI_PROXY_NONBLIND',main_cells=64,main_pages=16,
++        oracle_pages=8,continuation_pages=8,continuation_pairs=24,targeted_stage_pages=8,
++        total_distinct_reviewed_pages=40,rendered_pages=64,
++        caveat='C adoption is a conservative qualitative relation label, not exact shared-edge certification. Metadata part names are not generator inputs; alternative plausible uses and cap ambiguity stay PARTIAL/UNCERTAIN. No unique-source style score.',
++        files={str(p):sha(p) for p in d.glob('*.csv')}))
++    print('Recorded64 main cells,8 layout comparisons,24 continuation pairs,8 targeted stage pages; no model calls.')
++
++if __name__=='__main__':main()
+--- /dev/null
++++ r2/pilots/bench_trajectory_diagnostic_v1/stages.py (final)
+@@ -0,0 +1,45 @@
++"""Read-only continuous-stage pair accounting and GEO face survival."""
++import os
++os.environ['CUDA_VISIBLE_DEVICES']=''
++from .common import *
++import numpy as np,concurrent.futures,multiprocessing,collections
++from r2.tools.hinge_opposite_v1 import engine as H
++from r2.pilots.seam_followup_v1.binding import ILLEGAL
++
++def area(tri):return np.linalg.norm(np.cross(tri[:,1]-tri[:,0],tri[:,2]-tri[:,0]),axis=1)/2
++
++def one(job):
++    label,q=job;rid=q['request_id'];dest=OUT/'stage_audit'/label/rid;done=dest/'complete.json'
++    if done.exists():return read(done)
++    base=OUT/'evaluation'/label/rid;raw=arrays(base/'raw/raw.npz');k=q['K'];d=arrays(base/'post/proposal.npz')['official_unconstrained_proposal'];p=arrays(base/'post/pre_geo.npz')['output']
++    rows=[];scans={};keys={}
++    for stage,x in [('RAW',raw['raw']),('D0_PROPOSAL',d),('PRE_GEO',p)]:
++        path=dest/(stage+'_pairs.json')
++        if path.exists():scan=read(path)
++        else:scan=H.scan(x,k);save(path,scan)
++        scans[stage]=scan;keys[stage]={kind:{tuple(r['pair']) for r in v['contacts'] if r['classification'] in ILLEGAL} for kind,v in scan.items()}
++        row=dict(label=label,request_id=rid,split=q['split'],part=q['part_type'],stage=stage,free_faces=len(x)-k,free_area=float(area(x[k:]).sum()),C_corner_RMS_displacement=float(np.sqrt(np.mean((x[:k]-raw['raw'][:k])**2))))
++        for kind in ('CF','FF'):
++            affected=set()
++            for i,j in keys[stage][kind]:affected.update((i,j) if kind=='FF' else (j,))
++            row[kind+'_illegal_pairs']=len(keys[stage][kind]);row[kind+'_affected_free_count']=len(affected);row[kind+'_affected_free_fraction']=len(affected)/(len(x)-k)
++        rows.append(row)
++    transitions=[]
++    for a,b in [('RAW','D0_PROPOSAL'),('D0_PROPOSAL','PRE_GEO')]:
++        for kind in ('CF','FF'):
++            transitions.append(dict(label=label,request_id=rid,split=q['split'],part=q['part_type'],transition=a+'->'+b,kind=kind,old=len(keys[a][kind]),new=len(keys[b][kind]),retained=len(keys[a][kind]&keys[b][kind]),removed=len(keys[a][kind]-keys[b][kind]),added=len(keys[b][kind]-keys[a][kind])))
++    geo=read(base/'post/geometry.json');fr=[]
++    for rec in geo['face_records']:
++        if rec['known']:continue
++        i=rec['source_face_id'];r=dict(label=label,request_id=rid,split=q['split'],part=q['part_type'],**rec,role='SEAM' if raw['raw_seam_slot_mask'][i] else 'BULK',RAW_area=float(area(raw['raw'][i:i+1])[0]),D0_area=float(area(d[i:i+1])[0]),PRE_GEO_area=float(area(p[i:i+1])[0]));fr.append(r)
++    csvwrite(dest/'stage_pairs.csv',rows);csvwrite(dest/'pair_transitions.csv',transitions);csvwrite(dest/'GEO_face_survival.csv',fr)
++    r=dict(status='COMPLETE',rows=rows,transitions=transitions,faces=fr,model_calls=0,mesh_edits=0,definition='Original exact finite triangle detector; D0 CF uses moving D0 C and is diagnostic only. Same RAW slots paired within request; no cross-model face match.');save(done,r);return r
++
++def main():
++    qs=read(OUT/'evaluation_inputs/manifest.json')['requests'];dest=OUT/'stage_audit';done=dest/'complete.json'
++    if done.exists():return
++    save(dest/'resources.json',resources());tick=time.perf_counter()
++    with concurrent.futures.ProcessPoolExecutor(max_workers=2,mp_context=multiprocessing.get_context('spawn')) as pool:rr=list(pool.map(one,[(l,q) for l in LABELS for q in qs]))
++    for name,key in [('continuous_stage_pairs','rows'),('pair_transitions','transitions'),('GEO_face_survival','faces')]:csvwrite(dest/(name+'.csv'),[r for a in rr for r in a[key]])
++    save(done,dict(status='COMPLETE',requests=len(rr),seconds=time.perf_counter()-tick,model_calls=0,workers=2,files={str(p):sha(p) for p in dest.glob('*.csv')}));print('STAGE_AUDIT_COMPLETE',len(rr))
++if __name__=='__main__':main()
+--- /dev/null
++++ r2/pilots/bench_trajectory_diagnostic_v1/summaries.py (final)
+@@ -0,0 +1,57 @@
++"""Deterministic summary tables and scientific plots from saved numeric evidence."""
++from .common import *
++import numpy as np,collections
++import matplotlib
++matplotlib.use('Agg')
++import matplotlib.pyplot as plt
++
++def main():
++    d=OUT/'analysis_full';dest=d/'summaries';dest.mkdir(parents=True,exist_ok=True)
++    def load_csv(path):
++        rr=list(csv.DictReader(path.open(encoding='utf-8-sig')))
++        for r in rr:
++            for k,v in r.items():
++                try:r[k]=float(v)
++                except (ValueError,TypeError):pass
++        return rr
++    def group(rr,keys,vals):
++        b=collections.defaultdict(list)
++        for r in rr:b[tuple(r[k] for k in keys)].append(r)
++        return [{**dict(zip(keys,k)),**{v:float(np.mean([r[v] for r in rows])) for v in vals}} for k,rows in sorted(b.items())]
++    f=load_csv(d/'fixed_state_paired.csv');fixed=group(f,['t','region'],['COMMON_MSE','USER_MSE'])
++    for r in fixed:r.update(ratio=r['USER_MSE']/r['COMMON_MSE'],improved_requests=sum(x['t']==r['t'] and x['region']==r['region'] and x['delta_MSE']<0 for x in f))
++    csvwrite(dest/'fixed_by_time.csv',fixed)
++    pf=group(f,['parent_id','part','region'],['COMMON_MSE','USER_MSE'])
++    for r in pf:r['ratio']=r['USER_MSE']/r['COMMON_MSE']
++    csvwrite(dest/'fixed_by_parent.csv',pf)
++    a=load_csv(d/'fixed_state_full.csv');p=group(a,['label','t'],[c for c in a[0] if c.endswith('derivative') or c.endswith('split_mse')]);csvwrite(dest/'projection_by_time.csv',p)
++    z=load_csv(d/'continuation_start_end.csv')
++    for r in z:r['free_area_ratio']=r['free_area']/r['source_free_area']
++    vals=['endpoint_reference_mse','all_split_mse','tip_split_mse','bulk_split_mse','edge_ratio_median','edge_below_half_fraction','area_ratio_median','area_below_quarter_fraction','source_normal_flip_fraction','free_area_ratio']
++    cont=group(z,['start_t','stage'],vals);csvwrite(dest/'continuation_by_start.csv',cont)
++    r=load_csv(d/'response_paired.csv');resp=group(r,['split','t','region'],['COMMON_response','USER_response','response_direction_cosine']);csvwrite(dest/'response_by_time.csv',resp)
++    w=load_csv(OUT/'weights/functional/delta_W_h.csv');ww=group(w,['label','module'],['base_output_RMS','delta_output_RMS','delta_over_base']);csvwrite(dest/'functional_by_module.csv',ww)
++    fig,ax=plt.subplots(2,3,figsize=(15,8));colors={'COMMON':'#777777','USER':'#166da2'}
++    for i,region in enumerate(('all','bulk','tip')):
++        part=[r for r in fixed if r['region']==region]
++        for label in LABELS:ax[0,i].plot([r['t'] for r in part],[r[label+'_MSE'] for r in part],'o-',label=label,color=colors[label]);ax[0,i].set_yscale('log')
++        ax[0,i].set_title('Fixed train state: '+region+' velocity MSE');ax[0,i].set_xlabel('t');ax[0,i].legend()
++        for label in LABELS:
++            part=[r for r in p if r['label']==label];ax[1,i].plot([r['t'] for r in part],[r[region+'_split_derivative'] for r in part],'o-',label=label,color=colors[label])
++        ax[1,i].plot([r['t'] for r in part],[r['truth_'+region+'_split_derivative'] for r in part],'k--',label='paired target velocity');ax[1,i].axhline(0,c='gray',lw=.5);ax[1,i].set_title('Source-copy split derivative: '+region);ax[1,i].set_xlabel('t');ax[1,i].legend()
++    fig.suptitle('8 current TRAIN requests; exact same states and transported source identities');fig.tight_layout();fig.savefig(dest/'fixed_and_projection.png',dpi=160);plt.close(fig)
++    fig,ax=plt.subplots(1,3,figsize=(14,4))
++    for i,(key,title) in enumerate([('all_split_mse','Same-source corner split MSE'),('edge_ratio_median','Median edge / source edge'),('free_area_ratio','Total free area / source area')]):
++        for t in manifest()['continuations']:
++            rr={r['stage']:r for r in cont if r['start_t']==t};ax[i].plot([0,1],[rr['START'][key],rr['END'][key]],'o-',label=f'start {t}')
++        ax[i].set_xticks([0,1],['START','END']);ax[i].set_title(title);ax[i].legend()
++    ax[0].set_yscale('log');fig.suptitle('USER continuation: source-informed states; not generation success');fig.tight_layout();fig.savefig(dest/'continuation.png',dpi=160);plt.close(fig)
++    fig,ax=plt.subplots(1,2,figsize=(10,4))
++    for i,split in enumerate(('CURRENT_TRAIN','DEV')):
++        for label in LABELS:
++            for region,ls in [('bulk','-'),('tip','--')]:
++                rr=[r for r in resp if r['split']==split and r['region']==region];ax[i].plot([r['t'] for r in rr],[r[label+'_response'] for r in rr],'o'+ls,label=label+' '+region,color=colors[label])
++        ax[i].set_title(split);ax[i].set_xlabel('Common rollout state t');ax[i].set_ylabel('RMS velocity difference / RMS C difference');ax[i].legend()
++    fig.suptitle('C-only x scaling +/-2%; fixed free states and layout; larger is not better');fig.tight_layout();fig.savefig(dest/'condition_response.png',dpi=160);plt.close(fig)
++    for title,rr in [('FIXED',fixed),('CONTINUATION',cont),('RESPONSE',resp),('FUNCTIONAL',ww)]:print(title,json.dumps(rr))
++if __name__=='__main__':main()

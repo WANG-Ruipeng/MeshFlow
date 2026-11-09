@@ -1,0 +1,19 @@
+# Independent confirmation decision
+
+Decision recorded prospectively, after all main and curriculum scores and full visual reviews were completed: execute exactly one independent-input repeat of C20_40_MIX (candidate) versus R2_MIX_H_ALL (matched control). Each receives 6000 updates from the same official Chair EMA and Geo1010 initialization, with a fresh AdamW state and H_ALL lambda=0.25. This is not promotion or a default change.
+
+Selection evidence: relative to R2, C20_40_MIX lowers mean FF affected-free fraction by 1.0872 pp at C20 and 0.6539 pp at C40, with each ALL-eight leave-one-parent-out mean remaining negative. C40 small-angle fraction falls 0.8782 pp, improving 7/8 parents and all original six. C40 CF mean falls 0.4003 pp. The opposite curriculum has more widespread C40 CF/FF/I costs. Full images do not show universal visual dominance, but support testing the candidate rather than selecting on one score.
+
+Counterevidence remains part of the decision: candidate I rises 0.5753 pp at C20 and 0.1175 pp at C40 versus R2; C20 expanded-two CF/I both worsen, and original-six D_free falls 28.2%, which is a variation diagnostic, not a collapse verdict. C40 FF remains 0.7669 pp above START and 0.5069 pp above HIST. Local hanging sheets, layering and sharp fragments remain visible. No metric or difficult parent is excluded.
+
+Hypothesis: with an independent paired training-input stream, the 20->40->MIX order retains the C40 small-angle and FF improvements over simultaneous MIX, without consistent degradation of C compatibility, recognizable complete shapes or within-condition variation. All frozen metrics, strata, per-parent/noise tails and complete images remain decision evidence. No new favorable-only composite, significance threshold or retrospective numerical adoption gate is introduced.
+
+Training stream namespace: CHAIR_CONDITION_RECIPE_FACTORIAL_V1/confirmation/input_repeat1. Build fresh selected-pair inputs and OT maps, not historical cache substitution. Candidate/control share the new fixed multiset and exact final 2000-update suffix. Equal update count and sample multiset do not imply equal per-update free denominators. The new stream is an independent stochastic training-input repeat, not a new initialization seed.
+
+Evaluation: same frozen 16 C conditions / eight previously observed DEV parents, at C20 and C40, using registered noise n8,n9,n10,n11 under confirmation_noise/v1. These noises were not used for selection; C and parents were, so this tests new-noise repeatability, not new-condition or unseen-parent generalization. Exactly 64 outputs per method, 128 new Euler50 rollouts (6400 forwards). All RAWs precede scoring/rendering. Compare methods within this new panel; do not pair old n0/n1/n6/n7 outputs to new noises as identical requests. No extra START/HIST sampling.
+
+Execution ceiling after this repeat: 42000 new training updates and 640 scored output cells in this task (72 main cells reuse existing RAW). This confirmation adds 12000 updates, 96000 forwards/backwards and 128 rollouts. Existing global failure/OOM allowance and accounting remain authoritative; no scientific settings change or silent retry. At most two measured GPU workers, incrementally dispatched after resources and representative first updates are checked.
+
+Protocol limits stay prominent: differing C20/C40 candidate-selection policies mean the initial ratio-only construction requirement was NOT_SATISFIED. The curriculum comparison matches a shared pool/multiset and tests ordering, but cannot repair that deviation. H_ALL versus H_LATE also differs in total hybrid exposure. Training support stays the same 26 parents.
+
+No B, teacher, readout, auxiliary loss, solver scan, postprocessing, changed default, Git commit/push or additional curriculum. After this one repeat, complete the report and compact evidence ZIP and stop, regardless of result.

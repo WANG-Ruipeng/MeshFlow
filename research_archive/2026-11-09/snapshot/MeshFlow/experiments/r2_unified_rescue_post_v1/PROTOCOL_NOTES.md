@@ -1,0 +1,17 @@
+# Unified rescue CPU protocol
+
+This run uses 140 saved RAW/D0 proposals: Bench SEAM_S15000 and SEAM_S21000 (48 each), Chair S2000 BACK (16), and Chair PLAIN_S2000 SEAT (28). It loads no model, creates no noise/query bank, and never changes an old mesh, scorer, report, or default.
+
+The fixed engineering radius is 0.04197095609837992 model units. For a free face whose RAW shortest edge is at least 1.5 radii and whose hard-anchor-restored D0 shortest edge is below 1.25 radii, all three quadratic edge constraints determine the first entry into the forbidden short-edge interval. One alpha is applied to that face's RAW-to-D0 residual. This preserves the whole continuous safe prefix; a later feasible endpoint is not accepted after an earlier forbidden interval. A double root is a tangency, not entry. FP32 writeback moves alpha inward only if required to keep the threshold after rounding.
+
+RAW faces whose longest edge exceeds 3 radii and shortest exceeds 1 radius receive the independent anti-collapse guard. The original GEO order, nearest representative/ties, radius, cleanup and source maps are kept. A merge is rejected if another corner of the same protected face currently occupies the proposed cluster. Unvisited exact corner coordinates are reserved too. Previously coincident input corners and existing collinearity are not fabricated apart.
+
+The resulting GEO is exported using original C winding and fixed-C free orientation. Every retained hard C/seam corner must share its correct C index. Then exactly one original HINGE_OPP015, one original finite ALPHA pass, and one original exact-cycle HOLE pass run. Their candidate records remain separate. Their safeguards do not retrospectively guarantee that the preceding D0/GEO guards preserved every old edge or avoided every new collision; those costs are measured explicitly.
+
+Two full new scores are saved per request: GUARD_GEO and FINAL. Original 135 fields remain present; the existing 179-field bridge-aware scorer supplies its unchanged extension. Baseline values are read from old score caches; unavailable bridge extensions on historical 135-field rows stay NA. No new definition of FF, CF or I is introduced. I remains C-query conflict coverage, not the number of newly illegal face pairs.
+
+OLD_BASE→GUARD_GEO isolates the two guards jointly. OLD_FINAL→FINAL compares the actual deployed chains: Chair's old final already had HINGE+ALPHA+HOLE; Bench's old final had HINGE only. The Bench comparison therefore does not isolate only the guards. Closed C boundary/seam measures are NA, not automatic success or zero failure. Summaries average noises, then conditions, then parents within each panel; distinct categories/checkpoints are not pooled into one causal score.
+
+An initial CPU implementation attempt is preserved in `engineering_attempt_00`: six requests started, four completed, two partially executed; ten full scores were saved. It exposed the prospective-corner reservation case. This was corrected and verified with a dedicated synthetic fixture, alongside all-array original-GEO equivalence when the guard is disabled. The fixed 140 requests are evaluated again under the corrected frozen registration. This is disclosed CPU engineering work; there were no model, D0 or noise retries.
+
+Do not infer Chair is unchanged, that the filter guarantees overall quality, or that fewer deleted faces proves a surface is better. Keep old and new meshes, raw-slot edge fates, illegal face-pair identities, area, thin triangles, C identity, and graph applicability together.

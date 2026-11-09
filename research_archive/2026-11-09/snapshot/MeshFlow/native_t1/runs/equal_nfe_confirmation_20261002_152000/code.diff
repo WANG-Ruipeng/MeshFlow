@@ -1,0 +1,2347 @@
+diff --git a/experiments/mf_h1_local0/equal_nfe_confirmation/dispatch.py b/experiments/mf_h1_local0/equal_nfe_confirmation/dispatch.py
+new file mode 100644
+--- /dev/null
++++ b/experiments/mf_h1_local0/equal_nfe_confirmation/dispatch.py
+@@ -0,0 +1,97 @@
++"""Measured-resource coordinator; one locked GPU worker, independent CPU scorers."""
++from pathlib import Path
++import argparse, json, math, os, subprocess, sys, time
++
++ROOT=Path(__file__).resolve().parents[3]
++PREFIX='experiments.mf_h1_local0.equal_nfe_confirmation.'
++
++def read(path):return json.loads(Path(path).read_text())
++def write(path,value):
++    path=Path(path);tmp=path.with_suffix('.json.tmp');tmp.write_text(json.dumps(value,indent=2,allow_nan=False)+'\n');os.replace(tmp,path)
++def resources():
++    mem={s.split(':')[0]:int(s.split(':')[1].strip().split()[0])*1024 for s in Path('/proc/meminfo').read_text().splitlines() if s.startswith(('MemTotal:','MemAvailable:'))}
++    def cmd(args):
++        p=subprocess.run(args,capture_output=True,text=True);return dict(returncode=p.returncode,stdout=p.stdout.strip(),stderr=p.stderr.strip())
++    return dict(timestamp=time.time(),cpu_affinity=len(os.sched_getaffinity(0)),load=list(os.getloadavg()),memory=mem,
++        gpu=cmd(['nvidia-smi','--query-gpu=name,memory.total,memory.used,memory.free,utilization.gpu','--format=csv,noheader,nounits']),
++        processes=cmd(['nvidia-smi','--query-compute-apps=pid,process_name,used_memory','--format=csv']))
++
++def run(out):
++    out=Path(out).resolve();protocol=read(out/'registration/protocol.json')
++    dest=out/'dispatch.json'
++    if dest.exists():raise FileExistsError('No automatic dispatch replay')
++    logs=out/'logs';logs.mkdir(exist_ok=True)
++    env=os.environ.copy();env.update(CUBLAS_WORKSPACE_CONFIG=':4096:8',OMP_NUM_THREADS='1',MKL_NUM_THREADS='1',OPENBLAS_NUM_THREADS='1',NUMEXPR_NUM_THREADS='1',PYTHONDONTWRITEBYTECODE='1',PYTHONUNBUFFERED='1')
++    state=dict(status='RUNNING',started_timestamp=time.time(),GPU_max_workers=1,CPU_max_observed=0,events=[],CPU_workers=[],GPU_groups=[],failure=None,
++        timing_note='CPU process seconds overlap GPU and other CPU tasks; never sum as user wait. Dispatch wall is end-to-end orchestration only.')
++    running=[];pending=[];cpu_peak=0;cpu_completed=0;tick=time.perf_counter()
++    def cpu_poll():
++        nonlocal cpu_peak,cpu_completed
++        for item in list(running):
++            p=item['process'];rec=item['record']
++            try:
++                status=Path(f'/proc/{p.pid}/status').read_text()
++                for ln in status.splitlines():
++                    if ln.startswith(('VmHWM:','VmRSS:')):rec['peak_process_RSS_bytes']=max(rec['peak_process_RSS_bytes'],int(ln.split()[1])*1024)
++            except FileNotFoundError:pass
++            code=p.poll()
++            if code is not None:
++                rec.update(exit_code=code,wall_seconds=time.perf_counter()-item['tick'],completed_timestamp=time.time())
++                item['log'].close();running.remove(item);cpu_peak=max(cpu_peak,rec['peak_process_RSS_bytes']);cpu_completed+=1
++                state['events'].append(dict(kind='CPU_complete',group_id=rec['group_id'],resources=resources()))
++                print('CPU_COMPLETE',rec['group_id'],'exit',code,flush=True)
++        if not pending:return
++        snap=resources();cores=snap['cpu_affinity'];available_cores=max(0,math.floor(cores-snap['load'][0]-2))
++        memory_slots=max(0,math.floor((snap['memory']['MemAvailable']-4*1024**3)/(1.2*max(cpu_peak,256*1024**2))))
++        slots=min(1-len(running),available_cores,memory_slots) if not cpu_completed else min(available_cores,memory_slots)
++        # Unknown process peak: observe one already-authorized scoring group.
++        if not cpu_completed and running:slots=0
++        if pending and slots>0:
++            group=pending.pop(0);log=(logs/(group+'_score.log')).open('x')
++            rec=dict(group_id=group,started_timestamp=time.time(),peak_process_RSS_bytes=0,resource_before=snap,threads=1,observed_prior_peak_RSS_bytes=cpu_peak)
++            process=subprocess.Popen([sys.executable,'-B','-m',PREFIX+'evaluation','--out',str(out),'--group',group],cwd=ROOT,env=env,stdout=log,stderr=subprocess.STDOUT)
++            rec['pid']=process.pid;running.append(dict(process=process,record=rec,log=log,tick=time.perf_counter()));state['CPU_workers'].append(rec)
++            state['CPU_max_observed']=max(state['CPU_max_observed'],len(running));slots-=1
++            print('CPU_START',group,'concurrency',len(running),flush=True)
++            # Remeasure before each added CPU process.
++            snap=resources()
++        write(dest,state)
++    try:
++        for group in protocol['groups']:
++            gid=group['group_id'];snap=resources()
++            while True:
++                values=snap['gpu']['stdout'].splitlines()[0].split(',')
++                total,free=float(values[1]),float(values[3])
++                if free>=max(2048,total*.1)+1536:break
++                state['events'].append(dict(kind='GPU_resource_wait',group_id=gid,resources=snap))
++                print('GPU_RESOURCE_WAIT',gid,flush=True)
++                cpu_poll();write(dest,state);time.sleep(5);snap=resources()
++            rec=dict(group_id=gid,resource_before=snap,started_timestamp=time.time())
++            log=(logs/(gid+'_gpu.log')).open('x')
++            process=subprocess.Popen([sys.executable,'-B','-m',PREFIX+'worker','--out',str(out),'--group',gid],cwd=ROOT,env=env,stdout=log,stderr=subprocess.STDOUT)
++            rec['pid']=process.pid;state['GPU_groups'].append(rec);write(dest,state);start=time.perf_counter()
++            print('GPU_START',gid,flush=True)
++            while process.poll() is None:
++                cpu_poll();write(dest,state);time.sleep(.5)
++            log.close();rec.update(exit_code=process.returncode,wall_seconds=time.perf_counter()-start,resource_after=resources())
++            print('GPU_COMPLETE',gid,'exit',process.returncode,flush=True)
++            if any(t['kind']=='formal' for t in group['tasks']):pending.append(gid)
++            cpu_poll();write(dest,state)
++            if process.returncode!=0:
++                state['failure']=dict(group_id=gid,reason='GPU worker failed; no further GPU dispatch or retries')
++                break
++        while pending or running:
++            cpu_poll();write(dest,state);time.sleep(.5)
++        score_failed=[r['group_id'] for r in state['CPU_workers'] if r.get('exit_code')!=0]
++        state['status']='PASS' if state['failure'] is None and not score_failed else 'STOPPED'
++        state['CPU_failed_groups']=score_failed
++    except BaseException as e:
++        state['status']='STOPPED';state['failure']=repr(e);raise
++    finally:
++        state.update(wall_seconds=time.perf_counter()-tick,finished_timestamp=time.time(),CPU_peak_process_RSS_bytes=cpu_peak,resource_final=resources())
++        write(dest,state)
++    print(json.dumps(dict(status=state['status'],GPU_groups=len(state['GPU_groups']),CPU_groups=len(state['CPU_workers']),wall_seconds=state['wall_seconds'])),flush=True)
++    if state['status']!='PASS':raise SystemExit(1)
++
++if __name__=='__main__':
++    p=argparse.ArgumentParser();p.add_argument('--out',required=True);run(p.parse_args().out)
+diff --git a/experiments/mf_h1_local0/equal_nfe_confirmation/evaluation.py b/experiments/mf_h1_local0/equal_nfe_confirmation/evaluation.py
+new file mode 100644
+--- /dev/null
++++ b/experiments/mf_h1_local0/equal_nfe_confirmation/evaluation.py
+@@ -0,0 +1,346 @@
++"""Isolated, single-thread CPU scoring of registered Equal-NFE endpoints.
++
++The historical 54-scalar scorer is imported unchanged. Cross-condition rows
++reuse its two target remainder scores and add only fixed Gamma distances.
++No model, optimizer, OT, sampling, repair, or new topology audit is run here.
++"""
++from __future__ import annotations
++
++import os
++
++for _thread_variable in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
++                         "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
++    os.environ[_thread_variable] = "1"
++
++import argparse
++from pathlib import Path
++import sys
++import time
++import traceback
++
++import numpy as np
++
++from experiments.mf_h1_local0.jedge5_diagnosis.common import (
++    ROOT, EVALUATION_SHA, read_json, write_json, file_sha256,
++)
++from experiments.mf_h1_local0.jedge5_diagnosis.scoring import (
++    REFERENCE, banks_with_context_audit, reference_evaluator, score_one,
++)
++
++IDENTITY_FIELDS = ("task_id", "kind", "model", "solver", "parent", "patch", "seed")
++SOLVERS = ("Euler50", "Midpoint25", "E_quad50")
++
++
++def scalar_schema():
++    """Obtain the schema from the read-only scorer, without scoring geometry."""
++    ref = reference_evaluator()
++    blank_coverage = {str(t): None for t in ref.THRESHOLDS}
++    skeleton = dict(remainder=dict(own={}), whole=dict(surface={}),
++        edge_factorial_boundary=dict(surface=dict(coverage_by_bbox_fraction=blank_coverage),
++            edges=dict(RMS_bbox_pct=None, p95_bbox_pct=None, zero_length_edge_count=None,
++                       coverage_by_bbox_fraction=blank_coverage)))
++    result = ref.scalar_metrics(skeleton)
++    if len(result) != 54 or any(value is not None for value in result.values()):
++        raise ValueError("Frozen 54-scalar schema changed")
++    return result
++
++
++def _stem(value):
++    if not isinstance(value, str) or not value or any(x in value for x in ("/", "\\", "..")):
++        raise ValueError("Expected a single isolated filename stem")
++    return value
++
++
++def _sha_array(value):
++    from experiments.mf_h1_local0.native_inpainting_metrics import array_sha
++    return array_sha(value)
++
++
++def _source_identity():
++    files = [Path(__file__), REFERENCE / "evaluation.py", REFERENCE / "edge_metric.py"]
++    files.extend(ROOT / "experiments/mf_h1_local0" / filename for filename in (
++        "jedge5_diagnosis/scoring.py", "tgeo_m10_evaluation.py", "a_then_fc_evaluation.py",
++        "t1_gated_factorial_evaluation.py", "t1_native_confirmation_evaluation.py",
++        "guided_native_geometry_audit.py", "native_patch_metrics.py", "native_patch_seams.py",
++        "native_inpainting_metrics.py", "gpu_guidance_evaluation.py", "evaluate.py"))
++    return {str(path.relative_to(ROOT)): file_sha256(path) for path in files}
++
++
++def _normalized_area(free, length):
++    """Same arithmetic as archived shape_quality.total_area, without extra audit."""
++    normalized = np.asarray(free, dtype=np.float64).reshape(-1, 3, 3) / float(length)
++    area = .5 * np.linalg.norm(np.cross(normalized[:, 1] - normalized[:, 0],
++                                      normalized[:, 2] - normalized[:, 0]), axis=-1)
++    return float(area.sum() * length * length)
++
++
++def _fallback_metadata(free, length):
++    triangles = np.asarray(free, dtype=np.float64).reshape(-1, 3, 3)
++    normal = np.cross(triangles[:, 1] - triangles[:, 0], triangles[:, 2] - triangles[:, 0])
++    n2 = np.einsum("ti,ti->t", normal, normal)
++    fallback = n2 <= (2e-12 * length * length) ** 2
++    return dict(distance_fallback="Degenerate triangle interiors use their original finite edges",
++                fallback_triangle_count=int(fallback.sum()),
++                fallback_triangle_ids=np.flatnonzero(fallback).tolist(),
++                original_stable_normal_squared_threshold=float((2e-12 * length * length) ** 2))
++
++
++def _foreign_boundary(free, bank, target, patch, ledger):
++    """Apply unchanged boundary/edge formulas to a target's frozen Gamma only."""
++    from experiments.mf_h1_local0.guided_native_geometry_audit import point_to_triangle_surface_squared
++    ref = reference_evaluator()
++    edge_module = sys.modules["experiments.mf_h1_local0.jedge5_diagnosis.edge_metric"]
++    pre = f"parent{target}_patch{patch}_"
++    points = bank["arrays"][pre + "boundary_points"]
++    weights = bank["arrays"][pre + "boundary_weights"]
++    length = bank["cases_by_key"][target, 12]["bbox_diagonal"]
++    ledger["binding_foreign_Gamma_surface_calls_attempted"] = ledger.get("binding_foreign_Gamma_surface_calls_attempted", 0) + 1
++    squared = point_to_triangle_surface_squared(points, free, length)
++    if squared is None or not len(squared):
++        raise ValueError("Foreign target Gamma distance unavailable; no candidates is not zero")
++    distances = np.sqrt(squared)
++    order = np.argsort(distances, kind="stable")
++    cumulative = np.cumsum(weights[order])
++    position = min(int(np.searchsorted(cumulative, .95 * cumulative[-1], side="left")), len(order) - 1)
++    surface = dict(rms_bbox_pct=100 * float(np.sqrt(np.sum(weights * squared))) / length,
++                   p95_bbox_pct=100 * float(distances[order[position]]) / length,
++                   coverage_fraction=float(weights[distances < .001 * length].sum()))
++    coverage = {str(t): float(weights[distances < t * length].sum()) for t in ref.THRESHOLDS}
++    edge = edge_module.gamma_to_free_edges(free, points, weights, length, ledger=ledger)
++    edge_distances = np.asarray(edge["per_point_distances"], dtype=np.float64)
++    violations = edge_distances + ref.DISTANCE_ORDER_TOL_BBOX * length < distances
++    if bool(violations.any()):
++        raise ValueError("Foreign Gamma edge distance below surface beyond frozen tolerance")
++    ledger["binding_foreign_Gamma_surface_calls_returned"] = ledger.get("binding_foreign_Gamma_surface_calls_returned", 0) + 1
++    return surface, dict(surface=dict(coverage_by_bbox_fraction=coverage,
++                                     per_point_distances=distances.tolist()),
++        edges=edge, ordering=dict(status="PASS", violations=int(violations.sum()),
++            tolerance_bbox_fraction=ref.DISTANCE_ORDER_TOL_BBOX,
++            minimum_edge_minus_surface_bbox=float((edge_distances - distances).min() / length)),
++        fallback=_fallback_metadata(free, length))
++
++
++def cross_binding_rows(raw, metrics, bank, task, ledger):
++    """Target-indexed E_target(F_prediction); copied C never enters F."""
++    parent, patch = int(task["parent"]), int(task["patch"])
++    free = raw.reshape(112, 3, 3)[12:].astype(np.float64)
++    rows, detail = {}, {}
++    for target in (0, 1):
++        remainder = metrics["remainder"]["cross"][target]
++        common = metrics["common_unknown_R12"]["cross"][target]
++        if target == parent:
++            surface = metrics["guided_geometry_audit"]["boundary"]
++            extension = metrics["edge_factorial_boundary"]
++            ledger["binding_own_Gamma_scores_reused"] = ledger.get("binding_own_Gamma_scores_reused", 0) + 1
++        else:
++            surface, extension = _foreign_boundary(free, bank, target, patch, ledger)
++        ledger["binding_existing_remainder_scores_reused"] = ledger.get("binding_existing_remainder_scores_reused", 0) + 1
++        values = dict(remainder_symmetric_RMS_bbox_pct=remainder["symmetric_rms_bbox_pct"],
++            free_to_R12_RMS_bbox_pct=remainder["predicted_to_target_rms_bbox_pct"],
++            R12_to_free_RMS_bbox_pct=remainder["target_to_predicted_rms_bbox_pct"],
++            fixed_R12_coverage_RMS_bbox_pct=common["rms_bbox_pct"],
++            fixed_R12_coverage_within_1pct_fraction=common["fraction_target_points_within_1pct_bbox"],
++            boundary_RMS_bbox_pct=surface["rms_bbox_pct"], boundary_p95_bbox_pct=surface["p95_bbox_pct"],
++            boundary_coverage_fraction=surface["coverage_fraction"],
++            Gamma_to_free_edges_RMS_bbox_pct=extension["edges"]["RMS_bbox_pct"],
++            Gamma_to_free_edges_p95_bbox_pct=extension["edges"]["p95_bbox_pct"])
++        for name, source in (("Gamma_surface", extension["surface"]), ("Gamma_to_free_edges", extension["edges"])):
++            for threshold, value in source["coverage_by_bbox_fraction"].items():
++                values[f"{name}_coverage_{threshold}_fraction"] = value
++        pre = f"parent{target}_patch{patch}_"
++        identity = dict(target_bbox_diagonal=bank["cases_by_key"][target, 12]["bbox_diagonal"],
++            target_pairwise_points_sha256=_sha_array(bank["arrays"][pre + "pairwise_target_points"]),
++            target_coverage_points_sha256=_sha_array(bank["arrays"][pre + "coverage_points"]),
++            target_Gamma_points_sha256=_sha_array(bank["arrays"][pre + "boundary_points"]),
++            target_Gamma_weights_sha256=_sha_array(bank["arrays"][pre + "boundary_weights"]),
++            predicted_free_sha256=_sha_array(raw.reshape(112, 3, 3)[12:]), predicted_faces=100,
++            copied_C_included=False, region="Target's own R12 complement and fixed Gamma")
++        rows[str(target)] = dict(target_parent=target, prediction_parent=parent,
++            source_task_id=task["task_id"], status="PASS", metrics=values, identity=identity)
++        detail[str(target)] = dict(remainder=remainder, common_unknown_R12=common,
++            surface=surface, extension=extension,
++            fallback=_fallback_metadata(free, identity["target_bbox_diagonal"]))
++    return rows, detail
++
++
++def validate_endpoint(path, expected_sha, task, bank):
++    """Reject incomplete/altered trajectories before endpoint metrics are called."""
++    actual_sha = file_sha256(path)
++    if not expected_sha or actual_sha != expected_sha:
++        raise ValueError("Raw SHA256 missing or different from worker record")
++    with np.load(path, allow_pickle=False) as archive:
++        arrays = {key: archive[key].copy() for key in archive.files}
++    stage_key = "stage_states" if "stage_states" in arrays else "stages"
++    for key in ("raw", "states", "C", stage_key):
++        if key not in arrays:
++            raise ValueError("Missing trajectory field: " + key)
++        if arrays[key].dtype != np.float32 or not np.isfinite(arrays[key]).all():
++            raise ValueError("Nonfinite or non-FP32 trajectory field: " + key)
++    raw = arrays["raw"].reshape(112, 3, 3)
++    accepted = 26 if task["solver"] == "Midpoint25" else 51
++    states = arrays["states"].reshape(-1, 112, 3, 3)
++    stages = arrays[stage_key].reshape(-1, 112, 3, 3)
++    expected_C = bank["cases_by_key"][int(task["parent"]), 12]["constraints"]
++    if len(states) != accepted or len(stages) != 50:
++        raise ValueError("Incomplete trajectory: accepted/query counts differ")
++    if arrays["C"].reshape(12, 3, 3).tobytes() != expected_C.tobytes():
++        raise ValueError("Registered C identity differs")
++    if states[-1].tobytes() != raw.tobytes():
++        raise ValueError("Raw endpoint differs from final accepted state")
++    if any(x[:12].tobytes() != expected_C.tobytes() for x in np.concatenate((states, stages))):
++        raise ValueError("C changed in accepted or query state")
++    time_key = next((k for k in ("accepted_times_FP32", "accepted_times_control_FP64",
++                               "accepted_times", "control_times", "times") if k in arrays), None)
++    if time_key is None:
++        raise ValueError("Accepted endpoint time evidence absent")
++    times = arrays[time_key].reshape(-1)
++    if (len(times) != accepted or not np.isfinite(times).all() or float(times[0]) != 0.0
++            or float(times[-1]) != 1.0 or not np.all(np.diff(times) > 0)):
++        raise ValueError("Trajectory did not reach registered t=1 endpoint")
++    return raw, dict(status="PASS", raw_file_sha256=actual_sha,
++        raw_array_sha256=_sha_array(raw), C_array_sha256=_sha_array(expected_C),
++        predicted_free_sha256=_sha_array(raw[12:]), accepted_count=accepted,
++        query_stage_count=50, t_final=float(times[-1]), accepted_time_field=time_key,
++        known_slots=list(range(12)),
++        free_slots=list(range(12, 112)), C_preserved_all_accepted_and_query_states=True)
++
++
++def _registered_group(protocol, group_id):
++    groups = protocol["groups"]
++    if isinstance(groups, dict):
++        groups = [dict(value, group_id=key) for key, value in groups.items()]
++    selected = [group for group in groups if group["group_id"] == group_id]
++    if len(selected) != 1:
++        raise ValueError("Expected exactly one registered group: " + group_id)
++    tasks = selected[0]["tasks"]
++    ids = [task["task_id"] for task in tasks]
++    if len(set(ids)) != len(ids):
++        raise ValueError("Duplicate registered task ID")
++    for task in tasks:
++        _stem(task["task_id"])
++        if task["kind"] == "formal" and (task["model"] not in ("B", "J") or task["solver"] not in SOLVERS):
++            raise ValueError("Unknown formal model/solver")
++    return [task for task in tasks if task["kind"] == "formal"]
++
++
++def score_group(out, group_id):
++    import torch
++    torch.set_num_threads(1)
++    torch.set_num_interop_threads(1)
++    out = Path(out).resolve()
++    group_id = _stem(group_id)
++    result_path = out / "scores" / (group_id + ".json")
++    if result_path.exists():
++        raise FileExistsError("Scoring attempts are retained; refusing to overwrite " + str(result_path))
++    tick, cpu_tick = time.perf_counter(), time.process_time()
++    protocol_path = out / "registration/protocol.json"
++    tasks = _registered_group(read_json(protocol_path), group_id)
++    if not tasks:
++        raise ValueError("No formal tasks in registered group; regressions/repeats are not endpoint-scored")
++    worker_path = out / "workers" / (group_id + ".json")
++    worker = read_json(worker_path)
++    worker_rows = worker["rows"]
++    indexed = {row["task_id"]: row for row in worker_rows}
++    if len(indexed) != len(worker_rows):
++        raise ValueError("Duplicate worker task row")
++    result = dict(schema="equal_nfe_cpu_scores_v1", status="RUNNING", group_id=group_id,
++        rows=[], requested_count=len(tasks), ledger={}, model_forwards=0, OT_calls=0,
++        additional_intersection_scans_for_binding=0, topology_certification="NOT_RUN",
++        exact_predicate_certification="NOT_RUN", CPU_threads=1,
++        protocol_sha256=file_sha256(protocol_path), worker_sha256=file_sha256(worker_path),
++        evaluation_inputs_sha256=EVALUATION_SHA, metric_source_sha256=_source_identity())
++    write_json(result_path, result)
++    banks_tick = time.perf_counter()
++    banks = banks_with_context_audit(out)
++    result["bank_load_and_identity_seconds"] = time.perf_counter() - banks_tick
++    schema = scalar_schema()
++    for task in tasks:
++        task_id = task["task_id"]
++        detail_path = out / "scores" / (task_id + ".json")
++        if detail_path.exists():
++            raise FileExistsError(detail_path)
++        row = dict(task, status="NOT_SCORED", sampling_status=None, scalars54=dict(schema),
++            derived={}, cross_binding={}, score_path=str(detail_path.relative_to(out)))
++        detail = dict(row=row, metrics=None, cross_binding_details=None, ledger={})
++        row_tick, row_cpu = time.perf_counter(), time.process_time()
++        stage = "worker_identity"
++        try:
++            source = indexed.get(task_id)
++            if source is None:
++                row["status"] = "NOT_SCORED_MISSING_WORKER"
++            else:
++                row["sampling_status"] = source.get("status")
++                row["sampling"] = source
++                for key in IDENTITY_FIELDS:
++                    if source.get(key) != task.get(key):
++                        raise ValueError("Worker task identity differs: " + key)
++                if source.get("status") != "PASS":
++                    row["status"] = "NOT_SCORED_SAMPLING_FAILURE"
++                else:
++                    raw_path = reference_evaluator()._path(source.get("path") or source.get("raw_path") or f"raw/{task_id}.npz")
++                    if not raw_path.is_absolute():
++                        raw_path = out / raw_path
++                    raw_path = raw_path.resolve()
++                    raw_path.relative_to((out / "raw").resolve())
++                    row["raw_path"] = str(raw_path.relative_to(out))
++                    row["raw_sha256"] = source.get("sha256") or source.get("raw_sha256")
++                    stage = "endpoint_validation"
++                    raw, row["raw_identity"] = validate_endpoint(raw_path, row["raw_sha256"], task, banks[int(task["patch"])])
++                    stage = "original_54_metrics"
++                    detail["ledger"]["original_endpoint_scores_attempted"] = 1
++                    metrics, scalars = score_one(raw, banks[int(task["patch"])], int(task["parent"]), int(task["patch"]), detail["ledger"])
++                    detail["metrics"] = metrics
++                    if set(scalars) != set(schema):
++                        raise ValueError("Original scalar schema changed")
++                    row["scalars54"] = scalars
++                    detail["ledger"]["original_endpoint_scores_returned"] = 1
++                    bank = banks[int(task["patch"])]
++                    case = bank["cases_by_key"][int(task["parent"]), 12]
++                    area = metrics["t1_native_confirmation"]["free_shape_quality"]["total_area"]
++                    gt_area = _normalized_area(case["free_target"], case["bbox_diagonal"])
++                    row["derived"] = dict(free_total_area=area, GT_free_total_area=gt_area,
++                        free_area_over_GT_free_area=area / gt_area if gt_area > 0 else None,
++                        formula="Original shape_quality FP64 bbox-normalized area arithmetic; GT denominator uses own R12",
++                        role="Offline descriptive analysis only; no universal improvement direction")
++                    detail["ledger"]["GT_free_area_calculations"] = 1
++                    stage = "cross_binding_distances"
++                    row["cross_binding"], detail["cross_binding_details"] = cross_binding_rows(raw, metrics, bank, task, detail["ledger"])
++                    row["status"] = "PASS"
++                    row["geometry_status"] = metrics["t1_native_confirmation"]["EMBEDDED_GEOMETRY_VALIDITY_STATUS"]
++                    row["unresolved_pair_count"] = sum(view["verified"]["unresolved_count"] for view in metrics["t1_native_confirmation"]["detector_views"].values())
++        except Exception as exc:
++            row.update(status="SCORE_FAILED", failure_stage=stage, error=repr(exc), traceback=traceback.format_exc())
++        finally:
++            row["seconds"] = time.perf_counter() - row_tick
++            row["cpu_process_seconds"] = time.process_time() - row_cpu
++            for key, value in detail["ledger"].items():
++                result["ledger"][key] = result["ledger"].get(key, 0) + value
++            detail["row"] = row
++            write_json(detail_path, detail)
++            result["rows"].append(row)
++            result["completed"] = len(result["rows"])
++            result["seconds"] = time.perf_counter() - tick
++            result["cpu_process_seconds"] = time.process_time() - cpu_tick
++            write_json(result_path, result)
++            print("score", group_id, len(result["rows"]), "/", len(tasks), task_id, row["status"], flush=True)
++    result["status"] = "PASS" if all(row["status"] == "PASS" for row in result["rows"]) else "PARTIAL_OR_FAILED"
++    result["success_count"] = sum(row["status"] == "PASS" for row in result["rows"])
++    result["failure_or_missing_count"] = len(tasks) - result["success_count"]
++    result["seconds"] = time.perf_counter() - tick
++    result["cpu_process_seconds"] = time.process_time() - cpu_tick
++    write_json(result_path, result)
++    return result
++
++
++def main(argv=None):
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--out", required=True)
++    parser.add_argument("--group", required=True)
++    args = parser.parse_args(argv)
++    result = score_group(args.out, args.group)
++    if result["status"] != "PASS":
++        raise SystemExit(1)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/experiments/mf_h1_local0/equal_nfe_confirmation/final_audit.py b/experiments/mf_h1_local0/equal_nfe_confirmation/final_audit.py
+new file mode 100644
+--- /dev/null
++++ b/experiments/mf_h1_local0/equal_nfe_confirmation/final_audit.py
+@@ -0,0 +1,118 @@
++"""No-neural-call final audit of registration, arithmetic, accounting and protected assets."""
++from pathlib import Path
++import argparse, hashlib, json, subprocess, time
++import numpy as np
++
++ROOT=Path(__file__).resolve().parents[3]
++def sha(path):
++    h=hashlib.sha256()
++    with Path(path).open('rb') as f:
++        for chunk in iter(lambda:f.read(8*1024*1024),b''):h.update(chunk)
++    return h.hexdigest()
++def read(p):return json.loads(Path(p).read_text())
++def bits(a,b):
++    a=np.ascontiguousarray(a);b=np.ascontiguousarray(b)
++    return a.dtype==b.dtype and a.shape==b.shape and a.tobytes()==b.tobytes()
++
++def run(out):
++    out=Path(out).resolve();tick=time.perf_counter();protocol=read(out/'registration/protocol.json');checks=[]
++    def check(name,passed,**details):checks.append(dict(name=name,passed=bool(passed),**details))
++    check('immutable_protocol',sha(out/'registration/protocol.json')==(out/'registration/protocol.sha256').read_text().strip())
++    before=read(out/'registration/protection_before.json');changed=[]
++    for name,digest in before['hashes'].items():
++        p=ROOT/name
++        if not p.is_file() or sha(p)!=digest:changed.append(name)
++    check('protected_hashes',not changed,count=len(before['hashes']),changed=changed)
++    metadata=[]
++    for name,expected in before['prior_file_metadata'].items():
++        p=ROOT/name
++        if not p.is_file():metadata.append(dict(path=name,change='missing'))
++        elif [p.stat().st_size,p.stat().st_mtime_ns]!=expected:metadata.append(dict(path=name,change='size/mtime'))
++    check('existing_history_and_assets_metadata',not metadata,count=len(before['prior_file_metadata']),changed=metadata)
++    source_changes=[name for name,digest in protocol['source_sha256'].items() if sha(ROOT/name)!=digest]
++    check('registered_sources',not source_changes,changed=source_changes)
++    check('HEAD_unchanged',subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip()==protocol['HEAD'])
++    ledger=read(out/'forward_ledger.json');events=[json.loads(line) for line in (out/'forward_ledger.jsonl').read_text().splitlines()]
++    attempted=sum(e['action']=='attempt' for e in events);returned=sum(e['action']=='return' for e in events)
++    check('durable_ledger',attempted==ledger['total_attempts'] and returned==ledger['total_returns'],attempts=attempted,returns=returned)
++    check('budget',attempted<=6320 and ledger['attempts_by_kind']['formal']<=6000 and ledger['attempts_by_kind']['regression']<=200 and ledger['attempts_by_kind']['repeat']<=100 and ledger['attempts_by_kind']['warmup']<=20,by_kind=ledger['attempts_by_kind'])
++    rows={};workers=[]
++    for group in protocol['groups']:
++        p=out/'workers'/(group['group_id']+'.json')
++        if p.exists():
++            worker=read(p);workers.append(worker)
++            for row in worker['rows']:
++                if row['task_id'] in rows:raise RuntimeError('Duplicate task')
++                rows[row['task_id']]=row
++    trajectories=[];formals=[t for g in protocol['groups'] for t in g['tasks'] if t['kind']=='formal']
++    for task in [t for g in protocol['groups'] for t in g['tasks']]:
++        row=rows.get(task['task_id'])
++        if row is None or row.get('status')!='PASS':continue
++        p=out/row['path'];okay=sha(p)==row['sha256'];errors=[]
++        with np.load(p,allow_pickle=False) as z:
++            s=z['states'];v=z['stage_velocities'];q=z['stage_states'];C=z['C'].reshape(12,9)
++            known=z['known_slots'];free=z['free_slots'];M=25 if task['solver']=='Midpoint25' else 50
++            okay=okay and s.shape==(M+1,112,9) and q.shape==v.shape==(50,112,9)
++            okay=okay and s.dtype==q.dtype==v.dtype==np.float32 and np.isfinite(s).all() and np.isfinite(q).all() and np.isfinite(v).all()
++            okay=okay and bits(z['raw'],s[-1]) and bits(s[:,known],np.broadcast_to(C,s[:,known].shape).copy()) and bits(q[:,known],np.broadcast_to(C,q[:,known].shape).copy())
++            ideal=[(k/50)**2 for k in range(51)] if task['solver']=='E_quad50' else [k/M for k in range(M+1)]
++            dt=[1/50]*50 if task['solver']=='Euler50' else [ideal[k+1]-ideal[k] for k in range(M)]
++            okay=okay and bits(z['accepted_times_FP32'],np.asarray(ideal,np.float32)) and bits(z['step_sizes_FP32'],np.asarray(dt,np.float32))
++            query=[]
++            for k in range(M):
++                n=2*k if M==25 else k;query.append(ideal[k])
++                if not bits(q[n],s[k]):errors.append('start'+str(k))
++                if M==25:
++                    mid=s[k,free]+v[n,free]*np.float32(dt[k]*.5)
++                    if not bits(q[n+1,free],mid):errors.append('midpoint'+str(k))
++                    query.append((ideal[k]+ideal[k+1])*.5)
++                expect=s[k,free]+v[n+1 if M==25 else n,free]*np.float32(dt[k])
++                if not bits(s[k+1,free],expect):errors.append('accept'+str(k))
++            okay=okay and bits(z['stage_times_FP32'],np.asarray(query,np.float32)) and not errors
++            task_ledger=ledger['tasks'][task['task_id']]
++            okay=okay and task_ledger['attempts']==task_ledger['returns']==50
++        trajectories.append(dict(task_id=task['task_id'],passed=bool(okay),equation_mismatches=errors))
++    check('saved_trajectory_exact_arithmetic',all(r['passed'] for r in trajectories),audited=len(trajectories),failures=[r for r in trajectories if not r['passed']])
++    formal_success=sum(rows.get(t['task_id'],{}).get('status')=='PASS' for t in formals)
++    check('formal_matrix_complete',len(formals)==120 and formal_success==120,requested=len(formals),successful=formal_success)
++    check('regression_and_repeat',all(r.get('regression',{}).get('status')=='PASS' for r in rows.values() if r['kind'] in ('regression','repeat')) and sum(r['kind'] in ('regression','repeat') for r in rows.values())==6)
++    check('shared_lock_before_CUDA',all(w.get('CUDA_initialized_before_locked_runtime') is False and w.get('lock_held_until_process_exit') is True for w in workers),worker_count=len(workers))
++    results=read(out/'results.json') if (out/'results.json').exists() else {}
++    check('formal_scoring_complete',results.get('status')=='COMPLETE_SCORED_MATRIX' and results.get('formal_scored')==120)
++    check('scalar_schema_54',len(results.get('metric_names54',[]))==54)
++    binding=results.get('binding',[])
++    check('all_binding_groups_complete',len(binding)==60 and all(r.get('status')=='PASS' for r in binding))
++    score_rows=[];score_groups=[]
++    for group in protocol['groups']:
++        if not any(t['kind']=='formal' for t in group['tasks']):continue
++        path=out/'scores'/(group['group_id']+'.json')
++        if path.exists():
++            scored=read(path);score_groups.append(scored.get('status'));score_rows.extend(scored.get('rows',[]))
++    check('independent_score_manifest',len(score_groups)==20 and all(s=='PASS' for s in score_groups) and len(score_rows)==120 and {r['task_id'] for r in score_rows}=={t['task_id'] for t in formals})
++    import csv
++    counts={}
++    for name,expected in [('per_output.csv',120),('binding.csv',60)]:
++        p=out/name
++        if p.exists():
++            with p.open(newline='') as f:counts[name]=len(list(csv.DictReader(f)))
++        else:counts[name]=0
++        check(name+'_denominator',counts[name]==expected,rows=counts[name])
++    plots=sorted((out/'figures').glob('*.png'))
++    check('fixed_views',len(plots)>=10,count=len(plots))
++    diff=[]
++    for p in sorted(Path(__file__).parent.glob('*.py')):
++        relative=str(p.relative_to(ROOT));content=p.read_text().splitlines()
++        diff.extend([f'diff --git a/{relative} b/{relative}','new file mode 100644','--- /dev/null',f'+++ b/{relative}',f'@@ -0,0 +1,{len(content)} @@']+['+'+x for x in content])
++    (out/'code.diff').write_text('\n'.join(diff)+'\n')
++    result=dict(status='PASS' if all(c['passed'] for c in checks) else 'FAIL_OR_INCOMPLETE',checks=checks,model_forwards=0,CPU_trajectory_audits=len(trajectories),
++        seconds=time.perf_counter()-tick,HEAD=protocol['HEAD'],git_status=subprocess.check_output(['git','status','--porcelain'],cwd=ROOT,text=True),
++        code_diff_sha256=sha(out/'code.diff'),actual_forward_attempts=attempted,actual_forward_returns=returned,
++        artifacts={str(p.relative_to(out)):dict(sha256=sha(p),bytes=p.stat().st_size) for p in [out/'results.json',out/'per_output.csv',out/'paired_effects.csv',out/'binding.csv',out/'registration/protocol.json'] if p.exists()})
++    (out/'final_audit.json').write_text(json.dumps(result,indent=2,allow_nan=False)+'\n')
++    print(json.dumps({k:v for k,v in result.items() if k in ('status','seconds','actual_forward_attempts','CPU_trajectory_audits')}),flush=True)
++    if result['status']!='PASS':
++        print(json.dumps([c for c in checks if not c['passed']],indent=2),flush=True)
++        raise SystemExit(1)
++
++if __name__=='__main__':
++    p=argparse.ArgumentParser();p.add_argument('--out',required=True);run(p.parse_args().out)
+diff --git a/experiments/mf_h1_local0/equal_nfe_confirmation/plots.py b/experiments/mf_h1_local0/equal_nfe_confirmation/plots.py
+new file mode 100644
+--- /dev/null
++++ b/experiments/mf_h1_local0/equal_nfe_confirmation/plots.py
+@@ -0,0 +1,153 @@
++"""CPU-only fixed first-seed views using frozen target points and GT bounds."""
++from __future__ import annotations
++
++import argparse
++import time
++from pathlib import Path
++
++import numpy as np
++
++from .reporting import MODELS, SOLVERS, collect, read_json, sha256, write_json
++
++
++def array_digest(value):
++    import hashlib
++    a = np.asarray(value)
++    return hashlib.sha256(str(a.dtype).encode() + str(a.shape).encode() + a.tobytes()).hexdigest()
++
++
++def run(out):
++    import matplotlib
++    matplotlib.use("Agg")
++    import matplotlib.pyplot as plt
++    from matplotlib.colors import Normalize
++    from matplotlib.patches import Patch
++    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
++    from experiments.mf_h1_local0.jedge5_diagnosis.common import load_cases
++    from experiments.mf_h1_local0.evaluate import surface_distance_squared
++
++    begin = time.perf_counter()
++    out = Path(out).resolve()
++    protocol, rows, _, _, _, _ = collect(out)
++    seed = int(protocol["generation_seeds"][0])
++    plot_spec = protocol.get("plots", {})
++    elev = plot_spec.get("elev", plot_spec.get("elevation", 22))
++    azim = plot_spec.get("azim", plot_spec.get("azimuth", -55))
++    # Fixed before outputs: original parent GT bounding cube plus 10% each side.
++    radius_factor = plot_spec.get("radius_factor", .60)
++    vertical_axis = plot_spec.get("vertical_axis", "y")
++    color = plot_spec.get("coverage_color", {})
++    norm = Normalize(vmin=color.get("vmin", 0), vmax=color.get("vmax", 10), clip=True)
++    cmap = color.get("cmap", "viridis")
++    folder = out / "figures"
++    folder.mkdir(exist_ok=True)
++    selected = {(int(r["parent"]), int(r["patch"]), r["model"], r["solver"]): r for r in rows if int(r["seed"]) == seed}
++    cases = load_cases()
++    records, query_records = [], []
++    configs = [(m, s) for m in MODELS for s in SOLVERS]
++    for parent in (0, 1):
++        gt_points = cases[parent, 0]["full"].reshape(-1, 3)
++        center = (gt_points.max(0) + gt_points.min(0)) / 2
++        radius = float(np.ptp(gt_points, axis=0).max()) * radius_factor
++        for patch in range(5):
++            started = time.perf_counter()
++            case = cases[parent, patch]
++            q = np.asarray(case["coverage_points"], dtype=np.float64)
++            target = np.asarray(case["free"]).reshape(100, 3, 3)
++            condition = np.asarray(case["C"]).reshape(12, 3, 3)
++            fig = plt.figure(figsize=(20, 10.8))
++            annotations = []
++            for col, (model, solver) in enumerate(configs):
++                row = selected[parent, patch, model, solver]
++                path = out / "raw" / (row["task_id"] + ".npz")
++                raw, distances = None, None
++                status = row["sampling_status"]
++                if path.exists():
++                    with np.load(path, allow_pickle=False) as z:
++                        candidate = z["raw"].copy().reshape(112, 3, 3)
++                        known = z["known"].reshape(-1).astype(bool) if "known" in z.files else np.arange(112) < 12
++                        free = z["free"].reshape(-1).astype(bool) if "free" in z.files else ~known
++                    if known.sum() != 12 or free.sum() != 100 or not np.array_equal(candidate[known], condition):
++                        raise ValueError("Raw known/free identity mismatch before plotting")
++                    # Incomplete endpoint is shown as missing, never scored as t=1.
++                    completed = row["sampling"].get("status", "") in ("PASS", "COMPLETE", "SUCCESS")
++                    if row["scalars54"].get("fixed_R12_coverage_RMS_bbox_pct") is not None:
++                        completed = True
++                    if completed and np.isfinite(candidate).all():
++                        raw = candidate
++                        tick = time.perf_counter()
++                        d2 = surface_distance_squared(q, raw[free].astype(np.float64))
++                        distances = 100 * np.sqrt(d2) / case["bbox"]
++                        score = row["scalars54"].get("fixed_R12_coverage_RMS_bbox_pct")
++                        reconstructed = float(100 * np.sqrt(d2.mean()) / case["bbox"])
++                        if score is not None and not np.isclose(reconstructed, score, atol=1e-10, rtol=1e-10):
++                            raise ValueError(f"Frozen coverage plot/score mismatch: {row['task_id']}")
++                        query_path = folder / (row["task_id"] + "_coverage_queries.npz")
++                        np.savez_compressed(query_path, target_points=q, distance_squared=d2,
++                                            distance_bbox_percent=distances)
++                        query_records.append(dict(task_id=row["task_id"], raw_sha256=sha256(path),
++                            query_points_sha256=array_digest(q), query_count=len(q),
++                            fixed_R12_coverage_RMS_bbox_pct=reconstructed,
++                            above_color_maximum=int(np.sum(distances > norm.vmax)),
++                            out_of_fixed_bbox_vertex_count=int(np.any(np.abs(raw.reshape(-1, 3)-center)>radius, axis=1).sum()),
++                            query_seconds=time.perf_counter()-tick,
++                            query_file=str(query_path.relative_to(out)), query_file_sha256=sha256(query_path)))
++                for view in range(3):
++                    ax = fig.add_subplot(3, 6, view*6+col+1, projection="3d")
++                    if raw is not None and view < 2:
++                        ax.add_collection3d(Poly3DCollection(raw[free], facecolors=(.57, .68, .80, .93), edgecolors=(.15, .24, .32, .4), linewidths=.3))
++                        if view == 0:
++                            ax.add_collection3d(Poly3DCollection(condition, facecolors=(1., .62, .16, .98), edgecolors=(.55, .25, .03, .8), linewidths=.6))
++                    elif view == 2:
++                        ax.add_collection3d(Poly3DCollection(target, facecolors=(.6, .6, .6, .06), edgecolors=(.35, .35, .35, .18), linewidths=.3))
++                        ax.add_collection3d(Poly3DCollection(condition, facecolors=(1., .62, .16, .15), edgecolors=(.7, .35, .05, .6), linewidths=.5))
++                        if distances is not None:
++                            ax.scatter(q[:, 0], q[:, 1], q[:, 2], c=distances, cmap=cmap, norm=norm, s=8, depthshade=False, edgecolors="none")
++                    if raw is None:
++                        ax.text2D(.5, .5, "NO COMPLETE ENDPOINT\n" + str(status), transform=ax.transAxes, ha="center", fontsize=8)
++                    ax.set(xlim=(center[0]-radius, center[0]+radius), ylim=(center[1]-radius, center[1]+radius), zlim=(center[2]-radius, center[2]+radius))
++                    ax.set_box_aspect((1, 1, 1))
++                    ax.view_init(elev=elev, azim=azim, vertical_axis=vertical_axis)
++                    ax.set_axis_off()
++                    if view == 0:
++                        rms = row["scalars54"].get("remainder_symmetric_RMS_bbox_pct")
++                        label = f"{rms:.4f}%" if rms is not None else "NA"
++                        ax.set_title(f"{model} / {solver} / 50 NFE\nremainder RMS {label}", fontsize=9)
++                    if col == 0:
++                        ax.text2D(-.05, .5, ("Full: orange C, blue free", "Generated free only", "GT unknown-region coverage")[view], rotation=90, transform=ax.transAxes, va="center", fontsize=9)
++                if raw is not None:
++                    count = query_records[-1]["out_of_fixed_bbox_vertex_count"]
++                    above = query_records[-1]["above_color_maximum"]
++                    if count or above:
++                        annotations.append(f"{model}/{solver}: {count} vertices outside fixed GT cube; {above} points >{norm.vmax:g}%L")
++            fig.suptitle(f"P{parent} patch {patch} / registered seed {seed} / fixed GT bounds and camera", fontsize=13)
++            fig.legend(handles=[Patch(facecolor="#ffa329", label="Known C"), Patch(facecolor="#91adc9", label="Generated free"), Patch(facecolor="white", edgecolor="gray", label="GT free (heatmap row)")], loc="lower center", ncol=3, fontsize=9, bbox_to_anchor=(.5, .001))
++            if annotations:
++                fig.text(.04, .036, " | ".join(annotations), fontsize=7)
++            fig.subplots_adjust(left=.03, right=.945, top=.92, bottom=.07, wspace=0, hspace=.025)
++            bar = fig.add_axes([.96, .13, .012, .25])
++            fig.colorbar(plt.cm.ScalarMappable(norm=norm, cmap=cmap), cax=bar, label="GT point distance to free [% bbox]", extend="max")
++            path = folder / f"P{parent}_patch{patch}_seed{seed}.png"
++            fig.savefig(path, dpi=150)
++            plt.close(fig)
++            records.append(dict(parent=parent, patch=patch, seed=seed, path=str(path.relative_to(out)),
++                                sha256=sha256(path), seconds=time.perf_counter()-started,
++                                center=center.tolist(), radius=radius, target_points_sha256=array_digest(q),
++                                requested_configurations=configs, annotations=annotations))
++            print(f"plot P{parent}/patch{patch} complete", flush=True)
++    result = dict(status="PASS", records=records, query_records=query_records,
++                  model_forwards=0, distance_query_calls=len(query_records),
++                  total_target_points=sum(r["query_count"] for r in query_records),
++                  seconds=time.perf_counter()-begin, protocol_sha256=sha256(out/"registration/protocol.json"),
++                  camera=dict(elev=elev, azim=azim, vertical_axis=vertical_axis, radius_factor=radius_factor,
++                              bounds_source="original full GT only; never adjusted using generated outputs"),
++                  colors=dict(minimum=norm.vmin, maximum=norm.vmax, cmap=cmap, units="distance percent bbox", clipped=True),
++                  note="All ten first-seed contexts retained, including failures. Fixed GT query points; CPU plotting distances separately accounted. No geometry modifications.")
++    write_json(folder / "plot_manifest.json", result)
++    return result
++
++
++if __name__ == "__main__":
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--out", type=Path, required=True)
++    run(parser.parse_args().out)
+diff --git a/experiments/mf_h1_local0/equal_nfe_confirmation/preflight.py b/experiments/mf_h1_local0/equal_nfe_confirmation/preflight.py
+new file mode 100644
+--- /dev/null
++++ b/experiments/mf_h1_local0/equal_nfe_confirmation/preflight.py
+@@ -0,0 +1,191 @@
++"""CPU-only identity checks and immutable registration for 120 equal-NFE requests."""
++from native_t1 import runtime as _runtime
++from pathlib import Path
++import argparse, csv, hashlib, json, os, platform, re, shutil, subprocess, time
++import numpy as np
++import torch
++from native_t1.sampling import make_noise
++from experiments.mf_h1_local0.jedge5_diagnosis.common import (
++    ROOT, ASSETS, EVALUATION, EVALUATION_SHA, TRAIN, TRAIN_SHA,
++    load_model, load_cases, array_hash, file_sha256, write_json, read_json)
++
++HISTORICAL = ROOT/'native_t1/runs/jedge5_diagnosis_20261002_102215'
++PILOT = ROOT/'native_t1/runs/jedge5_solver_pilot_20261002_121000'
++SOLVERS = ['Euler50','Midpoint25','E_quad50']
++FILE_SHA = {'B':'0f22ce498ca2c27dc74b43890fb8aad20f0f3e7153aa74ee6d3c14ea445a2660',
++            'J':'cc7a248fa9a8570059f225cd1c313f21f08585925407a79418df6d63c9cae0e9'}
++
++def resource_snapshot():
++    def cmd(args):
++        p=subprocess.run(args,capture_output=True,text=True)
++        return dict(returncode=p.returncode,stdout=p.stdout.strip(),stderr=p.stderr.strip())
++    return dict(timestamp=time.time(),gpu=cmd(['nvidia-smi','--query-gpu=name,memory.total,memory.used,memory.free,utilization.gpu','--format=csv,noheader,nounits']),
++        gpu_processes=cmd(['nvidia-smi','--query-compute-apps=pid,process_name,used_memory','--format=csv']),
++        cpu_cores=os.cpu_count(),cpu_affinity=len(os.sched_getaffinity(0)),load=os.getloadavg(),
++        memory={line.split(':')[0]:line.split(':')[1].strip() for line in Path('/proc/meminfo').read_text().splitlines() if line.startswith(('MemTotal:','MemAvailable:','SwapFree:'))},
++        cpu_processes=cmd(['ps','-eo','pid,comm,pcpu,pmem,args','--sort=-pcpu']),
++        disk=cmd(['df','-B1',str(ROOT)]))
++
++def seed_audit(out):
++    roots=[ROOT/'native_t1/runs',ROOT/'native_t1/maintenance',ROOT/'experiments/mf_h1_local0/outputs',ROOT/'output']
++    used={};files=documents=csvs=0
++    pattern=re.compile(r'"([^"\r\n]*seed[^"\r\n]*)"\s*:\s*(\[[^\]]{0,8192}\]|-?\d+)',re.I)
++    def add(seed,path,field):
++        if type(seed) is int and seed>=10501:
++            used.setdefault(seed,[]).append(dict(path=str(path.relative_to(ROOT)),field=field))
++    for base in roots:
++        if not base.exists():continue
++        for p in base.rglob('*'):
++            if not p.is_file() or out in p.parents:continue
++            files+=1
++            for m in re.finditer(r'(?:seed|noise)[_-]?(\d+)',p.name,re.I):add(int(m.group(1)),p,'filename')
++            if p.suffix.lower() in ('.json','.jsonl'):
++                documents+=1
++                content=p.read_text(encoding='utf-8-sig',errors='replace')
++                for m in pattern.finditer(content):
++                    try:v=json.loads(m.group(2))
++                    except ValueError:continue
++                    for s in v if isinstance(v,list) else [v]:add(s,p,m.group(1))
++            elif p.suffix.lower()=='.csv':
++                csvs+=1
++                try:
++                    with p.open(encoding='utf-8-sig',errors='replace',newline='') as f:
++                        reader=csv.DictReader(f)
++                        fields=[k for k in (reader.fieldnames or []) if k and 'seed' in k.lower()]
++                        if fields:
++                            for row in reader:
++                                for k in fields:
++                                    if re.fullmatch(r'\d+',str(row.get(k,''))):add(int(row[k]),p,k)
++                except (csv.Error,ValueError):continue
++    trials=[];first=10501
++    while True:
++        pair=[first,first+1];hits=[dict(seed=s,**h) for s in pair for h in used.get(s,[])]
++        trials.append(dict(seeds=pair,hits=hits,unused=not hits))
++        if not hits:break
++        first+=2
++    return dict(seeds=pair,trials=trials,files_scanned=files,json_documents_scanned=documents,csv_documents_scanned=csvs,
++        roots=[str(p) for p in roots],scope='Semantic JSON seed fields, CSV seed columns and seed/noise filenames in retained local records. Does not certify unavailable/deleted/unrecorded history.',
++        exclusion=str(out))
++
++def task(kind,model,solver,parent,patch,seed,**more):
++    return dict(task_id=f'{kind}_{model}_{solver}_P{parent}_patch{patch}_seed{seed}',kind=kind,
++        model=model,solver=solver,parent=parent,patch=patch,seed=seed,**more)
++
++def protection_manifest(out,refs):
++    # Existing files are protected; newly created files in other authorized runs
++    # are allowed. Hash model/data/public code and selected history; metadata all old runs.
++    files=set(p for p in (ROOT/'native_t1').rglob('*.py') if 'runs' not in p.parts and '__pycache__' not in p.parts)
++    files.update((ROOT/'models').rglob('*.py'))
++    files.update((ROOT/'native_t1/checkpoints').rglob('*.pt'))
++    files.update([EVALUATION,TRAIN,ROOT/'AGENTS.md',ROOT/'WORKSPACE.md'])
++    files.update(Path(p) for p in refs)
++    files.update((ROOT/'experiments/mf_h1_local0/jedge5_solver_pilot').glob('*.py'))
++    files.update((ROOT/'experiments/mf_h1_local0/jedge5_diagnosis').glob('*.py'))
++    for p in (ROOT/'experiments/mf_h1_local0').glob('*.py'):files.add(p)
++    hashed={str(p.relative_to(ROOT)):file_sha256(p) for p in sorted(files) if p.is_file()}
++    metadata={}
++    for base in ('native_t1/runs','native_t1/maintenance','datasets','downloaded_data','assets'):
++        for p in (ROOT/base).rglob('*'):
++            if p.is_file() and out not in p.parents:
++                st=p.stat();metadata[str(p.relative_to(ROOT))]=[st.st_size,st.st_mtime_ns]
++    return dict(hashes=hashed,prior_file_metadata=metadata,policy='All hashed files must remain identical; missing/modified old files reported individually, additions outside this run allowed.')
++
++def run(out):
++    out=Path(out).resolve()
++    if out.parent!=ROOT/'native_t1/runs' or not out.name.startswith('equal_nfe_confirmation_'):raise ValueError('Isolated run required')
++    if out.exists():raise FileExistsError(out)
++    (out/'registration').mkdir(parents=True);started=time.perf_counter()
++    snapshot=resource_snapshot();write_json(out/'registration/resources_before.json',snapshot)
++    torch.set_num_threads(1);_runtime.configure_stable_runtime()
++    identities={}
++    for name in ('B','J'):
++        if file_sha256(ASSETS[name]['path'])!=FILE_SHA[name]:raise ValueError('Checkpoint file mismatch '+name)
++        model,identity=load_model(name,device='cpu')
++        identities[name]=dict(identity,parameter_count=sum(p.numel() for p in model.parameters()),
++            parameter_schema_sha256=hashlib.sha256(json.dumps([(n,list(p.shape),str(p.dtype)) for n,p in model.named_parameters()]).encode()).hexdigest())
++        if identity['cumulative_updates']!=3000:raise ValueError('Requires raw cumulative3000')
++        del model
++    if identities['B']['parameter_schema_sha256']!=identities['J']['parameter_schema_sha256']:raise ValueError('Model architectures differ')
++    cases=load_cases()
++    if len(cases)!=10 or file_sha256(TRAIN)!=TRAIN_SHA:raise ValueError('Input identity differs')
++    audit=seed_audit(out);seeds=audit['seeds'];write_json(out/'registration/seed_audit.json',audit)
++    noises={f'seed_{s}':make_noise(s).numpy() for s in seeds}
++    np.savez_compressed(out/'registration/noises.npz',**noises)
++    free={k:v[:,12:].copy() for k,v in noises.items()}
++    np.savez_compressed(out/'registration/free_noises.npz',**free)
++    inputs=[]
++    for (p,j),c in sorted(cases.items()):
++        if c['C'].reshape(12,9).tobytes()!=c['full'].reshape(112,9)[c['source_face_ids']].tobytes():raise ValueError('Known face slots/source mismatch')
++        if c['free'].reshape(100,9).tobytes()!=c['full'].reshape(112,9)[c['free_source_ids']].tobytes():raise ValueError('Free complement mismatch')
++        inputs.append(dict(parent=p,patch=j,condition_class='finetuning_C' if j==0 else 'other_previously_observed_C',
++            known_slots=list(range(12)),free_slots=list(range(12,112)),valid_slots=list(range(112)),
++            source_face_ids=c['source_face_ids'].tolist(),free_source_ids=c['free_source_ids'].tolist(),
++            arrays={k:array_hash(c[k]) for k in ('C','full','free','boundary_points','boundary_weights','coverage_points','pairwise_target_points')},bbox=c['bbox']))
++    write_json(out/'registration/input_identity.json',dict(cases=inputs,noise_protocol='native_t1.sampling.make_noise(seed): CPU torch.Generator, randn FP32 [1,112,9]; checked free slots12:112 saved as [1,100,9].',
++        noises={str(s):dict(full_sha256=array_hash(noises[f'seed_{s}']),free_sha256=array_hash(free[f'seed_{s}'])) for s in seeds}))
++    regression=[]
++    for solver in SOLVERS:
++        ref=HISTORICAL/'A/J/J_P0_patch4_seed10401_bf16_Euler50.npz' if solver=='Euler50' else PILOT/f'raw/case2/{solver}.npz'
++        regression.append(task('regression','J',solver,0,4,10401,noise_source='historical',reference_npz=str(ref),reference_sha256=file_sha256(ref)))
++    ref=HISTORICAL/'A/B/B_P0_patch0_seed10401_bf16_Euler50.npz'
++    regression.append(task('regression','B','Euler50',0,0,10401,noise_source='historical',reference_npz=str(ref),reference_sha256=file_sha256(ref)))
++    groups=[dict(group_id='regression',tasks=regression)]
++    rng=np.random.RandomState(2026100215);configs=[(m,s) for m in ('B','J') for s in SOLVERS]
++    for p in (0,1):
++        for j in range(5):
++            for seed in seeds:
++                tasks=[task('formal',*configs[i],p,j,seed,noise_source='new') for i in rng.permutation(6)]
++                groups.append(dict(group_id=f'block{len(groups)-1:02d}',parent=p,patch=j,seed=seed,tasks=tasks))
++    repeats=[]
++    for m,s in (('B','Euler50'),('J','Midpoint25')):
++        original=task('formal',m,s,0,0,seeds[0])['task_id']
++        repeats.append(task('repeat',m,s,0,0,seeds[0],noise_source='new',repeat_of=original))
++    groups.append(dict(group_id='repeats',tasks=repeats))
++    cache=HISTORICAL/'registration/static_context_audit.json'
++    shutil.copyfile(cache,out/'registration/static_context_audit.json')
++    from experiments.mf_h1_local0.jedge5_diagnosis.scoring import banks_with_context_audit,REFERENCE
++    banks=banks_with_context_audit(out)
++    if set(banks)!=set(range(5)):raise ValueError('Must score all5 patches')
++    refs=[t['reference_npz'] for t in regression]+[cache,REFERENCE/'evaluation.py',REFERENCE/'edge_metric.py']
++    protect=protection_manifest(out,refs);write_json(out/'registration/protection_before.json',protect)
++    source_dir=Path(__file__).parent
++    sources={str(p.relative_to(ROOT)):file_sha256(p) for p in sorted(source_dir.glob('*.py'))}
++    protocol=dict(schema='equal_nfe_confirmation_v1',status='FROZEN',created_timestamp=time.time(),
++        HEAD=subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip(),
++        git_status=subprocess.check_output(['git','status','--porcelain'],cwd=ROOT,text=True),
++        models=['B','J'],solvers=SOLVERS,primary_candidate='Midpoint25',secondary_candidate='E_quad50',
++        seeds=seeds,generation_seeds=seeds,groups=groups,historical_run=str(HISTORICAL),
++        budget=dict(formal_requests=120,formal_forwards=6000,regression_requests=4,regression_forwards=200,repeat_requests=2,repeat_forwards=100,warmup_forwards_max=20,total_forward_attempts_max=6320,planned_forwards=6300,planned_warmup_forwards=0),
++        input_archive=dict(path=str(EVALUATION),sha256=EVALUATION_SHA),checkpoint_identities=identities,
++        checkpoint_files={m:dict(path=str(ASSETS[m]['path']),sha256=FILE_SHA[m],state_sha256=ASSETS[m]['state'],raw=True) for m in ('B','J')},
++        noise_archive_sha256=file_sha256(out/'registration/noises.npz'),free_noise_archive_sha256=file_sha256(out/'registration/free_noises.npz'),
++        source_sha256=sources,metric_sources={str(p.relative_to(ROOT)):file_sha256(p) for p in refs[-2:]},
++        input_identity_sha256=file_sha256(out/'registration/input_identity.json'),known_slots=list(range(12)),free_slots=list(range(12,112)),
++        schedule_rng=dict(engine='numpy.RandomState',seed=2026100215,scope='six configurations independently permuted within each parent/patch/seed block; generation RNG separate'),
++        numeric=dict(Euler50='Production k/50 t; constant Python1/50; FP32 state + FP32 velocity * dt',
++            Midpoint25='Historical Python FP64 ideal k/25 grid; dt=t1-t0; midpoint=(t0+t1)*.5; independent FP32 casts; update from original state',
++            E_quad50='Historical Python FP64 (k/50)^2 grid; dt=t1-t0 before FP32 cast; front dense back sparse',
++            runtime='CUBLAS :4096:8; deterministic warn_only=False; TF32 off; SDPA math; BF16 forwards, FP32 params/states/integration; eval/no_grad'),
++        dispatch=dict(gpu_lock='/tmp/wrp_meshflow_jedge5_diag_gpu0.lock',maximum_GPU_workers=1,release='process exit after each group',
++            headroom='max(2048MiB,10%total)',CPU_threads_per_worker=1,CPU_workers='chosen from current available CPU/RAM and load before dispatch',
++            initial_GPU_peak='Observe authorized regression group; no probe forward; process VRAM plus allocated/reserved independently'),
++        grouping=dict(parents=[0,1],training_C_patches=[0],other_previously_observed_C_patches=[1,2,3,4],both_parents_seen_in_training=True,patch3_historical_overlap='11/12',patch4='lower historical overlap'),
++        statistics=dict(paired_before_summary=True,macro='mean two seeds per parent/patch then equal ten units',
++            missing='Difference requires all operands finite; cell mean requires both seeds; full macro requires all requested cells. Incomplete observed summaries separately labeled with valid/requested counts; never zero fill.',
++            sign='lower errors/counts better, higher coverage better, area descriptive only',success='No weighted score or new numerical success threshold; primary candidate interpretation based on all fixed metrics and strata'),
++        binding=dict(groups=60,scoring_cells=240,new_generation=0,row_target_bbox=True,free_only=True,save_both_directions=True,numerical_rule='inherit original cross_binding, raw differences retained'),
++        plots=dict(elev=22,azim=-55,vertical_axis='y',bbox='each parent original GT bounding cube center; radius=.60*max_axis_span',
++            coverage_color=dict(units='distance percent bbox',vmin=0,vmax=10,cmap='viridis',clip=True),seed='first_registered'),
++        failure_contract='No automatic retries, extra seeds, replacement outputs or unregistered forward calls. Stop dispatch after numerical/OOM/identity/regression failure; preserve attempted NFE and all120 requested rows.',
++        baseline_inheritance='Inherited BF16 face-permutation FAIL remains FAIL at its original tolerance; not retested or repaired.',
++        topology='Existing metrics retained; global watertight/exact-predicate certification NOT_RUN',
++        no_training=True,no_optimizer=True,no_EMA=True,no_default_change=True)
++    write_json(out/'registration/protocol.json',protocol)
++    (out/'registration/protocol.sha256').write_text(file_sha256(out/'registration/protocol.json')+'\n')
++    write_json(out/'registration/environment.json',dict(python=platform.python_version(),executable=os.sys.executable,torch=torch.__version__,CUDA=torch.version.cuda,numpy=np.__version__,CUDA_initialized=torch.cuda.is_initialized()))
++    if torch.cuda.is_initialized():raise RuntimeError('Preflight initialized CUDA')
++    result=dict(status='PASS',model_forwards=0,strict_CPU_checkpoint_loads=2,parameter_count=identities['B']['parameter_count'],cases=len(cases),seeds=seeds,seconds=time.perf_counter()-started)
++    write_json(out/'registration/preflight.json',result);print(json.dumps(result),flush=True)
++
++if __name__=='__main__':
++    p=argparse.ArgumentParser();p.add_argument('--out',required=True);run(p.parse_args().out)
+diff --git a/experiments/mf_h1_local0/equal_nfe_confirmation/reporting.py b/experiments/mf_h1_local0/equal_nfe_confirmation/reporting.py
+new file mode 100644
+--- /dev/null
++++ b/experiments/mf_h1_local0/equal_nfe_confirmation/reporting.py
+@@ -0,0 +1,386 @@
++"""CPU-only, complete-denominator reporting of the frozen equal-NFE matrix.
++
++This module never loads a model, scores geometry, selects outputs, or changes defaults.
++All differences are formed within the registered case before any aggregation.
++"""
++from __future__ import annotations
++
++import argparse
++import csv
++import hashlib
++import json
++import math
++import statistics
++import time
++from collections import defaultdict
++from pathlib import Path
++
++MODELS = ("B", "J")
++SOLVERS = ("Euler50", "Midpoint25", "E_quad50")
++EFFECTS = ("Delta_B_M", "Delta_B_Q", "Delta_J_M", "Delta_J_Q",
++           "A_E", "A_M", "A_Q", "I_M", "I_Q")
++MAIN_METRICS = (
++    "remainder_symmetric_RMS_bbox_pct", "free_to_R12_RMS_bbox_pct",
++    "R12_to_free_RMS_bbox_pct", "fixed_R12_coverage_within_1pct_fraction",
++    "boundary_p95_bbox_pct", "boundary_coverage_fraction",
++    "Gamma_to_free_edges_p95_bbox_pct", "Gamma_to_free_edges_coverage_0.001_fraction",
++    "CF_proper_pair_count", "CF_proper_affected_free_fraction", "FF_illegal_pair_count",
++    "free_minimum_angle_lt5_fraction", "free_q_gt10_fraction")
++NEUTRAL_METRICS = {
++    "near_C_area_fraction", "near_C_boundary_band_area_fraction",
++    "near_C_outside_boundary_band_area_fraction", "C_surface_area_fraction",
++    "free_total_surface_area", "free_total_area", "GT_free_total_area",
++    "free_area_over_GT_free_area", "shared_edge_component_count",
++    "exact_C_free_shared_edge_count", "exact_C_free_shared_vertex_count",
++}
++
++
++def read_json(path):
++    return json.loads(Path(path).read_text(encoding="utf-8-sig"))
++
++
++def write_json(path, value):
++    Path(path).write_text(json.dumps(value, ensure_ascii=False, indent=2,
++                                    allow_nan=False) + "\n", encoding="utf-8")
++
++
++def sha256(path):
++    h = hashlib.sha256()
++    with Path(path).open("rb") as f:
++        for data in iter(lambda: f.read(1024 * 1024), b""):
++            h.update(data)
++    return h.hexdigest()
++
++
++def number(value):
++    return isinstance(value, (int, float)) and math.isfinite(value)
++
++
++def direction(metric):
++    """No invented composite score or monotonic claim for descriptive areas/counts."""
++    if metric in NEUTRAL_METRICS:
++        return "descriptive"
++    if ("coverage" in metric and "RMS" not in metric) or metric == "free_angle_p05_degrees":
++        return "higher"
++    return "lower"
++
++
++def case_key(row):
++    return int(row["parent"]), int(row["patch"]), int(row["seed"])
++
++
++def summarize(values, metric, differences=False):
++    """values maps every requested (parent,patch,seed) to a scalar or explicit NA.
++
++    Full hierarchical mean is NA if any requested seed is absent. Available-only
++    statistics are separately named, with both sample and complete-cell counts.
++    The paired median always uses case differences, never marginal medians.
++    """
++    valid = {k: float(v) for k, v in values.items() if number(v)}
++    cells = defaultdict(dict)
++    for key, value in values.items():
++        cells[key[:2]][key] = value
++    cell_means = {}
++    for cell, members in cells.items():
++        usable = [float(v) for v in members.values() if number(v)]
++        cell_means[f"P{cell[0]}_patch{cell[1]}"] = {
++            "mean": statistics.mean(usable) if len(usable) == len(members) else None,
++            "available_mean": statistics.mean(usable) if usable else None,
++            "valid": len(usable), "requested": len(members),
++        }
++    complete = [r["mean"] for r in cell_means.values() if r["mean"] is not None]
++    d = direction(metric)
++    result = dict(requested=len(values), valid=len(valid), missing=len(values)-len(valid),
++                  cells_requested=len(cells), cells_complete=len(complete),
++                  direction=d, cells=cell_means,
++                  hierarchical_mean=statistics.mean(complete) if len(complete) == len(cells) and complete else None,
++                  available_complete_cell_mean=statistics.mean(complete) if complete else None,
++                  available_case_mean=statistics.mean(valid.values()) if valid else None,
++                  paired_median_delta=statistics.median(valid.values()) if valid and differences else None)
++    if valid:
++        worst_key = (min if d == "higher" else max)(valid, key=valid.get)
++        result["worst_case"] = dict(parent=worst_key[0], patch=worst_key[1], seed=worst_key[2], value=valid[worst_key])
++        result["minimum"] = min(valid.values())
++        result["maximum"] = max(valid.values())
++    else:
++        result["worst_case"] = result["minimum"] = result["maximum"] = None
++    if differences:
++        negative = sum(v < 0 for v in valid.values())
++        positive = sum(v > 0 for v in valid.values())
++        result.update(negative=negative, equal=sum(v == 0 for v in valid.values()), positive=positive,
++                      improved=(positive if d == "higher" else negative) if d != "descriptive" else None,
++                      worsened=(negative if d == "higher" else positive) if d != "descriptive" else None,
++                      sign_rule="exact raw difference; no post-hoc epsilon or success threshold")
++    return result
++
++
++def difference(a, b):
++    return float(a)-float(b) if number(a) and number(b) else None
++
++
++def make_effects(rows, metrics):
++    by = {(r["model"], r["solver"], case_key(r)): r for r in rows}
++    cases = sorted({case_key(r) for r in rows})
++    result = []
++    for case in cases:
++        def value(model, solver, metric):
++            return by.get((model, solver, case), {}).get("values", {}).get(metric)
++        diffs = {name: {} for name in EFFECTS}
++        for metric in metrics:
++            for code, solver in (("M", "Midpoint25"), ("Q", "E_quad50")):
++                for model in MODELS:
++                    diffs[f"Delta_{model}_{code}"][metric] = difference(value(model, solver, metric), value(model, "Euler50", metric))
++                diffs[f"I_{code}"][metric] = difference(diffs[f"Delta_J_{code}"][metric], diffs[f"Delta_B_{code}"][metric])
++            for code, solver in zip(("E", "M", "Q"), SOLVERS):
++                diffs[f"A_{code}"][metric] = difference(value("J", solver, metric), value("B", solver, metric))
++        for effect in EFFECTS:
++            result.append(dict(parent=case[0], patch=case[1], seed=case[2], effect=effect, differences=diffs[effect]))
++    return result
++
++
++def group_cases(cases):
++    cases = sorted(cases)
++    groups = {"all": cases}
++    for p in (0, 1):
++        groups[f"P{p}"] = [c for c in cases if c[0] == p]
++    groups["patch0_training_C"] = [c for c in cases if c[1] == 0]
++    groups["patch1_4_observed_C"] = [c for c in cases if c[1] in (1, 2, 3, 4)]
++    for p in (0, 1):
++        for patch in range(5):
++            groups[f"P{p}_patch{patch}"] = [c for c in cases if c[:2] == (p, patch)]
++    for seed in sorted({c[2] for c in cases}):
++        groups[f"seed{seed}"] = [c for c in cases if c[2] == seed]
++    return groups
++
++
++def summarize_all(rows, effects, metrics):
++    cases = sorted({case_key(r) for r in rows})
++    groups = group_cases(cases)
++    configs, paired = {}, {}
++    for group, keys in groups.items():
++        configs[group], paired[group] = {}, {}
++        keyset = set(keys)
++        for model in MODELS:
++            for solver in SOLVERS:
++                selected = {case_key(r): r for r in rows if r["model"] == model and r["solver"] == solver and case_key(r) in keyset}
++                name = model + "/" + solver
++                configs[group][name] = {
++                    "requested": len(keys), "scored": sum(r["status"] == "PASS" for r in selected.values()),
++                    "metrics": {m: summarize({k: selected.get(k, {}).get("values", {}).get(m) for k in keys}, m) for m in metrics},
++                }
++        for effect in EFFECTS:
++            selected = {case_key(r): r for r in effects if r["effect"] == effect and case_key(r) in keyset}
++            paired[group][effect] = {m: summarize({k: selected.get(k, {}).get("differences", {}).get(m) for k in keys}, m, True) for m in metrics}
++    return configs, paired
++
++
++def make_binding(rows, seeds, tolerance=0.0):
++    by = {(r["model"], r["solver"], int(r["parent"]), int(r["patch"]), int(r["seed"])): r for r in rows}
++    metrics = sorted({m for r in rows for entry in r.get("cross_binding", {}).values() for m in entry.get("metrics", {})})
++    records = []
++    for model in MODELS:
++        for solver in SOLVERS:
++            for patch in range(5):
++                for seed in seeds:
++                    a = by.get((model, solver, 0, patch, seed), {})
++                    b = by.get((model, solver, 1, patch, seed), {})
++                    four = {"EaFa": a.get("cross_binding", {}).get("0", {}),
++                            "EaFb": b.get("cross_binding", {}).get("0", {}),
++                            "EbFb": b.get("cross_binding", {}).get("1", {}),
++                            "EbFa": a.get("cross_binding", {}).get("1", {})}
++                    values = {}
++                    for metric in metrics:
++                        v = {key: entry.get("metrics", {}).get(metric) for key, entry in four.items()}
++                        da, db = difference(v["EaFb"], v["EaFa"]), difference(v["EbFa"], v["EbFb"])
++                        avg = (da + db) / 2 if number(da) and number(db) else None
++                        sign = lambda x: None if not number(x) else (1 if x > tolerance else (-1 if x < -tolerance else 0))
++                        values[metric] = dict(**v, delta_a=da, delta_b=db, mean=avg,
++                                              delta_a_sign=sign(da), delta_b_sign=sign(db), mean_sign=sign(avg),
++                                              both_directions_positive=(sign(da) == 1 and sign(db) == 1) if number(avg) else None)
++                    records.append(dict(model=model, solver=solver, patch=patch, seed=seed,
++                                        source_P0=a.get("task_id"), source_P1=b.get("task_id"),
++                                        status="PASS" if values and all(number(v["mean"]) for v in values.values()) else "INCOMPLETE",
++                                        metrics=values, sources={k: {x: v.get(x) for x in ("target_parent", "prediction_parent", "source_task_id", "identity")} for k, v in four.items()}))
++    return records
++
++
++def csv_write(path, rows):
++    fields = list(dict.fromkeys(key for row in rows for key in row))
++    with Path(path).open("w", encoding="utf-8-sig", newline="") as f:
++        writer = csv.DictWriter(f, fieldnames=fields)
++        writer.writeheader()
++        for row in rows:
++            writer.writerow({k: "NA" if v is None else (json.dumps(v, ensure_ascii=False, sort_keys=True) if isinstance(v, (dict, list)) else v) for k, v in row.items()})
++
++
++def fmt(value):
++    return "NA" if not number(value) else f"{value:.6g}"
++
++
++def table(headers, rows):
++    return "\n".join(["| " + " | ".join(headers) + " |", "| " + " | ".join("---" for _ in headers) + " |"] + ["| " + " | ".join(map(str, row)) + " |" for row in rows])
++
++
++def collect(out):
++    protocol = read_json(out / "registration/protocol.json")
++    tasks = [t for group in protocol["groups"] for t in group["tasks"]]
++    formal = [t for t in tasks if t["kind"] == "formal"]
++    expected = {(m, s, p, patch, seed) for m in MODELS for s in SOLVERS for p in (0, 1) for patch in range(5) for seed in protocol["generation_seeds"]}
++    actual = {(t["model"], t["solver"], int(t["parent"]), int(t["patch"]), int(t["seed"])) for t in formal}
++    if len(formal) != 120 or actual != expected or len({t["task_id"] for t in tasks}) != len(tasks):
++        raise ValueError("Protocol does not contain the exact unique formal 120-request matrix")
++    worker_rows, score_rows, workers, scores = {}, {}, [], []
++    for group in protocol["groups"]:
++        gid = group["group_id"]
++        for folder, dest, records in (("workers", worker_rows, workers), ("scores", score_rows, scores)):
++            path = out / folder / (str(gid) + ".json")
++            if not path.exists():
++                continue
++            data = read_json(path)
++            records.append(dict(group_id=gid, path=str(path.relative_to(out)), sha256=sha256(path), record=data))
++            for row in data.get("rows", []):
++                tid = row["task_id"]
++                if tid in dest:
++                    raise ValueError(f"Duplicate {folder} task {tid}")
++                dest[tid] = row
++    known_tasks = {t["task_id"]: t for t in tasks}
++    for source in (worker_rows, score_rows):
++        if set(source)-set(known_tasks):
++            raise ValueError("Unregistered task found")
++        for tid, row in source.items():
++            for field in ("model", "solver", "parent", "patch", "seed"):
++                if field in row and row[field] != known_tasks[tid][field]:
++                    raise ValueError(f"Identity mismatch for {tid}: {field}")
++    rows = []
++    metrics = sorted({key for r in score_rows.values() for key in r.get("scalars54", {})})
++    derived = sorted({key for r in score_rows.values() for key in r.get("derived", {}) if number(r["derived"][key]) or r["derived"][key] is None})
++    for task in formal:
++        tid = task["task_id"]
++        worker, score = worker_rows.get(tid, {}), score_rows.get(tid, {})
++        row = dict(task, sampling=worker, score=score,
++                   status=score.get("status", "NOT_SCORED"), sampling_status=score.get("sampling_status", worker.get("status", "NOT_RUN")),
++                   scalars54={m: score.get("scalars54", {}).get(m) for m in metrics},
++                   derived={m: score.get("derived", {}).get(m) for m in derived},
++                   cross_binding=score.get("cross_binding", {}))
++        row["values"] = dict(row["scalars54"], **row["derived"])
++        rows.append(row)
++    rows.sort(key=lambda r: (r["parent"], r["patch"], r["seed"], MODELS.index(r["model"]), SOLVERS.index(r["solver"])))
++    return protocol, rows, metrics, derived, workers, scores
++
++
++def audit_totals(workers, scores):
++    """Keep source audit records: never guess attempts from requested NFE."""
++    totals = defaultdict(float)
++    fields = ("model_forward_attempts", "model_forward_returns", "complete_rollouts", "failed_model_calls")
++    for w in workers:
++        r = w["record"]
++        counts = r.get("counts", r.get("ledger", {}))
++        for key in fields:
++            if number(counts.get(key)):
++                totals[key] += counts[key]
++    return {"worker_totals_if_explicit": dict(totals),
++            "worker_records": workers, "scoring_records": scores,
++            "timing_note": "Per-phase walls and CUDA events are nested. Concurrent CPU task seconds are not end-to-end user waiting time. Resource contention prevents an isolated speed comparison."}
++
++
++def report_text(result):
++    cfg, eff = result["configuration_summaries"], result["paired_summaries"]
++    rms = "remainder_symmetric_RMS_bbox_pct"
++    def mean(group, name, metric):
++        return fmt(cfg[group][name]["metrics"].get(metric, {}).get("hierarchical_mean"))
++    names = list(cfg["all"])
++    text = ["# JEdge5 Equal-NFE Sampler Confirmation", "",
++        "**是否应把 Midpoint25 作为下一阶段统一工作配置：尚待依据下列完整证据作最终科学判读；本自动报告不设置事后胜出阈值，不修改公共默认采样器。**", "",
++        "本轮新结果独立于旧 J/P0 四个开发案例。B 为纯 FM、J 为 JEdge5，均使用 raw 累计 3000 步权重；三个固定方法都为 50 NFE。Midpoint25 是主要确认候选，E_quad50 是次要候选，Euler50 是共同参照。", "",
++        f"正式请求 120；完成评分 {result['formal_scored']}；未完成评分 {120-result['formal_scored']}。每配置请求分母固定为 20，失败与缺失仍保留。", "",
++        "## 六配置主表", "",
++        "均值先在每个 parent/patch 内平均两 seed，再对十个单元等权平均。任何成员缺失时完整均值为 NA；JSON 另列可用配对统计、完整单元统计及有效分母。RMS/p95 为 % bbox，coverage 为比例，计数为每输出均值。", ""]
++    panels = [
++        (["配置", "剩余RMS", "free→GT", "GT→free", "固定coverage@1%L", "Γsurface p95", "Γsurface cov@0.1%L"],
++         [rms, "free_to_R12_RMS_bbox_pct", "R12_to_free_RMS_bbox_pct", "fixed_R12_coverage_within_1pct_fraction", "boundary_p95_bbox_pct", "boundary_coverage_fraction"]),
++        (["配置", "Γedge p95", "Γedge cov@0.1%L", "CF", "CF受影响free", "FF", "角<5°", "q>10"],
++         ["Gamma_to_free_edges_p95_bbox_pct", "Gamma_to_free_edges_coverage_0.001_fraction", "CF_proper_pair_count", "CF_proper_affected_free_fraction", "FF_illegal_pair_count", "free_minimum_angle_lt5_fraction", "free_q_gt10_fraction"])]
++    for headers, metrics in panels:
++        text += [table(headers, [[name]+[mean("all", name, m) for m in metrics] for name in names]), ""]
++    status_rows = []
++    for name in names:
++        model, solver = name.split("/")
++        rows = [r for r in result["rows"] if r["model"] == model and r["solver"] == solver]
++        success = sum(r["status"] == "PASS" for r in rows)
++        unresolved = sum((r["score"].get("unresolved_pair_count") or 0) > 0 for r in rows)
++        nfe = sum(r["sampling"].get("counts_after", {}).get("model_forward_attempts", 0)-r["sampling"].get("counts_before", {}).get("model_forward_attempts", 0) for r in rows)
++        wall = sum(r["sampling"].get("audit", {}).get("sampling_wall_seconds", 0) for r in rows)
++        cuda = sum(r["sampling"].get("audit", {}).get("model_forward_cuda_event_seconds", 0) or 0 for r in rows)
++        status_rows.append([name, f"{success}/{20-success}/{unresolved}", nfe, fmt(wall), fmt(cuda)])
++    text += [table(["配置", "评分成功/失败或缺失/未决输出", "实际前向尝试", "采样wall合计s", "模型CUDA事件合计s"], status_rows), "",
++        "成功表示执行与评分完成，不等于几何合法；未决输出数可与成功数重叠。连续指标自身有效分母见 JSON。", "",
++        "## 配对归因", "",
++        "ΔB/ΔJ 是同模型候选−Euler；A 是同采样器 J−B；I=ΔJ−ΔB。误差/相交负值改善，coverage 正值改善。表中为分层均差 / 逐case配对中位差，无总分。J 的训练配方增量主要比较 A_M；I 改善不自动表示 J 已优于 B。", ""]
++    key_metrics = [rms, "fixed_R12_coverage_within_1pct_fraction", "boundary_p95_bbox_pct", "Gamma_to_free_edges_p95_bbox_pct", "CF_proper_pair_count", "FF_illegal_pair_count"]
++    def paired_cell(effect, metric):
++        stats = eff["all"][effect].get(metric, {})
++        return fmt(stats.get("hierarchical_mean"))+" / "+fmt(stats.get("paired_median_delta"))
++    text += [table(["效应", "剩余RMS", "coverage", "Γsurface p95", "Γedge p95", "CF", "FF"],
++                   [[name]+[paired_cell(name, m) for m in key_metrics] for name in EFFECTS]), ""]
++    for metric in (rms, "boundary_p95_bbox_pct", "CF_proper_pair_count", "FF_illegal_pair_count"):
++        if metric not in result["metric_names54"]:
++            continue
++        text += [f"{metric}：有效配对、方向及尾部（其余全部指标同结构保存在 JSON）。", "",
++            table(["效应", "有效/请求", "改善/相等/恶化", "最差case与原始差"],
++                [[name, f"{eff['all'][name][metric]['valid']}/{eff['all'][name][metric]['requested']}",
++                  "/".join(str(eff["all"][name][metric][k]) for k in ("improved", "equal", "worsened")),
++                  json.dumps(eff["all"][name][metric]["worst_case"], ensure_ascii=False)] for name in EFFECTS]), ""]
++    text += ["## 分层结果", "",
++        "P0/P1、patch0 训练 C 与 patch1–4 已观察 C、十个单元、两份 seed 分别保留。下表列剩余 RMS；其余 54 指标、面积解释量、各组效应中位差/方向/最差case 均在 results.json。", "",
++        table(["分组"]+names, [[group]+[mean(group, name, rms) for name in names] for group in cfg]), "",
++        "## 条件绑定", "",
++        "60 组来自已有 P0/P1 输出，不新增生成。每组保存 E_a(F_a)、E_a(F_b)、E_b(F_b)、E_b(F_a)，两方向交换−正确差及均值。目标行固定自己的 R12、Gamma、bbox，F 排除复制 C。平均为正不等于两方向均正；coverage 的交换−正确差解释方向与误差相反。原数值规则为 >0/==0，不添加 tie 容差。绑定不是 60 个独立控制任务或新对象成功率。", "",
++        f"完整绑定组 {sum(r['status']=='PASS' for r in result['binding'])}/60；四格、原始差值与来源见 [binding.csv](binding.csv)。", "",
++        "## 固定视图", "",
++        "第一登记 seed 全部十上下文均展示六配置 full/free 与 GT 未知区域覆盖热图。镜头、GT 导出范围、查询点及色阶预登记；超固定范围/色阶计数保留于 figures/plot_manifest.json。", ""]
++    for p in (0, 1):
++        text.append("、".join(f"[P{p}/patch{patch}](figures/P{p}_patch{patch}_seed{result['generation_seeds'][0]}.png)" for patch in range(5)))
++    totals = result["accounting"]["worker_totals_if_explicit"]
++    text += ["", "## 执行、限制与交付", "",
++        f"原始worker显式计账：{json.dumps(totals, ensure_ascii=False)}。正式预算6000 NFE，历史回归最多200、重复最多100、接线/预热最多20，总硬上限6320。重复不算独立样本，实际失败/尝试保留。", "",
++        "共享flock最多一个GPU worker，CPU按资源预算并行。模型前向、采样、落盘、锁等待、加载、CPU评分和绘图分列于JSON原记录；嵌套或重叠时间不累加为用户等待时间。当前计时不是独占硬件或跨设备性能声明。", "",
++        "BF16实际前向、FP32参数与积分、严格确定性、TF32关闭、SDPA math。历史BF16 face-permutation FAIL以原容差继承（edge_factorial_20261001_123000/EDGE_FACTORIAL_REPORT.md:1038）；本轮重复通过也不把旧FAIL改为PASS。", "",
++        "patch0是原微调C；patch1–4未作为该微调C但已研究观察。两个父对象都参加过训练，patch3与历史片重合11/12，patch4历史重合较低，不称为新对象或全部未见上下文。两seed不支持可靠尾概率、显著性或泛化估计。更低GT误差不等于更精确ODE解，本轮不作数值真值或收敛结论。", "",
++        "保留退化与UNRESOLVED，未运行的水密/精确谓词/全局拓扑认证为NOT_RUN。无训练、OT、投影、焊接、删面、重网格；公共默认与权重不变。", "",
++        "交付：[results.json](results.json)、[120行逐输出](per_output.csv)、[逐case效应](paired_effects.csv)、[60组绑定](binding.csv)、[协议](registration/protocol.json)、[code.diff](code.diff)、[最终审计](final_audit.json)；raw/保留轨迹。到停止条件后不追加seed、采样器或训练。", ""]
++    return "\n".join(text)
++
++def run(out):
++    start = time.perf_counter()
++    out = Path(out).resolve()
++    if out.parent.name != "runs" or not out.name.startswith("equal_nfe_confirmation_"):
++        raise ValueError("Only an isolated equal_nfe_confirmation run is writable")
++    protocol, rows, metrics, derived, workers, scores = collect(out)
++    all_metrics = metrics + [m for m in derived if m not in metrics]
++    effects = make_effects(rows, all_metrics)
++    configs, paired = summarize_all(rows, effects, all_metrics)
++    tolerance = 0.0  # Existing binding uses exact >0 / ==0, no tie tolerance.
++    binding = make_binding(rows, protocol["generation_seeds"], tolerance)
++    csv_write(out / "per_output.csv", [dict(task_id=r["task_id"], model=r["model"], solver=r["solver"], parent=r["parent"], patch=r["patch"], seed=r["seed"], status=r["status"], sampling_status=r["sampling_status"], sampling_audit=r["sampling"], scoring_identity={k: v for k, v in r["score"].items() if k not in ("scalars54", "derived", "cross_binding")}, **r["values"]) for r in rows])
++    csv_write(out / "paired_effects.csv", [dict(parent=r["parent"], patch=r["patch"], seed=r["seed"], effect=r["effect"], **r["differences"]) for r in effects])
++    csv_write(out / "binding.csv", [dict(**{k: v for k, v in r.items() if k != "metrics"}, **{f"{m}__{k}": v for m, fields in r["metrics"].items() for k, v in fields.items()}) for r in binding])
++    result = dict(status="COMPLETE_SCORED_MATRIX" if all(r["status"] == "PASS" for r in rows) else "INCOMPLETE_OR_FAILED_MATRIX",
++                  formal_requested=120, formal_scored=sum(r["status"] == "PASS" for r in rows),
++                  generation_seeds=protocol["generation_seeds"], metric_names54=metrics, derived_names=derived,
++                  protocol_sha256=sha256(out / "registration/protocol.json"), rows=rows, paired_effects=effects,
++                  configuration_summaries=configs, paired_summaries=paired, binding=binding,
++                  binding_numerical_tolerance=tolerance, accounting=audit_totals(workers, scores),
++                  formal_requested_NFE=6000, total_model_forward_hard_limit=6320,
++                  model_forwards_from_reporting=0, default_changed=False, recommendation="PENDING_SCIENTIFIC_REVIEW",
++                  grouping_note="Means: seeds within cell, then equal weight cells. Missing full mean=NA. Available statistics explicitly named and denominators preserved.",
++                  reporting_seconds=time.perf_counter()-start)
++    write_json(out / "results.json", result)
++    (out / "EQUAL_NFE_CONFIRMATION_REPORT.md").write_text(report_text(result), encoding="utf-8")
++    print(json.dumps(dict(status=result["status"], formal_scored=result["formal_scored"], per_output_rows=len(rows), paired_rows=len(effects), binding_rows=len(binding), metric_count=len(metrics))))
++    return result
++
++
++if __name__ == "__main__":
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--out", type=Path, required=True)
++    run(parser.parse_args().out)
+diff --git a/experiments/mf_h1_local0/equal_nfe_confirmation/sampler.py b/experiments/mf_h1_local0/equal_nfe_confirmation/sampler.py
+new file mode 100644
+--- /dev/null
++++ b/experiments/mf_h1_local0/equal_nfe_confirmation/sampler.py
+@@ -0,0 +1,262 @@
++"""Exactly three registered 50-NFE paths; device-buffered raw trajectories.
++
++Euler is the production constant 1/50 expression. M/Q preserve the pilot's
++Python FP64 grid, independent time/dt conversion, and operation order.
++"""
++from native_t1.runtime import configure_stable_runtime
++from native_t1.model import native_execution
++from native_t1.artifacts import array_hash
++from contextlib import nullcontext
++import time
++import numpy as np
++import torch
++
++METHODS = {
++    'E': dict(name='Euler50', solver='Euler', intervals=50, nfe=50),
++    'M': dict(name='Midpoint25', solver='Midpoint', intervals=25, nfe=50),
++    'Q': dict(name='E_quad50', solver='Euler', intervals=50, nfe=50),
++}
++ALIASES = {v['name']: k for k, v in METHODS.items()}
++TIME_POLICY = ('E: production t=k/50 and constant Python 1/50; '
++               'M/Q: pilot FP64 grid, independently cast t and dt; '
++               'M stage time=(t0+t1)*.5 and half-step=dt*.5; no accumulation.')
++
++
++def new_counts():
++    return dict(model_forward_attempts=0, model_forward_returns=0,
++                accepted_steps=0, full_rollout_attempts=0, complete_rollouts=0,
++                sampling_failures=0, model_backward_calls=0, optimizer_updates=0,
++                geometry_gradient_calls=0, OT_calls=0, postprocessing_repairs=0)
++
++
++def _bits_equal(a, b):
++    return (a.dtype == b.dtype and a.shape == b.shape and
++            torch.equal(a.contiguous().view(torch.int32), b.contiguous().view(torch.int32)))
++
++
++def _validate(model, noise, C, method, cpu_mock, known_slots):
++    if method not in METHODS:
++        raise ValueError('Only preregistered E/M/Q are supported')
++    if not isinstance(cpu_mock, bool):
++        raise ValueError('cpu_mock must be explicit boolean')
++    if noise.dtype != torch.float32 or noise.shape != (1, 112, 9):
++        raise ValueError('Original FP32 [1,112,9] Gaussian required')
++    if C.dtype != torch.float32 or C.shape not in ((12, 3, 3), (12, 9)):
++        raise ValueError('FP32 K12 condition required')
++    if len(known_slots) != 12 or len(set(known_slots)) != 12 or any(k not in range(112) for k in known_slots):
++        raise ValueError('Twelve distinct explicit known slots required')
++    parameters = list(model.parameters())
++    expected_device = 'cpu' if cpu_mock else 'cuda'
++    if noise.device.type != expected_device or C.device != noise.device or any(p.device != noise.device for p in parameters):
++        raise ValueError('Explicit CPU mock or real CUDA required; no device fallback')
++    if not parameters or any(p.dtype != torch.float32 or p.requires_grad or p.grad is not None for p in parameters):
++        raise RuntimeError('Frozen FP32 parameters without stored gradients required')
++    if getattr(model, 'experiment_trainable', True) or any(m.training for m in model.modules()):
++        raise RuntimeError('Frozen eval model required')
++    if not bool(torch.isfinite(noise).all() and torch.isfinite(C).all()):
++        raise FloatingPointError('Nonfinite input')
++
++
++def _validate_velocity(velocity, state, cpu_mock):
++    if not isinstance(velocity, torch.Tensor) or velocity.shape != state.shape or velocity.device != state.device or velocity.requires_grad:
++        raise RuntimeError('Invalid velocity shape/device/gradient graph')
++    if velocity.dtype != (torch.float32 if cpu_mock else torch.bfloat16):
++        raise RuntimeError('Actual velocity dtype violates frozen precision path')
++    if not bool(torch.isfinite(velocity).all()):
++        raise FloatingPointError('Nonfinite model velocity')
++
++
++@torch.no_grad()
++def sample(model, noise, C, method, counts=None, cpu_mock=False, *,
++           known_slots=None, reserve_forward=None, forward_returned=None):
++    """Return raw[112,9], accepted states and audit (NPZ arrays in _arrays).
++
++    reserve_forward is called and must persist the attempt BEFORE every model
++    call. No retries are performed. Full GPU stage/state arrays are copied only
++    after sampling; finite/C checks still synchronize and are disclosed.
++    """
++    method = ALIASES.get(method, method)
++    known_slots = tuple(range(12) if known_slots is None else known_slots)
++    _validate(model, noise, C, method, cpu_mock, known_slots)
++    if not cpu_mock:
++        configure_stable_runtime()
++    spec = METHODS[method]
++    intervals = spec['intervals']
++    counts = new_counts() if counts is None else counts
++    for k in new_counts():
++        counts.setdefault(k, 0)
++    counts['full_rollout_attempts'] += 1
++    initial_attempts, initial_returns = counts['model_forward_attempts'], counts['model_forward_returns']
++    noise_hash, condition_hash = array_hash(noise), array_hash(C)
++    condition = C.reshape(12, 9)
++    free_slots = tuple(k for k in range(112) if k not in known_slots)
++    # Preserve production/pilot slice arithmetic exactly for the archived layout.
++    prefix = known_slots == tuple(range(12))
++    ki = slice(0, 12) if prefix else list(known_slots)
++    fi = slice(12, 112) if prefix else list(free_slots)
++    state = noise.clone()
++    state[:, ki] = condition[None]
++    known = torch.zeros((1, 112), dtype=torch.bool, device=noise.device)
++    known[:, ki] = True
++    valid = torch.ones_like(known)
++    y = torch.tensor([112], device=noise.device)
++    ideal = [(k / intervals)**2 if method == 'Q' else k / intervals for k in range(intervals + 1)]
++    steps = [1 / 50 for _ in range(50)] if method == 'E' else [ideal[k + 1] - ideal[k] for k in range(intervals)]
++    accepted, stage_states, velocities = [], [], []
++    stage_times, stage_intervals, stage_kinds, stage_dt = [], [], [], []
++    events, dtype_records = [], []
++    check_count = 0
++    host_seconds = check_seconds = 0.
++    copy_seconds = 0.
++    sync_seconds = 0.
++
++    def sync():
++        nonlocal sync_seconds
++        if not cpu_mock:
++            tick = time.perf_counter()
++            torch.cuda.synchronize(noise.device)
++            sync_seconds += time.perf_counter() - tick
++
++    def assert_state(value):
++        nonlocal check_count, check_seconds
++        tick = time.perf_counter()
++        check_count += 1
++        if value.dtype != torch.float32 or not _bits_equal(value[0, ki], condition):
++            raise RuntimeError('Stage/accepted C bits changed')
++        if not bool(torch.isfinite(value).all()):
++            raise FloatingPointError('Nonfinite stage/accepted state')
++        check_seconds += time.perf_counter() - tick
++
++    def advance(base, velocity, dt):
++        updated = base.clone()
++        updated[:, fi] = base[:, fi] + velocity[:, fi] * dt
++        updated[:, ki] = condition[None]
++        assert_state(updated)
++        return updated
++
++    def forward(value, t_control, interval, kind, dt_control):
++        nonlocal host_seconds, check_seconds
++        if counts['model_forward_attempts'] - initial_attempts >= 50:
++            raise RuntimeError('50-NFE per-rollout budget exceeded')
++        assert_state(value)
++        t = torch.full((1,), t_control, dtype=torch.float32, device=noise.device)
++        if not cpu_mock and (not torch.is_autocast_enabled('cuda') or torch.get_autocast_dtype('cuda') != torch.bfloat16):
++            raise RuntimeError('BF16 autocast context lost')
++        if reserve_forward is not None:
++            reserve_forward()
++        counts['model_forward_attempts'] += 1
++        stage_states.append(value[0].detach().clone())
++        stage_times.append(t_control)
++        stage_intervals.append(interval)
++        stage_kinds.append(kind)
++        stage_dt.append(dt_control)
++        if not cpu_mock:
++            begin, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
++            begin.record()
++        tick = time.perf_counter()
++        velocity = model(value, t, y, valid, known)
++        host_seconds += time.perf_counter() - tick
++        counts['model_forward_returns'] += 1
++        if not cpu_mock:
++            end.record()
++            events.append((begin, end))
++        if forward_returned is not None:
++            forward_returned()
++        tick = time.perf_counter()
++        if isinstance(velocity, torch.Tensor) and velocity.shape == value.shape:
++            # Keep returned nonfinite velocities too if numerical validation fails.
++            velocities.append(velocity.float()[0].detach().clone())
++        _validate_velocity(velocity, value, cpu_mock)
++        check_seconds += time.perf_counter() - tick
++        dtype_records.append(str(velocity.dtype))
++        v = velocity.float()
++        return v
++
++    def exported(values):
++        nonlocal copy_seconds
++        tick = time.perf_counter()
++        result = (torch.stack(values).cpu().numpy().copy() if values else np.empty((0, 112, 9), np.float32))
++        copy_seconds += time.perf_counter() - tick
++        return result
++
++    sync()
++    if not cpu_mock:
++        torch.cuda.reset_peak_memory_stats(noise.device)
++        sample_begin, sample_end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
++        sample_begin.record()
++    tick = time.perf_counter()
++    context = (nullcontext(dict(cpu_mock=True, native_precision='FP32 analytic only')) if cpu_mock else
++               native_execution(model, coordinates=(state, condition), autocast=True))
++    try:
++        assert_state(state)
++        accepted.append(state[0].detach().clone())
++        with context as runtime:
++            for k, dt in enumerate(steps):
++                t0, t1 = ideal[k], ideal[k + 1]
++                v1 = forward(state, t0, k, 'start', dt * .5 if method == 'M' else dt)
++                if method == 'M':
++                    midpoint = advance(state, v1, dt * .5)
++                    v2 = forward(midpoint, (t0 + t1) * .5, k, 'midpoint', dt)
++                    state = advance(state, v2, dt)
++                else:
++                    state = advance(state, v1, dt)
++                counts['accepted_steps'] += 1
++                accepted.append(state[0].detach().clone())
++        if not cpu_mock:
++            sample_end.record()
++        sync()
++        sampling_wall = time.perf_counter() - tick
++        if counts['model_forward_attempts'] - initial_attempts != 50 or counts['model_forward_returns'] - initial_returns != 50:
++            raise RuntimeError('Actual NFE differs from registered contract')
++        if array_hash(noise) != noise_hash or array_hash(C) != condition_hash:
++            raise RuntimeError('Input mutation')
++        states = exported(accepted)
++        coords = exported(stage_states)
++        vels = exported(velocities)
++        C_cpu = condition.cpu().numpy()
++        for values in (states, coords):
++            actual = np.ascontiguousarray(values[:, known_slots, :])
++            expect = np.broadcast_to(C_cpu, actual.shape).copy()
++            if not np.array_equal(actual.view(np.uint32), expect.view(np.uint32)):
++                raise RuntimeError('Exported C bits changed')
++        counts['complete_rollouts'] += 1
++        arrays = dict(stage_states=coords, stage_velocities=vels,
++            stage_times_FP32=np.asarray(stage_times, np.float32),
++            stage_times_control_FP64=np.asarray(stage_times, np.float64),
++            accepted_times_FP32=np.asarray(ideal, np.float32),
++            accepted_times_control_FP64=np.asarray(ideal, np.float64),
++            step_sizes_FP32=np.asarray(steps, np.float32), step_sizes_control_FP64=np.asarray(steps, np.float64),
++            stage_step_sizes_FP32=np.asarray(stage_dt, np.float32), stage_step_sizes_control_FP64=np.asarray(stage_dt, np.float64),
++            stage_interval=np.asarray(stage_intervals, np.int64), stage_kind=np.asarray(stage_kinds, dtype='U16'),
++            known_mask=known[0].cpu().numpy(), free_mask=(~known)[0].cpu().numpy(), valid_mask=valid[0].cpu().numpy(),
++            known_slots=np.asarray(known_slots, np.int64), free_slots=np.asarray(free_slots, np.int64))
++        return states[-1].copy(), states, dict(method=method, name=spec['name'], nfe=50, intervals=intervals,
++            model_forward_attempts=50, model_forward_returns=50, accepted_states=intervals + 1, recorded_stage_states=50,
++            time_policy=TIME_POLICY, ideal_accepted_times=ideal,
++            actual_stage_times_FP32=arrays['stage_times_FP32'].tolist(), actual_step_sizes_FP32=arrays['step_sizes_FP32'].tolist(),
++            actual_endpoint_t1_forward_calls=sum(t == 1. for t in stage_times), runtime=runtime,
++            actual_velocity_dtypes=sorted(set(dtype_records)), integration_dtype='torch.float32', parameter_dtype='torch.float32',
++            known_accepted_all_bitwise=True, known_stages_all_bitwise=True, known_check_count=check_count,
++            known_predicted_velocity_may_be_nonzero=True, known_velocity_applied=False, inputs_unchanged=True,
++            noise_sha256=noise_hash, condition_sha256=condition_hash, first_stage_velocity_sha256=array_hash(vels[0]),
++            total_faces=112, known_faces=12, free_faces=100, seconds=sampling_wall,
++            sampling_wall_seconds=sampling_wall, model_forward_host_seconds=host_seconds,
++            sampling_cuda_event_seconds=None if cpu_mock else sample_begin.elapsed_time(sample_end) / 1000,
++            model_forward_cuda_event_seconds=None if cpu_mock else sum(a.elapsed_time(b) for a, b in events) / 1000,
++            explicit_cuda_synchronize_seconds=sync_seconds, finite_and_C_check_seconds=check_seconds,
++            stage_and_state_CPU_copy_seconds=copy_seconds,
++            peak_cuda_allocated=0 if cpu_mock else torch.cuda.max_memory_allocated(noise.device),
++            peak_cuda_reserved=0 if cpu_mock else torch.cuda.max_memory_reserved(noise.device),
++            peak_scope='Reset immediately before this rollout; includes resident model, device trajectories and caches.',
++            timing_note='Nested timings are not additive. Full arrays transfer after sampling; finite/C checks synchronize each stage; durable budget logging is within wall/event time.',
++            model_backwards=0, optimizer_updates=0, OT_calls=0, geometry_gradient_calls=0, postprocessing=None,
++            cpu_mock=cpu_mock, _arrays=arrays)
++    except BaseException as exc:
++        counts['sampling_failures'] += 1
++        exc.partial_states = exported(accepted)
++        exc.partial_stage_states = exported(stage_states)
++        exc.partial_stage_velocities = exported(velocities)
++        exc.partial_stage_times_FP32 = np.asarray(stage_times, np.float32)
++        exc.partial_stage_times_control_FP64 = np.asarray(stage_times, np.float64)
++        exc.partial_counts = dict(counts)
++        raise
+diff --git a/experiments/mf_h1_local0/equal_nfe_confirmation/test_evaluation.py b/experiments/mf_h1_local0/equal_nfe_confirmation/test_evaluation.py
+new file mode 100644
+--- /dev/null
++++ b/experiments/mf_h1_local0/equal_nfe_confirmation/test_evaluation.py
+@@ -0,0 +1,74 @@
++"""Small CPU fixtures for free-only binding and endpoint eligibility."""
++import tempfile
++import unittest
++from pathlib import Path
++
++from . import evaluation as e
++import numpy as np
++
++
++class EvaluationFixtures(unittest.TestCase):
++    def test_frozen_null_schema(self):
++        values = e.scalar_schema()
++        self.assertEqual(len(values), 54)
++        self.assertTrue(all(value is None for value in values.values()))
++        self.assertIn("exact_C_free_shared_edge_count", values)
++        self.assertIn("Gamma_to_free_edges_coverage_0.001_fraction", values)
++
++    def test_foreign_gamma_uses_free_and_target_scale(self):
++        triangle = np.array([[[0., 0., 2.], [1., 0., 2.], [0., 1., 2.]]])
++        points = np.array([[.2, .2, 0.], [.3, .3, 0.]])
++        weights = np.array([.5, .5])
++        bank = dict(arrays={}, cases_by_key={})
++        for p, length in ((0, 1.), (1, 2.)):
++            pre = f"parent{p}_patch0_"
++            bank["arrays"].update({pre + "boundary_points": points, pre + "boundary_weights": weights})
++            bank["cases_by_key"][p, 12] = dict(bbox_diagonal=length)
++        ledger = {}
++        a, ea = e._foreign_boundary(triangle, bank, 0, 0, ledger)
++        b, eb = e._foreign_boundary(triangle, bank, 1, 0, ledger)
++        self.assertAlmostEqual(a["rms_bbox_pct"], 200.)
++        self.assertAlmostEqual(b["rms_bbox_pct"], 100.)
++        self.assertEqual(a["coverage_fraction"], 0.)
++        self.assertEqual(ledger["binding_foreign_Gamma_surface_calls_returned"], 2)
++        self.assertGreater(ea["edges"]["RMS_bbox_pct"], a["rms_bbox_pct"])
++        self.assertEqual(eb["fallback"]["fallback_triangle_count"], 0)
++        degenerate = np.zeros((1, 3, 3))
++        _, fallback = e._foreign_boundary(degenerate, bank, 1, 0, ledger)
++        self.assertEqual(fallback["fallback"]["fallback_triangle_count"], 1)
++
++    def test_incomplete_or_changed_trajectory_rejected(self):
++        task = dict(solver="Midpoint25", parent=0)
++        C = np.zeros((12, 3, 3), dtype=np.float32)
++        raw = np.zeros((112, 3, 3), dtype=np.float32)
++        states = np.repeat(raw[None], 26, axis=0)
++        stages = np.repeat(raw[None], 50, axis=0)
++        times = np.linspace(0, 1, 26)
++        bank = dict(cases_by_key={(0, 12): dict(constraints=C)})
++        with tempfile.TemporaryDirectory() as temporary:
++            path = Path(temporary) / "raw.npz"
++            def save():
++                np.savez(path, raw=raw, states=states, stage_states=stages, C=C,
++                         accepted_times_FP32=times.astype(np.float32),
++                         accepted_times_control_FP64=np.linspace(0, 1, 26))
++                return e.file_sha256(path)
++            endpoint, identity = e.validate_endpoint(path, save(), task, bank)
++            self.assertEqual(identity["accepted_count"], 26)
++            self.assertEqual(endpoint.shape, (112, 3, 3))
++            times[-1] = .96
++            with self.assertRaisesRegex(ValueError, "t=1"):
++                e.validate_endpoint(path, save(), task, bank)
++            times[-1] = 1.
++            stages[4, 0, 0, 0] = 1.
++            with self.assertRaisesRegex(ValueError, "C changed"):
++                e.validate_endpoint(path, save(), task, bank)
++
++    def test_regressions_excluded_from_formal_denominator(self):
++        formal = dict(task_id="formal", kind="formal", model="B", solver="Euler50")
++        extra = dict(task_id="repeat", kind="repeat", model="B", solver="Euler50")
++        protocol = dict(groups=[dict(group_id="block00", tasks=[formal, extra])])
++        self.assertEqual(e._registered_group(protocol, "block00"), [formal])
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/experiments/mf_h1_local0/equal_nfe_confirmation/test_reporting.py b/experiments/mf_h1_local0/equal_nfe_confirmation/test_reporting.py
+new file mode 100644
+--- /dev/null
++++ b/experiments/mf_h1_local0/equal_nfe_confirmation/test_reporting.py
+@@ -0,0 +1,64 @@
++"""Small CPU tests for scientific aggregation, not implementation-mirroring tests."""
++import unittest
++
++from .reporting import make_binding, make_effects, summarize
++
++
++class ReportingTests(unittest.TestCase):
++    def test_median_is_of_paired_differences(self):
++        rows = []
++        for seed, a, b in zip((1, 2, 3), (0, 100, 101), (0, 1, 101)):
++            for solver, value in (("Euler50", a), ("Midpoint25", b)):
++                rows.append(dict(model="B", solver=solver, parent=0, patch=0, seed=seed, values={"RMS": value}))
++        effects = make_effects(rows, ["RMS"])
++        diff = {(r["parent"], r["patch"], r["seed"]): r["differences"]["RMS"] for r in effects if r["effect"] == "Delta_B_M"}
++        stats = summarize(diff, "RMS", True)
++        self.assertEqual(stats["paired_median_delta"], 0)  # difference of marginal medians would be -99
++        self.assertEqual((stats["improved"], stats["equal"], stats["worsened"]), (1, 2, 0))
++
++    def test_coverage_improvement_sign(self):
++        values = {(0, 0, 1): .2, (0, 0, 2): -.1, (0, 1, 1): 0}
++        result = summarize(values, "boundary_coverage_fraction", True)
++        self.assertEqual((result["improved"], result["equal"], result["worsened"]), (1, 1, 1))
++        self.assertEqual(result["worst_case"]["seed"], 2)
++
++    def test_missing_does_not_become_success_subset_mean(self):
++        values = {(0, 0, 1): 1, (0, 0, 2): None, (1, 0, 1): 10, (1, 0, 2): 20}
++        stats = summarize(values, "RMS", True)
++        self.assertIsNone(stats["hierarchical_mean"])
++        self.assertEqual(stats["available_complete_cell_mean"], 15)
++        self.assertEqual((stats["valid"], stats["requested"], stats["cells_complete"]), (3, 4, 1))
++        self.assertEqual(stats["paired_median_delta"], 10)
++
++    def test_hierarchy_equal_weights_cells(self):
++        values = {(0, 0, 1): 0, (0, 0, 2): 2, (1, 0, 1): 10}
++        stats = summarize(values, "RMS")
++        self.assertEqual(stats["hierarchical_mean"], 5.5)
++        self.assertEqual(stats["available_case_mean"], 4)
++
++    def test_interaction_requires_all_four_operands(self):
++        rows = [dict(model=m, solver=s, parent=0, patch=0, seed=1, values={"RMS": v})
++                for m, s, v in (("B", "Euler50", 4), ("B", "Midpoint25", 2), ("J", "Euler50", 10), ("J", "Midpoint25", 3))]
++        effect = {r["effect"]: r["differences"]["RMS"] for r in make_effects(rows, ["RMS"])}
++        self.assertEqual((effect["Delta_B_M"], effect["Delta_J_M"], effect["A_M"], effect["I_M"]), (-2, -7, 1, -5))
++        rows.pop()
++        effect = {r["effect"]: r["differences"]["RMS"] for r in make_effects(rows, ["RMS"])}
++        self.assertIsNone(effect["I_M"])
++        self.assertIsNone(effect["A_M"])
++
++    def test_binding_keeps_both_directions(self):
++        rows = []
++        # P0 correct 2 / P1 foreign 3 => +1; P1 correct 10 / P0 foreign 9 => -1.
++        for parent, vals in ((0, (2, 9)), (1, (3, 10))):
++            rows.append(dict(model="B", solver="Euler50", parent=parent, patch=0, seed=1, task_id=f"source{parent}",
++                             cross_binding={str(p): {"metrics": {"RMS": v}} for p, v in enumerate(vals)}))
++        row = make_binding(rows, [1])[0]
++        self.assertEqual(row["metrics"]["RMS"]["mean"], 0)
++        self.assertEqual(row["metrics"]["RMS"]["delta_a"], 1)
++        self.assertEqual(row["metrics"]["RMS"]["delta_b"], -1)
++        self.assertFalse(row["metrics"]["RMS"]["both_directions_positive"])
++        self.assertEqual(row["source_P1"], "source1")
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/experiments/mf_h1_local0/equal_nfe_confirmation/test_sampler.py b/experiments/mf_h1_local0/equal_nfe_confirmation/test_sampler.py
+new file mode 100644
+--- /dev/null
++++ b/experiments/mf_h1_local0/equal_nfe_confirmation/test_sampler.py
+@@ -0,0 +1,206 @@
++"""Bounded CPU-only formula, layout, precision and durable-budget fixtures."""
++from native_t1.runtime import configure_stable_runtime
++import argparse
++import hashlib
++import json
++import math
++from pathlib import Path
++import tempfile
++import time
++import numpy as np
++import torch
++from .sampler import METHODS, sample, new_counts, _validate_velocity
++from .worker import ForwardLedger, LIMITS, TOTAL_LIMIT, compare_archive
++
++
++class AnalyticModel(torch.nn.Module):
++    def __init__(self, kind, C, known_slots=None, fail_on=None):
++        super().__init__()
++        self.anchor = torch.nn.Parameter(torch.zeros(()), requires_grad=False)
++        self.experiment_trainable = False
++        self.kind, self.C = kind, C.reshape(12, 9).clone()
++        self.known_slots = list(range(12) if known_slots is None else known_slots)
++        self.fail_on, self.calls, self.times = fail_on, 0, []
++        self.eval()
++
++    def forward(self, x, t, y, valid, known):
++        self.calls += 1
++        self.times.append(float(t[0]))
++        assert x.dtype == t.dtype == torch.float32
++        assert y.tolist() == [112] and valid.all()
++        assert torch.where(known[0])[0].tolist() == sorted(self.known_slots)
++        assert torch.equal(x[0, self.known_slots].contiguous().view(torch.int32), self.C.view(torch.int32))
++        if self.calls == self.fail_on:
++            raise RuntimeError('fixture injected model failure')
++        v = (torch.ones_like(x) * .75 if self.kind == 'constant' else
++             x.clone() if self.kind == 'linear' else torch.ones_like(x) * t[0])
++        v[:, self.known_slots] = 123.
++        return v
++
++
++def run_cpu_tests():
++    torch.set_num_threads(1)
++    tick = time.perf_counter()
++    C = torch.arange(108, dtype=torch.float32).reshape(12, 3, 3) / 100
++    C[0, 0, 0] = -0.
++    noise = torch.ones((1, 112, 9), dtype=torch.float32)
++    rows = []
++    counts = dict(real_model_forwards=0, model_backwards=0, optimizer_updates=0, OT_calls=0,
++                  CPU_mock_forward_attempts=0, CPU_mock_forward_returns=0,
++                  CPU_mock_complete_rollouts=0, expected_rejections=0)
++    def accumulate(ledger):
++        counts['CPU_mock_forward_attempts'] += ledger['model_forward_attempts']
++        counts['CPU_mock_forward_returns'] += ledger['model_forward_returns']
++        counts['CPU_mock_complete_rollouts'] += ledger['complete_rollouts']
++    for kind in ('constant', 'linear', 'time'):
++        for method, spec in METHODS.items():
++            model, ledger = AnalyticModel(kind, C), new_counts()
++            old_noise, old_C = noise.clone(), C.clone()
++            raw, states, audit = sample(model, noise, C, method, ledger, cpu_mock=True)
++            arrays = audit['_arrays']
++            accumulate(ledger)
++            assert model.calls == ledger['model_forward_attempts'] == ledger['model_forward_returns'] == 50
++            assert states.shape == (spec['intervals'] + 1, 112, 9)
++            assert arrays['stage_states'].shape == arrays['stage_velocities'].shape == (50, 112, 9)
++            assert audit['known_accepted_all_bitwise'] and audit['known_stages_all_bitwise']
++            assert np.all(arrays['stage_velocities'][:, :12] == 123.)
++            assert torch.equal(noise.view(torch.int32), old_noise.view(torch.int32))
++            assert torch.equal(C.view(torch.int32), old_C.view(torch.int32))
++            assert audit['actual_endpoint_t1_forward_calls'] == 0
++            assert min(model.times) == 0. and max(model.times) < 1.
++            assert arrays['accepted_times_FP32'][-1] == 1.
++            assert model.times[-1] == float(np.float32(.9604 if method == 'Q' else .98))
++            h = arrays['step_sizes_control_FP64']
++            value = float(raw[12, 0])
++            if kind == 'constant':
++                expected = 1.75
++            elif kind == 'time':
++                expected = 1.5 if method == 'M' else 1.5 - .5 * float(np.sum(h * h))
++            else:
++                expected = float(np.prod(1 + h + .5 * h * h)) if method == 'M' else float(np.prod(1 + h))
++            assert abs(value - expected) < 3e-6
++            # CPU arithmetic replay explicitly catches accidental midpoint-as-two-half-Euler.
++            independent = np.float32(1.)
++            times = arrays['accepted_times_control_FP64']
++            for k, dt in enumerate(h):
++                v1 = np.float32(.75 if kind == 'constant' else independent if kind == 'linear' else times[k])
++                if method == 'M':
++                    mid = np.float32(independent + v1 * np.float32(dt * .5))
++                    vmid = np.float32(.75 if kind == 'constant' else mid if kind == 'linear' else (times[k] + times[k + 1]) * .5)
++                    independent = np.float32(independent + vmid * np.float32(dt))
++                else:
++                    independent = np.float32(independent + v1 * np.float32(dt))
++            assert np.float32(value).view(np.uint32) == independent.view(np.uint32)
++            if method == 'E':
++                assert np.all(arrays['step_sizes_FP32'] == np.float32(1 / 50))
++            if method == 'Q':
++                assert arrays['step_sizes_FP32'][0] == np.float32(.0004)
++                assert arrays['step_sizes_FP32'][-1] == np.float32(.0396)
++            rows.append(dict(field=kind, solver=method, calls=model.calls, endpoint=value,
++                             discrete_formula=expected, final_query=model.times[-1],
++                             float32_arithmetic_bitwise=True))
++    # Explicit non-prefix and non-sorted condition slots; C order is preserved.
++    slots = [111, 1, 103, 3, 95, 5, 87, 7, 79, 9, 71, 11]
++    ledger = new_counts()
++    raw, states, audit = sample(AnalyticModel('constant', C, slots), noise, C, 'M', ledger,
++                                cpu_mock=True, known_slots=slots)
++    accumulate(ledger)
++    assert np.array_equal(raw[slots].view(np.uint32), C.numpy().reshape(12, 9).view(np.uint32))
++    assert np.allclose(raw[[i for i in range(112) if i not in slots]], 1.75, atol=3e-6, rtol=0.)
++    # One returned first stage and a reserved failed second stage: no accepted update.
++    ledger = new_counts()
++    model = AnalyticModel('constant', C, fail_on=2)
++    try:
++        sample(model, noise, C, 'M', ledger, cpu_mock=True)
++    except RuntimeError as exc:
++        assert 'fixture injected' in str(exc)
++        assert len(exc.partial_states) == 1
++        assert len(exc.partial_stage_states) == 2 and len(exc.partial_stage_velocities) == 1
++    else:
++        raise AssertionError('Expected injected model failure')
++    assert ledger['model_forward_attempts'] == 2 and ledger['model_forward_returns'] == 1
++    assert ledger['sampling_failures'] == 1 and ledger['complete_rollouts'] == 0
++    accumulate(ledger)
++    counts['expected_rejections'] += 1
++    with tempfile.TemporaryDirectory(prefix='equal_nfe_budget_') as directory:
++        # Historical diagnosis retains only five indexed accepted states for J/E.
++        archive_path = Path(directory) / 'sparse_history.npz'
++        indices = np.asarray([0, 5, 10, 20, 25], np.int64)
++        np.savez(archive_path, raw=raw, states=states[indices], state_indices=indices)
++        historical = compare_archive(archive_path, dict(raw=raw, states=states, **audit['_arrays']))
++        assert historical['status'] == 'PASS'
++        assert historical['comparisons'][1]['archived_state_indices'] == indices.tolist()
++        path = Path(directory) / 'forward_ledger.json'
++        durable = ForwardLedger(path)
++        task = dict(task_id='CPU_fixture', kind='repeat')
++        ledger = new_counts()
++        model = AnalyticModel('constant', C, fail_on=2)
++        try:
++            sample(model, noise, C, 'M', ledger, cpu_mock=True,
++                   reserve_forward=lambda: durable.reserve(task), forward_returned=lambda: durable.returned(task))
++        except RuntimeError:
++            pass
++        else:
++            raise AssertionError('Expected durable failure fixture')
++        accumulate(ledger)
++        restored = ForwardLedger(path)
++        assert restored.state['total_attempts'] == 2 and restored.state['total_returns'] == 1
++        assert restored.state['tasks']['CPU_fixture'] == dict(kind='repeat', attempts=2, returns=1)
++        # Rejection happens before the mocked model call and does not create an attempt.
++        for budget_kind in LIMITS:
++            restored.state['attempts_by_kind'][budget_kind] = LIMITS[budget_kind]
++            model, ledger = AnalyticModel('constant', C), new_counts()
++            try:
++                sample(model, noise, C, 'E', ledger, cpu_mock=True,
++                       reserve_forward=lambda kind=budget_kind: restored.reserve(dict(task_id='blocked_' + kind, kind=kind)))
++            except RuntimeError as exc:
++                assert 'budget exhausted' in str(exc)
++            else:
++                raise AssertionError('Category budget not enforced')
++            assert model.calls == ledger['model_forward_attempts'] == 0
++            assert restored.state['total_attempts'] == 2
++            counts['expected_rejections'] += 1
++        restored.state['total_attempts'] = TOTAL_LIMIT
++        restored.state['attempts_by_kind']['formal'] = 0
++        try:
++            restored.reserve(dict(task_id='total_block', kind='formal'))
++        except RuntimeError:
++            counts['expected_rejections'] += 1
++        else:
++            raise AssertionError('Global 6320 cap not enforced')
++    for action in (
++        lambda: sample(AnalyticModel('constant', C), noise, C, 'E', cpu_mock=False),
++        lambda: sample(AnalyticModel('constant', C), noise, C, 'Heun25', cpu_mock=True),
++        lambda: _validate_velocity(torch.zeros_like(noise), noise, cpu_mock=False),
++        lambda: sample(AnalyticModel('constant', C), noise, C, 'M', cpu_mock=True, known_slots=[0] * 12),
++    ):
++        try:
++            action()
++        except (ValueError, RuntimeError):
++            counts['expected_rejections'] += 1
++        else:
++            raise AssertionError('Expected fail-closed rejection')
++    assert not torch.cuda.is_initialized()
++    return dict(status='PASS', rows=rows, counts=counts, CUDA_initialized=False,
++                seconds=time.perf_counter() - tick,
++                fixture_groups=['three fields x three solvers, formula + exact FP32 recurrence',
++                    'non-prefix unsorted mask and signed-zero C bit preservation',
++                    'failed-forward attempt/return and partial trajectory accounting',
++                    'durable journal replay, four category caps and global 6320 cap',
++                    'no CPU/precision fallback; unregistered solver and invalid slot rejection'],
++                note='10 successful analytic CPU mock trajectories, 2 intentionally failed mock trajectories. No real model created or GPU initialized. Formula fixtures do not establish neural-field convergence order.')
++
++
++if __name__ == '__main__':
++    parser = argparse.ArgumentParser()
++    parser.add_argument('--record', required=True)
++    args = parser.parse_args()
++    path = Path(args.record)
++    if path.exists():
++        raise FileExistsError(path)
++    result = run_cpu_tests()
++    result['sources'] = {str(p): hashlib.sha256(p.read_bytes()).hexdigest()
++                         for p in (Path(__file__), Path(__file__).with_name('sampler.py'), Path(__file__).with_name('worker.py'))}
++    path.parent.mkdir(parents=True, exist_ok=True)
++    path.write_text(json.dumps(result, indent=2, allow_nan=False) + '\n', encoding='utf-8')
++    print(json.dumps(result, indent=2), flush=True)
+diff --git a/experiments/mf_h1_local0/equal_nfe_confirmation/worker.py b/experiments/mf_h1_local0/equal_nfe_confirmation/worker.py
+new file mode 100644
+--- /dev/null
++++ b/experiments/mf_h1_local0/equal_nfe_confirmation/worker.py
+@@ -0,0 +1,395 @@
++"""One bounded preregistered task group under the shared lifetime GPU flock.
++
++No torch import (and no CUDA/model creation) precedes the lock. The append-only
++forward journal is fsynced before each call, so failed attempts retain budget.
++"""
++import argparse
++import hashlib
++import json
++import os
++from pathlib import Path
++import subprocess
++import threading
++import time
++import traceback
++
++LIMITS = dict(formal=6000, regression=200, repeat=100, warmup=20)
++TOTAL_LIMIT = 6320
++LOCK_PATH = '/tmp/wrp_meshflow_jedge5_diag_gpu0.lock'
++FILE_HASHES = {
++    'B': '0f22ce498ca2c27dc74b43890fb8aad20f0f3e7153aa74ee6d3c14ea445a2660',
++    'J': 'cc7a248fa9a8570059f225cd1c313f21f08585925407a79418df6d63c9cae0e9',
++}
++
++
++def read_json(path):
++    return json.loads(Path(path).read_text(encoding='utf-8-sig'))
++
++
++def save_json(path, value):
++    path = Path(path)
++    path.parent.mkdir(parents=True, exist_ok=True)
++    temporary = path.with_suffix(path.suffix + '.tmp')
++    with temporary.open('w', encoding='utf-8') as stream:
++        json.dump(value, stream, indent=2, allow_nan=False)
++        stream.write('\n')
++        stream.flush()
++        os.fsync(stream.fileno())
++    os.replace(temporary, path)
++
++
++def sha256(path):
++    digest = hashlib.sha256()
++    with Path(path).open('rb') as stream:
++        for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b''):
++            digest.update(chunk)
++    return digest.hexdigest()
++
++
++class ForwardLedger:
++    """Caller must own the GPU flock; journal is the durable source of truth."""
++    def __init__(self, path):
++        self.path = Path(path)
++        self.journal = self.path.with_suffix('.jsonl')
++        self.state = dict(total_attempts=0, total_returns=0,
++                          attempts_by_kind={k: 0 for k in LIMITS},
++                          returns_by_kind={k: 0 for k in LIMITS}, tasks={},
++                          limits=LIMITS, total_limit=TOTAL_LIMIT,
++                          durability='Every attempt fsynced before model call; returns fsynced after model return.')
++        if self.journal.exists():
++            for line in self.journal.read_text(encoding='utf-8').splitlines():
++                self._apply(json.loads(line))
++        elif self.path.exists():
++            raise RuntimeError('Ledger summary exists without its durable journal')
++        self.path.parent.mkdir(parents=True, exist_ok=True)
++        save_json(self.path, self.state)
++
++    def _apply(self, event):
++        key, kind, action = event['task_id'], event['kind'], event['action']
++        if kind not in LIMITS or action not in ('attempt', 'return'):
++            raise ValueError('Invalid durable ledger event')
++        task = self.state['tasks'].setdefault(key, dict(kind=kind, attempts=0, returns=0))
++        if task['kind'] != kind:
++            raise RuntimeError('Task ledger kind changed')
++        field = 'attempts' if action == 'attempt' else 'returns'
++        task[field] += 1
++        self.state['total_' + field] += 1
++        self.state[field + '_by_kind'][kind] += 1
++        if (self.state['total_attempts'] > TOTAL_LIMIT or
++                self.state['attempts_by_kind'][kind] > LIMITS[kind] or
++                task['returns'] > task['attempts']):
++            raise RuntimeError('Corrupt or over-budget forward ledger')
++
++    def _append(self, task, action):
++        event = dict(task_id=task['task_id'], kind=task['kind'], action=action,
++                     timestamp=time.time(), pid=os.getpid())
++        with self.journal.open('a', encoding='utf-8') as stream:
++            stream.write(json.dumps(event, separators=(',', ':')) + '\n')
++            stream.flush()
++            os.fsync(stream.fileno())
++        self._apply(event)
++
++    def reserve(self, task):
++        kind, key = task['kind'], task['task_id']
++        if kind not in LIMITS:
++            raise ValueError('Unregistered budget category')
++        existing = self.state['tasks'].get(key, {})
++        if (self.state['total_attempts'] >= TOTAL_LIMIT or
++                self.state['attempts_by_kind'][kind] >= LIMITS[kind] or
++                existing.get('attempts', 0) >= (1 if kind == 'warmup' else 50)):
++            raise RuntimeError('Durable forward budget exhausted before model call')
++        self._append(task, 'attempt')
++
++    def returned(self, task):
++        previous = self.state['tasks'].get(task['task_id'])
++        if previous is None or previous['returns'] >= previous['attempts']:
++            raise RuntimeError('Forward return without a reserved attempt')
++        self._append(task, 'return')
++
++    def flush(self):
++        save_json(self.path, self.state)
++
++
++def snapshot():
++    def cmd(args):
++        try:
++            result = subprocess.run(args, capture_output=True, text=True, timeout=10)
++            return dict(returncode=result.returncode, stdout=result.stdout.strip(), stderr=result.stderr.strip())
++        except (OSError, subprocess.TimeoutExpired) as exc:
++            return dict(returncode=-1, stdout='', stderr=repr(exc))
++    memory_path = Path('/proc/meminfo')
++    memory = ({s.split(':')[0]: s.split(':', 1)[1].strip() for s in memory_path.read_text().splitlines()
++               if s.startswith(('MemTotal:', 'MemAvailable:', 'SwapFree:'))} if memory_path.exists() else {})
++    result = dict(timestamp=time.time(),
++        gpu=cmd(['nvidia-smi', '--query-gpu=name,memory.total,memory.used,memory.free,utilization.gpu', '--format=csv,noheader,nounits']),
++        processes=cmd(['nvidia-smi', '--query-compute-apps=pid,process_name,used_memory', '--format=csv,noheader,nounits']),
++        cpu_cores=os.cpu_count(), available_cpu_cores=len(os.sched_getaffinity(0)),
++        load=list(os.getloadavg()), memory=memory,
++        cpu_processes=cmd(['ps', '-eo', 'pid,comm,pcpu,pmem,nlwp', '--sort=-pcpu']))
++    return result
++
++
++def peak_resources(snapshots):
++    used, process_used = [], []
++    pid = str(os.getpid())
++    for item in snapshots:
++        try:
++            used.append(float(item['gpu']['stdout'].splitlines()[0].split(',')[2]))
++        except (ValueError, IndexError):
++            pass
++        for line in item['processes']['stdout'].splitlines():
++            parts = [p.strip() for p in line.split(',')]
++            if len(parts) >= 3 and parts[0] == pid:
++                try:
++                    process_used.append(float(parts[-1]))
++                except ValueError:
++                    pass
++    return dict(nvidia_smi_process_peak_MiB=max(process_used) if process_used else None,
++                nvidia_smi_total_used_peak_MiB=max(used) if used else None,
++                process_measurement_note='Sampled every 1 s, not a guaranteed continuous peak; WSL may report process VRAM N/A. Total used includes unrelated processes.')
++
++
++def compare_archive(path, current, *, require_stages=False):
++    import numpy as np
++    path = Path(path)
++    if not path.exists():
++        if require_stages:
++            raise FileNotFoundError(path)
++        return dict(status='ARCHIVE_REGRESSION_UNAVAILABLE', path=str(path))
++    aliases = dict(raw=('raw', 'output'), states=('states', 'path'),
++                   stage_states=('stage_states',), stage_velocities=('stage_velocities', 'velocities'),
++                   stage_times_FP32=('stage_times_FP32', 'times_FP32'),
++                   accepted_times_FP32=('accepted_times_FP32',), step_sizes_FP32=('step_sizes_FP32',))
++    rows = []
++    with np.load(path, allow_pickle=False) as archive:
++        for target, names in aliases.items():
++            name = next((n for n in names if n in archive.files), None)
++            if name is None:
++                if require_stages:
++                    raise RuntimeError('Repeat archive missing ' + target)
++                continue
++            a, b = np.asarray(current[target]), archive[name]
++            selected_indices = None
++            if target == 'states' and a.shape != b.shape and 'state_indices' in archive.files:
++                indices = archive['state_indices']
++                if (indices.dtype.kind not in 'iu' or indices.ndim != 1 or
++                        len(indices) != len(b) or np.any(indices < 0) or np.any(indices >= len(a))):
++                    raise RuntimeError('Invalid archived accepted-state indices')
++                a = a[indices]
++                selected_indices = indices.tolist()
++            if target == 'raw' and b.shape != a.shape and b.size == a.size:
++                b = b.reshape(a.shape)
++            equal = a.shape == b.shape and a.dtype == b.dtype and np.array_equal(
++                np.ascontiguousarray(a).view(np.uint8), np.ascontiguousarray(b).view(np.uint8))
++            rows.append(dict(current_key=target, archived_key=name, bitwise_equal=bool(equal),
++                             current_shape=list(a.shape), archived_shape=list(b.shape), archived_state_indices=selected_indices))
++    if not rows:
++        raise RuntimeError('Archive contains no comparable raw/states arrays')
++    status = 'PASS' if all(row['bitwise_equal'] for row in rows) else 'FAIL'
++    return dict(status=status, path=str(path), sha256=sha256(path), comparisons=rows,
++                unarchived_fields=[k for k in aliases if k not in {r['current_key'] for r in rows}])
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument('--out', required=True)
++    parser.add_argument('--group', required=True)
++    args = parser.parse_args()
++    root = Path(__file__).resolve().parents[3]
++    out = Path(args.out).resolve()
++    protocol_path = out / 'registration/protocol.json'
++    protocol = read_json(protocol_path)
++    if protocol.get('status') != 'FROZEN':
++        raise RuntimeError('Protocol must be frozen before worker dispatch')
++    matching = [g for g in protocol['groups'] if str(g['group_id']) == args.group]
++    if len(matching) != 1:
++        raise ValueError('Exactly one registered group must match')
++    tasks = matching[0]['tasks']
++    if any(t['kind'] not in ('regression', 'formal', 'repeat') for t in tasks):
++        raise ValueError('Worker only executes registered full trajectories')
++    dest = out / 'workers' / (args.group + '.json')
++    if dest.exists():
++        raise FileExistsError('Worker group already attempted; automatic retry forbidden: ' + str(dest))
++    (out / 'raw').mkdir(parents=True, exist_ok=True)
++    info = dict(group_id=args.group, status='WAITING_LOCK', rows=[], counts={},
++                lock_path=LOCK_PATH, actual_gpu_workers=1, requested_tasks=len(tasks),
++                protocol_sha256=sha256(protocol_path), resource_snapshots=[snapshot()], load_events=[])
++    save_json(dest, info)
++    import fcntl
++    lock_fd = os.open(LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o666)
++    waiting = time.perf_counter()
++    print('WAIT_LOCK', args.group, flush=True)
++    fcntl.flock(lock_fd, fcntl.LOCK_EX)
++    info.update(lock_inode=os.fstat(lock_fd).st_ino, lock_owner_pid=os.getpid(),
++                lock_wait_seconds=time.perf_counter() - waiting, lock_acquired_timestamp=time.time())
++    info['resource_snapshots'].append(snapshot())
++    parts = info['resource_snapshots'][-1]['gpu']['stdout'].splitlines()[0].split(',')
++    total, free = float(parts[1]), float(parts[3])
++    headroom = max(2048., total * .1)
++    info['dispatch'] = dict(headroom_MiB=headroom, free_MiB=free,
++                            concurrency_reason='Experiment requires one lifetime GPU flock owner.',
++                            minimum_additional_capacity_MiB=1536)
++    if free < headroom + 1536:
++        info['status'] = 'RESOURCE_BLOCKED'
++        save_json(dest, info)
++        raise RuntimeError('Insufficient available memory with required headroom')
++    os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
++    for name in ('OMP_NUM_THREADS', 'MKL_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'NUMEXPR_NUM_THREADS'):
++        os.environ[name] = '1'
++    from native_t1.runtime import configure_stable_runtime
++    import numpy as np
++    import torch
++    from native_t1.artifacts import array_hash, state_sha256
++    from experiments.mf_h1_local0.jedge5_diagnosis.common import ASSETS, load_model, load_cases, noise_bank
++    from .sampler import sample, new_counts
++    if torch.cuda.is_initialized():
++        raise RuntimeError('CUDA initialized before locked worker runtime')
++    info['CUDA_initialized_before_locked_runtime'] = False
++    configure_stable_runtime()
++    torch.set_num_threads(1)
++    torch.set_num_interop_threads(1)
++    ledger = ForwardLedger(out / 'forward_ledger.json')
++    for task in tasks:
++        if task['task_id'] in ledger.state['tasks'] or (out / 'raw' / (task['task_id'] + '.npz')).exists():
++            raise RuntimeError('Task already attempted; retry forbidden: ' + task['task_id'])
++    counts = new_counts()
++    info.update(status='RUNNING', counts=counts)
++    save_json(dest, info)
++    stop = threading.Event()
++    def monitor():
++        while not stop.wait(1.):
++            info['resource_snapshots'].append(snapshot())
++    monitor_thread = threading.Thread(target=monitor, daemon=True)
++    monitor_thread.start()
++    started = time.perf_counter()
++    cache, identities = {}, {}
++    active_label = None
++    current_row = None
++    task_tick = None
++    try:
++        for source, expected in protocol.get('source_sha256', {}).items():
++            source_path = Path(source)
++            if not source_path.is_absolute():
++                source_path = root / source_path
++            if sha256(source_path) != expected:
++                raise RuntimeError('Frozen source changed: ' + str(source_path))
++        cases = load_cases()
++        new_noise = noise_bank(out)
++        old_run = protocol.get('historical_run', root / 'native_t1/runs/jedge5_diagnosis_20261002_102215')
++        historical_noise = noise_bank(old_run) if any(t['noise_source'] == 'historical' for t in tasks) else {}
++        for task in tasks:
++            task_tick = time.perf_counter()
++            current_row = dict(task, status='RUNNING', sampling_status='RUNNING', counts_before=dict(counts))
++            info['rows'].append(current_row)
++            save_json(dest, info)
++            label = task['model']
++            if label not in FILE_HASHES:
++                raise ValueError('Only frozen B/J models authorized')
++            loading = time.perf_counter()
++            if active_label != label:
++                if active_label is not None:
++                    cache[active_label].cpu()
++                    if state_sha256(cache[active_label]) != identities[active_label]['state_sha256']:
++                        raise RuntimeError('Frozen model state mutated')
++                    torch.cuda.empty_cache()
++                if label not in cache:
++                    if sha256(ASSETS[label]['path']) != FILE_HASHES[label]:
++                        raise RuntimeError('Checkpoint file identity changed')
++                    cache[label], identities[label] = load_model(label, device='cpu')
++                cache[label].cuda()
++                torch.cuda.synchronize()
++                active_label = label
++                info['load_events'].append(dict(model=label, seconds=time.perf_counter() - loading,
++                    identity=identities[label], cuda_allocated=torch.cuda.memory_allocated(),
++                    cuda_reserved=torch.cuda.memory_reserved()))
++            current_row['load_seconds'] = time.perf_counter() - loading
++            case = cases[int(task['parent']), int(task['patch'])]
++            bank = historical_noise if task['noise_source'] == 'historical' else new_noise
++            noise = bank[int(task['seed'])].clone().cuda()
++            C = torch.from_numpy(case['C'].copy()).cuda()
++            # Two representative linear hooks on the first real call only.
++            dtype_facts, handles = {}, []
++            linears = [(n, m) for n, m in cache[label].named_modules() if isinstance(m, torch.nn.Linear)]
++            for name, module in (linears[:1] + linears[-1:]):
++                def dtype_hook(module, inputs, output, name=name):
++                    if name not in dtype_facts:
++                        dtype_facts[name] = dict(parameter=str(module.weight.dtype),
++                            input=str(inputs[0].dtype), output=str(output.dtype))
++                handles.append(module.register_forward_hook(dtype_hook))
++            try:
++                raw, states, audit = sample(cache[label], noise, C, task['solver'], counts=counts,
++                    known_slots=protocol.get('known_slots', list(range(12))),
++                    reserve_forward=lambda task=task: ledger.reserve(task),
++                    forward_returned=lambda task=task: ledger.returned(task))
++            finally:
++                for handle in handles:
++                    handle.remove()
++            arrays = audit.pop('_arrays')
++            audit['actual_accepted_times_FP32'] = arrays['accepted_times_FP32'].tolist()
++            audit['representative_layer_dtypes'] = dtype_facts
++            payload = dict(raw=raw, states=states, C=case['C'], **arrays)
++            writing = time.perf_counter()
++            path = out / 'raw' / (task['task_id'] + '.npz')
++            with path.open('xb') as stream:
++                np.savez_compressed(stream, **payload)
++            current_row.update(path=str(path.relative_to(out)), sha256=sha256(path), audit=audit,
++                nfe=50, model_file_sha256=FILE_HASHES[label], model_state_sha256=identities[label]['state_sha256'],
++                input_sha256=array_hash(states[0]), C_sha256=array_hash(case['C']), noise_sha256=array_hash(bank[int(task['seed'])]),
++                noise_free_sha256=array_hash(bank[int(task['seed'])][:, 12:]),
++                trajectory_write_seconds=time.perf_counter() - writing)
++            reference = task.get('reference_npz')
++            if task['kind'] == 'repeat':
++                reference = out / 'raw' / (task['repeat_of'] + '.npz')
++            if reference:
++                comparison = compare_archive(reference, payload, require_stages=task['kind'] == 'repeat')
++                current_row['regression'] = comparison
++                if comparison['status'] == 'FAIL':
++                    raise RuntimeError('Bitwise archived trajectory comparison failed')
++            elif task['kind'] == 'regression':
++                current_row['regression'] = dict(status='ARCHIVE_REGRESSION_UNAVAILABLE')
++            current_row.update(status='PASS', sampling_status='PASS', counts_after=dict(counts),
++                               wall_seconds=time.perf_counter() - task_tick)
++            ledger.flush()
++            save_json(dest, info)
++            print('COMPLETE', task['task_id'], 'NFE', 50, 'seconds', round(current_row['wall_seconds'], 3), flush=True)
++            current_row = None
++        info['final_model_state_sha256'] = {label: state_sha256(model) for label, model in cache.items()}
++        if any(info['final_model_state_sha256'][label] != identities[label]['state_sha256'] for label in cache):
++            raise RuntimeError('Final frozen model identity changed')
++        info['status'] = 'PASS'
++    except BaseException as exc:
++        info['status'] = 'STOPPED'
++        info['error'] = dict(message=repr(exc), traceback=traceback.format_exc())
++        if current_row is not None:
++            current_row.update(status='FAIL', sampling_status='FAIL', error=repr(exc), counts_after=dict(counts),
++                               wall_seconds=time.perf_counter() - task_tick)
++            if hasattr(exc, 'partial_states'):
++                partial_path = out / 'raw' / (current_row['task_id'] + '.failed_partial.npz')
++                with partial_path.open('xb') as stream:
++                    np.savez_compressed(stream, states=exc.partial_states,
++                        stage_states=exc.partial_stage_states, stage_velocities=exc.partial_stage_velocities,
++                        stage_times_FP32=exc.partial_stage_times_FP32,
++                        stage_times_control_FP64=exc.partial_stage_times_control_FP64)
++                current_row['partial_path'] = str(partial_path.relative_to(out))
++        raise
++    finally:
++        stop.set()
++        monitor_thread.join(timeout=10)
++        info['seconds'] = time.perf_counter() - started
++        info['resource_snapshots'].append(snapshot())
++        info.update(peak_resources(info['resource_snapshots']))
++        if torch.cuda.is_initialized():
++            info['last_rollout_peak_cuda_allocated'] = torch.cuda.max_memory_allocated()
++            info['last_rollout_peak_cuda_reserved'] = torch.cuda.max_memory_reserved()
++        info['lock_held_until_process_exit'] = True
++        info['ledger'] = ledger.state
++        ledger.flush()
++        save_json(dest, info)
++        cache.clear()
++        if torch.cuda.is_initialized():
++            torch.cuda.empty_cache()
++        # Keep lock_fd open: process exit releases after the CUDA context dies.
++
++
++if __name__ == '__main__':
++    main()

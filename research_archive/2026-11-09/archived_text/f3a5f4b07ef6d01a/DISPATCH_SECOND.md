@@ -1,0 +1,3 @@
+After CU first real request: GPU total 16,303 MiB, used 2,526 MiB, free 13,454 MiB; measured utilization 5%, Windows immediate recheck 20%. Allocated 584,180,224 bytes, reserved 648,019,968 bytes; inference only. WSL PID 322, process VRAM N/A, RSS 2,009,006,080 bytes. Available RAM 64,222,507,008 bytes, CPU load 0.493/0.136/0.045.
+
+Conservative incremental slot estimate floor((13454-2048)/(1.2*1536)) = 6; capped to the one remaining authorized UC job. Start UC after CU reached this observed peak (CU had completed 8/16 when dispatching), never simultaneous loading. Planned maximum two GPU workers. No user process stopped. Windows graphics-process names/VRAM unavailable by permission; PIDs 43040,38944,25360,8752,38564,5736,59528,73556,55308 and system PID 4 were present.

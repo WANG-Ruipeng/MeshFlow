@@ -1,0 +1,106 @@
+"""Close the CPU section review without changing original meshes or scorers."""
+from collections import Counter
+from datetime import datetime, timezone
+from pathlib import Path
+import csv
+import hashlib
+import json
+
+ROOT=Path(__file__).resolve().parents[3]
+OUT=ROOT/'experiments/r2_seam_s2000_section_audit_v1'
+
+def sha(p): return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+def read(p): return json.loads(Path(p).read_text(encoding='utf-8-sig'))
+def save(name,obj): (OUT/name).write_text(json.dumps(obj,ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
+
+def main():
+ protocol=read(OUT/'protocol.json')
+ reviews=[]
+ for split in ('train','dev'):
+  with (OUT/f'visual_{split}.csv').open(encoding='utf-8-sig',newline='') as f:
+   reviews.extend(csv.DictReader(f))
+ ids=[q['request_id'] for q in protocol['requests']]
+ assert len(reviews)==28 and {r['request_id'] for r in reviews}==set(ids)
+ assert len({r['request_id'] for r in reviews})==28
+ reviews.sort(key=lambda r:ids.index(r['request_id']))
+ for row in reviews:
+  assert row['actually_viewed'].lower()=='true'
+  assert row['reviewer']=='AI_PROXY_NONBLIND'
+  p=OUT/'gallery'/Path(row['image_path'].replace('\\','/')).name
+  assert sha(p)==row['image_sha256']
+ with (OUT/'visual_review.csv').open('w',encoding='utf-8-sig',newline='') as f:
+  w=csv.DictWriter(f,fieldnames=list(reviews[0]));w.writeheader();w.writerows(reviews)
+ summary={}
+ for split in ('TRAIN','DEV'):
+  rr=[r for r in reviews if r['split']==split]
+  summary[split]={k:dict(Counter(r[k] for r in rr)) for k in (
+   'post_suspect_internal_sheet_visible','post_isolated_section_line_visible','first_visible_stage')}
+ save('visual_summary.json',summary)
+ assert read(OUT/'gallery/render_geometry_check.json')['status']=='PASS'
+ checks={path:sha(path)==digest for path,digest in protocol['source_hashes'].items()}
+ assert all(checks.values())
+ save('source_assets_after.json',{'status':'PASS','files':len(checks),'unchanged':checks})
+ report='''# S2000四阶段截面与疑似悬片核查
+
+**截面里确实存在“悬着的线段/薄片”这一现象，但它至少包含两种不同情况：截面外仍有共边连接的正常截线，以及完整网格中只通过顶点相连、没有共边邻面的三角片。后者不能用“小角率不高、极小面积面很少”排除。** 上一轮外部视角的图审不覆盖这一内部/座底问题。
+
+已实际查看S2000全部28份的四阶段对照：RAW、官方D0未恢复提议、恢复C/seam锚点、原POST。原中央front/side切面和坐标范围保持不变；另配同平面的真实半空间裁剪图。只渲染既有网格，没有重新训练、生成、运行D0/GEO或FF/I评分。
+
+先看[两处逐面高亮对照](tracked_sections.png)，再看[完整28份图集](gallery/index.html)。高亮图上排为3f/n2侧截面，下排为608/n3正截面局部放大；列从左到右为四个阶段。红线、橙线对应固定的原RAW面槽，不是在每个阶段重新挑最像的面。
+
+| 位置与原面槽 | 完整POST网格里的实际连接 | 四阶段观察 |
+| --- | --- | --- |
+| 3f/n2侧截面上方孤立短横线，slot21，seam | 属于含C的166面共边分量；并非仅点接，更不是独立漂浮片 | RAW已有，D0改变高度/斜率，恢复与POST又调整；孤立截线始终能看见 |
+| 608/n3座底左侧短横线，slot77，bulk | **没有任何共边邻面，共边分量只有这1张面**；仅通过顶点进入含C的134面分量 | RAW已有；D0使其位置更平，恢复阶段不变，POST仍未形成共边连接 |
+| 608/n3座底右侧较长横线，slot113，bulk | 属于31面的共边分量，该分量不含C；与C仅有共点路径 | RAW已有；D0/恢复/POST保留这个较大座底部分，不能把整段都叫作微小碎屑 |
+
+这些共边/共点图只描述完整保存网格的索引连接，不自动认证合法接口、无相交或可用流形。
+
+**slot77是本次最直接的新证据。** 它最小内角38.02°，面积2.777924模型单位²，A/L²=0.032762，远大于上一轮极小面积阈值1e-5。它既不是针状小角面，也不是微小面积面，但三条边都没有共边邻面。因此，“碎、裂”的观感不能只用小角和面积去解释。
+
+同一剖面上，slot77与slot113之间的间隔在RAW已经存在；高亮图显示D0之后该处间隔变宽，后续没有闭合。这里说的是两张已定位面在固定平面的截线间隔，不是全局最近距离，也不能推成D0造成所有断片。真正完全脱离整个网格，与只通过顶点相连，仍是两个不同结论；slot77属于后者。
+
+**图审范围与限制。**
+
+28份主图均由AI实际逐页非盲查看，记录为AI_PROXY_NONBLIND，详见[visual_review.csv](visual_review.csv)。图里部分短线对应背部片、横档或较大下层外壳；另有不规整薄片/内层截线无法仅凭这两视角确定用途，保留UNCERTAIN。疑似面并未全部完成逐面身份定位，三张上表追踪面不作为全组发生率估计。
+
+旧截面使用有限三角面与平面的真实交线，没有按质心删除整面；因此这些线不是那种粗糙删面算法凭空造的。但连接可以绕到平面外，二维交线不连仍不能直接证明三维面漂浮。共面三角形的三条边会同时显示，多条线也不能直接计成多层面。
+
+新增半剖图逐三角形计算半空间交点，不封口。紫色线是人为剖切边缘，不是模型裂缝；完整未裁网格的vertices/faces才用于连接核验。D0提议里的蓝色C发生了移动，仅作诊断，不是满足保留C合同的成品。
+
+**这轮修正了什么判断。**
+
+用户在截面里指出的问题应保留，不能由上一轮外观图或极小面积比例否定。当前已经确认：至少有普通角度、较大面积的面，其共边连接确实不完整；也有看似漂浮但在截面外已连接的反例。下一步若评价“断片”，应分别记录完整网格的共边断连、仅点接、完全分离与剖面外连接，而不是把小角率改名为断片率。本轮到此结束，没有自动新增训练或几何修复。
+
+**交付与执行。**
+
+- [逐面完整网格连接表](topology/per_face_connectivity.csv)：4234张保留面，原RAW槽/POST面索引、角色、两种连通分量及邻面。
+- [原两处追踪](case_trace.json)与[slot77补充追踪](case_trace_addendum.json)：近似点定位最近三候选、准确交线端点、四阶段同面身份及拓扑。
+- 每份图附`_sections.png`预览与`_identity.npz`：可把可见像素、有限交线或裁剪片回查至原面槽。
+- [绘图几何核验](gallery/render_geometry_check.json)：112份四阶段源文件hash不变，8204条有限交线在固定平面及原三角内，31970个裁剪三角在正确半空间与原面内；来源面映射及84个主产物hash通过。
+- 最终核查原协议登记的168份源资产hash全部不变。全部统计/图审/新图独立保存；旧报告、评分器、数据与权重未改。
+
+资源实际测量：24逻辑CPU、约61.3GiB可用RAM；RTX5080空闲约13GiB但GPU科学worker为0。连接账本1CPU进程约1.36秒；首张实际页面测量后，主图渲染2CPU进程、每进程1线程，墙钟9.75秒，最高进程RSS约134MiB。逐图AI查看、文档与准备时间另计。额外高亮图为单CPU绘图，不改变源几何。初版截线显示裁框修正及极瘦面验证器的数值修正记录在[engineering_notes.json](gallery/engineering_notes.json)，初版预览保留。
+
+只读状态入口：
+
+```powershell
+wsl -d Ubuntu -- /mnt/e/MeshFlow-Control-artifacts/venv/bin/python -B /mnt/e/MeshFlow/r2/tools/seam_s2000_section_audit_v1/resume.py
+```
+
+源码位于`r2/tools/seam_s2000_section_audit_v1/`，SHA256见source_hashes.json；状态入口不启动任何实验。未改变默认模型、commit或push。
+'''
+ (OUT/'REPORT.md').write_text(report,encoding='utf-8')
+ save('source_hashes.json',{str(p.relative_to(ROOT)):sha(p) for p in sorted(Path(__file__).parent.glob('*.py'))})
+ names=['protocol.json','REPORT.md','visual_train.csv','visual_dev.csv','visual_review.csv','visual_summary.json',
+        'case_trace.json','case_trace_addendum.json','tracked_sections.png','tracked_sections.json',
+        'gallery/completion.json','gallery/render_geometry_check.json','source_assets_after.json','source_hashes.json']
+ save('completion.json',{'status':'COMPLETE','time_utc':datetime.now(timezone.utc).isoformat(),'requests':28,
+      'actual_main_pages_reviewed':28,'same_plane_stage_panels':224,'cutaway_stage_panels':224,
+      'original_assets_unchanged':168,'model_loads':0,'model_forwards':0,'new_generation':0,'new_noise':0,
+      'GEO_runs':0,'FF_I_scoring':0,'GPU_scientific_workers':0,'commit':False,'push':False,
+      'receipt_note':'Gallery completion preserves render-time pending-review status; this receipt closes actual image review.',
+      'artifact_hashes':{n:sha(OUT/n) for n in names}})
+ print(json.dumps({'status':'COMPLETE','reviewed':28,'source_assets_unchanged':168,'summary':summary}))
+
+if __name__=='__main__': main()

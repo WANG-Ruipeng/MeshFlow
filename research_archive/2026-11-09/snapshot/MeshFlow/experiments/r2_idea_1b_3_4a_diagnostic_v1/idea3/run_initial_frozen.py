@@ -1,0 +1,440 @@
+"""Registered CPU source-label audit of original-C-edge anchored face slots.
+
+No model imports, training, new noise, mesh mutation or source pair rescans.
+The original legal-edge graph is executed from its unmodified AST function;
+the original verified pair detector runs only on nine bounded analytic controls.
+"""
+from __future__ import annotations
+import os
+for name in ('OMP_NUM_THREADS','MKL_NUM_THREADS','OPENBLAS_NUM_THREADS','NUMEXPR_NUM_THREADS'):
+    os.environ[name]='1'
+os.environ['CUDA_VISIBLE_DEVICES']=''
+from pathlib import Path
+import argparse,ast,collections,csv,hashlib,importlib.util,itertools,json,math,sys,time,traceback
+import numpy as np
+
+HERE=Path(__file__).resolve().parent
+ROOT=HERE.parents[2]
+FULL=ROOT/'experiments/r2_full_seat_learning_curve_v1'
+VERSION='idea3_original_source_edge_slot_label_diagnostic_v1'
+GRAPH=ROOT/'r2/pilots/anchor_aware_denoiser_v1/evaluation.py'
+GEOMETRY=ROOT/'experiments/mf_h1_local0/guided_native_geometry_geometry.py'
+PRIMARY=ROOT/'experiments/mf_h1_local0/native_patch_seams.py'
+COUPLING=ROOT/'r2/src/meshflow_control/training/coupling.py'
+DATASET=ROOT/'r2/src/meshflow_control/data/dataset.py'
+CONTROL_NAMES=['legal_strip','interior_arc_T_junction','coordinate_copy_without_ID_share',
+ 'two_slots_same_edge','degenerate_third_point','isolated_tiny_flap',
+ 'same_winding_shared_edge','duplicate_C_face','inward_coplanar_overlap']
+
+def clean(v):
+    if isinstance(v,np.ndarray):return clean(v.tolist())
+    if isinstance(v,np.generic):return clean(v.item())
+    if isinstance(v,dict):return {str(k):clean(x) for k,x in v.items()}
+    if isinstance(v,(list,tuple)):return [clean(x) for x in v]
+    if isinstance(v,float) and not math.isfinite(v):return None
+    return v
+def sha(p):return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+def read(p):return json.loads(Path(p).read_text(encoding='utf-8-sig'))
+def arrays(p):
+    with np.load(p,allow_pickle=False) as z:return {k:z[k].copy() for k in z.files}
+def write(p,v):
+    p=Path(p);assert p.resolve().is_relative_to(HERE)
+    p.parent.mkdir(parents=True,exist_ok=True)
+    value=json.dumps(clean(v),ensure_ascii=False,indent=2,sort_keys=True)+'\n'
+    if p.exists():
+        if p.read_text(encoding='utf-8')!=value:raise RuntimeError('Refuse overwrite: '+str(p))
+    else:p.write_text(value,encoding='utf-8')
+def csvwrite(p,rows):
+    rows=clean(rows);p=Path(p);assert p.resolve().is_relative_to(HERE)
+    keys=list(dict.fromkeys(k for r in rows for k in r)) or ['status']
+    with p.open('x',encoding='utf-8',newline='') as h:
+        w=csv.DictWriter(h,fieldnames=keys);w.writeheader()
+        for r in rows:w.writerow({k:json.dumps(v,ensure_ascii=False) if isinstance(v,(dict,list)) else v for k,v in r.items()})
+def module(path,name):
+    spec=importlib.util.spec_from_file_location(name,path);m=importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m);return m
+def verify(reg):
+    for p,h in reg['protected_hashes'].items():assert sha(p)==h,p
+    assert sha(__file__)==reg['entry_sha256']
+
+def register():
+    p=HERE/'registration.json'
+    if p.exists():r=read(p);verify(r);return r
+    data=read(FULL/'inputs/training_data.json');base=read(FULL/'registration.json')
+    records=[];protected={}
+    def protect(p,h=None):
+        p=str(Path(p));actual=sha(p)
+        if h is not None:assert actual==h,p
+        protected[p]=actual
+    for p in [FULL/'inputs/training_data.json',FULL/'registration.json',
+      ROOT/'WORKSPACE.md',ROOT/'r2/docs/research_route_memory.md',ROOT/'r2/docs/research_route_registry.json',
+      ROOT/'native_t1/docs/control_metrics.md',HERE.parent/'resources_initial.json',GRAPH,GEOMETRY,PRIMARY,COUPLING,DATASET,
+      ROOT/'r2/src/meshflow_control/data/stream.py',ROOT/'r2/pilots/full_seat_learning_curve_v1/data.py',
+      ROOT/'r2/pilots/full_seat_learning_curve_v1/train.py',ROOT/'r2/pilots/user_data_scaling_32_67_v1/training_data.py',
+      FULL/'plans/FULL_SEAT.json',FULL/'ot/FULL_SEAT/00000.npz',FULL/'ot/FULL_SEAT/00000.json']:
+        protect(p)
+    for tid in data['train_task_ids']:
+        t=data['tasks'][tid]
+        row=dict(condition_id=tid,parent_id=t['parent_id'],group='TRAIN47',split='TRAIN',
+          condition_path=t['condition_source'],condition_sha256=t['condition_source_sha256'],
+          parent_npz=t['parent_npz'],parent_sha256=t['parent_npz_sha256'],
+          quality_path=t['source_quality_path'],quality_sha256=t['source_quality_sha256'],
+          mask_path=t['mask_path'],mask_sha256=t['mask_sha256'],proof_path=t['edge_proof_path'],proof_sha256=t['edge_proof_sha256'])
+        records.append(row)
+    for c in base['conditions']:
+        split=next(x['split'] for x in base['requests'] if x['parent_id']==c['parent_id'])
+        records.append(dict(condition_id=c['condition_id'],parent_id=c['parent_id'],group='PANEL6',split=split,
+          condition_path=c['condition_path'],condition_sha256=c['condition_sha256'],
+          parent_npz=c['parent_npz'],parent_sha256=c['parent_sha256'],
+          quality_path=c['source_quality_path'],quality_sha256=c['source_quality_sha256']))
+    for row in records:
+        for pk,hk in [('condition_path','condition_sha256'),('parent_npz','parent_sha256'),('quality_path','quality_sha256'),('mask_path','mask_sha256'),('proof_path','proof_sha256')]:
+            if pk in row:protect(row[pk],row[hk])
+    assert len(records)==53 and len({r['condition_id'] for r in records})==50
+    r=dict(version=VERSION,status='FROZEN',utc=time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),
+      records=records,entry_sha256=sha(__file__),protected_hashes=protected,
+      input_scope='47 previously qualified TRAIN SEAT_FULL plus six FULL panel conditions; three duplicated TRAIN identities, total50 unique. DEV diagnostic only.',
+      scientific_question='Can one nullable slot per original C open edge represent legal source C/Y adjacency without duplicating a Y face?',
+      boundary_domain='All source-ID C edges with exactly one incident C face; descriptive, not user-required interface.',
+      source_qualification='Original actual_valid_graph with inherited exhaustive pair classifications; exactly two nondegenerate nonduplicate incident faces and resolved legal contact. Winding reported separately.',
+      third_vertex='Unique third source vertex of each incident Y triangle; ID and coordinate retained. Free predicted third coordinate does not imply connection to other slots/bulk.',
+      multi_edge_policy='Count0/1/2/3 C edges per Y. Report one-owner canonical lexical edge assignment per distinct Y, with other edge references marked represented-by-owner, never second faces.',
+      null_policy='No supported legal Y neighbour => source target Null/unsupported, not proof all user completions must be Null. Owner aliases are distinct from physical Null.',
+      synthetic_controls=CONTROL_NAMES,synthetic_pair_tests_max=100,
+      OT_scope='First registered batch8 saved maps only; reconstruct all face/corner permutations and inverse mask/vertexIDs, no noise or OT recomputation. One3x3 enumerated constrained assignment toy.',
+      resources=dict(CPU_workers=1,BLAS_threads=1,GPU_workers=0,source='../resources_initial.json'),
+      budget=dict(unique_source_conditions=50,rows_by_group=53,production_pair_rescans=0,models=0,forwards=0,backwards=0,updates=0,new_noise_arrays=0,production_OT=0,synthetic_controls=9,cached_OT_examples=8),
+      prior_route=dict(closest='R10 Geometry-derived Partner Closure',boundary='Teacher partner accuracy100% did not yield free-generation legal closure; anchor conflicts and large terminal corrections.',difference='Explicit original C endpoints and edge IDs are part of generated face representation from initialization; no terminal partner inference or geometric movement of C.',required_future_observation='Adequate unambiguous real label coverage plus a defined collision-free face ownership/matching contract; later actual rollout adoption and legal length without CF/FF costs, not teacher reconstruction alone.'))
+    write(HERE/'registration.json',r);return r
+
+def extract_original_functions():
+    tree=ast.parse(GRAPH.read_text(encoding='utf-8'));nodes=[n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='actual_valid_graph']
+    nodes += [n for n in tree.body if isinstance(n,ast.Assign) and any(isinstance(t,ast.Name) and t.id in ('LEGAL','ILLEGAL') for t in n.targets)]
+    env={'np':np,'collections':collections};exec(compile(ast.Module(body=nodes,type_ignores=[]),str(GRAPH),'exec'),env)
+    primary=module(PRIMARY,'idea3_original_primary')
+    tree=ast.parse(GEOMETRY.read_text(encoding='utf-8'))
+    names={'_bump','classify_triangle_pair_primary','_barycentric','_inside_distances','_cross2','_point_on_segment2',
+      '_segment_intersections2','_deduplicate','_convex_hull2','_coplanar_intersection','_edge_triangle_hits','_shared_count','classify_triangle_pair_independent','verified_pair'}
+    selected=[n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name in names]
+    selected += [n for n in tree.body if isinstance(n,ast.Assign) and any(isinstance(t,ast.Name) and t.id in ('ILLEGAL_CLASSES','DETECTOR_POLICY') for t in n.targets)]
+    detector={'np':np,'math':math,'itertools':itertools,'_primary_classifier':primary.classify_triangle_pair}
+    exec(compile(ast.Module(body=selected,type_ignores=[]),str(GEOMETRY),'exec'),detector)
+    # Store exact original function text, not a renamed/new mathematical definition.
+    snapshots={'actual_valid_graph.py':'\n\n'.join(ast.get_source_segment(GRAPH.read_text(encoding='utf-8'),n) for n in nodes),
+      'verified_pair_cpu_functions.py':'\n\n'.join(ast.get_source_segment(GEOMETRY.read_text(encoding='utf-8'),n) for n in selected)}
+    for name,content in snapshots.items():(HERE/'source_code'/name).write_text(content+'\n',encoding='utf-8')
+    return env['actual_valid_graph'],detector['verified_pair']
+
+def edgebook(faces):
+    result=collections.defaultdict(list)
+    for fi,face in enumerate(faces):
+        for j in range(3):
+            u,v=map(int,(face[j],face[(j+1)%3]));result[tuple(sorted((u,v)))].append((fi,u,v))
+    return result
+def directed(face,u,v):
+    return next((int(face[j]),int(face[(j+1)%3])) for j in range(3) if {int(face[j]),int(face[(j+1)%3])}=={u,v})
+
+def analyze_source(row,graph):
+    a=arrays(row['parent_npz']);c=arrays(row['condition_path']);q=read(row['quality_path'])
+    faces=a['source_faces'];v=a['model_vertices'];canonical=a['source_face_vertex_ids'];N=len(faces)
+    known=c['source_face_ids'].astype(int);free=c['free_source_ids'].astype(int);K=len(known);Cset=set(known.tolist())
+    assert np.array_equal(np.sort(np.r_[known,free]),np.arange(N))
+    assert np.array_equal(v[canonical],a['full_target'].reshape(N,3,3))
+    assert np.array_equal(c['C'],v[canonical[known]]) and np.array_equal(c['C_original'],v[faces[known]])
+    assert np.array_equal(c['C_original_source_vertex_ids'],faces[known])
+    assert q['input_npz_sha256']==row['parent_sha256'] and q['status']=='COMPLETE' and q['independent_verification']
+    assert q['receipt']['new_unique_pair_tests']==N*(N-1)//2
+    order=np.r_[known,free];idx={int(fi):i for i,fi in enumerate(order)};pairs={'CF':{'contacts':[]},'FF':{'contacts':[]}}
+    pb={tuple(x['pair']):x for x in q['pair_contacts']}
+    flags={s:collections.Counter() for s in ('CC','CF','FF')}
+    for (i,j),r in pb.items():
+        scope='CC' if i in Cset and j in Cset else 'CF' if (i in Cset)!=(j in Cset) else 'FF'
+        flags[scope][r['category']]+=1
+        if scope=='CC':continue
+        if scope=='CF':ci,fi=(i,j) if i in Cset else (j,i);pair=[idx[ci],idx[fi]-K]
+        else:pair=sorted([idx[i]-K,idx[j]-K])
+        pairs[scope]['contacts'].append(dict(pair=pair,classification=r['classification']))
+    top,graphrows,reached=graph(v,faces[order],K,pairs)
+    graphbyedge={(r['vertex_u'],r['vertex_v']):r for r in graphrows}
+    edges=edgebook(faces);cvertices=sorted(set(faces[known].ravel().tolist()))
+    boundary={e:o for e,o in edges.items() if sum(fi in Cset for fi,_,_ in o)==1}
+    legal=[];edge_rows=[];face_edges=collections.defaultdict(list);all_face_edges=collections.defaultdict(list)
+    original=a.get('retained_to_original_face',np.arange(N))
+    for eid,((u,w),owners) in enumerate(sorted(boundary.items())):
+        co=[fi for fi,_,_ in owners if fi in Cset];fo=[fi for fi,_,_ in owners if fi not in Cset]
+        g=graphbyedge.get((u,w));accepted=bool(g and g['is_C_F'] and g['valid_edge'])
+        for fi in fo:all_face_edges[fi].append(eid)
+        if accepted:
+            assert len(co)==len(fo)==1
+            fi=fo[0];third=[int(x) for x in faces[fi] if int(x) not in (u,w)];assert len(third)==1
+            d=directed(faces[co[0]],u,w);fd=directed(faces[fi],u,w)
+            item=dict(condition_id=row['condition_id'],parent_id=row['parent_id'],source_edge_id=eid,
+              vertex_u=u,vertex_v=w,C_source_face=int(co[0]),Y_source_face=int(fi),
+              C_original_face_id=int(original[co[0]]),Y_original_face_id=int(original[fi]),
+              C_directed_edge=d,Y_directed_edge=fd,winding_opposite=d==fd[::-1],
+              third_vertex_id=third[0],third_vertex_xyz=v[third[0]].tolist(),
+              third_vertex_already_in_C=third[0] in cvertices,
+              length_model=g['length_model'],classification=g['pair_classification'],unique_Y_face=True,
+              source_edge_key=[u,w],Y_source_vertex_ids=faces[fi].tolist(),
+              Y_canonical_endpoint_corners=np.flatnonzero(np.isin(canonical[fi],[u,w])).tolist())
+            legal.append(item);face_edges[fi].append(eid)
+        edge_rows.append(dict(condition_id=row['condition_id'],parent_id=row['parent_id'],source_edge_id=eid,
+          vertex_u=u,vertex_v=w,C_source_faces=co,Y_source_faces=fo,whole_incidence=len(owners),
+          legal_source_interface=accepted,length_model=float(np.linalg.norm(v[u].astype(float)-v[w])),
+          classification=g['pair_classification'] if g else 'NA_NO_Y_FACE',
+          rejection=g['rejected_reasons'] if g else ['NO_Y_SOURCE_FACE'],
+          source_target='Y_FACE' if accepted else 'NULL_UNSUPPORTED_SOURCE'))
+    owner={fi:min(es) for fi,es in face_edges.items()}
+    for x in legal:
+        x.update(Y_legal_C_edges=len(face_edges[x['Y_source_face']]),owner_slot_edge_id=owner[x['Y_source_face']],
+          assignment='FACE_OWNER' if x['source_edge_id']==owner[x['Y_source_face']] else 'ALIAS_TO_OWNER_NO_SECOND_FACE')
+    frows=[]
+    for fi in free:
+        fi=int(fi);es=face_edges.get(fi,[])
+        frows.append(dict(condition_id=row['condition_id'],parent_id=row['parent_id'],Y_source_face=fi,
+          Y_original_face_id=int(original[fi]),Y_source_vertex_ids=faces[fi].tolist(),
+          C_open_edges_incident=len(all_face_edges.get(fi,[])),legal_C_edges=len(es),
+          legal_edge_ids=es,owner_edge_id=owner.get(fi),
+          role='BULK' if not es else 'ONE_EDGE_FACE' if len(es)==1 else 'MULTI_EDGE_FACE_ASSIGN_ONCE'))
+    mask=np.zeros((N,3),bool)
+    for x in legal:mask[x['Y_source_face'],x['Y_canonical_endpoint_corners']]=True
+    if 'proof_path' in row:
+        proof=read(row['proof_path']);saved=arrays(row['mask_path'])['source_interface_corner_mask']
+        assert np.array_equal(mask,saved)
+        old={(x['source_vertex_u'],x['source_vertex_v'],x['free_source_face_rows'][0]) for x in proof['legal_edges']}
+        assert old=={(x['vertex_u'],x['vertex_v'],x['Y_source_face']) for x in legal}
+    hist=collections.Counter(len(face_edges.get(int(fi),[])) for fi in free)
+    internal=[o for o in edges.values() if sum(fi in Cset for fi,_,_ in o)==2]
+    same=sum(len(co:= [(fi,u,w) for fi,u,w in o if fi in Cset])==2 and co[0][1:]==co[1][1:] for o in internal)
+    aliases=len(cvertices)-len({tuple(v[x].tolist()) for x in cvertices})
+    metrics=dict(condition_id=row['condition_id'],parent_id=row['parent_id'],N=N,K=K,free_faces=N-K,
+      C_open_edges=len(boundary),C_open_vertices=len({x for e in boundary for x in e}),
+      C_nonmanifold_edges=sum(sum(fi in Cset for fi,_,_ in o)>2 for o in edges.values()),
+      whole_nonmanifold_edges=top['nonmanifold_edges'],C_same_direction_internal_edges=int(same),
+      coordinate_alias_extra_C_vertex_IDs=aliases,C_source_vertex_ID_roundtrip=True,
+      legal_CY_edges=len(legal),legal_CY_length=sum(x['length_model'] for x in legal),
+      legal_CY_opposite_edges=sum(x['winding_opposite'] for x in legal),
+      source_supported_edge_fraction=len(legal)/len(boundary) if boundary else None,
+      source_null_slots=len(boundary)-len(legal),distinct_interface_Y_faces=len(face_edges),
+      unique_third_vertex_labels=len(legal),single_edge_Y_faces=hist[1],multi_edge_Y_faces=hist[2]+hist[3],
+      one_edge_only_edge_coverage=hist[1]/len(legal) if legal else None,
+      duplicate_faces_if_every_edge_independently_instantiates=len(legal)-len(face_edges),
+      total_faces_if_every_edge_instantiates_then_bulk=K+len(legal)+hist[0],
+      owner_plus_bulk_exact_source_face_budget=K+len(face_edges)+hist[0]==N,
+      third_vertex_is_C_ID_edges=sum(x['third_vertex_already_in_C'] for x in legal),
+      mask_corners=int(mask.sum()),source_quality_status=q['status'],
+      **{f'Y_faces_with_{i}_legal_C_edges':hist[i] for i in range(4)},
+      **{s+'_'+category+'_pairs':flags[s][category] for s in ('CC','CF','FF') for category in ('illegal','unknown','legal_contact')})
+    assert sum(hist.values())==N-K and sum(i*n for i,n in hist.items())==len(legal) and all(i<=3 for i in hist)
+    return metrics,edge_rows,legal,frows,mask
+
+def controls(graph,detector):
+    base=[[0,0,0],[1,0,0],[1,1,0],[0,1,0]];cf=[[0,1,2],[0,2,3]]
+    fixtures={
+      'legal_strip':(base+[[.5,-.5,0],[0,-1,0]],cf+[[1,0,4],[4,0,5]],1,1,'Shared original endpoints, consistent direction and a second free face; still no whole-object guarantee.'),
+      'interior_arc_T_junction':(base+[[.25,0,0],[.75,0,0],[.5,-.5,0]],cf+[[5,4,6]],0,0,'Both endpoints lie on the original boundary segment, but C lacks their split vertices: no indexed whole-edge sharing.'),
+      'coordinate_copy_without_ID_share':(base+[[1,0,0],[0,0,0],[.5,-.5,0]],cf+[[4,5,6]],0,0,'Byte-equal endpoint positions using new IDs do not share the C edge.'),
+      'two_slots_same_edge':(base+[[.5,-.5,0],[.5,0,-1]],cf+[[1,0,4],[1,0,5]],0,0,'Two independent occupied slots plus C produce three-incidence nonmanifold edge.'),
+      'degenerate_third_point':(base+[[.5,0,0]],cf+[[1,0,4]],0,0,'Third point on the anchor line creates zero area, rejected despite copied IDs.'),
+      'isolated_tiny_flap':(base+[[.5,-.0001,0],[10,0,0],[12,0,0],[10,2,0]],cf+[[1,0,4],[5,6,7]],1,1,'One legal tiny attached flap coexists with a detached large free component; endpoint sharing does not ensure attachment to body.'),
+      'same_winding_shared_edge':(base+[[.5,-.5,0]],cf+[[0,1,4]],1,0,'Exact original edge and legal pair do not enforce opposite winding unless slot corner order is fixed.'),
+      'duplicate_C_face':(base,cf+[[0,1,2]],0,0,'Copying all C vertices into an existing C triangle is duplicate/overlap, not useful attachment.'),
+      'inward_coplanar_overlap':(base+[[.5,.25,0]],cf+[[1,0,4]],0,0,'Third point goes into C interior: correct anchored edge and order still allow positive-area overlap.')}
+    out=[];allpairs=[];edges=[];ledger={};fixturearrays={}
+    for name in CONTROL_NAMES:
+        vv,ff,expected,opposed,meaning=fixtures[name];v=np.asarray(vv,np.float64);f=np.asarray(ff,np.int64);tri=v[f];K=2
+        pairs={'CF':{'contacts':[]},'FF':{'contacts':[]}}
+        for scope in ('CF','FF'):
+            ii=itertools.product(range(K),range(K,len(f))) if scope=='CF' else itertools.combinations(range(K,len(f)),2)
+            for i,j in ii:
+                d=detector(tri[i],tri[j],math.sqrt(3)*2/.3762,ledger)
+                pair=[i,j-K] if scope=='CF' else [i-K,j-K]
+                pairs[scope]['contacts'].append(dict(pair=pair,classification=d['classification']))
+                allpairs.append(dict(control=name,scope=scope,source_faces=[i,j],**d))
+        top,er,_=graph(v,f,K,pairs)
+        assert top['C_F_valid_edge_count']==expected,(name,top)
+        assert top['C_F_valid_opposite_winding_edge_count']==opposed,(name,top)
+        out.append(dict(control=name,expected_valid_CF_edges=expected,expected_opposite_CF_edges=opposed,**top,
+          third_point_free=True,guarantee_boundary=meaning,status='PASS'))
+        edges.extend(dict(control=name,**x) for x in er)
+        fixturearrays[name+'__vertices']=v;fixturearrays[name+'__faces']=f
+    np.savez_compressed(HERE/'control_arrays.npz',**fixturearrays)
+    assert ledger.get('verified_pair_tests',0)<=100
+    return out,allpairs,edges,ledger
+
+def ot_examples(data):
+    coupling=module(COUPLING,'idea3_original_coupling')
+    tree=ast.parse(DATASET.read_text(encoding='utf-8'));nodes=[n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='permutations']
+    env={'np':np,'CYCLIC':np.asarray([[0,1,2],[1,2,0],[2,0,1]],np.int64)}
+    exec(compile(ast.Module(body=nodes,type_ignores=[]),str(DATASET),'exec'),env)
+    plan=read(FULL/'plans/FULL_SEAT.json');cachepath=FULL/'ot/FULL_SEAT/00000.npz';cache=arrays(cachepath)
+    receipt=read(cachepath.with_suffix('.json'));assert sha(cachepath)==receipt['sha256']
+    assert receipt['identity']['plan_sha256']==sha(FULL/'plans/FULL_SEAT.json')
+    rows=[]
+    for r in plan['records'][:8]:
+        t=data['tasks'][r['task_id']];a=arrays(t['parent_npz']);c=arrays(t['condition_source']);mask=arrays(t['mask_path'])['source_interface_corner_mask']
+        n,k=r['N'],r['K'];fo,cp,order=env['permutations'](r['permutation_seed'],n,k)
+        prefix=str(r['sample_index']);face,corner=coupling.validate_map(cache[prefix+'_face'],cache[prefix+'_corner'])
+        known=c['source_face_ids'];free=c['free_source_ids'];preids=free[fo]
+        ids=np.r_[known,preids[np.argsort(face)]][order]
+        corners=np.concatenate((cp[:k],coupling.to_noise_slots(cp[k:],face,corner)))[order]
+        knownmask=(np.arange(n)<k)[order];m=mask[ids[:,None],corners]
+        undo=np.zeros_like(mask);undo[ids[:,None],corners]=m
+        vid=a['source_face_vertex_ids'];transported=vid[ids[:,None],corners]
+        back=np.zeros_like(vid);back[ids[:,None],corners]=transported
+        direct=mask.copy();assert np.array_equal(mask,undo) and np.array_equal(vid,back) and not m[knownmask].any()
+        labels=np.arange((n-k)*3).reshape(n-k,3)
+        assert np.array_equal(coupling.to_target_slots(coupling.to_noise_slots(labels,face,corner),face,corner),labels)
+        odd=sum(np.linalg.det(np.eye(3)[p])<0 for p in corner)
+        rows.append(dict(sample_index=r['sample_index'],task_id=r['task_id'],N=n,K=k,mask_source_corners=int(mask.sum()),
+          transported_corners=int(m.sum()),wrong_if_mask_left_at_old_slots=int(np.count_nonzero(m!=direct)),
+          original_face_corner_IDs_reconstructed=True,source_mask_roundtrip_exact=True,
+          original_to_noise_to_target_roundtrip=True,OT_odd_corner_permutations=int(odd),
+          free_face_permutation_changed=int(np.count_nonzero(face!=np.arange(n-k))),
+          cache_path=str(cachepath),cache_sha256=sha(cachepath),status='PASS'))
+    # Enumerate one fixed, tiny cost matrix: production OT is never called.
+    cost=np.asarray([[8,0,3],[0,8,3],[3,3,0]],float)
+    allowed=np.eye(3,dtype=bool);perms=list(itertools.permutations(range(3)))
+    uncon=min(perms,key=lambda p:(sum(cost[i,p[i]] for i in range(3)),p))
+    constrained=min((p for p in perms if all(allowed[i,p[i]] for i in range(3))),key=lambda p:(sum(cost[i,p[i]] for i in range(3)),p))
+    assert uncon==(1,0,2) and constrained==(0,1,2)
+    toy=dict(slot_roles=['C_edge_A','C_edge_B','bulk'],target_roles=['C_edge_A','C_edge_B','bulk'],cost=cost,
+      unconstrained_assignment=uncon,constrained_assignment=constrained,
+      unconstrained_wrong_edge_roles=2,constrained_wrong_edge_roles=0,
+      interpretation='A geometric minimum-cost face/corner permutation does not preserve pinned edge roles. A future decoder requires role-compatible face assignment and endpoint-preserving corner permutations; carrying diagnostic masks alone is insufficient.',
+      new_production_OT=0,tiny_permutations_enumerated=len(perms),status='PASS')
+    return rows,toy
+
+def summarize(rows):
+    sums=['C_open_edges','legal_CY_edges','legal_CY_opposite_edges','source_null_slots','distinct_interface_Y_faces',
+      'single_edge_Y_faces','multi_edge_Y_faces','duplicate_faces_if_every_edge_independently_instantiates','third_vertex_is_C_ID_edges',
+      'free_faces','mask_corners',*[f'Y_faces_with_{i}_legal_C_edges' for i in range(4)]]
+    result={k:sum(r[k] for r in rows) for k in sums}
+    result.update(conditions=len(rows),parents=len({r['parent_id'] for r in rows}),
+      conditions_with_multi_edge_Y=sum(r['multi_edge_Y_faces']>0 for r in rows),
+      conditions_with_source_null=sum(r['source_null_slots']>0 for r in rows),
+      conditions_with_any_legal_interface=sum(r['legal_CY_edges']>0 for r in rows),
+      conditions_with_all_source_boundary_supported=sum(r['C_open_edges']==r['legal_CY_edges'] for r in rows),
+      source_supported_edges_fraction=result['legal_CY_edges']/result['C_open_edges'],
+      one_edge_face_coverage_of_interface_faces=result['single_edge_Y_faces']/result['distinct_interface_Y_faces'],
+      one_edge_face_coverage_of_legal_edges=result['single_edge_Y_faces']/result['legal_CY_edges'],
+      conditions_with_inherited_FF_illegal=sum(r['FF_illegal_pairs']>0 for r in rows),
+      all_C_source_ID_roundtrips=all(r['C_source_vertex_ID_roundtrip'] for r in rows),
+      all_owner_policy_face_budgets_exact=all(r['owner_plus_bulk_exact_source_face_budget'] for r in rows))
+    return result
+
+def report(summary,rows,controlrows):
+    a=summary['TRAIN47'];d=summary['PANEL_DEV'];pan=[r for r in rows if r['group']=='PANEL6']
+    text=f'''# Idea 3：共享 C 原边槽位的真实监督可行性诊断
+
+状态：COMPLETE，纯 CPU；没有训练、模型前向、生成、新噪声、生产 OT 或来源几何重评分。47条既有训练条件＋6条固定 FULL 面板条件，共50条去重来源条件；面板3条TRAIN重复身份单独展示，3条DEV只诊断，不进入训练。
+
+## 核心结果
+
+训练池的 {a['C_open_edges']} 条原 C 开放边中，{a['legal_CY_edges']} 条有原评分判据支持的合法 C/Y 共边（{a['source_supported_edges_fraction']:.2%}）。47/47条件有真实接口，全部端点原ID、C来源绕序及唯一第三顶点标签可复核；不存在“只有合成玩具能造标签”的问题。
+
+| 训练标签性质 | 计数 |
+|---|---:|
+| 原 C 开放边 / 支持边 / 无合法来源Y邻面 | {a['C_open_edges']} / {a['legal_CY_edges']} / {a['source_null_slots']} |
+| 不同接口 Y 三角面 | {a['distinct_interface_Y_faces']} |
+| Y 面接0/1/2/3条合法C边 | {a['Y_faces_with_0_legal_C_edges']} / {a['Y_faces_with_1_legal_C_edges']} / {a['Y_faces_with_2_legal_C_edges']} / {a['Y_faces_with_3_legal_C_edges']} |
+| 多边同面涉及条件 | {a['conditions_with_multi_edge_Y']} / 47 |
+| 每边独立生成一张脸会重复的实例 | {a['duplicate_faces_if_every_edge_independently_instantiates']} |
+| 单边面占接口面 / 占合法边 | {a['one_edge_face_coverage_of_interface_faces']:.2%} / {a['one_edge_face_coverage_of_legal_edges']:.2%} |
+| 第三顶点本身已经是C原顶点的边标签 | {a['third_vertex_is_C_ID_edges']} |
+| 来源绕序相反的合法边 | {a['legal_CY_opposite_edges']} / {a['legal_CY_edges']} |
+| 仍有来源Y内部非法面对的条件 | {a['conditions_with_inherited_FF_illegal']} / 47 |
+
+可见真实标签足以支持一个有边界的**表征合同验证**；不能直接推出未来训练收益。保留所有47条既定条件，没有根据新统计删父，31条已有Y风险也不改成“全网格干净”。开放边全部只是描述域，未升级成用户必须封闭的接口。
+
+## 单边槽位必须补齐的离散合同
+
+1. 使用原 C 开放边ID和两个原顶点ID；令边端点在各时刻直接引用C，端点不进入独立自由角点积分。仅预测轮廓弧长位置不能保证源边整段索引共享：可能形成T-junction。
+2. 每个来源Y面最多输出一次。本诊断保存按字典序最小合法边确定的FACE_OWNER；其余对应边是ALIAS_TO_OWNER_NO_SECOND_FACE，不是再实例化一张重复面。这个规则只是可复算的标签分配示例，不是已确定的最佳学习方案。
+3. Null用于该来源没有合法邻面的边；多边同面的别名不能混成“此边没有接续”。若第三顶点也是另一个C顶点，连续预测其坐标不能保证其ID一致，必须另有C顶点引用/面组机制或明确只承诺一条锚边。
+4. 单槽最多一个占用面；不能把多个slots绑定同一原边。固定反向端点顺序能保证该边的局部绕序，仍不能保证第三点不退化、不向C内部翻折、不穿过其他面，或与其余free组成主体。
+5. 带Null的槽位也改变面数合同：保留固定N时，需要将未占用的边槽返回bulk或显式分配计数；不能把退化三角形当Null导出。多边owner＋bulk复原来源集合时，本次全部50条件面数守恒。
+
+## 六父条件（来源标签，不是生成成绩）
+
+| 父 | split | K/N | C开放边 | 合法原边 | 接口Y面 | 多边Y面 | Null |
+|---|---|---:|---:|---:|---:|---:|---:|
+'''
+    for r in pan:text+=f"| {r['parent_id'][:6]} | {r['split']} | {r['K']}/{r['N']} | {r['C_open_edges']} | {r['legal_CY_edges']} | {r['distinct_interface_Y_faces']} | {r['multi_edge_Y_faces']} | {r['source_null_slots']} |\n"
+    text+=f'''
+DEV三条件有{d['legal_CY_edges']}条来源合法边；这是标签可用性的既有来源诊断，不是DEV输入的真实用户必接答案。父对象来源几何不是开放生成的唯一GT。
+
+## 原OT为什么不能直接照搬
+
+原流程：free面先置换、各面循环角序→free-only nested OT（面Hungarian与全部6种角排列）→目标转入噪声槽→HYBRID→全C/free槽再次置换。原三维自由槽没有固定边角色。OT的奇排列还可改变内部绕序，导出必须使用原C与来源映射。
+
+本次读取原第一批8条实际缓存，只重放离散置换、不抽噪声、不重新求OT。8/8的端点标记及原顶点ID都能往返恢复；若丢掉source_face_ids/corner_permutations，旧位置mask会错。3×3固定成本例中，无约束最小分配交换两条C边角色；受限分配才保留角色。**仅把mask搬到原OT结果，不足以维持固定边槽表征。** 未来必须冻结按原边角色允许的face匹配、端点角序及Null/bulk的分配合同。
+
+## 原合法边判据的正反控
+
+以下9个显式小网格调用原verified_pair与原actual_valid_graph；没有改变检测器阈值，没有扫描生产输出。独立探针不能替代训练或全局品质证据。
+
+| 控制 | 合法C/F边 | 反向合法边 | 意义 |
+|---|---:|---:|---|
+'''
+    for r in controlrows:text+=f"| {r['control']} | {r['C_F_valid_edge_count']} | {r['C_F_valid_opposite_winding_edge_count']} | {r['guarantee_boundary']} |\n"
+    text+='''
+小翻片可以通过局部合法边而没有接入远处主体；重复C、重叠、退化和三入射边会被拒绝。硬共享的确定性质是指定原边的索引复用，不是“100%生成合理、流形、水密、完整椅子”。
+
+## 与R10的区别、是否值得训练
+
+R10在teacher状态配对正确率100%，但自由生成中伙伴可靠性、锚冲突与大位移让闭合均0/40。本设计的实质差异是**从生成状态初始化就共享明确原边的两个端点ID**，不在末端猜伙伴再搬动现有角点；因此没有被R10等价覆盖。但Null占用、第三点、与bulk的连接仍要学习，不能拿本次源标签覆盖宣称rollout已经解决。
+
+本次支持将Idea3列为可实施候选，先把离散所有权与受限匹配合同作为实现的一部分；不支持“8–16个任意弧长槽一定接好”或直接把原无约束OT用于硬锚槽。以后真实训练的通过条件应在同请求同时成立：RAW采用、较长合法原边连接和整体主体，并披露CF/FF与退化代价；仅合成控通过/teacher复原/合法小翻片增加不够。本轮不启动该训练。
+
+文件：per_condition.csv、per_C_open_edge.csv、per_source_interface.csv、per_source_Y_face.csv、ot_transport_examples.csv、constrained_matching_toy.json、controls.csv、control_pairs.json、control_arrays.npz、source_hashes.json、registration.json、completion.json。run.py --stage all可核验完成状态，已完成不会重复运行；--stage status只查状态。原资产只读，所有新文件限idea3目录。
+'''
+    (HERE/'REPORT.md').write_text(text,encoding='utf-8')
+
+def run():
+    reg=register();done=HERE/'completion.json'
+    if done.exists():
+        d=read(done);verify(reg)
+        for p,h in d['output_hashes'].items():assert sha(p)==h,p
+        return d
+    attempt=HERE/'attempt.json'
+    if attempt.exists():raise RuntimeError('Incomplete prior attempt retained; no silent retry')
+    write(attempt,dict(status='STARTED',utc=time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),registration_sha256=sha(HERE/'registration.json')))
+    tick=time.perf_counter()
+    try:
+        (HERE/'source_code').mkdir(exist_ok=True);graph,detector=extract_original_functions()
+        data=read(FULL/'inputs/training_data.json');unique={};conds=[];edges=[];interfaces=[];faces=[]
+        for r in reg['records']:
+            key=r['condition_id']
+            if key not in unique:
+                unique[key]=analyze_source(r,graph)
+                m,e,i,f,_=unique[key];edges.extend(e);interfaces.extend(i);faces.extend(f)
+            conds.append(dict(group=r['group'],split=r['split'],**unique[key][0]))
+        ctrl,pairs,ce,ledger=controls(graph,detector);ot,toy=ot_examples(data)
+        summary={g:summarize([r for r in conds if r['group']==g]) for g in ('TRAIN47','PANEL6')}
+        summary['PANEL_DEV']=summarize([r for r in conds if r['group']=='PANEL6' and r['split']=='DEV'])
+        summary.update(version=VERSION,unique_source_conditions=len(unique),source_pair_rescans=0,synthetic_pair_tests=ledger,
+          actual_model_forwards=0,actual_training_updates=0,actual_generated_outputs=0,new_gaussian_draws=0,new_production_OT=0)
+        for name,rows in [('per_condition',conds),('per_C_open_edge',edges),('per_source_interface',interfaces),
+          ('per_source_Y_face',faces),('controls',ctrl),('control_edges',ce),('ot_transport_examples',ot)]:csvwrite(HERE/(name+'.csv'),rows)
+        write(HERE/'control_pairs.json',pairs);write(HERE/'constrained_matching_toy.json',toy);write(HERE/'summary.json',summary)
+        report(summary,conds,ctrl);verify(reg)
+        assert 'torch' not in sys.modules,'No torch imported in this diagnostic'
+        write(HERE/'source_hashes.json',dict(original_sources=reg['protected_hashes'],entry_source_sha256=sha(__file__),
+          executed_unmodified_AST_sources=[str(GRAPH),str(GEOMETRY)],source_files_changed=0))
+        output={str(p):sha(p) for p in HERE.rglob('*') if p.is_file() and p.name not in ('completion.json','attempt.json')}
+        d=dict(status='COMPLETE',version=VERSION,seconds=time.perf_counter()-tick,registration_sha256=sha(HERE/'registration.json'),
+          CPU_workers=1,threads=1,GPU_workers=0,torch_imported=False,models=0,forwards=0,backwards=0,updates=0,
+          new_meshes_generated=0,synthetic_controls=9,source_conditions=len(unique),condition_rows=len(conds),
+          original_source_pair_rescans=0,synthetic_verified_pairs=ledger.get('verified_pair_tests',0),
+          cached_OT_examples=len(ot),new_production_OT=0,source_hashes_unchanged=len(reg['protected_hashes']),output_hashes=output)
+        write(done,d);return d
+    except BaseException as exc:
+        write(HERE/'failed.json',dict(status='FAILED',error=repr(exc),traceback=traceback.format_exc(),seconds=time.perf_counter()-tick))
+        raise
+
+if __name__=='__main__':
+    p=argparse.ArgumentParser();p.add_argument('--stage',choices=['register','all','status'],default='status');a=p.parse_args()
+    if a.stage=='register':r=register();print(json.dumps(dict(status=r['status'],records=len(r['records']),protected_files=len(r['protected_hashes']))))
+    elif a.stage=='all':r=run();print(json.dumps({k:v for k,v in r.items() if k!='output_hashes'}))
+    else:print(json.dumps(dict(status=read(HERE/'completion.json')['status'] if (HERE/'completion.json').exists() else 'PENDING',registered=(HERE/'registration.json').exists(),failed=(HERE/'failed.json').exists())))

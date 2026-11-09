@@ -1,0 +1,546 @@
+"""CPU-only wider HIGH-pool endpoint accounting; original B remains read-only.
+
+No torch/model import, neural forward, geometry scoring, or scientific retry.
+Large artifacts are streamed once for file hashes; existing JSON sidecars carry
+the training serializer's state hashes. This is not a new tensor-state rehash.
+"""
+from __future__ import annotations
+
+import argparse
+from collections import Counter, defaultdict
+import csv
+import difflib
+import hashlib
+import json
+import math
+from pathlib import Path
+import statistics
+import time
+
+from .common import ROOT, OUT, ARMS, NARROW_ROOT, NARROW_ARM, read, sha, resolve, write_new
+from . import stream
+
+DEST = OUT / 'training_closeout'
+EXPECTED = dict(train_forward=12000, train_backward=12000, optimizer_update=1500)
+GROUPS = ('OLD', 'FOCUS', 'HIGH')
+EXPECTED_GROUPS = {
+    'WIDE_HIGH': dict(OLD=9000, FOCUS=1500, HIGH=1500),
+}
+CAUTION = ('Different HIGH parent coverage and N values change the distribution of training FM. '
+           'Do not rank generated quality from mixed FM or group training errors; '
+           'use the fixed paired generation evaluation separately. Instance, '
+           'coordinate and observed loss shares differ; none is a gradient-norm share. '
+           'NATURAL_HIGH is completed historical evidence, not another training arm in this run.')
+
+
+def require(test, message):
+    if not test:
+        raise ValueError(message)
+
+
+def jsonl(path):
+    with Path(path).open(encoding='utf-8-sig') as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+
+def object_hash(obj):
+    return hashlib.sha256(json.dumps(obj, sort_keys=True, separators=(',', ':'),
+                                    ensure_ascii=False, allow_nan=False).encode()).hexdigest()
+
+
+def table(path, rows):
+    require(bool(rows), 'Empty table: ' + str(path))
+    with Path(path).open('x', encoding='utf-8', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0]))
+        writer.writeheader(); writer.writerows(rows)
+
+
+def summary(rows):
+    if not rows:
+        return dict(observation_status='NA_NO_EXPOSURE', instances=0,
+                    parents_observed=0, free_scalar_count=0,
+                    sample_macro_velocity_mse=None, parent_macro_velocity_mse=None,
+                    coordinate_micro_velocity_mse=None, sample_macro_endpoint_mse=None,
+                    coordinate_micro_endpoint_mse=None)
+    means = [r['all_free_velocity_sse'] / r['all_free_scalar_count'] for r in rows]
+    endpoints = [r['all_free_endpoint_sse'] / r['all_free_scalar_count'] for r in rows]
+    parents = defaultdict(list)
+    for r, value in zip(rows, means):
+        parents[r['parent_id']].append(value)
+    den = sum(r['all_free_scalar_count'] for r in rows)
+    return dict(observation_status='OBSERVED', instances=len(rows), parents_observed=len(parents), free_scalar_count=den,
+                sample_macro_velocity_mse=statistics.mean(means),
+                parent_macro_velocity_mse=statistics.mean(statistics.mean(v) for v in parents.values()),
+                coordinate_micro_velocity_mse=sum(r['all_free_velocity_sse'] for r in rows) / den,
+                sample_macro_endpoint_mse=statistics.mean(endpoints),
+                coordinate_micro_endpoint_mse=sum(r['all_free_endpoint_sse'] for r in rows) / den)
+
+
+def loss_allocation(arm, exposures, updates):
+    """Account observed loss without treating group share as gradient magnitude.
+
+    Per-update group losses use that update's actual whole-batch divisor.
+    Pooled-coordinate share differs from the mean of per-update shares; both
+    are retained. No group receives an artificial MSE of zero when unobserved.
+    """
+    require(len(exposures) == 8 * len(updates) and bool(updates), 'Loss allocation input count differs')
+    per_update = []
+    total_coords = sum(r['all_free_scalar_count'] for r in exposures)
+    total_fm = sum(u['FM'] for u in updates)
+    require(total_coords > 0 and math.isfinite(total_fm) and total_fm >= 0, 'Invalid total loss/coordinates')
+    for index, u in enumerate(updates):
+        batch = exposures[index * 8:(index + 1) * 8]
+        den = sum(r['all_free_scalar_count'] for r in batch)
+        require(den == u['free_coordinate_denominator'], 'Allocation denominator differs')
+        require(math.isclose(sum(r['loss_contribution'] for r in batch), u['FM'], rel_tol=1e-9, abs_tol=1e-9),
+                'Logged contributions no longer sum to actual FM')
+        for g in GROUPS:
+            rs = [r for r in batch if r['replay_group'] == g]
+            coords = sum(r['all_free_scalar_count'] for r in rs)
+            sse = sum(r['all_free_velocity_sse'] for r in rs)
+            actual = sum(r['loss_contribution'] for r in rs)
+            require(math.isclose(actual, sse / den, rel_tol=5e-6, abs_tol=2e-7),
+                    'Group loss does not use the batch divisor')
+            per_update.append(dict(arm=arm, local_step=u['local_step'], group=g,
+                exposure_status='OBSERVED' if rs else 'NA_NO_EXPOSURE', instances=len(rs),
+                N_min=min((r['N'] for r in rs), default=None), N_max=max((r['N'] for r in rs), default=None),
+                free_scalar_count=coords, whole_batch_free_scalar_denominator=den,
+                instance_share=len(rs) / 8, coordinate_share=coords / den,
+                group_velocity_sse=sse, group_coordinate_mse=sse / coords if coords else None,
+                actual_loss_contribution=actual, whole_batch_FM=u['FM'],
+                actual_loss_share=actual / u['FM'] if u['FM'] else None))
+    aggregates = []
+    for g in GROUPS:
+        rs = [r for r in exposures if r['replay_group'] == g]
+        entries = [r for r in per_update if r['group'] == g]
+        contribution = sum(r['actual_loss_contribution'] for r in entries)
+        shares = [r['actual_loss_share'] for r in entries if r['actual_loss_share'] is not None]
+        aggregates.append(dict(arm=arm, group=g, **summary(rs),
+            updates_total=len(updates), updates_with_exposure=sum(bool(r['instances']) for r in entries),
+            total_instance_share=len(rs) / len(exposures),
+            pooled_free_coordinate_share=sum(r['free_scalar_count'] for r in entries) / total_coords,
+            mean_update_free_coordinate_share=statistics.mean(r['coordinate_share'] for r in entries),
+            actual_normalized_loss_sum=contribution,
+            mean_update_actual_loss_contribution=contribution / len(updates),
+            actual_loss_share_of_summed_FM=contribution / total_fm if total_fm else None,
+            mean_update_actual_loss_share=statistics.mean(shares) if shares else None,
+            loss_share_updates_defined=len(shares)))
+    require(math.isclose(sum(r['actual_normalized_loss_sum'] for r in aggregates), total_fm,
+                         rel_tol=1e-9, abs_tol=1e-8), 'Group aggregate losses do not sum to FM')
+    buckets = defaultdict(list)
+    for r in exposures:
+        buckets[(r['replay_group'], int(r['N']), int(r['K']))].append(r)
+    by_n = []
+    for (g, n, k), rs in sorted(buckets.items()):
+        by_n.append(dict(arm=arm, group=g, N=n, K=k, count_embedding_bucket=n//20, free_faces=n-k,
+            free_coordinates_per_instance=9*(n-k), **summary(rs),
+            instance_share_all=len(rs)/len(exposures),
+            pooled_coordinate_share_all=sum(r['all_free_scalar_count'] for r in rs)/total_coords,
+            actual_normalized_loss_sum=sum(r['loss_contribution'] for r in rs),
+            actual_loss_share_of_summed_FM=sum(r['loss_contribution'] for r in rs)/total_fm if total_fm else None))
+    return by_n, per_update, aggregates
+
+
+def check_ledger(path, arm, exposures):
+    rows = jsonl(path)
+    pending, starts, done = {}, [], []
+    successful, attempted = Counter(), Counter()
+    for row in rows:
+        require(row['arm'] == arm, 'Ledger arm changed')
+        require(row['event'] in ('CALL_BEGIN', 'CALL_DONE'), 'Failed/unknown ledger event')
+        require(row['kind'] in EXPECTED, 'Unexpected head/probe/scientific call')
+        call_id = row['call_id']
+        if row['event'] == 'CALL_BEGIN':
+            require(call_id == len(starts) + 1 and not pending,
+                    'Reused/skipped call ID or overlapping pending call')
+            pending[call_id] = row
+            starts.append(row); attempted[row['kind']] += 1
+        else:
+            require(call_id in pending, 'Completed call lacks begin')
+            begin = pending.pop(call_id)
+            require(all(row[k] == begin[k] for k in ('kind', 'context', 'attempt_id')),
+                    'Call completion identity changed')
+            require(math.isfinite(row['seconds']) and row['seconds'] >= 0, 'Invalid call duration')
+            done.append(row); successful[row['kind']] += 1
+    require(not pending and dict(attempted) == EXPECTED and dict(successful) == EXPECTED,
+            'Incomplete/excess training budget')
+    expected_order = []
+    for step in range(1, 1501):
+        for micro in range(8):
+            for kind in ('train_forward', 'train_backward'):
+                expected_order.append((step, micro, kind))
+        expected_order.append((step, None, 'optimizer_update'))
+    for row, (step, micro, kind) in zip(starts, expected_order):
+        c = row['context']
+        require((c['stage_step'], c.get('microbatch'), row['kind']) == (step, micro, kind),
+                'Ledger step/microbatch order changed')
+        require(c['global_step'] == 21000 + step and c['native_total_step'] == 9000 + step
+                and c['curriculum_step'] == 3000 + step
+                and c['local_step'] == step and c['seam_total_step'] == 0,
+                'Ledger cumulative cursor changed')
+        if micro is not None:
+            require(c['condition_id'] == exposures[(step - 1) * 8 + micro]['condition_id'],
+                    'Ledger/exposure condition differs')
+    return dict(attempted=dict(attempted), successful=dict(successful), failed=0,
+                pending=0, head_calls=0, probe_calls=0, ledger_events=len(rows),
+                exact_order_checked=True,
+                scientific_call_seconds={k:sum(r['seconds'] for r in done if r['kind'] == k)
+                                         for k in EXPECTED})
+
+
+def artifact(path, expected, arm, schema):
+    path = Path(path)
+    side = read(path.with_suffix('.json'))
+    require(side == expected, 'Status and sidecar differ: ' + str(path))
+    require(side['arm'] == arm and side['schema'] == schema and side['stage'] == 'NATIVE'
+            and side['stage_step'] == 1500 and side['local_step'] == 1500
+            and side['global_step'] == 22500 and side['curriculum_step'] == 4500,
+            'Final artifact cursor/schema differs')
+    require(path.stat().st_size == side['bytes'] and sha(path) == side['sha256'],
+            'Final artifact bytes/hash changed')
+    return side
+
+
+def audit_arm(reg, arm):
+    folder = OUT / 'training' / arm
+    state = read(folder / 'status.json')
+    require(state['status'] == 'COMPLETE' and state['stage_step'] == state['local_step'] == 1500
+            and state['global_step'] == 22500 and state['native_total_step'] == 10500
+            and state['curriculum_step'] == 4500
+            and state['seam_total_step'] == state['head_calls'] == state['probe_calls'] == 0,
+            'Training endpoint incomplete or budget differs')
+    require(state['registration_sha256'] == sha(OUT / 'training_registration.json'), 'Registration changed')
+    manifest = read(reg['manifest'])
+    registered_cases = {r['condition_id']:r for r in manifest['train']}
+    spec = reg['schedules'][arm]
+    require(sha(spec['path']) == spec['sha256'], 'Frozen schedule changed')
+    schedule = read(spec['path'])
+    updates = jsonl(folder / 'training_log.jsonl')
+    exposures = jsonl(folder / 'exposure.jsonl')
+    require(len(updates) == 1500 and len(exposures) == 12000, 'Log/exposure count differs')
+    identity_rows, by_parent = [], defaultdict(list)
+    expected_counts = Counter()
+    for step, entry in enumerate(schedule['steps'], 1):
+        require(entry['step'] == entry['stage_step'] == step, 'Frozen schedule cursor differs')
+        u = updates[step - 1]
+        require(u['stage_step'] == u['local_step'] == step and u['global_step'] == 21000 + step
+                and u['native_total_step'] == 9000 + step and u['seam_total_step'] == 0
+                and u['curriculum_step'] == 3000 + step
+                and u['head_calls'] == u['head_step'] == 0 and u['arm'] == arm,
+                'Update log cursor/head count differs')
+        batch = exposures[(step - 1) * 8:step * 8]
+        for micro, (planned, actual) in enumerate(zip(entry['samples'], batch)):
+            identity = {k:actual[k] for k in planned}
+            require(identity == planned, 'Actual exposure differs from frozen stream')
+            require(actual['arm'] == arm and actual['stage_step'] == actual['local_step'] == step
+                    and actual['microbatch'] == micro and actual['global_step'] == 21000 + step
+                    and actual['native_total_step'] == 9000 + step
+                    and actual['curriculum_step'] == 3000 + step,
+                    'Exposure cursor differs')
+            require(actual['head_forward_called'] is False and actual['mechanism']['active_seam_slots'] == 0
+                    and actual['mechanism']['policy'] == 'NATIVE_ALL_FREE_OT', 'Extra mechanism detected')
+            require(actual['all_free_scalar_count'] == 9 * (actual['N'] - actual['K']) > 0,
+                    'Free-coordinate denominator mismatch')
+            require(actual['replay_group'] in GROUPS and 128 <= actual['N'] <= 799
+                    and 2 <= actual['K'] < actual['N'], 'Actual natural N/group differs')
+            source_row = registered_cases[actual['condition_id']]
+            require((actual['N'], actual['K'], actual['parent_id'], actual['replay_group']) ==
+                    (int(source_row['N']), int(source_row['K']), source_row['parent_id'], source_row['replay_group']),
+                    'Logged natural N/K/parent/group differs from frozen case')
+            for k in ('all_free_velocity_sse', 'all_free_endpoint_sse', 'loss_contribution', 't'):
+                require(math.isfinite(actual[k]), 'Nonfinite actual exposure statistic')
+            expected_counts[planned['condition_id']] += 1
+            by_parent[actual['parent_id']].append(actual)
+            identity_rows.append(dict(arm=arm, local_step=step, microbatch=micro,
+                condition_id=actual['condition_id'], parent_id=actual['parent_id'],
+                expected_identity_sha256=object_hash(planned), actual_identity_sha256=object_hash(identity)))
+        den = sum(r['all_free_scalar_count'] for r in batch)
+        sse = sum(r['all_free_velocity_sse'] for r in batch)
+        require(den == u['free_coordinate_denominator'] == u['all_free_scalar_count'], 'Batch denominator changed')
+        require(math.isclose(sse, u['all_free_velocity_sse'], rel_tol=1e-10, abs_tol=1e-8), 'Batch SSE differs')
+        require(math.isclose(sse / den, u['FM'], rel_tol=5e-6, abs_tol=2e-7)
+                and math.isclose(sum(r['loss_contribution'] for r in batch), u['FM'], rel_tol=1e-9, abs_tol=1e-9),
+                'FM no longer equals original free-coordinate weighted objective')
+    require(dict(expected_counts) == schedule['condition_exposure'], 'Condition exposure total differs')
+    ledger = check_ledger(folder / 'calls.jsonl', arm, exposures)
+    require(not state['calls']['failed'] and not state['calls']['pending_call_ids'], 'Status records failed/pending work')
+    for key in ('attempted', 'successful'):
+        require(dict(state['calls'][key]) == EXPECTED, 'Status/ledger counts differ')
+    init = read(folder / 'branch_initialization.json')
+    for key in ('source_checkpoint_sha256', 'source_generator_sha256', 'source_optimizer_sha256', 'source_rng_sha256'):
+        require(init[key] == reg[key], 'Branch source identity mismatch')
+    require(init['inherited_optimizer'] and init['inherited_rng'] and not init['fresh_AdamW']
+            and not init['head_used'] and init['new_branch_arm'] == arm, 'Initialization policy mismatch')
+    cp = artifact(folder / 'checkpoint_step1500.pt', state['checkpoint'], arm,
+                  'bench_high_joint_coverage_training_v1')
+    export = artifact(folder / 'generator_step1500.pt', state['inference_export'], arm,
+                      'bench_high_joint_coverage_generator_v1')
+    require(cp['generator_state_sha256'] == export['generator_state_sha256']
+            and cp['head_state_sha256'] == export['head_state_sha256'], 'Checkpoint/export state hash mismatch')
+    require(bool(cp.get('optimizer_state_sha256')) and bool(cp.get('rng_sha256')), 'Missing recovery state hashes')
+    parent_rows = []
+    for parent, rows in sorted(by_parent.items()):
+        require(len({r['condition_id'] for r in rows}) == 1, 'Multiple C per parent')
+        require(len({(r['N'], r['K'], r['replay_group']) for r in rows}) == 1,
+                'Parent natural N/K/group changed during training')
+        parent_rows.append(dict(arm=arm, parent_id=parent, condition_id=rows[0]['condition_id'],
+            group=rows[0]['replay_group'], N=rows[0]['N'], K=rows[0]['K'], count_embedding_bucket=rows[0]['N']//20,
+            clean_instances=sum(r['augmentation'] == 'CLEAN' for r in rows),
+            xwidth_instances=sum(r['augmentation'] == 'X_WIDTH' for r in rows), **summary(rows)))
+    group_counts = {g:sum(r['instances'] for r in parent_rows if r['group'] == g) for g in GROUPS}
+    require(group_counts == EXPECTED_GROUPS[arm],
+            'Actual group exposure allocation mismatch')
+    bins = []
+    for first in range(1, 1501, 50):
+        last = first + 49; subset = exposures[(first - 1) * 8:last * 8]
+        for group in ('ALL_MIXTURE', *GROUPS):
+            rs = [r for r in subset if group == 'ALL_MIXTURE' or
+                  r['replay_group'] == group]
+            bins.append(dict(arm=arm, first_local_step=first, last_local_step=last, group=group,
+                actual_update_FM_mean=statistics.mean(r['FM'] for r in updates[first-1:last]) if group == 'ALL_MIXTURE' else '',
+                **summary(rs)))
+    attempts = []
+    require(not list((folder / 'attempts').glob('*/failure.json')), 'Recorded failed attempt exists')
+    for p in sorted((folder / 'attempts').iterdir()):
+        final = read(p / 'final_status.json'); resource = read(p / 'resources.json')
+        require(final['status'] in ('COMPLETE', 'INTERRUPTED_SAFE'), 'Unclosed or failed attempt')
+        attempts.append(dict(attempt=p.name, status=final['status'], final_local_step=final['local_step'],
+            active_wall_seconds=final['elapsed_seconds'], resources_summary=resource['summary'],
+            resources_path=str(p / 'resources.json'), resources_sha256=sha(p / 'resources.json')))
+    timing = dict(arm=arm, attempts=attempts, attempt_count=len(attempts),
+        active_attempt_wall_seconds=sum(r['active_wall_seconds'] for r in attempts),
+        sum_update_seconds=sum(r['update_seconds'] for r in updates),
+        sum_input_seconds=sum(r['input_seconds'] for r in updates),
+        first_logged_update_unix=updates[0]['time_unix'], last_logged_update_unix=updates[-1]['time_unix'],
+        peak_allocated_bytes=max(r['peak_allocated_bytes'] for r in updates),
+        peak_reserved_bytes=max(r['peak_reserved_bytes'] for r in updates),
+        final_resource_summary=state.get('resources'),
+        timing_scope='Attempts include load/checkpoint IO; update sums exclude input and most checkpoint IO. Concurrent worker wall times are not additive elapsed time or isolated benchmarks.')
+    result = dict(arm=arm, status='PASS', local_step=1500, global_step=22500,
+        native_total_step=10500, curriculum_step=4500,
+        ledger=ledger, exposure_rows_checked=12000, unique_parents=len(by_parent), group_exposures=group_counts,
+        identity_sequence_sha256=object_hash(identity_rows), final_checkpoint=cp, inference_export=export,
+        metadata_scope='Global22500/curriculum4500 from hashed artifact sidecars; Native10500 from completed training status and exact update ledger. No second tensor load/state rehash.',
+        evidence_hashes={str(folder/n):sha(folder/n) for n in ('status.json','calls.jsonl','training_log.jsonl','exposure.jsonl','branch_initialization.json')})
+    n_rows, coordinate_rows, group_rows = loss_allocation(arm, exposures, updates)
+    return result, identity_rows, parent_rows, bins, timing, n_rows, coordinate_rows, group_rows
+
+
+def plot_curves(rows, path):
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    fig, axes = plt.subplots(1, 4, figsize=(20, 4.4), constrained_layout=True)
+    for ax, group in zip(axes, ('ALL_MIXTURE', *GROUPS)):
+        for arm in (NARROW_ARM, *ARMS):
+            rs = [r for r in rows if r['arm'] == arm and r['group'] == group
+                  and r['observation_status'] == 'OBSERVED']
+            if not rs:
+                continue
+            key = 'actual_update_FM_mean' if group == 'ALL_MIXTURE' else 'parent_macro_velocity_mse'
+            ax.plot([r['last_local_step'] for r in rs], [r[key] for r in rs], label=arm)
+        ax.set_title(group + (' / actual mixed FM' if group == 'ALL_MIXTURE' else ' / parent-equal MSE'))
+        ax.set_xlabel('New optimizer updates'); ax.set_ylabel('Velocity MSE'); ax.grid(alpha=.25); ax.legend()
+    fig.suptitle('50-update bins; HIGH parents and N differ. Historical narrow B vs new W; training loss is not generated quality.', fontsize=11)
+    fig.savefig(path, dpi=160); plt.close(fig)
+
+
+def csv_rows(path):
+    def typed(value):
+        if value == '': return None
+        try: return json.loads(value)
+        except json.JSONDecodeError: return value
+    with resolve(path).open(encoding='utf-8-sig', newline='') as f:
+        return [{k:typed(v) for k,v in r.items()} for r in csv.DictReader(f)]
+
+
+def bucket_allocation(arm, exposures):
+    groups=defaultdict(list)
+    for r in exposures:groups[(r['replay_group'],int(r['N'])//20)].append(r)
+    coords=sum(r['all_free_scalar_count'] for r in exposures)
+    loss=sum(r['loss_contribution'] for r in exposures)
+    return [dict(arm=arm,group=g,count_embedding_bucket=b,N_min=min(r['N'] for r in rs),
+        N_max=max(r['N'] for r in rs),**summary(rs),instance_share_all=len(rs)/len(exposures),
+        pooled_coordinate_share_all=sum(r['all_free_scalar_count'] for r in rs)/coords,
+        actual_normalized_loss_sum=sum(r['loss_contribution'] for r in rs),
+        actual_loss_share_of_summed_FM=sum(r['loss_contribution'] for r in rs)/loss if loss else None)
+        for (g,b),rs in sorted(groups.items())]
+
+
+def narrow_evidence():
+    """Reuse the completed audit; verify bytes without repeating training work."""
+    close=NARROW_ROOT/'training_closeout';completed=read(close/'complete.json')
+    require(completed['status']=='PASS' and completed['model_calls']==0, 'Historical closeout incomplete')
+    checked={}
+    for p,h in completed['outputs'].items():
+        require(sha(p)==h,'Historical closeout evidence changed: '+p);checked[p]=h
+    audit=read(close/'training_audit.json')
+    result=next(r for r in audit['arms'] if r['arm']==NARROW_ARM)
+    require(result['status']=='PASS' and result['local_step']==1500 and result['global_step']==22500,
+            'Historical comparator endpoint differs')
+    for p,h in result['evidence_hashes'].items():
+        require(sha(p)==h,'Historical comparator log changed: '+p);checked[p]=h
+    folder=NARROW_ROOT/'training'/NARROW_ARM
+    for filename,key in (('checkpoint_step1500.pt','final_checkpoint'),('generator_step1500.pt','inference_export')):
+        p=folder/filename;side=read(p.with_suffix('.json'))
+        require(side==result[key] and sha(p)==side['sha256'],'Historical endpoint bytes changed')
+        checked[str(p)]=side['sha256']
+    bins=[r for r in csv_rows(close/'FM_50step_bins.csv') if r['arm']==NARROW_ARM]
+    allocations=[r for r in csv_rows(close/'actual_loss_allocation_by_group.csv') if r['arm']==NARROW_ARM]
+    exposures=jsonl(folder/'exposure.jsonl')
+    require(len(exposures)==12000,'Historical comparator exposure count differs')
+    return dict(status='PASS',arm=NARROW_ARM,global_step=22500,historical_no_new_training=True,
+        closeout=str(close/'complete.json'),closeout_sha256=sha(close/'complete.json'),
+        evidence_hashes=checked),bins,allocations,exposures
+
+
+def actual_pairing(manifest, schedule, old_rows, wide_rows):
+    planned=stream.validate_frozen_narrow(schedule,manifest['train'])
+    require(len(old_rows)==len(wide_rows)==12000,'Actual paired exposure count differs')
+    random_fields=('alpha','scale_xyz','augmentation','noise_seed','epsilon_seed','time_seed','permutation_seed','t')
+    identity_fields=('index','condition_index','condition_id','parent_id','part_type','sample_index','N','K')
+    counts=Counter()
+    for left,right in zip(old_rows,wide_rows):
+        require((left['local_step'],left['microbatch'],left['replay_group'])==
+                (right['local_step'],right['microbatch'],right['replay_group']),'Actual paired slot changed')
+        require(all(left[k]==right[k] for k in random_fields),'Actual augmentation/time/noise/OT seed changed')
+        if left['replay_group']!='HIGH':
+            require(all(left[k]==right[k] for k in identity_fields),'Actual OLD/FOCUS source changed')
+        counts[left['replay_group']]+=1
+    require(dict(counts)==dict(OLD=9000,FOCUS=1500,HIGH=1500),'Actual paired group totals differ')
+    return dict(status='PASS',planned=planned,actual_exact_OLD=counts['OLD'],actual_exact_FOCUS=counts['FOCUS'],
+        actual_paired_HIGH_random_fields=counts['HIGH'],actual_t_exact=True,
+        excluded_comparisons=['Training predictions, losses and optimizer states naturally differ after pool selection'])
+
+
+def run():
+    # No artifact hashing or write is performed while WIDE_HIGH is unfinished.
+    for arm in ARMS:
+        p = OUT / 'training' / arm / 'status.json'
+        require(p.exists() and read(p).get('status') == 'COMPLETE', 'WIDE_HIGH endpoint must be COMPLETE before closeout')
+    if (DEST / 'complete.json').exists():
+        done = read(DEST / 'complete.json')
+        for p, h in done['outputs'].items():
+            require(sha(p) == h, 'Existing closeout output changed')
+        return done
+    require(not DEST.exists(), 'Partial closeout exists; inspect it before retrying this CPU audit')
+    started = time.time(); reg = read(OUT / 'training_registration.json')
+    require(reg['status'] == 'FROZEN' and reg['arms'] == list(ARMS), 'Registration differs')
+    require(reg['model_config']['face_bin']==20, 'Official face-count bucket definition changed')
+    for p, h in reg['training_code_hashes'].items():
+        require(sha(p) == h, 'Frozen source changed: ' + p)
+    for key in ('manifest', 'eval_manifest', 'source_checkpoint'):
+        require(sha(reg[key]) == reg[key + '_sha256'], 'Protected source/input changed: ' + key)
+    for p,h in reg['protected'].items():
+        require(sha(p)==h,'Protected historical source changed: '+p)
+    for p,h in reg['gate_hashes'].items():
+        require(sha(p)==h,'Frozen preparation evidence changed: '+p)
+    source_sidecar = read(resolve(reg['source_checkpoint']).with_suffix('.json'))
+    require(source_sidecar['sha256'] == reg['source_checkpoint_sha256']
+            and source_sidecar['generator_state_sha256'] == reg['source_generator_sha256']
+            and source_sidecar['optimizer_state_sha256'] == reg['source_optimizer_sha256']
+            and source_sidecar['rng_sha256'] == reg['source_rng_sha256'], 'Source sidecar states differ')
+    results, identities, parents, bins, times = [], [], [], [], []
+    by_n, coordinates, allocations = [], [], []
+    for arm in ARMS:
+        result, identity_rows, parent_rows, bin_rows, timing, n_rows, coordinate_rows, group_rows = audit_arm(reg, arm)
+        results.append(result); identities.extend(identity_rows); parents.extend(parent_rows); bins.extend(bin_rows); times.append(timing)
+        by_n.extend(n_rows); coordinates.extend(coordinate_rows); allocations.extend(group_rows)
+    narrow,narrow_bins,narrow_allocation,narrow_rows=narrow_evidence()
+    wide_rows=jsonl(OUT/'training/WIDE_HIGH/exposure.jsonl')
+    manifest=read(reg['manifest']);schedule=read(reg['schedules']['WIDE_HIGH']['path'])
+    pairing=actual_pairing(manifest,schedule,narrow_rows,wide_rows)
+    bucket_rows=bucket_allocation(NARROW_ARM,narrow_rows)+bucket_allocation('WIDE_HIGH',wide_rows)
+    DEST.mkdir()
+    table(DEST / 'actual_exposure_per_parent.csv', parents)
+    table(DEST / 'exposure_identity_checks.csv', identities)
+    table(DEST / 'FM_50step_bins.csv', bins)
+    table(DEST / 'actual_exposure_by_N.csv', by_n)
+    table(DEST / 'actual_loss_allocation_per_update.csv', coordinates)
+    table(DEST / 'actual_loss_allocation_by_group.csv', allocations)
+    table(DEST / 'comparative_loss_allocation_by_group.csv', narrow_allocation+allocations)
+    table(DEST / 'comparative_exposure_by_count_bucket.csv', bucket_rows)
+    table(DEST / 'comparative_FM_50step_bins.csv', narrow_bins+bins)
+    write_new(DEST/'actual_stream_pairing.json',pairing)
+    write_new(DEST/'reused_narrow_evidence.json',narrow)
+    write_new(DEST / 'resource_and_attempt_wallclock.json', dict(arms=times, caution=CAUTION,
+        dispatch_observations={str(p):sha(p) for p in sorted((OUT/'dispatch').glob('*observations.json'))}))
+    plot_curves(narrow_bins+bins, DEST / 'learning_curves.png')
+    write_new(DEST / 'training_audit.json', dict(status='PASS', arms=results, caution=CAUTION,
+        source_exposure_B_unchanged=True, source_checkpoint_sha256=reg['source_checkpoint_sha256'],
+        reused_narrow=narrow,actual_stream_pairing=pairing,
+        model_calls=0, tensor_loads=0, new_scientific_work=0))
+    code = Path(__file__)
+    diff = ''.join(difflib.unified_diff([], code.read_text(encoding='utf-8').splitlines(True),
+                                       fromfile='/dev/null', tofile=str(code.relative_to(ROOT))))
+    (DEST / 'code.diff').write_text(diff, encoding='utf-8')
+    done = dict(schema='bench_high_joint_coverage_training_closeout_v1', status='PASS',
+        arms=list(ARMS), total_updates=1500, total_forwards=12000, total_backwards=12000,
+        historical_comparator=NARROW_ARM,historical_comparator_new_updates=0,
+        total_head_calls=0, failed_calls=0, pending_calls=0, exposure_identity_rows=12000,
+        source_exposure_B_unchanged=True, training_registration_sha256=sha(OUT/'training_registration.json'),
+        audit_code_sha256=sha(code), outputs={str(p):sha(p) for p in sorted(DEST.iterdir()) if p.is_file()},
+        seconds=time.time()-started, model_calls=0, tensor_loads=0, caution=CAUTION)
+    write_new(DEST/'complete.json', done)
+    return done
+
+
+def cpu_check():
+    """Small deterministic accounting test; no scientific samples or tensors."""
+    exposures, updates = [], []
+    for step in (1, 2):
+        batch = []
+        for micro in range(8):
+            group = 'OLD' if micro < 6 else ('FOCUS' if step == 1 else 'HIGH')
+            n, k = (128, 8) if group == 'OLD' else ((256, 16) if group == 'FOCUS' else (776, 68))
+            count = 9*(n-k); mse = dict(OLD=1., FOCUS=2., HIGH=4.)[group]
+            batch.append(dict(parent_id=f'{group}_{micro // 2}', replay_group=group,
+                N=n, K=k, all_free_scalar_count=count, all_free_velocity_sse=count*mse,
+                all_free_endpoint_sse=count*mse*.25))
+        den = sum(r['all_free_scalar_count'] for r in batch)
+        for row in batch: row['loss_contribution'] = row['all_free_velocity_sse']/den
+        exposures.extend(batch)
+        updates.append(dict(local_step=step, free_coordinate_denominator=den,
+                            FM=sum(r['loss_contribution'] for r in batch)))
+    ns, per_step, groups = loss_allocation('WIDE_HIGH', exposures, updates)
+    require(len(ns) == 3 and len(per_step) == 6 and len(groups) == 3, 'Accounting shape differs')
+    high = next(r for r in groups if r['group'] == 'HIGH')
+    require(high['instances'] == 2 and high['total_instance_share'] == .125,
+            'High instance fraction changed')
+    expected_mean_coordinates = .5*(2*9*708)/(6*9*120+2*9*708)
+    require(math.isclose(high['mean_update_free_coordinate_share'], expected_mean_coordinates),
+            'Coordinate mean includes zero-exposure updates incorrectly')
+    expected_loss = (2*9*708*4)/(6*9*120+2*9*708)
+    require(math.isclose(high['actual_normalized_loss_sum'], expected_loss), 'Weighted contribution wrong')
+    control_rows = [dict(r, replay_group='FOCUS' if r['replay_group']=='HIGH' else r['replay_group']) for r in exposures]
+    _, _, control = loss_allocation('FIXTURE_NO_HIGH', control_rows, updates)
+    empty = next(r for r in control if r['group']=='HIGH')
+    require(empty['observation_status']=='NA_NO_EXPOSURE' and empty['instances']==0
+            and empty['sample_macro_velocity_mse'] is None and empty['actual_normalized_loss_sum']==0,
+            'Unobserved group must have zero contribution but NA MSE')
+    corrupt = [dict(r) for r in exposures]; corrupt[0]['loss_contribution'] += .1
+    try:
+        loss_allocation('WIDE_HIGH', corrupt, updates)
+    except ValueError:
+        pass
+    else:
+        raise ValueError('Accounting accepted a broken denominator/contribution log')
+    buckets=bucket_allocation('WIDE_HIGH',exposures)
+    high_bucket=next(r for r in buckets if r['group']=='HIGH')
+    require(high_bucket['count_embedding_bucket']==38 and high_bucket['N_min']==high_bucket['N_max']==776,
+            'Actual maximum face-count bucket differs')
+    require(math.isclose(high_bucket['actual_normalized_loss_sum'],high['actual_normalized_loss_sum']),
+            'Bucket contribution differs from exact-N rows')
+    return dict(status='PASS', model_calls=0, tensor_loads=0, production_OT_calls=0,
+        checks=['whole_batch_coordinate_vs_instance_weight', 'observed_SSE_to_loss_contribution',
+                'absent_HIGH_has_NA_MSE_zero_contribution', 'zero_exposure_updates_in_mean',
+                'corrupt_contribution_rejected','N776_K68_bucket38_coordinate_accounting'],
+        code_sha256=sha(Path(__file__)), evidence_scope='Small synthetic arithmetic rows only; not experiment observations')
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--cpu-check', action='store_true')
+    args = parser.parse_args()
+    result = cpu_check() if args.cpu_check else run()
+    print(json.dumps({k:v for k,v in result.items() if k != 'outputs'}, indent=2))

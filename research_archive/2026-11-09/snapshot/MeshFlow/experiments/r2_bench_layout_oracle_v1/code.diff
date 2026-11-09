@@ -1,0 +1,2323 @@
+diff --git a/experiments/r2_bench_layout_oracle_v1/archive_tools/archive_sources.py b/experiments/r2_bench_layout_oracle_v1/archive_tools/archive_sources.py
+new file mode 100644
+--- /dev/null
++++ b/experiments/r2_bench_layout_oracle_v1/archive_tools/archive_sources.py
+@@ -0,0 +1,162 @@
++"""Freeze small source files only; no imports of experiment/model code."""
++from __future__ import annotations
++import ast
++import datetime
++import difflib
++import hashlib
++import json
++from pathlib import Path
++import re
++
++ROOT = Path('/mnt/e/MeshFlow')
++OUT = ROOT / 'experiments/r2_bench_layout_oracle_v1'
++CODE = ROOT / 'r2/pilots/bench_layout_oracle_v1'
++ARCHIVE = OUT / 'source_archive'
++HASH = re.compile(r'^[a-fA-F0-9]{64}$')
++SOURCE_SUFFIXES = {'.py', '.ps1', '.cpp', '.h', '.cu', '.cuh'}
++
++
++def sha(p):
++    return hashlib.sha256(p.read_bytes()).hexdigest()
++
++
++def resolve(value):
++    s = str(value).replace('\\', '/')
++    if re.match(r'^[A-Za-z]:/', s):
++        return Path('/mnt') / s[0].lower() / s[3:]
++    p = Path(s)
++    return p if p.is_absolute() else ROOT / p
++
++
++def archive_rel(p):
++    if p.is_relative_to(ROOT):
++        return p.relative_to(ROOT)
++    parts = p.parts
++    if len(parts) > 3 and parts[1] == 'mnt':
++        return Path('_external') / parts[2].upper() / Path(*parts[3:])
++    raise ValueError('Unexpected external source root: ' + str(p))
++
++
++def source_maps(value, source_registration, expected, roles):
++    if isinstance(value, dict):
++        for key, val in value.items():
++            if Path(str(key)).suffix.lower() in SOURCE_SUFFIXES and isinstance(val, str) and HASH.fullmatch(val):
++                p = resolve(key)
++                if p in expected and expected[p] != val.lower():
++                    raise ValueError('Conflicting registered hash: ' + str(p))
++                expected[p] = val.lower()
++                roles.setdefault(p, set()).add('registered:' + str(source_registration.relative_to(ROOT)))
++            else:
++                source_maps(val, source_registration, expected, roles)
++    elif isinstance(value, list):
++        for val in value:
++            source_maps(val, source_registration, expected, roles)
++
++
++def direct_imports(path):
++    """Resolve workspace Python imports without importing or executing them."""
++    found = set()
++    try:
++        tree = ast.parse(path.read_text(encoding='utf-8-sig'))
++    except (UnicodeError, SyntaxError):
++        return found
++    names = []
++    for node in ast.walk(tree):
++        if isinstance(node, ast.Import):
++            names.extend(alias.name for alias in node.names)
++        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
++            names.append(node.module)
++            names.extend(node.module + '.' + a.name for a in node.names if a.name != '*')
++        elif isinstance(node, ast.ImportFrom) and node.level:
++            base = path.parent
++            for _ in range(node.level - 1): base = base.parent
++            if node.module: base = base / Path(*node.module.split('.'))
++            candidates = [base]
++            candidates.extend(base / a.name for a in node.names if a.name != '*')
++            for candidate in candidates:
++                for p in (candidate.with_suffix('.py'), candidate / '__init__.py'):
++                    if p.is_file() and p.is_relative_to(ROOT): found.add(p)
++    for name in names:
++        if name.startswith('r2.'):
++            module = ROOT / Path(*name.split('.'))
++        elif name.startswith('meshflow_control.'):
++            module = ROOT / 'r2/src' / Path(*name.split('.'))
++        else:
++            continue
++        for p in (module.with_suffix('.py'), module / '__init__.py'):
++            if p.is_file(): found.add(p)
++    return found
++
++
++def run():
++    if ARCHIVE.exists() or (OUT / 'source_hashes.json').exists() or (OUT / 'code.diff').exists():
++        raise FileExistsError('Source snapshot is immutable; create a supplement instead of replacing it')
++    registrations = [OUT / 'registrations/PLAIN.json', OUT / 'registrations/LAYOUT.json',
++        OUT / 'evaluation/score_registration.json']
++    prior = ROOT / 'experiments/r2_bench_four_routes_v1/exposure/evaluation/inference_registrations'
++    registrations += [prior / ('EXPOSURE__' + k + '.json') for k in ('RAW', 'D0')]
++    expected, roles = {}, {}
++    for p in registrations:
++        source_maps(json.loads(p.read_text(encoding='utf-8-sig')), p, expected, roles)
++    own = set(CODE.glob('*.py'))
++    own.update((OUT / 'archive_tools').glob('*.py'))
++    for p in own: roles.setdefault(p, set()).add('new_isolated_pilot_or_archive_tool')
++    # Snapshot the frozen registered closure and static local dependencies. This
++    # is intentionally conservative; it is not a dynamic per-function trace.
++    pending = list(set(expected) | own)
++    visited = set()
++    while pending:
++        p = pending.pop()
++        if p in visited: continue
++        visited.add(p)
++        if not p.is_file(): raise FileNotFoundError(p)
++        if p.suffix == '.py':
++            for imported in direct_imports(p):
++                roles.setdefault(imported, set()).add('static_workspace_import_dependency')
++                if imported not in visited: pending.append(imported)
++    for p in visited:
++        if p.stat().st_size > 2_000_000:
++            raise ValueError('Unexpected large source asset: ' + str(p))
++        if p in expected and sha(p) != expected[p]:
++            raise ValueError('Registered source changed: ' + str(p))
++    rows = []
++    for p in sorted(visited, key=str):
++        target = ARCHIVE / archive_rel(p)
++        target.parent.mkdir(parents=True, exist_ok=True)
++        body = p.read_bytes()
++        with target.open('xb') as stream: stream.write(body)
++        digest = sha(p)
++        if sha(target) != digest: raise ValueError('Copy hash mismatch')
++        rows.append(dict(source_path=str(p), archive_path=str(target),
++            relative_archive_path=str(target.relative_to(ARCHIVE)), sha256=digest,
++            bytes=len(body), roles=sorted(roles.get(p, {'static_workspace_import_dependency'})),
++            registered_expected_sha256=expected.get(p),
++            unchanged_against_frozen_registration=(digest == expected[p]) if p in expected else None))
++    chunks = []
++    for p in sorted(own, key=str):
++        relative = str(p.relative_to(ROOT))
++        lines = p.read_text(encoding='utf-8-sig').splitlines(keepends=True)
++        if lines and not lines[-1].endswith('\n'): lines[-1] += '\n'
++        chunks.append('diff --git a/' + relative + ' b/' + relative + '\nnew file mode 100644\n')
++        chunks.extend(difflib.unified_diff([], lines, fromfile='/dev/null', tofile='b/' + relative))
++    with (OUT / 'code.diff').open('x', encoding='utf-8', newline='\n') as stream:
++        stream.write(''.join(chunks))
++    receipt = dict(status='COMPLETE', version='layout_oracle_source_archive_v1',
++        utc=datetime.datetime.now(datetime.timezone.utc).isoformat(),
++        scope='Frozen registration closure plus static local Python import closure and isolated pilot source; no dynamic call coverage claim',
++        git_head_read_only='7af33f892b8fb6194fbc54748b6010cf54507169',
++        git_command_policy='git -c safe.directory=E:/MeshFlow; no git config, index, commit or push changes',
++        diff_scope='New isolated pilot/archive files as additions from /dev/null; not the entire dirty-worktree diff',
++        inherited_source_policy='Frozen registered original sources verified byte-identical; other import dependencies snapshot-only',
++        files=rows, file_count=len(rows), source_bytes=sum(r['bytes'] for r in rows),
++        new_code_files=len(own), registered_source_files=len(expected),
++        all_registered_sources_unchanged=True,
++        copied_weights=0, copied_datasets=0, model_calls=0,
++        code_diff=dict(path=str(OUT/'code.diff'),sha256=sha(OUT/'code.diff'),bytes=(OUT/'code.diff').stat().st_size),
++        registrations={str(p):sha(p) for p in registrations})
++    with (OUT / 'source_hashes.json').open('x', encoding='utf-8') as stream:
++        json.dump(receipt, stream, ensure_ascii=False, indent=2); stream.write('\n')
++    print(json.dumps({k:receipt[k] for k in ('status','file_count','source_bytes','new_code_files','registered_source_files','all_registered_sources_unchanged')}))
++
++
++if __name__ == '__main__': run()
+diff --git a/r2/pilots/bench_layout_oracle_v1/__init__.py b/r2/pilots/bench_layout_oracle_v1/__init__.py
+new file mode 100644
+--- /dev/null
++++ b/r2/pilots/bench_layout_oracle_v1/__init__.py
+@@ -0,0 +1 @@
++"""Isolated coarse-layout privileged-information pilot, October 2026."""
+diff --git a/r2/pilots/bench_layout_oracle_v1/common.py b/r2/pilots/bench_layout_oracle_v1/common.py
+new file mode 100644
+--- /dev/null
++++ b/r2/pilots/bench_layout_oracle_v1/common.py
+@@ -0,0 +1,28 @@
++"""Independent identities; reuses pure I/O helpers, never old output globals."""
++from pathlib import Path
++import hashlib, json, os, time
++from r2.pilots.bench_three_mechanisms_v1.common import (
++    resolve, read, sha, arrays, npz, verify, csvwrite, write, event, resources)
++
++ROOT = Path(__file__).resolve().parents[3]
++OUT = ROOT / 'experiments/r2_bench_layout_oracle_v1'
++EXPERIMENT = 'R2_BENCH_LAYOUT_ORACLE_V1'
++OLD = ROOT / 'experiments/r2_bench_four_routes_v1/exposure'
++PRIOR = ROOT / 'experiments/r2_bench_multilod_training_v1'
++SOURCE = OLD / 'training/M_PLUS3000/checkpoint_step3000.pt'
++SOURCE_INFERENCE = OLD / 'training/M_PLUS3000/generator_step3000.pt'
++BASE_STEP, NATIVE_BASE = 25500, 13500
++UPDATES = {'PLAIN':1000, 'LAYOUT':1000}
++LABELS = ('EXPOSURE','PLAIN1000','LAYOUT1000','LAYOUT_NULL')
++NEW_LABELS = LABELS[1:]
++PANEL_PREFIXES = ('a8e987','27eb79','bcb4f5','459f90','f495bd','df6fd3')
++REGISTRATION = OUT / 'registration.json'
++L = 9.208138264587333
++
++def seed(*parts):
++    return int.from_bytes(hashlib.sha256('|'.join(map(str,(EXPERIMENT,)+parts)).encode()).digest()[:4], 'little')
++
++def register_resource(phase):
++    r = resources()
++    event(OUT/'resources/snapshots.jsonl', dict(phase=phase, **r))
++    return r
+diff --git a/r2/pilots/bench_layout_oracle_v1/control.py b/r2/pilots/bench_layout_oracle_v1/control.py
+new file mode 100644
+--- /dev/null
++++ b/r2/pilots/bench_layout_oracle_v1/control.py
+@@ -0,0 +1,30 @@
++"""Recoverable phase entrypoint; dispatch never silently replays a job."""
++import argparse,json,math
++from . import common as C
++
++def dispatch(arm,estimate=5000):
++    from .training import register
++    reg=register(arm);path=C.OUT/f'registrations/{arm}.json'
++    resource=C.register_resource('DISPATCH_DECISION_'+arm)
++    headroom=max(2048.,.10*resource['total_mib'])
++    slots=math.floor(max(0,resource['free_mib']-headroom)/(1.2*estimate))
++    if slots<1:raise RuntimeError('RESOURCE_WAIT: insufficient measured headroom')
++    go=dict(authorized=True,arm=arm,registration_sha256=C.sha(path),resource=resource,
++        headroom_mib=headroom,minimum_free_mib=headroom+1.2*estimate,observed_or_conservative_worker_mib=estimate,
++        additional_slots=slots,policy='Start incrementally; formal update first, remeasure before second arm; no synthetic GPU probe')
++    C.write(C.OUT/f'dispatch/{arm}_go.json',go)
++    return go
++
++def status():
++    result={}
++    for arm in C.UPDATES:
++        p=C.OUT/f'training/{arm}/status.json'
++        if p.exists():
++            r=C.read(p);result[arm]={k:r.get(k) for k in ('status','step','target','elapsed_seconds','last','error')}
++        else:result[arm]={'status':'NOT_STARTED'}
++    result['resources']=C.register_resource('STATUS')
++    return result
++
++if __name__=='__main__':
++    p=argparse.ArgumentParser();p.add_argument('action',choices=['dispatch','status']);p.add_argument('--arm',choices=list(C.UPDATES));p.add_argument('--estimate-mib',type=float,default=5000);a=p.parse_args()
++    print(json.dumps(dispatch(a.arm,a.estimate_mib) if a.action=='dispatch' else status(),ensure_ascii=False))
+diff --git a/r2/pilots/bench_layout_oracle_v1/data.py b/r2/pilots/bench_layout_oracle_v1/data.py
+new file mode 100644
+--- /dev/null
++++ b/r2/pilots/bench_layout_oracle_v1/data.py
+@@ -0,0 +1,392 @@
++"""CPU-only source-region construction for the Bench layout oracle pilot.
++
++Source geometry is used only for the explicitly privileged layout diagnostic.
++No model, CUDA, target repair, source overwrite or generated noise is involved.
++"""
++from __future__ import annotations
++
++import argparse
++import csv
++import hashlib
++import json
++from datetime import datetime, timezone
++from functools import lru_cache
++from pathlib import Path
++import numpy as np
++
++ROOT = Path(__file__).resolve().parents[3]
++OUT = ROOT / "experiments/r2_bench_layout_oracle_v1/data"
++PRIOR = ROOT / "experiments/r2_bench_three_mechanisms_v1/data"
++L = float(np.sqrt(3) * 2 / .3762)
++SLOTS = ("BACK_REGION", "SUPPORT_REGION")
++REGION_SOURCES = (
++    "experiments/r2_bench_user_data_v2/manifest.json",
++    "experiments/r2_bench_user_data_v2_expansion_v1/manifest.json",
++    "experiments/r2_bench_parts_v1/data/manifest.json",
++    "experiments/r2_bench_coverage_expansion_v1/data/manifest.json",
++    "experiments/r2_bench_user_relation_rebuild_v1/manifest.json",
++    "experiments/r2_bench_three_family_v1/tasks/final_manifest.json",
++)
++
++
++def resolve(p):
++    s = str(p).replace("\\", "/")
++    if s.startswith("/mnt/e/"):
++        return ROOT.parent / s[len("/mnt/e/"):]
++    if s.lower().startswith("e:/"):
++        return ROOT.parent / s[3:]
++    return ROOT / s if not Path(s).is_absolute() else Path(s)
++
++
++def read(p):
++    return json.loads(resolve(p).read_text(encoding="utf-8-sig"))
++
++
++def sha(p):
++    h = hashlib.sha256()
++    with resolve(p).open("rb") as f:
++        for b in iter(lambda: f.read(1024 * 1024), b""):
++            h.update(b)
++    return h.hexdigest()
++
++
++def write(p, obj):
++    p = resolve(p)
++    p.parent.mkdir(parents=True, exist_ok=True)
++    p.write_text(json.dumps(obj, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
++
++
++def get_rows(doc):
++    if isinstance(doc, list):
++        return doc
++    for k in ("conditions", "rows", "train", "candidates", "accepted"):
++        if isinstance(doc.get(k), list):
++            return doc[k]
++    return []
++
++
++def inventory():
++    manifest = read(PRIOR / "manifest.json")
++    ep = read(PRIOR / "eval_manifest.json")
++    cases = manifest["train"] + list({q["condition_id"]: q for q in ep["requests"]}.values())
++    result = []
++    for r in cases:
++        z = np.load(resolve(r["case_path"]), allow_pickle=False)
++        result.append(dict(parent=r["parent_id"], condition=r["condition_id"],
++                           group=r.get("replay_group", r.get("eval_group")),
++                           case_path=r["case_path"], arrays={k: dict(shape=list(z[k].shape), dtype=str(z[k].dtype)) for k in z.files}))
++    write(OUT / "source_inventory.json", result)
++    print(json.dumps(result[:2] + result[-6:], indent=2))
++
++
++def type_slot(r):
++    part = r.get("part_type", "")
++    if part == "BACK_SURFACE":
++        return 0
++    if part in ("LEG_SUPPORT", "SEAT_SUPPORT"):
++        return 1
++    cid = r.get("condition_id", "")
++    # These explicit reviewed condition names identify a complete end support.
++    if any(x in cid for x in ("END_FRAME_FULL", "END_WALL_FULL", "COMPLETE_LEFT_END_OUTER_SURFACE")):
++        return 1
++    return None
++
++
++def library():
++    result = []
++    for path in REGION_SOURCES:
++        p = resolve(path)
++        if not p.exists():
++            continue
++        for r in get_rows(read(p)):
++            slot = type_slot(r)
++            if slot is None or not r.get("case_path"):
++                continue
++            review = r.get("review") or {}
++            if isinstance(review, str):
++                review = json.loads(review)
++            decisions = [str(r.get(k, "")) for k in ("review_status", "eligibility", "decision")]
++            decisions.append(str(review.get("decision", "")))
++            if not any("ACCEPT" in s for s in decisions):
++                continue
++            result.append(dict(row=r, slot=slot, manifest=str(p), manifest_sha256=sha(p)))
++    return result
++
++
++def region_inventory():
++    manifest = read(PRIOR / "manifest.json")
++    ep = read(PRIOR / "eval_manifest.json")
++    cases = list({r["condition_id"]: r for r in manifest["train"] + ep["requests"]}.values())
++    lib = library()
++    records = []
++    for r in cases:
++        z = np.load(resolve(r["case_path"]), allow_pickle=False)
++        full = z["full_target"]
++        parts = []
++        failures = []
++        for item in lib:
++            rr = item["row"]
++            if rr["parent_id"] != r["parent_id"]:
++                continue
++            pp = resolve(rr["case_path"])
++            if not pp.exists():
++                failures.append(dict(condition=rr["condition_id"],reason="MISSING_CASE"))
++                continue
++            zz = np.load(pp, allow_pickle=False)
++            if "full_target" not in zz or not np.array_equal(full, zz["full_target"]):
++                failures.append(dict(condition=rr["condition_id"],reason="TARGET_ARRAY_NOT_IDENTICAL",keys=list(zz.files)))
++                continue
++            ids = sorted(set(zz["known_ids"].tolist()) - set(z["known_ids"].tolist()))
++            if not ids:
++                continue
++            parts.append(dict(slot=item["slot"], source_condition=rr["condition_id"], face_ids=ids,
++                extent=rr.get("extent_description", ""), manifest=item["manifest"], case_path=str(pp)))
++        records.append(dict(parent_id=r["parent_id"],condition_id=r["condition_id"],
++            group=r.get("replay_group",r.get("eval_group")),case_path=r["case_path"],
++            N=int(z["N"]),K=int(z["K"]),regions=parts,failures=failures))
++    write(OUT / "region_inventory.json", records)
++    print(json.dumps([dict(parent=x["parent_id"][:6],group=x["group"],regions=[(p["slot"],len(p["face_ids"])) for p in x["regions"]],failures=len(x["failures"])) for x in records],indent=2))
++
++
++def area_center(C):
++    C = np.asarray(C, np.float64).reshape(-1,3,3)
++    a = np.linalg.norm(np.cross(C[:,1]-C[:,0], C[:,2]-C[:,0]), axis=1) / 2
++    if not np.isfinite(a).all() or a.sum() <= 0:
++        raise ValueError("C has no finite positive area")
++    return np.sum(C.mean(1) * a[:, None], axis=0) / a.sum()
++
++
++def propose_and_render():
++    import matplotlib
++    matplotlib.use("Agg")
++    import matplotlib.pyplot as plt
++    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
++    records = read(OUT / "region_inventory.json")
++    proposed = []
++    for r in records:
++        z = np.load(resolve(r["case_path"]), allow_pickle=False)
++        full, known = z["full_target"], z["known_ids"]
++        item = dict(r)
++        item["proposal"] = None
++        if not r["regions"]:
++            # A geometric proposal only. Admission requires actual source-image review.
++            cutoff = float(full[known, :, 1].min()) - .005 * L
++            ids = [int(i) for i in z["free_ids"] if float(full[i,:,1].mean()) < cutoff]
++            item["proposal"] = dict(slot=1, face_ids=ids, cutoff_y=cutoff,
++                recipe="triangle_centroid_y < min(C.y) - 0.005L; source lower-region proposal, not automatic semantic acceptance",
++                status="PENDING_ACTUAL_VISUAL_REVIEW")
++        proposed.append(item)
++        fig = plt.figure(figsize=(14,4.8), dpi=130)
++        for j, (elev, azim) in enumerate(((20,-65),(15,65),(10,0))):
++            ax = fig.add_subplot(1,3,j+1,projection="3d")
++            ax.add_collection3d(Poly3DCollection(full,facecolors="#b6bec4",edgecolors="#6f777d",linewidths=.12,alpha=.2))
++            ax.add_collection3d(Poly3DCollection(full[known],facecolors="#078fc5",edgecolors="#005577",linewidths=.25,alpha=.9))
++            for slot in range(2):
++                ids = sorted({i for p in item["regions"] if p["slot"]==slot for i in p["face_ids"]})
++                if item["proposal"] and item["proposal"]["slot"]==slot:
++                    ids = item["proposal"]["face_ids"]
++                if ids:
++                    color = "#9c4dcc" if slot==0 else "#ed8c20"
++                    ax.add_collection3d(Poly3DCollection(full[ids],facecolors=color,edgecolors="#464646",linewidths=.22,alpha=.78))
++            points=full.reshape(-1,3);lo=points.min(0);hi=points.max(0);mid=(lo+hi)/2; span=max(hi-lo)*.53
++            ax.set_xlim(mid[0]-span,mid[0]+span);ax.set_ylim(mid[1]-span,mid[1]+span);ax.set_zlim(mid[2]-span,mid[2]+span)
++            ax.set_box_aspect((1,1,1));ax.view_init(elev=elev,azim=azim,vertical_axis="y")
++            ax.set_xlabel("x");ax.set_ylabel("y (up)");ax.set_zlabel("z")
++        proposal_text="PROPOSAL" if item["proposal"] else "EXACT-SAME-TARGET REVIEWED REGIONS"
++        fig.suptitle(f'{r["parent_id"][:6]} | N={r["N"]}, K={r["K"]} | {proposal_text}\nC cyan / back purple / support orange. Regions need not cover every component.')
++        path=OUT / "region_gallery" / (r["parent_id"]+".png")
++        path.parent.mkdir(parents=True,exist_ok=True)
++        fig.tight_layout();fig.savefig(path);plt.close(fig)
++        item["review_image"] = str(path);item["review_image_sha256"] = sha(path)
++    write(OUT / "region_proposals.json", proposed)
++    print(json.dumps([dict(parent=r["parent_id"][:6],count=len(r["proposal"]["face_ids"]),image=r["review_image"]) for r in proposed if r["proposal"]],indent=2))
++
++
++MANUAL_REVIEW = {
++    "27eb79": "Three actual source views show the selected lower vertical leg portions below the complete curved seat. Their union bounds are a coarse lower-support region; upper arm/frame and back remain UNKNOWN, not absent.",
++    "28b9f2": "Three source views show two rectangular end supports and the undersides/sides of the slatted seat between them. Admit the broad seat-support assembly region, not a pure individual-leg label.",
++    "abf250": "Three views show the selected two thick rectangular end supports below the slatted seat. The selected region does not include the blue top faces.",
++    "945214": "Three views show lower end frames, legs, longitudinal brace and lower slat surfaces. Admit a broad lower support-and-frame region; raised end rails are not relabelled as a back.",
++    "af264c": "Three views show lower legs and the seat-surrounding lower frame. Tall rear bars and arm tops are unselected and remain UNKNOWN in the back slot.",
++    "bcb4f5": "Three views show the curved continuous ring base/shell under the flat top. Admit as broad support shell, explicitly not four legs and not independent disconnected parts.",
++    "77aa33": "Three views show the two ornamented pedestal supports under the blue seat. Admit their combined coarse bounds, with internal shape and count not transmitted to the model.",
++}
++
++
++def encode_boxes(bboxes, valid, C):
++    """Fixed 2x8 schema: relative centre, FULL extent, BACK/SUPPORT onehot."""
++    bbox = np.asarray(bboxes, np.float32)
++    valid = np.asarray(valid, bool)
++    if bbox.shape != (2,2,3) or valid.shape != (2,):
++        raise ValueError("Expected two coarse boxes and separate known-region mask")
++    centre = area_center(C)
++    out = np.zeros((2,8), np.float32)
++    out[:,:3] = ((bbox[:,0].astype(np.float64)+bbox[:,1].astype(np.float64))/2-centre)/L
++    out[:,3:6] = (bbox[:,1].astype(np.float64)-bbox[:,0].astype(np.float64))/L
++    out[0,6],out[1,7] = 1,1
++    out[~valid] = 0
++    if not np.isfinite(out).all() or (out[valid,3:6]<0).any():
++        raise ValueError("Nonfinite or negative coarse extent")
++    return out, valid.copy(), centre.astype(np.float32)
++
++
++def build():
++    proposals = read(OUT / "region_proposals.json")
++    original = read(PRIOR / "manifest.json")
++    evaluation = read(PRIOR / "eval_manifest.json")
++    by_cond = {}
++    protected = {}
++    manual = []
++    all_rows = []
++    now = datetime.now(timezone.utc).isoformat()
++    for r in proposals:
++        path=resolve(r["case_path"]);protected[str(path)]=sha(path)
++        z=np.load(path,allow_pickle=False);full=z["full_target"];known=set(z["known_ids"].tolist())
++        regions=[set(),set()]
++        provenance=[]
++        for p in r["regions"]:
++            regions[p["slot"]].update(p["face_ids"])
++            provenance.append(dict(kind="INHERITED_REVIEW_EXACT_SAME_TARGET",**p))
++            for source_path in (p["manifest"],p["case_path"]):
++                protected[str(resolve(source_path))]=sha(source_path)
++        if r["proposal"]:
++            note=MANUAL_REVIEW[r["parent_id"][:6]]
++            review=dict(parent_id=r["parent_id"],condition_id=r["condition_id"],
++                reviewer="AI_PROXY_layout_data_build_NONBLIND",actually_viewed=True,
++                decision="ACCEPT_COARSE_SUPPORT_REGION",reviewed_utc=now,
++                image=r["review_image"],image_sha256=r["review_image_sha256"],observations=note,
++                scope="Source-target region curation only; not generated-output or human review")
++            if sha(r["review_image"]) != r["review_image_sha256"]:
++                raise ValueError("Reviewed image changed")
++            manual.append(review)
++            p=r["proposal"];regions[p["slot"]].update(p["face_ids"])
++            provenance.append(dict(kind="NEW_ACTUALLY_REVIEWED_SOURCE_REGION",**p,review=review))
++        regions=[sorted(s-known) for s in regions]
++        bbox=np.zeros((2,2,3),np.float32);valid=np.zeros(2,bool)
++        for slot,ids in enumerate(regions):
++            if ids:
++                triangles=full[ids]
++                area=np.linalg.norm(np.cross(triangles[:,1]-triangles[:,0],triangles[:,2]-triangles[:,0]),axis=1).sum()/2
++                if area <= 1e-12*L*L:
++                    raise ValueError("Region has no positive geometric area")
++                pts=triangles.reshape(-1,3);bbox[slot]=np.stack((pts.min(0),pts.max(0)));valid[slot]=True
++        tokens,valid,centre=encode_boxes(bbox,valid,full[z["known_ids"]])
++        dest=OUT/"layouts"/(r["condition_id"]+".npz");dest.parent.mkdir(parents=True,exist_ok=True)
++        np.savez(dest,tokens=tokens,valid=valid,center_C=centre,absolute_bbox=bbox,
++            back_face_ids=np.asarray(regions[0],np.int64),support_face_ids=np.asarray(regions[1],np.int64),
++            L=np.asarray(L,np.float64),schema=np.asarray("BACK_SUPPORT_BBOX_CENTRE_EXTENT_ONEHOT8_V1"))
++        record=dict(parent_id=r["parent_id"],condition_id=r["condition_id"],case_path=str(path),case_sha256=sha(path),
++            layout_npz=str(dest),layout_npz_sha256=sha(dest),valid=valid.tolist(),
++            region_status=["OBSERVED_REGION" if v else "UNKNOWN_NOT_ABSENT" for v in valid],
++            bbox_scope="Union bounds of reviewed selected non-C surfaces; not a complete semantic decomposition",
++            input_scope="ORACLE_PRIVILEGED_SOURCE_LAYOUT",source_face_ids=regions,provenance=provenance,
++            geometry_modified=False,N=r["N"],K=r["K"],image=r["review_image"],image_sha256=r["review_image_sha256"])
++        by_cond[r["condition_id"]]=record;all_rows.append(record)
++    train=[];excluded=[]
++    for r in original["train"]:
++        rec=by_cond[r["condition_id"]]
++        if any(rec["valid"]):
++            row=dict(r);row.update(layout_npz=rec["layout_npz"],layout_npz_sha256=rec["layout_npz_sha256"],layout_valid=rec["valid"])
++            train.append(row)
++        else:
++            excluded.append(dict(parent_id=r["parent_id"],reason="NO_VERIFIED_NON_C_LAYOUT"))
++    eval_rows=[]
++    for q in evaluation["requests"]:
++        rec=by_cond[q["condition_id"]]
++        if not any(rec["valid"]):
++            raise ValueError("Registered evaluation request has no privileged layout")
++        eval_rows.append(dict(request_id=q["request_id"],parent_id=q["parent_id"],condition_id=q["condition_id"],
++            layout_npz=rec["layout_npz"],layout_npz_sha256=rec["layout_npz_sha256"],
++            valid=rec["valid"],input_scope="ORACLE_PRIVILEGED_SOURCE_LAYOUT"))
++    write(OUT/"manifest.json",dict(schema="R2_BENCH_LAYOUT_ORACLE_V1_data",train=train,excluded=excluded,
++        source_manifest=str(PRIOR/"manifest.json"),source_manifest_sha256=sha(PRIOR/"manifest.json"),
++        slots=list(SLOTS),layout_dim=8,independent_new_parents=0,new_C=0,source_geometry_changed=False))
++    write(OUT/"eval_manifest.json",evaluation)
++    write(OUT/"layout_eval_manifest.json",dict(requests=eval_rows,input_scope="ORACLE_PRIVILEGED_SOURCE_LAYOUT"))
++    write(OUT/"layout_records.json",dict(records=all_rows,schema="BACK_SUPPORT_BBOX_CENTRE_EXTENT_ONEHOT8_V1"))
++    write(OUT/"manual_source_review.json",dict(records=manual,source_review_only=True))
++    write(OUT/"protected_sources.json",protected)
++    write(OUT/"data_ready.json",dict(status="COMPLETE",train_parents=len(train),eval_requests=len(eval_rows),
++        eval_parents=len({r["parent_id"] for r in eval_rows}),old_review_target_matches=sum(not r["proposal"] for r in proposals),
++        new_source_regions_reviewed=len(manual),training_model_calls=0,model_forwards=0,new_scientific_noise=0,
++        new_layout_bboxes=sum(sum(r["valid"]) for r in all_rows),
++        engineering_events=["Historical nullable review field handled before region extraction; zero model calls"],
++        caveat="Known masks identify available reviewed regions, not semantic absence. Correct-source P is extra information, not C-only inference or a mathematical upper bound."))
++    print(json.dumps(dict(status="COMPLETE",parents=len(train),requests=len(eval_rows),manual_reviews=len(manual))))
++
++
++@lru_cache(maxsize=128)
++def _load_layout(path):
++    with np.load(resolve(path),allow_pickle=False) as z:
++        return {k:z[k].copy() for k in z.files}
++
++
++@lru_cache(maxsize=1)
++def _records_by_condition():
++    return {r["condition_id"]:r for r in read(OUT/"layout_records.json")["records"]}
++
++
++def training_layout(case, row, sample):
++    record=_records_by_condition()[row["condition_id"]]
++    z=_load_layout(row.get("layout_npz",record["layout_npz"]))
++    bbox=z["absolute_bbox"].copy();bbox[...,0]*=np.float32(row["alpha"])
++    C=np.asarray(sample["xt"])[np.asarray(sample["known_mask"],bool)]
++    tokens,valid,_=encode_boxes(bbox,z["valid"],C)
++    if row.get("layout_drop",False):
++        tokens[:]=0;valid[:]=False
++    return tokens,valid
++
++
++def eval_layout(q):
++    record=_records_by_condition()[q["condition_id"]]
++    z=_load_layout(record["layout_npz"])
++    return z["tokens"].copy(),z["valid"].copy()
++
++
++def verify():
++    manifest=read(OUT/"manifest.json");records=_records_by_condition();checks=[]
++    for cid,r in records.items():
++        assert sha(r["case_path"])==r["case_sha256"]
++        assert sha(r["layout_npz"])==r["layout_npz_sha256"]
++        case=np.load(resolve(r["case_path"]),allow_pickle=False);layout=_load_layout(r["layout_npz"])
++        for a in (.9,1.,1.1):
++            full=case["full_target"].copy();full[...,0]*=np.float32(a)
++            sample=dict(xt=full[case["known_ids"]],known_mask=np.ones(len(case["known_ids"]),bool))
++            tokens,valid=training_layout(case,dict(condition_id=cid,alpha=a),sample)
++            bbox=np.zeros((2,2,3),np.float32)
++            for slot,ids in enumerate(r["source_face_ids"]):
++                assert not set(ids)&set(case["known_ids"].tolist())
++                if ids:
++                    pts=full[ids].reshape(-1,3);bbox[slot]=np.stack((pts.min(0),pts.max(0)))
++            truth,mask,_=encode_boxes(bbox,layout["valid"],sample["xt"])
++            np.testing.assert_array_equal(tokens,truth);np.testing.assert_array_equal(valid,mask)
++            dropped,vm=training_layout(case,dict(condition_id=cid,alpha=a,layout_drop=True),sample)
++            assert not dropped.any() and not vm.any()
++        checks.append(dict(condition_id=cid,three_width_scales_exact=True,unknown_not_absent=True,
++            non_C_region_identity=True,dropout_all_null=True))
++    for p,h in read(OUT/"protected_sources.json").items():
++        assert sha(p)==h
++    result=dict(status="PASS",conditions=len(checks),checks=checks,model_calls=0,OT_calls=0,
++        source_target_modified=False,layout_truth_scope="Source diagnostic only")
++    write(OUT/"verification.json",result)
++    print(json.dumps({k:result[k] for k in ("status","conditions","model_calls","OT_calls")}))
++
++
++if __name__ == "__main__":
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--inventory", action="store_true")
++    parser.add_argument("--region-inventory", action="store_true")
++    parser.add_argument("--propose-render", action="store_true")
++    parser.add_argument("--build", action="store_true")
++    parser.add_argument("--verify", action="store_true")
++    args = parser.parse_args()
++    if args.inventory:
++        inventory()
++    if args.region_inventory:
++        region_inventory()
++    if args.propose_render:
++        propose_and_render()
++    if args.build:
++        build()
++    if args.verify:
++        verify()
+diff --git a/r2/pilots/bench_layout_oracle_v1/evaluation.py b/r2/pilots/bench_layout_oracle_v1/evaluation.py
+new file mode 100644
+--- /dev/null
++++ b/r2/pilots/bench_layout_oracle_v1/evaluation.py
+@@ -0,0 +1,414 @@
++"""Frozen paired layout-information evaluation; original scorers stay read-only.
++
++Only ``sample`` invokes the generator. Source-region P is privileged diagnostic
++information, not a C-only deployment result. RAW for every registered mode must
++finish before the first official single D0 invocation.
++"""
++from __future__ import annotations
++import os
++os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
++for _key in ('OMP_NUM_THREADS','MKL_NUM_THREADS','OPENBLAS_NUM_THREADS','NUMEXPR_NUM_THREADS'):
++    os.environ[_key] = '1'
++import argparse
++import copy
++from functools import lru_cache
++import inspect
++import json
++from pathlib import Path
++import sys
++import time
++import traceback
++import types
++from . import common as C
++
++ROOT, OUT, OLD = C.ROOT, C.OUT, C.OLD
++MANIFEST = OUT/'data/eval_manifest.json'
++P_MANIFEST = OUT/'data/layout_eval_manifest.json'
++LABELS = ('EXPOSURE','PLAIN1000','LAYOUT1000','LAYOUT_NULL')
++NEW_LABELS = LABELS[1:]
++STAGES = ('RAW','BASE_POST','CLEAN_FINAL_POST')
++VERSION = 'bench_layout_oracle_evaluation_v1'
++SCORE_REGISTRATION = OUT/'evaluation/score_registration.json'
++
++
++def dispatch_guard(snapshot, estimate_mib):
++    from r2.pilots.bench_three_mechanisms_v1.evaluation import dispatch_guard as guard
++    return guard(snapshot, estimate_mib)
++
++
++def requests(label=None):
++    if label is not None and label not in LABELS: raise ValueError(label)
++    qs=C.read(MANIFEST)['requests']
++    if not qs or len({q['request_id'] for q in qs})!=len(qs): raise ValueError('Empty/duplicate panel')
++    reg=C.read(C.REGISTRATION)
++    expected=reg.get('eval_requests',12)
++    if len(qs)!=expected: raise ValueError('Registered evaluation cardinality changed')
++    return qs
++
++
++def budget():
++    n=len(requests()); return dict(requests=n,parents=len({q['parent_id'] for q in requests()}),
++        new_RAW=3*n,new_D0=3*n,generator_forwards=150*n,logical_Euler_vector_fields=150*n,
++        new_score_rows=9*n,reused_score_rows=3*n,total_score_rows=12*n)
++
++
++def root_for(label,q=None):
++    if label not in LABELS: raise ValueError(label)
++    return OLD if label=='EXPOSURE' else OUT
++
++
++def new_requests(label):
++    if label not in LABELS: raise ValueError(label)
++    return requests(label) if label in NEW_LABELS else []
++
++
++def label_spec(label):
++    if label not in NEW_LABELS: raise ValueError('Baseline sampling forbidden')
++    arm='PLAIN' if label=='PLAIN1000' else 'LAYOUT'
++    return dict(mode=arm,arm=arm,local_step=1000,global_step=C.BASE_STEP+1000,subset='full',
++        schema='bench_layout_oracle_generator_v1',
++        generator_path=str(OUT/'training'/arm/'generator_step1000.pt'),
++        input_scope='ORACLE_PRIVILEGED_SOURCE_REGIONS' if label=='LAYOUT1000' else 'C_ONLY',
++        layout_mask='REGISTERED_VALID' if label=='LAYOUT1000' else 'ALL_FALSE')
++
++
++def training_barrier():
++    files={}
++    for label in ('PLAIN1000','LAYOUT1000'):
++        p=C.resolve(label_spec(label)['generator_path'])
++        if not p.exists(): raise FileNotFoundError('Wait for both fixed training endpoints: '+str(p))
++        sidecar=p.with_suffix('.json')
++        if sidecar.exists():
++            r=C.read(sidecar)
++            if r.get('sha256')!=C.sha(p): raise ValueError('Endpoint sidecar hash differs')
++            files[str(sidecar)]=C.sha(sidecar)
++        files[str(p)]=C.sha(p)
++    return files
++
++
++def _code_hashes(code,kind):
++    inherited=C.read(OLD/'evaluation/inference_registrations'/('EXPOSURE__'+kind+'.json'))['code']
++    C.verify(inherited)
++    return {**inherited,**{str(p):C.sha(p) for p in Path(__file__).parent.glob('*.py')},**code}
++
++
++def all_raw_barrier():
++    audit=C.read(OUT/'audits/reference_cache_audit.json'); C.verify(audit['files']); C.verify(audit['protected'])
++    paths=[]
++    for label in NEW_LABELS:
++        engine().verify_raw(label)
++        paths.extend(engine().raw_receipt(q,label) for q in requests())
++    if len(paths)!=budget()['new_RAW']: raise ValueError('Every registered RAW must precede D0')
++    return paths
++
++
++def _cpu_worker(job):
++    label,q,mode,regsha=job
++    e=engine(); result=e.raw_one(label,q,regsha) if mode=='raw' else e.post_one(label,q,regsha)
++    if 'torch' in sys.modules: raise RuntimeError('CPU scoring imported torch')
++    print('EVALUATED',mode,label,q['request_id'],flush=True)
++    return result
++
++
++@lru_cache(maxsize=1)
++def engine():
++    from r2.pilots.bench_four_routes_v1.exposure import evaluation as original
++    before=(original.OUT,original.MANIFEST,original.LABELS)
++    ns=dict(vars(original))
++    for name,obj in vars(original).items():
++        if inspect.isfunction(obj) and obj.__globals__ is vars(original):
++            fn=types.FunctionType(obj.__code__,ns,obj.__name__,obj.__defaults__,obj.__closure__)
++            fn.__kwdefaults__=obj.__kwdefaults__; ns[name]=fn
++    ns.update(OUT=OUT,OLD_M=OLD,MANIFEST=MANIFEST,LABELS=LABELS,NEW_LABELS=NEW_LABELS,
++        ARMS={label:label for label in NEW_LABELS},VERSION=VERSION,__file__=__file__,
++        requests=requests,new_requests=new_requests,root_for=root_for,budget=budget,
++        prepare_panel=prepare_panel,prepare_manifest=prepare_panel,prepare_scores=prepare_scores,
++        registration_path=lambda:C.REGISTRATION,label_spec=label_spec,
++        reuse_spec=lambda q,label:dict(root=str(OLD),label=label) if label=='EXPOSURE' else None,
++        inference_code_hashes=_code_hashes,all_raw_barrier=all_raw_barrier,cpu_one=_cpu_worker,
++        sample=sample,collect=collect,run_cpu=run_cpu)
++    if (original.OUT,original.MANIFEST,original.LABELS)!=before: raise AssertionError('Original globals changed')
++    return types.SimpleNamespace(**ns)
++
++
++def layout_record(q):
++    manifest=C.read(P_MANIFEST)
++    rows=manifest.get('requests',manifest.get('rows'))
++    if not isinstance(rows,list): raise ValueError('Layout manifest needs request rows')
++    found=[r for r in rows if r['request_id']==q['request_id']]
++    if len(found)!=1: raise ValueError('Exactly one registered layout per request required')
++    row=found[0]; path=C.resolve(row['layout_npz'])
++    if C.sha(path)!=row['layout_npz_sha256']: raise ValueError('Layout input hash changed')
++    bundle=C.arrays(path)
++    import numpy as np
++    if (bundle['tokens'].shape!=(2,8) or bundle['tokens'].dtype!=np.float32 or
++        bundle['valid'].shape!=(2,) or bundle['valid'].dtype!=np.bool_ or
++        not np.isfinite(bundle['tokens']).all()): raise ValueError('Layout token contract')
++    return row,bundle
++
++
++def prepare_panel():
++    done=OUT/'audits/reference_cache_audit.json'
++    if done.exists():
++        r=C.read(done); C.verify(r['files']); C.verify(r['protected']); return r
++    manifest=C.read(MANIFEST); qs=requests(); fields=manifest['metric_fields']
++    if len(fields)!=177 or len(set(fields))!=177: raise ValueError('Original177 metrics changed')
++    C.verify(manifest.get('protected',{}))
++    src=OLD/'data/eval_manifest.json'; source=C.read(src)
++    original={q['request_id']:q for q in source['requests']}
++    if any(q!=original[q['request_id']] for q in qs): raise ValueError('Original request fields changed')
++    protected={**manifest.get('protected',{}),str(src):C.sha(src),str(P_MANIFEST):C.sha(P_MANIFEST),
++        str(OLD/'results/completion.json'):C.sha(OLD/'results/completion.json')}
++    oldrows={(r['stage'],r['request_id']):r for r in C.read(OLD/'results/metric_rows.json') if r['label']=='EXPOSURE'}
++    protected[str(OLD/'results/metric_rows.json')]=C.sha(OLD/'results/metric_rows.json')
++    e=engine(); cells=[]
++    for q in qs:
++        lr,_=layout_record(q); protected[lr['layout_npz']]=lr['layout_npz_sha256']
++        for key,hkey in (('inference_npz','inference_npz_sha256'),('metadata_npz','metadata_sha256'),
++                        ('source_npz','source_npz_sha256'),('noise_npz','noise_sha256')):
++            p=C.resolve(q[key]); h=C.sha(p)
++            if h!=q[hkey]: raise ValueError('Input changed: '+key)
++            protected[str(p)]=h
++        query=C.resolve(q['query_descriptor']['path'])
++        if C.sha(query)!=q['query_descriptor']['sha256']: raise ValueError('Query changed')
++        protected[str(query)]=C.sha(query)
++        for kind in ('raw','post'):
++            folder=e.producer('EXPOSURE',q,kind); receipt=C.read(folder/'receipt.json')
++            protected.update(receipt['files']); protected[str(folder/'receipt.json')]=C.sha(folder/'receipt.json')
++        for stage in STAGES:
++            row,score,folder=e.authenticate_score('EXPOSURE',q,stage)
++            if any(row[m]!=oldrows[stage,q['request_id']][m] for m in fields): raise ValueError('Cached baseline changed')
++            cells.append(dict(label='EXPOSURE',request_id=q['request_id'],stage=stage,source=str(folder)))
++            for name in ('row.json','score.json','complete.json'): protected[str(folder/name)]=C.sha(folder/name)
++        p=OLD/'cpu/EXPOSURE'/q['request_id']/'complete.json'; r=C.read(p)
++        C.verify(r['files']); protected.update(r['files']); protected[str(p)]=C.sha(p)
++    oldscore=C.read(OLD/'evaluation/score_registration.json'); C.verify(oldscore['source_hashes']); protected.update(oldscore['source_hashes'])
++    for kind in ('RAW','D0'):
++        p=OLD/'evaluation/inference_registrations'/('EXPOSURE__'+kind+'.json'); r=C.read(p)
++        C.verify(r['code']); protected.update(r['code']); protected[str(p)]=C.sha(p)
++    plan=dict(status='FROZEN',schema=VERSION,labels=list(LABELS),new_labels=list(NEW_LABELS),stages=list(STAGES),budget=budget(),
++        primary_contrasts=['LAYOUT1000-PLAIN1000','LAYOUT1000-LAYOUT_NULL'],
++        scope='LAYOUT1000 uses privileged source coarse regions; not C-only deployment or a mathematical upper bound',
++        baseline='EXPOSURE cached; no model/scoring rerun',new_initial_noise_arrays=0,new_queries=0,new_cameras_or_sections=0,
++        raw_barrier='All registered new RAWs before first D0',
++        chain='single officialBenchD0 -> GEO_C/sourcewinding -> HINGE_OPP015 -> ALPHA -> HOLE',
++        rating='Actual AI_PROXY required; metrics never generate visual labels')
++    C.write(OUT/'data/evaluation_plan.json',plan)
++    result=dict(status='PASS',schema=VERSION,requests=len(qs),parents=len({q['parent_id'] for q in qs}),
++        score_rows_reused=3*len(qs),numeric_fields=177,source_score_rows=cells,protected=protected,
++        model_calls=0,scoring_calls=0,new_noise=0,new_queries=0,
++        files={str(p):C.sha(p) for p in (MANIFEST,P_MANIFEST,OUT/'data/evaluation_plan.json')})
++    C.write(done,result); return result
++
++
++def prepare_scores():
++    e=engine(); CPU,scorers=e.cpu_modules()
++    from r2.pilots.chair_back_transfer_v1.evaluate import source_hashes
++    prepare_panel()
++    files=[Path(__file__),Path(CPU.__file__),Path(CPU.H.__file__),Path(CPU.alpha.__file__),Path(CPU.holes.__file__),Path(CPU.M.__file__)]
++    code={str(p):C.sha(p) for p in files}; code.update(source_hashes())
++    result=dict(status='FROZEN',schema=VERSION+'_score_registration',labels=list(LABELS),stages=list(STAGES),
++        eval_manifest_sha256=C.sha(MANIFEST),registration_sha256=C.sha(C.REGISTRATION),source_hashes=code,
++        new_score_rows=budget()['new_score_rows'],reused_score_rows=budget()['reused_score_rows'],
++        metric_fields=C.read(MANIFEST)['metric_fields'],model_calls=0,new_queries=0,source_GT_success=False,
++        all_native_seam_fields='NA_NOT_SEAM_REPRESENTATION',chain='Unchanged BASE_POST -> HINGE_OPP015 -> ALPHA -> HOLE')
++    C.write(SCORE_REGISTRATION,result); return result
++
++
++def run_cpu(labels,mode,workers=2):
++    import concurrent.futures
++    import multiprocessing
++    if workers not in (1,2) or mode not in ('raw','post'): raise ValueError('Frozen CPU scope')
++    if not labels or len(set(labels))!=len(labels) or any(x not in NEW_LABELS for x in labels): raise ValueError('Unknown new labels')
++    reg=prepare_scores(); e=engine(); CPU,SC=e.cpu_modules(); key=mode+'__'+'__'.join(labels)
++    dest=OUT/'evaluation/completions'/(key+'.json')
++    if dest.exists(): r=C.read(dest); C.verify(r['files']); return r
++    jobs=[(label,q,mode,C.sha(SCORE_REGISTRATION)) for label in labels for q in new_requests(label)]
++    for label,q,_,_ in jobs:
++        e.producer(label,q,'raw')
++        if mode=='post': e.producer(label,q,'post')
++    from r2.pilots.chair_back_transfer_v1.evaluate import worker_count
++    tick=time.perf_counter(); before=SC.resources(); first=_cpu_worker(jobs[0]); count=worker_count(SC.resources(),first,workers)
++    dispatch=OUT/'evaluation/dispatch'/(key+'__'+str(time.time_ns())+'.json')
++    C.write(dispatch,dict(workers=count,threads_per_worker=1,resources_before=before,resources_after_first=SC.resources(),
++        first_peak_RSS_KiB=first['peak_RSS_KiB'],model_calls=0,score_registration_sha256=C.sha(SCORE_REGISTRATION)))
++    with concurrent.futures.ProcessPoolExecutor(max_workers=count,mp_context=multiprocessing.get_context('spawn')) as pool:
++        receipts=[first,*pool.map(_cpu_worker,jobs[1:])]
++    C.verify(reg['source_hashes'])
++    paths=[e.score_dir(label,q,'RAW')/'audit_receipt.json' if mode=='raw' else OUT/'cpu'/label/q['request_id']/'complete.json' for label,q,_,_ in jobs]
++    result=dict(status='COMPLETE',mode=mode,labels=labels,cells=len(receipts),workers=count,seconds=time.perf_counter()-tick,
++        model_calls=0,new_queries=0,dispatch=str(dispatch),files={str(p):C.sha(p) for p in paths})
++    C.write(dest,result); return result
++
++
++def _layout(q,label):
++    import numpy as np
++    from r2.pilots.bench_natural_n_recipe_v1.runtime import inference_layout
++    core,source=engine().source_assets(q); lay=inference_layout(**core)
++    logits=np.full(len(lay['edge_records']),-1,np.float32)
++    dest=OUT/'evaluation'/label/'layouts'/q['condition_id']
++    if (dest/'receipt.json').exists():
++        r=C.read(dest/'receipt.json'); C.verify(r['files']); prior=C.arrays(dest/'layout.npz')
++        if any(not np.array_equal(prior[k],v) for k,v in lay.items()): raise ValueError('Native layout changed')
++    else:
++        if dest.exists(): raise RuntimeError('Unsealed layout')
++        C.npz(dest/'layout.npz',{**lay,'occupancy_logits':logits}); C.npz(dest/'source_condition.npz',source)
++        C.write(dest/'receipt.json',dict(status='COMPLETE',label=label,condition_id=q['condition_id'],
++            occupancy_forward_calls=0,source_labels_read=False,input_sha256=q['inference_npz_sha256'],
++            files={str(p):C.sha(p) for p in dest.iterdir() if p.is_file()}))
++    return lay,logits,source,dest
++
++
++def sample(label,estimated_peak_mib=3500):
++    if label not in NEW_LABELS: raise ValueError('Baseline sampling forbidden')
++    e=engine(); prepare_panel(); endpoint_files=training_barrier()
++    out=OUT/'evaluation'/label; complete=e.raw_completion(label)
++    if complete.exists(): e.verify_raw(label); return C.read(complete)
++    if list(out.glob('sampling_attempt_*')): raise RuntimeError('Prior sample attempt; no silent retry')
++    spec=label_spec(label); checkpoint=C.resolve(spec['generator_path']); checkpoint_hash=C.sha(checkpoint)
++    protected={**endpoint_files,str(checkpoint):checkpoint_hash,str(MANIFEST):C.sha(MANIFEST),
++        str(P_MANIFEST):C.sha(P_MANIFEST),str(C.REGISTRATION):C.sha(C.REGISTRATION)}
++    code=_code_hashes({},'RAW')
++    C.write(OUT/'evaluation/inference_registrations'/(label+'__RAW.json'),dict(status='FROZEN',label=label,spec=spec,
++        outputs=len(requests()),solver='Euler50',maximum_logical_vector_fields=50*len(requests()),
++        new_initial_noise=0,input_scope=spec['input_scope'],protected=protected,code=code))
++    import numpy as np
++    import torch
++    from meshflow_control import runtime
++    from meshflow_control.checkpoints import state_hash
++    from meshflow_control.geo_io import write_indexed_ply
++    from r2.pilots.bench_control_transfer_v1 import sample as sampler
++    from r2.pilots.seam_slot_c200_v1.generate import raw_arrays
++    from r2.pilots.user_condition_finetune_v1.trainer import GPUObserver
++    attempt=out/('sampling_attempt_'+str(time.time_ns())); attempt.mkdir(parents=True)
++    resources=C.resources(); C.write(attempt/'resources_before.json',resources); dispatch_guard(resources,estimated_peak_mib)
++    observer=GPUObserver(C.EXPERIMENT+'_'+label,interval=1.); observer.__enter__()
++    model=None; completed=0; tick=time.perf_counter()
++    try:
++        runtime.configure_stable_runtime()
++        p=torch.load(checkpoint,map_location='cpu',weights_only=True,mmap=True)
++        if (p['schema']!=spec['schema'] or p['arm']!=spec['arm'] or int(p['local_step'])!=1000 or
++            int(p['global_step'])!=spec['global_step'] or p.get('EMA',False)): raise ValueError('Wrong endpoint')
++        if state_hash(p['generator_state'])!=p['generator_state_sha256']: raise ValueError('Endpoint state hash')
++        if spec['arm']=='PLAIN':
++            from r2.pilots.bench_natural_n_recipe_v1.runtime import build_model
++        else:
++            from .model import build_model
++        model=build_model(copy.deepcopy(p['model_config']),readout_mode='none',trainable=False)
++        model.load_state_dict(p['generator_state'],strict=True); model.to('cuda').set_trainable(False).eval()
++        before=state_hash(model.state_dict())
++        identity=dict(path=str(checkpoint),sha256=checkpoint_hash,state_sha256=before,local_step=1000,
++            global_step=spec['global_step'],EMA=False,input_scope=spec['input_scope'])
++        if spec['arm']=='LAYOUT': identity['layout_module']=model.layout_metadata()
++        C.write(attempt/'model_identity.json',identity); C.write(attempt/'resources_loaded.json',C.resources())
++        for q in requests():
++            dest=out/q['request_id']/'raw'
++            if dest.exists(): raise RuntimeError('Existing unaggregated RAW requires explicit recovery')
++            lay,logits,source,lp=_layout(q,label); dest.mkdir(parents=True)
++            lr,pbundle=layout_record(q); protected[lr['layout_npz']]=lr['layout_npz_sha256']
++            C.write(dest/'attempt.json',dict(label=label,request=q,generator=identity,logical_forward_budget=50))
++            noise=C.arrays(q['noise_npz'])['z']
++            if spec['arm']=='PLAIN':
++                raw,trajectory,audit=sampler.rollout(model,lay,noise,'PLAIN',dest/'calls.jsonl')
++            else:
++                tokens=torch.from_numpy(pbundle['tokens'][None]).to('cuda')
++                valid=torch.from_numpy(pbundle['valid'][None]).to('cuda')
++                if label=='LAYOUT_NULL': valid=torch.zeros_like(valid)
++                with model.layout_context(tokens,valid):
++                    raw,trajectory,audit=sampler.rollout(model,lay,noise,'PLAIN',dest/'calls.jsonl')
++            mesh=raw_arrays(raw,lay,logits,source)
++            C.npz(dest/'raw.npz',mesh); C.npz(dest/'trajectory.npz',dict(state=trajectory)); C.npz(dest/'source_condition.npz',source)
++            C.npz(dest/'layout_information.npz',dict(tokens=pbundle['tokens'],
++                valid=pbundle['valid'] if label=='LAYOUT1000' else np.zeros(2,bool),center_C=pbundle['center_C']))
++            C.write(dest/'layout_information.json',dict(record=lr,input_scope=spec['input_scope'],
++                source_coarse_regions_supplied=label=='LAYOUT1000',missing_does_not_mean_absent=True))
++            write_indexed_ply(dest/'raw.ply',mesh['vertices'],mesh['faces']); C.write(dest/'audit.json',audit)
++            C.write(dest/'receipt.json',dict(status='COMPLETE',execution='NEW',label=label,arm=spec['arm'],
++                request_id=q['request_id'],condition_id=q['condition_id'],generator=identity,checkpoint_sha256=checkpoint_hash,
++                generator_forwards=50,logical_vector_fields=50,new_generator_forwards=50,D0_forwards=0,new_D0_forwards=0,
++                raw_sha256=C.sha(dest/'raw.npz'),noise_sha256=q['noise_sha256'],source_labels_read=label=='LAYOUT1000',
++                input_scope=spec['input_scope'],head_forwards=0,
++                head_accounting='Legacy occupancy head only; layout branch is inside each generator forward',
++                layout_branch_invocations=50 if spec['arm']=='LAYOUT' else 0,
++                layout_receipt=str(lp/'receipt.json'),
++                representation='NATIVE_ALL_FREE',audit=audit,files={str(f):C.sha(f) for f in dest.iterdir() if f.is_file()}))
++            completed+=1
++            if completed in (1,2,len(requests())): C.write(attempt/f'resources_output{completed}.json',C.resources())
++            print(json.dumps(dict(stage='RAW',label=label,completed=completed,request_id=q['request_id'])),flush=True)
++        if before!=state_hash(model.state_dict()): raise ValueError('Frozen evaluation model mutated')
++        C.verify(protected); C.verify(code)
++        result=dict(status='COMPLETE',label=label,subset='full',outputs=len(requests()),total_new_rollouts=len(requests()),
++            total_new_generator_forwards=50*len(requests()),logical_vector_fields=50*len(requests()),total_new_head_forwards=0,
++            checkpoint_sha256=checkpoint_hash,seconds=time.perf_counter()-tick,input_scope=spec['input_scope'],
++            files={str(e.raw_receipt(q,label)):C.sha(e.raw_receipt(q,label)) for q in requests()})
++        C.write(complete,result); return result
++    except BaseException as exc:
++        C.write(attempt/'failure.json',dict(error=repr(exc),traceback=traceback.format_exc(),completed_outputs=completed,no_automatic_retry=True)); raise
++    finally:
++        observer.__exit__(None,None,None)
++        C.write(attempt/'resources.json',dict(summary=observer.summary(),samples=observer.samples))
++        del model; torch.cuda.empty_cache()
++
++
++def collect():
++    from r2.pilots.bench_adaptation_strength_v1.collect_v2 import decorate,aggregate,numeric
++    done=OUT/'results/completion.json'
++    if done.exists(): r=C.read(done); C.verify(r['files']); C.verify(r['source_rows']); return r
++    reg=C.read(SCORE_REGISTRATION); C.verify(reg['source_hashes'])
++    metrics=C.read(MANIFEST)['metric_fields']; rows=[]; sources={}; e=engine()
++    for label in LABELS:
++        for q in requests():
++            for stage in STAGES:
++                src,score,folder=e.authenticate_score(label,q,stage); row=decorate(src,label,q,stage)
++                row.update(seam_applicability=score['seam_to_bulk']['status'],eval_group=q['eval_group'],report_group=q['report_group'],
++                    result_origin='REUSED_READ_ONLY' if label=='EXPOSURE' else 'NEW_REGISTERED',source_score_label=label,
++                    input_scope='ORACLE_PRIVILEGED_SOURCE_REGIONS' if label=='LAYOUT1000' else 'C_ONLY',
++                    source_style_success_criterion=False)
++                if any(row[m]!=src[m] for m in metrics): raise ValueError('Original metric altered')
++                rows.append(row)
++                for name in ('row.json','score.json','complete.json'): sources[str(folder/name)]=C.sha(folder/name)
++    if len(rows)!=budget()['total_score_rows']: raise ValueError('Score cardinality differs')
++    conditions=aggregate(rows,('label','stage','report_group','eval_group','parent_id','condition_id'),metrics)
++    parents=aggregate(conditions,('label','stage','report_group','eval_group','parent_id'),metrics)
++    summary=aggregate(parents,('label','stage','report_group','eval_group'),metrics)
++    by={(r['label'],r['stage'],r['request_id']):r for r in rows}; pairs=[]
++    contrasts=[('EXPOSURE',label) for label in NEW_LABELS]+[('PLAIN1000','LAYOUT1000'),('PLAIN1000','LAYOUT_NULL'),('LAYOUT_NULL','LAYOUT1000')]
++    for ref,cand in contrasts:
++        for stage in STAGES:
++            for q in requests():
++                a,b=by[ref,stage,q['request_id']],by[cand,stage,q['request_id']]
++                row=dict(reference=ref,candidate=cand,stage=stage,**{k:q[k] for k in ('request_id','condition_id','parent_id','noise_index','eval_group','report_group')})
++                for m in metrics:
++                    row[m+'__reference']=a[m]; row[m+'__candidate']=b[m]
++                    row[m+'__delta']=b[m]-a[m] if numeric(a[m]) and numeric(b[m]) else None
++                pairs.append(row)
++    delta=[m+'__delta' for m in metrics]
++    pc=aggregate(pairs,('reference','candidate','stage','report_group','eval_group','parent_id','condition_id'),delta)
++    pp=aggregate(pc,('reference','candidate','stage','report_group','eval_group','parent_id'),delta)
++    tables=dict(per_output=rows,per_condition=conditions,per_parent=parents,parent_macro_summary=summary,
++        paired_per_output=pairs,paired_per_condition=pc,paired_per_parent=pp)
++    for name,table in tables.items(): C.csvwrite(OUT/'results'/(name+'.csv'),table)
++    C.write(OUT/'results/metric_rows.json',rows)
++    files={str(OUT/'results'/(name+'.csv')):C.sha(OUT/'results'/(name+'.csv')) for name in tables}
++    files[str(OUT/'results/metric_rows.json')]=C.sha(OUT/'results/metric_rows.json')
++    result=dict(status='COMPLETE',rows=len(rows),new_score_rows=budget()['new_score_rows'],
++        reused_score_rows=budget()['reused_score_rows'],paired_rows=len(pairs),metric_fields=metrics,source_rows=sources,
++        model_calls=0,scoring_calls=0,new_queries=0,files=files)
++    C.write(done,result); return result
++
++
++def main():
++    p=argparse.ArgumentParser(description=__doc__)
++    p.add_argument('action',choices=('prepare','prepare-scores','sample','collect'))
++    p.add_argument('--label',choices=NEW_LABELS); p.add_argument('--estimated-peak-mib',type=float,default=3500)
++    a=p.parse_args()
++    if a.action=='prepare': r=prepare_panel()
++    elif a.action=='prepare-scores': r=prepare_scores()
++    elif a.action=='collect': r=collect()
++    else:
++        if not a.label: p.error('--label required')
++        r=sample(a.label,a.estimated_peak_mib)
++    print(json.dumps({k:v for k,v in r.items() if k not in ('files','protected','source_rows','source_score_rows','source_hashes','metric_fields')},ensure_ascii=False))
++
++
++if __name__=='__main__': main()
+diff --git a/r2/pilots/bench_layout_oracle_v1/gallery.py b/r2/pilots/bench_layout_oracle_v1/gallery.py
+new file mode 100644
+--- /dev/null
++++ b/r2/pilots/bench_layout_oracle_v1/gallery.py
+@@ -0,0 +1,139 @@
++"""Fixed cameras and original finite sections; image creation never makes ratings."""
++from __future__ import annotations
++import os
++os.environ['CUDA_VISIBLE_DEVICES']=''
++for key in ('OMP_NUM_THREADS','MKL_NUM_THREADS','OPENBLAS_NUM_THREADS','NUMEXPR_NUM_THREADS'):os.environ[key]='1'
++import argparse
++import concurrent.futures
++import html
++import io
++import json
++import multiprocessing
++import resource
++import sys
++import time
++import numpy as np
++from . import common as C, evaluation as E
++
++GALLERY=C.OUT/'gallery'
++VERSION='bench_layout_oracle_four_mode_three_stage_gallery_v1'
++
++
++def mesh_spec(label,q,stage):
++    e=E.engine()
++    if stage=='RAW':
++        folder=e.producer(label,q,'raw');path=folder/'raw.npz';receipt=folder/'receipt.json'
++    elif stage=='BASE_POST':
++        folder=e.producer(label,q,'post');path=folder/'post.npz';receipt=folder/'receipt.json'
++    else:
++        path=E.root_for(label)/'cpu'/label/q['request_id']/stage/'post.npz'
++        receipt=E.root_for(label)/'cpu'/label/q['request_id']/'complete.json'
++    saved=C.read(receipt);C.verify(saved['files'])
++    if not any(C.resolve(p)==path and h==C.sha(path) for p,h in saved['files'].items()):
++        raise ValueError('Image source mesh is not sealed by its original producer')
++    return dict(label=label,path=str(path),sha256=C.sha(path),producer=str(receipt),producer_sha256=C.sha(receipt))
++
++
++def render_page(page):
++    if 'torch' in sys.modules:raise RuntimeError('Gallery must run in fresh CPU process')
++    from r2.pilots.chair_multipart_seam_v1 import gallery as G
++    q,stage=page['q'],page['stage'];pageid=stage+'__'+q['request_id']
++    folder=GALLERY/pageid;png=folder/'comparison.png';receipt=folder/'comparison.json'
++    identity=dict(version=VERSION,page_id=pageid,stage=stage,request_id=q['request_id'],
++        source_sha256=C.sha(__file__),cells=page['cells'],bounds=q['gallery_bounds'],depth_bounds=q['gallery_depth_bounds'])
++    if receipt.exists():
++        r=C.read(receipt)
++        if r['identity']!=identity or C.sha(png)!=r['image_sha256']:raise ValueError('Frozen image changed')
++        return r
++    if png.exists():raise RuntimeError('Unsealed image; no overwrite')
++    folder.mkdir(parents=True,exist_ok=True);tick=time.perf_counter();plt=G.H._mpl()
++    fig=plt.figure(figsize=(20,16.5),dpi=110,facecolor='white')
++    grid=fig.add_gridspec(len(E.LABELS),4,left=.025,right=.99,bottom=.055,top=.89,wspace=.19,hspace=.29)
++    depth,bounds=q['gallery_depth_bounds'],q['gallery_bounds'];display=[]
++    try:
++        for row,cell in enumerate(page['cells']):
++            k=int(q['K']);arr=C.arrays(cell['path']);tri,roles=G.roles(arr,k)
++            inp=C.arrays(q['inference_npz']);original=inp['C_vertices'][inp['C_faces_original']]
++            if not np.array_equal(tri[:k],original):raise ValueError('Rendered C differs from input')
++            geometry=dict(C=tri[:k],F=tri[k:],C_original=original,tri=tri)
++            facts=dict(label=cell['label'],stage=stage,N_requested=int(q['N']),N_output=len(tri),K=k,views=[])
++            for col,azimuth in enumerate((-60,120)):
++                raster,scope=G.role_raster(tri,roles,k,G.D.basis(azimuth,23),np.asarray(depth['center']),depth['span'])
++                ax=fig.add_subplot(grid[row,col]);ax.imshow(raster);ax.set_axis_off()
++                ax.set_title(cell['label']+f' | {stage} | az={azimuth}\nK={k}, requestedN={q["N"]}, outputN={len(tri)}',fontsize=8)
++                facts['views'].append(dict(azimuth=azimuth,**scope))
++                if scope['projected_vertices_outside_inherited_frame']:
++                    ax.text(.01,.01,'Inherited frame clipping; see receipt',transform=ax.transAxes,fontsize=7,color='#b34b27')
++            for col,view in ((2,'front'),(3,'side')):
++                ax=fig.add_subplot(grid[row,col]);seams=np.flatnonzero(roles[k:]=='SEAM')
++                G.H.draw_section(ax,geometry,seams,bounds,G.C.L,view,1)
++                position=bounds['front_positions' if view=='front' else 'side_positions'][1]
++                from matplotlib.collections import LineCollection
++                axis,project=(2,(0,1)) if view=='front' else (0,(2,1))
++                sections,ids=G.H.finite_sections(geometry['F'],axis,position,1e-12*G.C.L)
++                bridge=roles[k:][ids]=='BRIDGE'
++                if bridge.any():ax.add_collection(LineCollection(sections[bridge][:,:,project],colors='#41a46c',linewidths=1.6,zorder=3))
++                ax.set_title(cell['label']+' | '+stage+' | '+view+f'={position:.5f}',fontsize=8)
++            display.append(facts)
++        fig.suptitle(q['request_id']+' | '+stage+' | '+q['report_group']+'\n'
++            'EXPOSURE / PLAIN1000 / LAYOUT1000 (SOURCE ORACLE) / LAYOUT_NULL | Same C, N, saved noise, cameras and finite sections\n'
++            'Blue: condition C | Gray: generated bulk | Green: added bridge',fontsize=11)
++        fig.text(.5,.018,'Actual AI_PROXY viewing is recorded separately. Sections and graph components alone do not certify cracks/fragments. No unique-source-style grading.',ha='center',fontsize=8)
++        buffer=io.BytesIO();fig.savefig(buffer,format='png',dpi=110)
++        with png.open('xb') as f:f.write(buffer.getvalue())
++    finally:plt.close(fig)
++    r=dict(status='PENDING_ACTUAL_VIEW',identity=identity,page_id=pageid,stage=stage,image_path=str(png),
++        image_sha256=C.sha(png),display=display,seconds=time.perf_counter()-tick,
++        peak_RSS_KiB=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,model_calls=0,scoring_calls=0,ratings_generated=0)
++    C.write(receipt,r);return r
++
++
++def render(workers=2):
++    if workers not in (1,2):raise ValueError('Controller-selected bounded CPU workers')
++    done=GALLERY/'complete.json'
++    if done.exists():
++        r=C.read(done);C.verify(r['files']);C.verify(r['protected']);return r
++    from r2.pilots.bench_four_routes_v1.resources import snapshot
++    pages=[];protected={str(E.MANIFEST):C.sha(E.MANIFEST)}
++    for q in E.requests():
++        for stage in E.STAGES:
++            cells=[mesh_spec(label,q,stage) for label in E.LABELS]
++            pages.append(dict(q=q,stage=stage,cells=cells))
++            for c in cells:protected[c['path']]=c['sha256'];protected[c['producer']]=c['producer_sha256']
++    if len(pages)!=3*len(E.requests()):raise ValueError('Fixed gallery cardinality')
++    C.write(GALLERY/'definition.json',dict(version=VERSION,pages=pages,protected=protected,
++        camera='Original saved frame; azimuth -60/120 elevation23',section='Original front/side position index1',
++        layout='Four modes x two oblique views and two original finite sections; LAYOUT1000 source regions are privileged',ratings_generated=0))
++    dispatch=GALLERY/'dispatch'/str(time.time_ns());tick=time.perf_counter()
++    C.write(dispatch/'before.json',dict(workers=workers,threads_per_worker=1,resources=snapshot(),pages=len(pages)))
++    if workers==1:results=[render_page(page) for page in pages]
++    else:
++        with concurrent.futures.ProcessPoolExecutor(max_workers=workers,mp_context=multiprocessing.get_context('spawn')) as pool:
++            results=list(pool.map(render_page,pages))
++    rows=sorted(results,key=lambda r:r['page_id'])
++    chunks=['<!doctype html><meta charset="utf-8"><title>Bench coarse-layout privileged-information comparison</title>',
++        '<h1>EXPOSURE / PLAIN1000 / LAYOUT1000 (SOURCE ORACLE) / LAYOUT_NULL</h1><p>Fixed registered pages. RAW, BASE_POST and CLEAN_FINAL_POST. Original noise, scale and cross sections. LAYOUT1000 has privileged source coarse regions; it is not a C-only deployment result. AI_PROXY review is separate.</p>']
++    for r in rows:
++        rel=r['page_id']+'/comparison.png'
++        chunks.append('<h2>'+html.escape(r['page_id'])+'</h2><a href="'+html.escape(rel,quote=True)+'"><img style="max-width:100%" src="'+html.escape(rel,quote=True)+'"></a>')
++    text='\n'.join(chunks);index=GALLERY/'index.html'
++    if index.exists():
++        if index.read_text('utf-8')!=text:raise ValueError('Gallery index changed')
++    else:
++        with index.open('x',encoding='utf-8') as f:f.write(text)
++    C.verify(protected)
++    C.write(dispatch/'complete.json',dict(status='COMPLETE',seconds=time.perf_counter()-tick,resources=snapshot()))
++    paths=[GALLERY/'definition.json',index]+[C.resolve(r['image_path']) for r in rows]+[GALLERY/r['page_id']/'comparison.json' for r in rows]
++    r=dict(status='COMPLETE',pages=len(pages),review_status='PENDING_ACTUAL_AI_PROXY_REVIEW',ratings_generated=0,
++        model_calls=0,scoring_calls=0,workers=workers,seconds=time.perf_counter()-tick,protected=protected,
++        files={str(p):C.sha(p) for p in paths})
++    C.write(done,r);return r
++
++
++def main():
++    p=argparse.ArgumentParser(description=__doc__);p.add_argument('--workers',type=int,choices=(1,2),default=2)
++    a=p.parse_args();r=render(a.workers)
++    print(json.dumps({k:v for k,v in r.items() if k not in ('files','protected')},ensure_ascii=False))
++
++
++if __name__=='__main__':main()
+diff --git a/r2/pilots/bench_layout_oracle_v1/model.py b/r2/pilots/bench_layout_oracle_v1/model.py
+new file mode 100644
+--- /dev/null
++++ b/r2/pilots/bench_layout_oracle_v1/model.py
+@@ -0,0 +1,276 @@
++"""A coarse, privileged layout input for the unchanged Native face generator.
++
++The only new operation is one FP32 cross-attention residual after Native's
++coordinate/role/Geo embedding.  Layout tokens are NOT generated triangles,
++do not consume face slots, and contain no target face/corner correspondences.
++An all-missing layout is explicitly distinct from an observed absent part.
++No inherited model or module-global function is modified.
++"""
++from __future__ import annotations
++
++from contextlib import contextmanager
++import math
++
++import torch
++from torch import nn
++
++from r2.pilots.bench_natural_n_recipe_v1 import runtime as native
++from r2.pilots.bench_natural_n_recipe_v1.runtime import (
++    NativeModel, assert_native_runtime, native_block_forward,
++    native_final_forward, native_execution,
++)
++
++VERSION = "bench_coarse_source_layout_embedding_readout_v1"
++LAYOUT_DIM = 8
++LAYOUT_SLOTS = 2
++READOUT_DIM = 64
++READOUT_HEADS = 4
++LAYOUT_SEED = 20261030
++L = math.sqrt(3.0) * 2.0 / 0.3762
++TOKEN_FIELDS = (
++    "center_x_relative_to_C_area_centroid_over_L",
++    "center_y_relative_to_C_area_centroid_over_L",
++    "center_z_relative_to_C_area_centroid_over_L",
++    "extent_x_over_L", "extent_y_over_L", "extent_z_over_L",
++    "is_BACK_REGION", "is_SUPPORT_REGION",
++)
++
++
++def c_area_centroid(x, known_mask):
++    """Surface-area centroid of C in the unmodified world/model coordinates."""
++    faces = x.float().reshape(x.shape[0], x.shape[1], 3, 3)
++    a, b, c = faces.unbind(dim=2)
++    area2 = torch.linalg.vector_norm(torch.cross(b - a, c - a, dim=-1), dim=-1)
++    weight = area2 * known_mask.to(area2.dtype)
++    denom = weight.sum(dim=1)
++    if bool((denom <= 0).any()) or not bool(torch.isfinite(denom).all()):
++        raise ValueError("C must have positive finite total area")
++    return ((a + b + c) / 3.0 * weight[..., None]).sum(dim=1) / denom[:, None]
++
++
++class LayoutReadout(nn.Module):
++    """Small geometry-aware cross-attention; exactly zero-initialized exit."""
++
++    def __init__(self, hidden_dim=768, *, seed=LAYOUT_SEED):
++        super().__init__()
++        self.hidden_dim = int(hidden_dim)
++        self.seed = int(seed)
++        # CPU-only isolated initialization also works inside an outer meta scope.
++        # It never advances the inherited training stream's CPU RNG state.
++        with torch.random.fork_rng(devices=[]), torch.device("cpu"):
++            # torch.manual_seed also touches CUDA generators if already active;
++            # seed only the isolated CPU default generator here.
++            torch.default_generator.manual_seed(self.seed)
++            self.query_norm = nn.LayerNorm(self.hidden_dim, elementwise_affine=False)
++            self.query_hidden = nn.Linear(self.hidden_dim, READOUT_DIM, bias=False)
++            self.query_position = nn.Linear(3, READOUT_DIM, bias=False)
++            self.layout_embed = nn.Sequential(
++                nn.Linear(LAYOUT_DIM, READOUT_DIM), nn.SiLU(),
++                nn.Linear(READOUT_DIM, READOUT_DIM),
++            )
++            self.key = nn.Linear(READOUT_DIM, READOUT_DIM, bias=False)
++            self.value = nn.Linear(READOUT_DIM, READOUT_DIM, bias=False)
++            self.output = nn.Linear(READOUT_DIM, self.hidden_dim, bias=False)
++            for module in self.modules():
++                if isinstance(module, nn.Linear):
++                    nn.init.xavier_uniform_(module.weight)
++                    if module.bias is not None:
++                        nn.init.zeros_(module.bias)
++            nn.init.zeros_(self.output.weight)
++
++    def metadata(self):
++        return dict(version=VERSION, token_fields=list(TOKEN_FIELDS),
++            slot_order=["BACK_REGION", "SUPPORT_REGION"], slots=LAYOUT_SLOTS,
++            token_dimension=LAYOUT_DIM, hidden_dimension=self.hidden_dim,
++            readout_dimension=READOUT_DIM, heads=READOUT_HEADS,
++            output_initialization="zeros", initialization_seed=self.seed,
++            parameters=sum(p.numel() for p in self.parameters()),
++            injection="once after coordinate/role/Geo embedding; valid free only",
++            arithmetic="FP32 branch, add and cast to inherited hidden dtype",
++            center="C triangle area-weighted centroid", scale_L=L,
++            layout_semantics="privileged coarse source region bbox, not C-only prediction",
++            missing_semantics="mask false is unknown/dropped, not observed absence",
++            generated_face_slots_added=0)
++
++    def forward(self, hidden, x, known_mask, valid_mask, tokens, layout_valid):
++        batch, faces = x.shape[:2]
++        if hidden.shape != (batch, 3 * faces, self.hidden_dim):
++            raise ValueError("Unexpected inherited corner hidden shape")
++        if tokens.shape != (batch, LAYOUT_SLOTS, LAYOUT_DIM) or tokens.dtype != torch.float32:
++            raise ValueError("layout_tokens must be FP32 [B,2,8]")
++        if layout_valid.shape != (batch, LAYOUT_SLOTS) or layout_valid.dtype != torch.bool:
++            raise ValueError("layout_valid must be bool [B,2]")
++        if tokens.device != x.device or layout_valid.device != x.device:
++            raise ValueError("Layout and coordinates must be colocated")
++        if not bool(torch.isfinite(tokens).all()):
++            raise ValueError("Layout tokens, including masked placeholders, must be finite")
++        if bool((tokens[..., 3:6][layout_valid] < 0).any()):
++            raise ValueError("Observed layout extents must be nonnegative")
++        expected_roles = torch.eye(2, device=tokens.device, dtype=tokens.dtype)[None].expand(batch, -1, -1)
++        if not torch.equal(tokens[..., 6:8][layout_valid], expected_roles[layout_valid]):
++            raise ValueError("Observed token type must match fixed BACK/SUPPORT slot")
++        with torch.autocast(device_type=x.device.type, enabled=False):
++            center = c_area_centroid(x, known_mask)
++            position = (x.float().reshape(batch, faces * 3, 3) - center[:, None, :]) / L
++            query = self.query_hidden(self.query_norm(hidden.float())) + self.query_position(position)
++            # Invalid rows cannot leak values through the embedding biases or keys.
++            clean_tokens = torch.where(layout_valid[..., None], tokens, torch.zeros_like(tokens))
++            encoded = self.layout_embed(clean_tokens)
++            width = READOUT_DIM // READOUT_HEADS
++            q = query.reshape(batch, 3 * faces, READOUT_HEADS, width).transpose(1, 2)
++            k = self.key(encoded).reshape(batch, LAYOUT_SLOTS, READOUT_HEADS, width).transpose(1, 2)
++            v = self.value(encoded).reshape(batch, LAYOUT_SLOTS, READOUT_HEADS, width).transpose(1, 2)
++            scores = (q @ k.transpose(-2, -1)) / math.sqrt(width)
++            any_layout = layout_valid.any(dim=1)
++            scores = scores.masked_fill(~layout_valid[:, None, None, :], -torch.inf)
++            # Avoid NaN in all-missing softmax; its output is multiplied by zero.
++            scores = torch.where(any_layout[:, None, None, None], scores, torch.zeros_like(scores))
++            attention = torch.softmax(scores, dim=-1) * layout_valid[:, None, None, :].to(scores.dtype)
++            context = (attention @ v).transpose(1, 2).reshape(batch, 3 * faces, READOUT_DIM)
++            delta = self.output(context)
++            free = (valid_mask & ~known_mask).repeat_interleave(3, dim=1)
++            active = free & any_layout[:, None]
++            delta = torch.where(active[..., None], delta, torch.zeros_like(delta))
++            # Keeping the old tensor explicitly for known/padding/missing rows
++            # guarantees no quantization change for these rows.
++            result = torch.where(active[..., None], (hidden.float() + delta).to(hidden.dtype), hidden)
++        return result, delta
++
++
++class LayoutNative(NativeModel):
++    """Native with an instance-local, scoped optional coarse layout input."""
++
++    def configure_layout(self, tokens, layout_valid):
++        """Replace this worker's current microbatch P without touching weights."""
++        if getattr(self, "_layout_context_active", False):
++            raise RuntimeError("Cannot replace layout inside a scoped rollout")
++        if tokens is None or layout_valid is None:
++            raise ValueError("Use clear_layout for no input; NULL uses explicit false validity")
++        self._layout_payload = (tokens, layout_valid)
++        return self
++
++    def clear_layout(self):
++        if getattr(self, "_layout_context_active", False):
++            raise RuntimeError("Cannot clear layout inside a scoped rollout")
++        self._layout_payload = None
++        return self
++
++    @contextmanager
++    def layout_context(self, tokens, layout_valid):
++        """Scope a fixed P to a rollout; no mutable parameter/state-dict changes.
++
++        Use a distinct model instance per worker. Nested contexts are refused so
++        an accidental stale/scope-overlapping input cannot silently be reused.
++        """
++        if getattr(self, "_layout_payload", None) is not None:
++            raise RuntimeError("A layout context is already active on this model")
++        if tokens is None or layout_valid is None:
++            raise ValueError("Pass explicit finite tokens and validity, including for NULL")
++        self._layout_payload = (tokens, layout_valid)
++        self._layout_context_active = True
++        try:
++            yield self
++        finally:
++            self._layout_payload = None
++            self._layout_context_active = False
++
++    def layout_metadata(self):
++        return self.layout_branch.metadata()
++
++    def forward(self, x, t, y, valid_mask=None, known_mask=None, *, observer=None,
++                layout_tokens=None, layout_valid=None):
++        payload = getattr(self, "_layout_payload", None)
++        if layout_tokens is not None or layout_valid is not None:
++            if layout_tokens is None or layout_valid is None or payload is not None:
++                raise ValueError("Provide one complete layout input, explicit or scoped")
++            payload = (layout_tokens, layout_valid)
++        if payload is None:
++            # Exact inherited function when no layout is requested.
++            return super().forward(x, t, y, valid_mask=valid_mask,
++                                   known_mask=known_mask, observer=observer)
++        assert_native_runtime(self, coordinates=(x, t))
++        if x.ndim != 3 or x.shape[-1] != 9:
++            raise ValueError("Expected FP32 x[B,padded_N,9]")
++        batch, faces, _ = x.shape
++        if t.shape != (batch,) or y.shape != (batch,) or y.dtype != torch.int64:
++            raise ValueError("Expected free t[B] and integer total N[B]")
++        if not bool(torch.isfinite(x).all() and torch.isfinite(t).all()):
++            raise ValueError("Nonfinite coordinates/time")
++        if bool(((t < 0) | (t > 1)).any()):
++            raise ValueError("Free time outside [0,1]")
++        for mask in (valid_mask, known_mask):
++            if mask is None or mask.dtype != torch.bool or mask.shape != (batch, faces) or mask.device != x.device:
++                raise ValueError("Colocated separate bool[B,padded_N] masks required")
++        if bool((known_mask & ~valid_mask).any()):
++            raise ValueError("Known faces must be valid")
++        if not torch.equal(valid_mask.sum(1), y) or bool(((y < 128) | (y > 799)).any()):
++            raise ValueError("y must count real faces only, N128..799")
++        if bool((known_mask.sum(1) == 0).any()) or bool(((valid_mask & ~known_mask).sum(1) == 0).any()):
++            raise ValueError("Each sample requires known and free faces")
++        if self.readout_mode != "none" or len(self.readouts):
++            raise ValueError("Layout experiment requires original no-readout Native")
++        hidden, role = self._embed(x, known_mask, valid_mask)
++        original_hidden = hidden
++        hidden, delta = self.layout_branch(hidden, x, known_mask, valid_mask, *payload)
++        c_free = self.backbone.t_embedder(t)
++        c_known = self.backbone.t_embedder(torch.ones_like(t))
++        count = self.backbone.y_embedder(y // self.backbone.face_bin, False)
++        c_free, c_known = c_free + count, c_known + count
++        face_time = torch.where(known_mask, torch.ones_like(t[:, None]), t[:, None])
++        if observer is not None:
++            observer(dict(site="layout_embedding", original_hidden=original_hidden,
++                delta=delta, hidden=hidden, layout_valid=payload[1]))
++            observer(dict(site="embedding", hidden=hidden, role=role,
++                known_mask=known_mask, valid_mask=valid_mask, face_time=face_time,
++                c_free=c_free, c_known=c_known))
++        for index, block in enumerate(self.backbone.layers, 1):
++            hidden = native_block_forward(block, hidden, c_free, c_known, known_mask,
++                valid_mask, observer=observer, layer_index=index, face_time=face_time)
++        output = native_final_forward(self.backbone.final_layer, hidden, c_free,
++            c_known, known_mask, observer=observer, face_time=face_time)
++        return output.view(batch, faces, 9)
++
++
++def attach_layout(model, *, seed=LAYOUT_SEED):
++    """Add the fresh branch to an owned base instance after base optimizer load."""
++    if hasattr(model, "layout_branch"):
++        raise ValueError("Layout branch already exists")
++    if type(model) is not NativeModel:
++        raise TypeError("Expected an owned, unmodified natural-N Native instance")
++    branch = LayoutReadout(int(model.role_embedding.shape[-1]), seed=seed)
++    device = model.role_embedding.device
++    if device.type != "meta":
++        branch.to(device=device, dtype=torch.float32)
++    branch.requires_grad_(model.experiment_trainable)
++    # Native's deterministic contract requires eval even while gradients train.
++    branch.eval()
++    model.__class__ = LayoutNative
++    model.layout_branch = branch
++    model._layout_payload = None
++    model._layout_context_active = False
++    return model
++
++
++def build_model(model_config, readout_mode="none", readout_seed=20261007,
++                trainable=True, *, layout_seed=LAYOUT_SEED):
++    model = native.build_model(model_config, readout_mode=readout_mode,
++        readout_seed=readout_seed, trainable=trainable)
++    return attach_layout(model, seed=layout_seed)
++
++
++def split_base_state(state):
++    """Split full checkpoint keys for strict inherited/new-module loading."""
++    prefix = "layout_branch."
++    base = {k: v for k, v in state.items() if not k.startswith(prefix)}
++    layout = {k[len(prefix):]: v for k, v in state.items() if k.startswith(prefix)}
++    if not base or not layout:
++        raise ValueError("Expected a full layout candidate state, not a base-only checkpoint")
++    return base, layout
++
++
++def layout_parameters(model):
++    return list(model.layout_branch.parameters())
++
++
++def base_parameters(model):
++    return [p for name, p in model.named_parameters() if not name.startswith("layout_branch.")]
+diff --git a/r2/pilots/bench_layout_oracle_v1/post.py b/r2/pilots/bench_layout_oracle_v1/post.py
+new file mode 100644
+--- /dev/null
++++ b/r2/pilots/bench_layout_oracle_v1/post.py
+@@ -0,0 +1,33 @@
++"""Unchanged official single D0 / GEO_C / source winding / CPU cascade."""
++from __future__ import annotations
++import argparse
++import json
++from . import evaluation as E
++
++
++def d0(label,estimated_peak_mib=3500):
++    if label not in E.NEW_LABELS: raise ValueError('Baseline D0 rerun forbidden')
++    E.all_raw_barrier()
++    return E.engine().d0(label,estimated_peak_mib)
++
++
++def cpu(mode,labels=None,workers=2):
++    if mode not in ('raw','post') or workers not in (1,2): raise ValueError('Fixed CPU scope')
++    E.all_raw_barrier()
++    return E.run_cpu(list(E.NEW_LABELS if labels is None else labels),mode,workers)
++
++
++def main():
++    p=argparse.ArgumentParser(description=__doc__); p.add_argument('action',choices=('verify','d0','raw','post'))
++    p.add_argument('--label',choices=E.NEW_LABELS); p.add_argument('--labels',nargs='+',choices=E.NEW_LABELS)
++    p.add_argument('--workers',type=int,choices=(1,2),default=2); p.add_argument('--estimated-peak-mib',type=float,default=3500)
++    a=p.parse_args()
++    if a.action=='verify': r=dict(status='PASS',RAW=len(E.all_raw_barrier()))
++    elif a.action=='d0':
++        if not a.label: p.error('--label required')
++        r=d0(a.label,a.estimated_peak_mib)
++    else: r=cpu(a.action,a.labels,a.workers)
++    print(json.dumps({k:v for k,v in r.items() if k!='files'},ensure_ascii=False))
++
++
++if __name__=='__main__': main()
+diff --git a/r2/pilots/bench_layout_oracle_v1/prepare.py b/r2/pilots/bench_layout_oracle_v1/prepare.py
+new file mode 100644
+--- /dev/null
++++ b/r2/pilots/bench_layout_oracle_v1/prepare.py
+@@ -0,0 +1,79 @@
++"""Freeze the common eligible pool, paired schedule and bounded evaluation."""
++import collections,copy,json
++from . import common as C
++
++def prepare():
++    manifest=C.read(C.OUT/'data/manifest.json')
++    rows=manifest['train'];by_parent={r['parent_id']:r for r in rows}
++    groups={g:sorted([r for r in rows if r['replay_group']==g],key=lambda x:x['parent_id']) for g in ('OLD','FOCUS','HIGH')}
++    if not all(groups.values()):raise ValueError('Common pool must contain all original exposure groups; do not silently reweight')
++    source=C.read(C.PRIOR/'data/schedule_PLAIN1500.json')
++    coefs=C.read(C.PRIOR/'data/coefficients_PLAIN1500.json')
++    if isinstance(coefs,dict):coefs=coefs['steps']
++    schedule=copy.deepcopy(source);schedule['steps']=schedule['steps'][:1000]
++    pointers=collections.Counter();exposure=collections.Counter();changes=[]
++    for entry in schedule['steps']:
++        local=entry['stage_step'];entry.update(global_step=C.BASE_STEP+local,native_total_step=C.NATIVE_BASE+local)
++        used=set()
++        for pos in (0,2,4,6):
++            original=entry['samples'][pos];g=original['replay_group'];pid=original['parent_id']
++            if pid not in by_parent or pid in used:
++                candidates=groups[g]
++                for _ in candidates:
++                    r=candidates[pointers[g]%len(candidates)];pointers[g]+=1
++                    if r['parent_id'] not in used:break
++                else:raise ValueError('Not enough distinct eligible parents in group')
++                changes.append(dict(step=local,position=pos,old_parent=pid,new_parent=r['parent_id']))
++            else:r=by_parent[pid]
++            used.add(r['parent_id'])
++            drop=C.seed('layout_drop',local,pos//2)%5==0
++            for mi in (pos,pos+1):
++                q=entry['samples'][mi]
++                for field in ('parent_id','condition_id','case_id','case_path','case_sha256','target_version_id','N','K','replay_group'):
++                    q[field]=r[field]
++                q['physical_condition_id']=r['condition_id'];q['layout_drop']=drop
++                for field in ('noise_seed','epsilon_seed','time_seed','permutation_seed'):q[field]=C.seed('PAIRED',local,mi,field)
++                exposure[r['parent_id']]+=1
++    schedule.update(schema=C.EXPERIMENT+'_paired_schedule',experiment=C.EXPERIMENT,updates=1000,
++        arm='COMMON_BOTH_ARMS',layout_dropout='SHA256 per CLEAN/X_WIDTH pair modulo5=0; independent of source shape',
++        sampling='Original group and parent schedule retained where eligible; deterministic within-group replacement otherwise',
++        parent_exposure=dict(exposure),replacements=changes)
++    outco=[]
++    for e,old in zip(schedule['steps'],coefs):
++        counts=[9*(r['N']-r['K']) for r in e['samples']];gg=[r['replay_group'] for r in e['samples']]
++        weights=old['reference_group_mse_weights'];denom=sum(counts)
++        mass={g:sum(c for c,h in zip(counts,gg) if g==h) for g in weights}
++        gains=[weights[g]*denom/mass[g] for g in gg]
++        if abs(sum(w for w in weights.values())-1)>1e-10:raise ValueError('Invalid reference group weights')
++        outco.append(dict(stage_step=e['stage_step'],reference_group_mse_weights=weights,micro_free_scalar_counts=counts,
++            micro_groups=gg,micro_gains=gains,denominator=denom))
++    from .training import validate_stream
++    validate_stream(schedule['steps'],outco)
++    C.write(C.OUT/'data/schedule.json',schedule);C.write(C.OUT/'data/coefficients.json',outco)
++    panel=C.read(C.OUT/'data/eval_manifest.json');qs=panel['requests']
++    if len(qs)!=12 or len({q['parent_id'] for q in qs})!=6:raise ValueError('Frozen 12 request panel required')
++    heldout={q['parent_id'] for q in qs if q['eval_group'] in ('DEV','NEW_PARENT_HOLDOUT','HIGH_HOLDOUT')}
++    if heldout&by_parent.keys():raise ValueError('Evaluation parent leakage')
++    C.verify({r['case_path']:r['case_sha256'] for r in rows})
++    C.write(C.OUT/'data/preparation.json',dict(status='PASS',parents=len(rows),groups={g:len(v) for g,v in groups.items()},
++        instances=8000,parent_exposure=dict(exposure),replacement_pairs=len(changes),
++        layout_dropped_instances=sum(r['layout_drop'] for e in schedule['steps'] for r in e['samples']),
++        model_calls=0,resource=C.register_resource('CPU_PREPARATION')))
++    paths=[C.OUT/'data'/x for x in ('manifest.json','layout_records.json','eval_manifest.json','layout_eval_manifest.json','schedule.json','coefficients.json','preparation.json','verification.json','manual_source_review.json')]
++    C.write(C.REGISTRATION,dict(status='FROZEN',experiment=C.EXPERIMENT,
++        source=str(C.SOURCE),source_sha256=C.sha(C.SOURCE),source_global=25500,
++        updates={'PLAIN':1000,'LAYOUT':1000},batch=8,microbatch=1,lr=1e-5,hybrid_lambda=.25,
++        information_contract='Coarse source-privileged region boxes; not C-only completion, not a mathematical upper bound',
++        layout_features='2 slots BACK_REGION/SUPPORT_REGION: relative center/L, full extent/L, onehot2; unknown=masked',
++        architecture='64dim 4head embedding-only free-corner crossattention; zero output; base Native unchanged',
++        layout_dropout=.2,training_scope='Same eligible parents, geometry, N, random streams and group FM coefficients',
++        evaluation=dict(requests=12,labels=list(C.LABELS),new_RAW=36,new_D0=36,sampling_forwards=1800,
++            stages=['RAW','BASE_POST','CLEAN_FINAL_POST'],all_new_raw_before_D0=True,
++            metrics='Original177 fields and same physical queries; per-request transitions and AI_PROXY five-axis review',
++            main_question='RAW C adoption AND plausible body AND major supports; costs CF/FF/I/fragmentation and posterior losses retained'),
++        stopping='Fixed endpoints and panel; no best selection, predictor training, backend changes, automatic extension or retries',
++        authorization='User accepted proposed direction and two1000-update paired pilot',
++        data={str(p):C.sha(p) for p in paths}))
++    print(json.dumps(dict(status='FROZEN',parents=len(rows),new_raw=36,updates=2000)))
++
++if __name__=='__main__':prepare()
+diff --git a/r2/pilots/bench_layout_oracle_v1/test_evaluation.py b/r2/pilots/bench_layout_oracle_v1/test_evaluation.py
+new file mode 100644
+--- /dev/null
++++ b/r2/pilots/bench_layout_oracle_v1/test_evaluation.py
+@@ -0,0 +1,51 @@
++"""CPU-only interface tests; no real generator, scorer, or CUDA calls."""
++from __future__ import annotations
++import unittest
++from unittest.mock import patch
++from . import evaluation as E
++
++
++class EvaluationContracts(unittest.TestCase):
++    def test_privileged_label_explicit(self):
++        self.assertEqual(E.label_spec('LAYOUT1000')['input_scope'],'ORACLE_PRIVILEGED_SOURCE_REGIONS')
++        self.assertEqual(E.label_spec('LAYOUT_NULL')['input_scope'],'C_ONLY')
++        self.assertEqual(E.label_spec('LAYOUT_NULL')['generator_path'],E.label_spec('LAYOUT1000')['generator_path'])
++        self.assertNotEqual(E.label_spec('PLAIN1000')['generator_path'],E.label_spec('LAYOUT1000')['generator_path'])
++
++    def test_no_baseline_model_dispatch(self):
++        with self.assertRaises(ValueError): E.label_spec('EXPOSURE')
++        with self.assertRaises(ValueError): E.sample('EXPOSURE')
++
++    def test_no_original_module_mutation(self):
++        from r2.pilots.bench_four_routes_v1.exposure import evaluation as old
++        before=(old.OUT,old.MANIFEST,old.LABELS)
++        engine=E.engine()
++        self.assertEqual((old.OUT,old.MANIFEST,old.LABELS),before)
++        self.assertEqual(engine.raw_one.__globals__['OUT'],E.OUT)
++        self.assertEqual(engine.raw_one.__globals__['root_for']('EXPOSURE'),E.OLD)
++        self.assertEqual(engine.d0.__globals__['all_raw_barrier'],E.all_raw_barrier)
++        self.assertEqual(engine.raw_one.__globals__['cpu_one'],E._cpu_worker)
++        self.assertIsNot(engine.raw_one.__globals__,vars(old))
++
++    def test_registered_dynamic_budget(self):
++        qs=[{'parent_id':'a','request_id':'a0'},{'parent_id':'a','request_id':'a1'},
++            {'parent_id':'b','request_id':'b0'},{'parent_id':'b','request_id':'b1'}]
++        with patch.object(E,'requests',return_value=qs):
++            b=E.budget()
++        self.assertEqual((b['new_RAW'],b['new_D0'],b['total_score_rows']),(12,12,48))
++        self.assertEqual(b['generator_forwards'],600)
++
++    def test_reject_manifest_cardinality_change(self):
++        def read(path):
++            if path==E.MANIFEST: return {'requests':[{'request_id':'a'}]}
++            return {'eval_requests':12}
++        with patch.object(E.C,'read',side_effect=read):
++            with self.assertRaises(ValueError): E.requests()
++
++    def test_root_scope(self):
++        self.assertEqual(E.root_for('EXPOSURE'),E.OLD)
++        self.assertTrue(all(E.root_for(x)==E.OUT for x in E.NEW_LABELS))
++        with self.assertRaises(ValueError): E.root_for('UNKNOWN')
++
++
++if __name__=='__main__': unittest.main()
+diff --git a/r2/pilots/bench_layout_oracle_v1/test_model.py b/r2/pilots/bench_layout_oracle_v1/test_model.py
+new file mode 100644
+--- /dev/null
++++ b/r2/pilots/bench_layout_oracle_v1/test_model.py
+@@ -0,0 +1,293 @@
++"""CPU-only contracts on reduced-width real Native/DiT arithmetic.
++
++No production checkpoint is loaded and no CUDA context is initialized. These
++operator checks are not additional large-model training/probe jobs.
++"""
++from __future__ import annotations
++
++import copy
++from contextlib import ExitStack
++import unittest
++from unittest import mock
++
++import torch
++from torch import nn
++
++from . import model as M
++from meshflow_control.models.backbone.equidit import DiT
++
++
++def fixture():
++    with torch.random.fork_rng(devices=[]):
++        torch.default_generator.manual_seed(31519)
++        model = M.NativeModel.__new__(M.NativeModel)
++        nn.Module.__init__(model)
++        model.backbone = DiT(hidden_dim=12, num_heads=3, num_layers=12,
++            max_length=800, gradient_checkpointing=False, class_dropout_prob=0.,
++            version=3, pe_freq=2, mixed_precision="fp32", use_dit_like_pe=False,
++            face_cond=True, face_bin=20, use_rmsnorm=True, use_qknorm=True)
++        model.role_embedding = nn.Parameter(torch.zeros(2, 12))
++        model.context_encoder = None
++        model.context_observer = None
++        model.readout_mode = "none"
++        model.readouts = nn.ModuleDict()
++        model.readout_observer = None
++        model.experiment_trainable = True
++        with torch.no_grad():
++            for name, parameter in model.named_parameters():
++                if "norm" in name and parameter.ndim == 1:
++                    parameter.fill_(1.)
++                else:
++                    parameter.normal_(0., .065)
++        model.eval()
++        return model
++
++
++def inputs():
++    generator = torch.Generator().manual_seed(12122)
++    x = torch.randn(1, 128, 9, generator=generator, requires_grad=True)
++    known = torch.zeros(1, 128, dtype=torch.bool)
++    known[:, :4] = True
++    tokens = torch.tensor([[[0., .2, .1, .4, .3, .1, 1., 0.],
++                            [0., -.2, 0., .5, .3, .4, 0., 1.]]])
++    return x, torch.tensor([.63]), torch.tensor([128]), torch.ones_like(known), known, tokens, torch.ones(1, 2, dtype=torch.bool)
++
++
++class LayoutOperators(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        torch.set_num_threads(1)
++        if torch.cuda.is_initialized():
++            raise RuntimeError("CPU tests must not inherit initialized CUDA")
++
++    def setUp(self):
++        self.stack = ExitStack()
++        self.stack.enter_context(mock.patch.object(M, "assert_native_runtime", lambda *a, **k: None))
++        self.stack.enter_context(mock.patch.object(M.native, "assert_native_runtime", lambda *a, **k: None))
++        self.addCleanup(self.stack.close)
++
++    def test_branch_initialization_preserves_cpu_rng_and_is_seeded(self):
++        state = torch.get_rng_state().clone()
++        with mock.patch.object(torch.cuda, "manual_seed_all", side_effect=AssertionError("Do not alter CUDA RNG")):
++            a = M.LayoutReadout(12, seed=88)
++            b = M.LayoutReadout(12, seed=88)
++        self.assertTrue(torch.equal(state, torch.get_rng_state()))
++        self.assertTrue(all(torch.equal(v, b.state_dict()[k]) for k, v in a.state_dict().items()))
++        self.assertEqual(torch.count_nonzero(a.output.weight).item(), 0)
++
++    def test_attach_preserves_inherited_parameter_identity_and_order(self):
++        model = fixture()
++        names = [n for n, _ in model.named_parameters()]
++        parameters = list(model.parameters())
++        M.attach_layout(model)
++        self.assertEqual(names, [n for n, _ in model.named_parameters() if not n.startswith("layout_branch.")])
++        self.assertTrue(all(a is b for a, b in zip(parameters, M.base_parameters(model))))
++        self.assertTrue(all(not module.training for module in model.modules()))
++        with self.assertRaises(ValueError):
++            M.attach_layout(model)
++
++    def test_zero_exit_exact_output_and_input_vjp(self):
++        original = fixture()
++        candidate = M.attach_layout(copy.deepcopy(original))
++        x, t, y, valid, known, tokens, lv = inputs()
++        a = original(x, t, y, valid, known)
++        b = candidate(x, t, y, valid, known, layout_tokens=tokens, layout_valid=lv)
++        self.assertTrue(torch.equal(a, b))
++        cot = torch.linspace(-1., 1., a.numel()).reshape_as(a)
++        ga = torch.autograd.grad((a * cot).sum(), x, retain_graph=True)[0]
++        gb = torch.autograd.grad((b * cot).sum(), x)[0]
++        self.assertTrue(torch.equal(ga, gb))
++
++    def test_missing_layout_is_exact_after_nonzero_branch(self):
++        original = fixture()
++        candidate = M.attach_layout(copy.deepcopy(original))
++        with torch.no_grad():
++            candidate.layout_branch.output.weight.fill_(.1)
++        x, t, y, valid, known, tokens, lv = inputs()
++        a = original(x, t, y, valid, known)
++        b = candidate(x, t, y, valid, known, layout_tokens=tokens, layout_valid=torch.zeros_like(lv))
++        c = candidate(x, t, y, valid, known)
++        self.assertTrue(torch.equal(a, b))
++        self.assertTrue(torch.equal(a, c))
++
++    def test_known_padding_and_missing_rows_have_zero_delta(self):
++        branch = M.LayoutReadout(12)
++        with torch.no_grad():
++            branch.output.weight.fill_(.15)
++        x, _, _, valid, known, tokens, lv = inputs()
++        valid[:, -5:] = False
++        hidden = torch.randn(1, 384, 12)
++        result, delta = branch(hidden, x, known, valid, tokens, lv)
++        inactive = (known | ~valid).repeat_interleave(3, 1)
++        self.assertTrue(torch.equal(result[inactive], hidden[inactive]))
++        self.assertEqual(torch.count_nonzero(delta[inactive]).item(), 0)
++        self.assertGreater(torch.count_nonzero(delta[~inactive]).item(), 0)
++
++    def test_nonzero_layout_changes_real_model_prediction(self):
++        candidate = M.attach_layout(fixture())
++        with torch.no_grad():
++            candidate.layout_branch.output.weight.normal_(0., .04)
++        x, t, y, valid, known, tokens, lv = inputs()
++        a = candidate(x, t, y, valid, known)
++        b = candidate(x, t, y, valid, known, layout_tokens=tokens, layout_valid=lv)
++        self.assertGreater((b-a).abs().max().item(), 1e-7)
++
++    def test_zero_exit_has_real_backward_and_second_update_reaches_encoder(self):
++        branch = M.LayoutReadout(12)
++        optimizer = torch.optim.AdamW(branch.parameters(), lr=.001)
++        x, _, _, valid, known, tokens, lv = inputs()
++        hidden = torch.randn(1, 384, 12, requires_grad=True)
++        for step in range(2):
++            optimizer.zero_grad(set_to_none=True)
++            result, _ = branch(hidden, x, known, valid, tokens, lv)
++            result.square().mean().backward()
++            self.assertTrue(all(p.grad is not None and torch.isfinite(p.grad).all() for p in branch.parameters()))
++            self.assertGreater(branch.output.weight.grad.abs().sum().item(), 0.)
++            if step == 1:
++                self.assertGreater(branch.layout_embed[0].weight.grad.abs().sum().item(), 0.)
++                self.assertGreater(branch.query_hidden.weight.grad.abs().sum().item(), 0.)
++            optimizer.step()
++
++    def test_null_training_still_has_zero_finite_branch_gradients(self):
++        branch = M.LayoutReadout(12)
++        x, _, _, valid, known, tokens, lv = inputs()
++        hidden = torch.randn(1, 384, 12, requires_grad=True)
++        result, delta = branch(hidden, x, known, valid, tokens, torch.zeros_like(lv))
++        result.square().mean().backward()
++        self.assertEqual(torch.count_nonzero(delta).item(), 0)
++        for p in branch.parameters():
++            self.assertIsNotNone(p.grad)
++            self.assertEqual(torch.count_nonzero(p.grad).item(), 0)
++
++    def test_context_is_scoped_no_state_change_and_nested_rejected(self):
++        candidate = M.attach_layout(fixture())
++        x, t, y, valid, known, tokens, lv = inputs()
++        before = {k: v.clone() for k, v in candidate.state_dict().items()}
++        with self.assertRaisesRegex(RuntimeError, "sentinel"):
++            with candidate.layout_context(tokens, lv):
++                candidate(x, t, y, valid, known)
++                with self.assertRaises(RuntimeError):
++                    with candidate.layout_context(tokens, lv):
++                        pass
++                with self.assertRaises(ValueError):
++                    candidate(x, t, y, valid, known, layout_tokens=tokens, layout_valid=lv)
++                raise RuntimeError("sentinel")
++        self.assertIsNone(candidate._layout_payload)
++        self.assertTrue(all(torch.equal(v, before[k]) for k, v in candidate.state_dict().items()))
++
++    def test_invalid_tokens_and_extents_refused(self):
++        candidate = M.attach_layout(fixture())
++        x, t, y, valid, known, tokens, lv = inputs()
++        for change in ("negative_extent", "wrong_role", "nan"):
++            altered = tokens.clone()
++            if change == "negative_extent": altered[0, 0, 3] = -1.
++            elif change == "wrong_role": altered[0, 0, 6:] = 0.
++            else: altered[0, 0, 0] = float("nan")
++            with self.assertRaises(ValueError):
++                candidate(x, t, y, valid, known, layout_tokens=altered, layout_valid=lv)
++
++    def test_source_and_input_arrays_never_mutated(self):
++        candidate = M.attach_layout(fixture())
++        arrays = inputs()
++        prior = [v.detach().clone() for v in arrays]
++        x, t, y, valid, known, tokens, lv = arrays
++        candidate(x, t, y, valid, known, layout_tokens=tokens, layout_valid=lv)
++        self.assertTrue(all(torch.equal(a, b) for a, b in zip(arrays, prior)))
++
++    def test_configure_replaces_microbatch_and_clear_restores_bypass(self):
++        model = M.attach_layout(fixture())
++        x, t, y, valid, known, tokens, lv = inputs()
++        with torch.no_grad(): model.layout_branch.output.weight.normal_(0., .04)
++        baseline = model(x, t, y, valid, known)
++        model.configure_layout(tokens, lv)
++        self.assertGreater((model(x, t, y, valid, known)-baseline).abs().max().item(), 0.)
++        model.configure_layout(tokens, torch.zeros_like(lv))
++        self.assertTrue(torch.equal(model(x, t, y, valid, known), baseline))
++        model.clear_layout()
++        self.assertIsNone(model._layout_payload)
++        with model.layout_context(tokens, lv):
++            with self.assertRaises(RuntimeError): model.configure_layout(tokens, lv)
++            with self.assertRaises(RuntimeError): model.clear_layout()
++
++    def test_state_split_roundtrip(self):
++        model = M.attach_layout(fixture())
++        base, layout = M.split_base_state(model.state_dict())
++        other = fixture()
++        other.load_state_dict(base, strict=True)
++        M.attach_layout(other, seed=57)
++        other.layout_branch.load_state_dict(layout, strict=True)
++        self.assertTrue(all(torch.equal(v, other.state_dict()[k]) for k, v in model.state_dict().items()))
++        with self.assertRaises(ValueError): M.split_base_state(base)
++
++    def test_area_centroid_and_global_translation_consistency(self):
++        x, _, _, valid, known, tokens, lv = inputs()
++        centroid = M.c_area_centroid(x, known)
++        translated = x.reshape(1, 128, 3, 3) + torch.tensor([1., -2., 3.])
++        shifted = M.c_area_centroid(translated.reshape_as(x), known)
++        self.assertTrue(torch.allclose(shifted-centroid, torch.tensor([[1., -2., 3.]]), atol=2e-6, rtol=0.))
++
++    def test_no_cuda_initialized(self):
++        self.assertFalse(torch.cuda.is_initialized())
++
++
++def run_recorded_gate(path):
++    """Record explicitly scoped small-CPU operator work, never production work."""
++    import datetime
++    import hashlib
++    import json
++    from pathlib import Path
++    counts = dict(reduced_native_block_calls=0, layout_module_calls=0,
++                  autograd_backward_calls=0, input_vjp_grad_calls=0,
++                  tiny_AdamW_updates=0)
++    def counted(key, function):
++        def call(*args, **kwargs):
++            counts[key] += 1
++            return function(*args, **kwargs)
++        return call
++    block = counted("reduced_native_block_calls", M.native_block_forward)
++    branch = counted("layout_module_calls", M.LayoutReadout.forward)
++    backward = counted("autograd_backward_calls", torch.autograd.backward)
++    grad = counted("input_vjp_grad_calls", torch.autograd.grad)
++    step = counted("tiny_AdamW_updates", torch.optim.AdamW.step)
++    with ExitStack() as stack:
++        stack.enter_context(mock.patch.object(M, "native_block_forward", block))
++        stack.enter_context(mock.patch.object(M.native, "native_block_forward", block))
++        stack.enter_context(mock.patch.object(M.LayoutReadout, "forward", branch))
++        stack.enter_context(mock.patch.object(torch.autograd, "backward", backward))
++        stack.enter_context(mock.patch.object(torch.autograd, "grad", grad))
++        stack.enter_context(mock.patch.object(torch.optim.AdamW, "step", step))
++        suite = unittest.defaultTestLoader.loadTestsFromTestCase(LayoutOperators)
++        result = unittest.TextTestRunner(verbosity=2).run(suite)
++    source = [Path(M.__file__).resolve(), Path(__file__).resolve()]
++    receipt = dict(status="PASS" if result.wasSuccessful() else "FAIL",
++        utc=datetime.datetime.now(datetime.timezone.utc).isoformat(),
++        tests=result.testsRun, failures=[(str(t), e) for t, e in result.failures],
++        errors=[(str(t), e) for t, e in result.errors],
++        source_sha256={str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in source},
++        scope="CPU reduced-width operator tests; not a production neural experiment",
++        fixture=dict(real_DiT_arithmetic=True, hidden_dimension=12, heads=3,
++            blocks=12, face_slots=128, production_checkpoint_loaded=False,
++            original_GPU_runtime_assertions_mocked=True,
++            mocked_guards=["model.assert_native_runtime", "natural_N_runtime.assert_native_runtime"],
++            mock_reason="CPU float32 reduced fixture; production files retain full guards"),
++        counted_CPU_work=counts,
++        production_work=dict(generator_forwards=0, generator_backwards=0,
++            generator_optimizer_updates=0, checkpoint_loads=0, CUDA_initialized=torch.cuda.is_initialized()),
++        earlier_development_runs=[dict(tests=14, reason="initial implementation"),
++            dict(tests=15, reason="trainer prefix/configure API alignment"),
++            dict(tests=15, reason="all-modules-eval contract")],
++        earlier_CPU_call_counts="not individually instrumented; all reduced fixtures and CPU only",
++        runtime_GPU_certification=False)
++    path = Path(path)
++    path.parent.mkdir(parents=True, exist_ok=True)
++    with path.open("x", encoding="utf-8") as stream:
++        json.dump(receipt, stream, ensure_ascii=False, indent=2)
++        stream.write("\n")
++    return result.wasSuccessful()
++
++
++if __name__ == "__main__":
++    import sys
++    if len(sys.argv) == 3 and sys.argv[1] == "--receipt":
++        raise SystemExit(0 if run_recorded_gate(sys.argv[2]) else 1)
++    unittest.main()
+diff --git a/r2/pilots/bench_layout_oracle_v1/test_training.py b/r2/pilots/bench_layout_oracle_v1/test_training.py
+new file mode 100644
+--- /dev/null
++++ b/r2/pilots/bench_layout_oracle_v1/test_training.py
+@@ -0,0 +1,111 @@
++"""CPU-only schedule/optimizer ownership tests; no generator forward or CUDA."""
++from __future__ import annotations
++import copy
++import sys
++from types import SimpleNamespace
++import unittest
++from unittest.mock import patch
++import torch
++from . import common as C, prepare as P, training as T
++sys.path.insert(0,str(C.ROOT/'r2/src'))
++
++
++class TinyOwnedParameters(torch.nn.Module):
++    readout_mode='none'
++    def __init__(self):
++        super().__init__()
++        self.first=torch.nn.Parameter(torch.ones(2,3))
++        self.second=torch.nn.Parameter(torch.full((3,),2.))
++        self.eval()
++
++
++def initialized_optimizer(model, step):
++    opt=torch.optim.AdamW(model.parameters(),lr=1e-5,betas=(.9,.95),eps=1e-8,weight_decay=0.)
++    for p in model.parameters():
++        opt.state[p]=dict(step=torch.tensor(float(step)),exp_avg=torch.full_like(p,.25),exp_avg_sq=torch.full_like(p,.125))
++    return opt
++
++
++class TrainingContracts(unittest.TestCase):
++    def test_new_branch_does_not_reorder_or_reset_inherited_optimizer(self):
++        from r2.pilots.bench_full_seat_curriculum_v1.training_state import validate_optimizer
++        model=TinyOwnedParameters(); opt=initialized_optimizer(model,25500)
++        original_names=[n for n,_ in model.named_parameters()]
++        original_ids=[id(p) for p in model.parameters()]
++        old_state={id(p):{k:v.clone() for k,v in s.items()} for p,s in opt.state.items()}
++        model.layout_branch=torch.nn.ParameterList([torch.nn.Parameter(torch.zeros(2))])
++        view=T.BaseParameters(model)
++        self.assertEqual([n for n,_ in view.named_parameters()],original_names)
++        self.assertEqual([id(p) for p in view.parameters()],original_ids)
++        self.assertEqual(validate_optimizer(view,opt,25500),[original_names])
++        for p,s in opt.state.items():
++            for k,v in s.items(): self.assertTrue(torch.equal(v,old_state[id(p)][k]))
++        with self.assertRaises(ValueError): validate_optimizer(model,opt,25500)
++
++    def test_layout_optimizer_has_separate_local_cursor(self):
++        model=TinyOwnedParameters(); model.layout_branch=torch.nn.ParameterList([torch.nn.Parameter(torch.ones(2))])
++        opt=initialized_optimizer(model.layout_branch,1)
++        T.check_layout_optimizer(model,opt,1)
++        with self.assertRaises(ValueError): T.check_layout_optimizer(model,opt,25501)
++        opt.param_groups[0]['lr']=2e-5
++        with self.assertRaises(ValueError): T.check_layout_optimizer(model,opt,1)
++
++    def test_incomplete_ledger_cannot_resume(self):
++        counts=dict(train_forward=8,train_backward=8,optimizer_update=1)
++        rows=[]
++        for kind in ('train_forward','train_backward'):
++            rows += [dict(event='CALL_BEGIN',kind=kind,context=dict(arm='PLAIN',step=1,microbatch=i)) for i in range(8)]
++        rows += [dict(event='CALL_BEGIN',kind='optimizer_update',context=dict(arm='PLAIN',step=1))]
++        ledger=SimpleNamespace(pending=[],failed=[],attempted=counts.copy(),successful=counts.copy(),rows=rows,
++            limits=dict(train_forward=8000,train_backward=8000,optimizer_update=1000))
++        T.require_cursor(ledger,1)
++        ledger.successful['train_backward']=7
++        with self.assertRaises(RuntimeError): T.require_cursor(ledger,1)
++        ledger.successful['train_backward']=8; ledger.pending=[1]
++        with self.assertRaises(RuntimeError): T.require_cursor(ledger,1)
++
++    def test_actual_parent_schedule_pairing_and_group_fm_coefficients(self):
++        # Real old streams are read only. New files and resource calls are mocked.
++        from r2.pilots.bench_three_mechanisms_v1 import common as old
++        manifest=C.read(old.OUT/'data/manifest.json')
++        panel=C.read(old.OUT/'data/eval_manifest.json')
++        source=C.read(C.PRIOR/'data/schedule_PLAIN1500.json')
++        coefs=C.read(C.PRIOR/'data/coefficients_PLAIN1500.json')
++        written={}
++        def read(path):
++            if path==C.OUT/'data/manifest.json': return copy.deepcopy(manifest)
++            if path==C.OUT/'data/eval_manifest.json': return copy.deepcopy(panel)
++            if path==C.PRIOR/'data/schedule_PLAIN1500.json': return copy.deepcopy(source)
++            if path==C.PRIOR/'data/coefficients_PLAIN1500.json': return copy.deepcopy(coefs)
++            raise AssertionError(path)
++        def write(path,value,**kwargs): written[str(path)]=copy.deepcopy(value)
++        with patch.object(C,'read',side_effect=read), patch.object(C,'write',side_effect=write), \
++             patch.object(C,'verify'),patch.object(C,'sha',return_value='CPU_TEST_ONLY'), \
++             patch.object(C,'register_resource',return_value={'model_calls':0}):
++            P.prepare()
++        schedule=written[str(C.OUT/'data/schedule.json')]['steps']
++        coeff=written[str(C.OUT/'data/coefficients.json')]
++        self.assertEqual(len(schedule),1000); self.assertEqual(len(coeff),1000)
++        self.assertEqual([e['stage_step'] for e in schedule],list(range(1,1001)))
++        T.validate_stream(schedule,coeff)
++        with self.assertRaises(ValueError): T.validate_stream(schedule[:-1],coeff)
++        broken=copy.deepcopy(schedule); broken[0]['samples'][1]['layout_drop']=not broken[0]['samples'][0]['layout_drop']
++        with self.assertRaises(ValueError): T.validate_stream(broken,coeff)
++        for e,c,original in zip(schedule,coeff,source['steps']):
++            self.assertEqual([r['parent_id'] for r in e['samples']],[r['parent_id'] for r in original['samples']])
++            for start in (0,2,4,6):
++                a,b=e['samples'][start:start+2]
++                self.assertEqual(a['parent_id'],b['parent_id'])
++                self.assertEqual(a['case_sha256'],b['case_sha256'])
++                self.assertEqual(a['layout_drop'],b['layout_drop'])
++                self.assertEqual(a['layout_drop'],C.seed('layout_drop',e['stage_step'],start//2)%5==0)
++            D=c['denominator']; counts=c['micro_free_scalar_counts']; gains=c['micro_gains']; groups=c['micro_groups']
++            T.validate_allocation(c,counts,groups,gains,e['stage_step'])
++            for group,weight in c['reference_group_mse_weights'].items():
++                self.assertAlmostEqual(sum(n*g for n,g,k in zip(counts,gains,groups) if k==group)/D,weight,places=12)
++        badcounts=coeff[0]['micro_free_scalar_counts'].copy(); badcounts[0]+=9
++        with self.assertRaises(ValueError):
++            T.validate_allocation(coeff[0],badcounts,coeff[0]['micro_groups'],coeff[0]['micro_gains'],1)
++
++
++if __name__=='__main__': unittest.main()
+diff --git a/r2/pilots/bench_layout_oracle_v1/training.py b/r2/pilots/bench_layout_oracle_v1/training.py
+new file mode 100644
+--- /dev/null
++++ b/r2/pilots/bench_layout_oracle_v1/training.py
+@@ -0,0 +1,244 @@
++"""Paired 1000-update continuations with an explicit privileged layout branch."""
++from __future__ import annotations
++import os
++os.environ['CUBLAS_WORKSPACE_CONFIG']=':4096:8'
++for k in ('OMP_NUM_THREADS','MKL_NUM_THREADS','OPENBLAS_NUM_THREADS','NUMEXPR_NUM_THREADS'):os.environ[k]='2'
++import argparse, copy, signal, time, traceback
++from pathlib import Path
++from . import common as C
++
++class BaseParameters:
++    """Read-only optimizer view retaining original parameter names/order."""
++    def __init__(self,model): self.model=model
++    @property
++    def training(self):return self.model.training
++    readout_mode='none'
++    def named_parameters(self):
++        return ((n,p) for n,p in self.model.named_parameters() if not n.startswith('layout_branch.'))
++    def parameters(self):return (p for _,p in self.named_parameters())
++
++def register(arm):
++    if arm not in C.UPDATES:raise ValueError(arm)
++    C.read(C.REGISTRATION)
++    inherited=C.read(C.PRIOR/'training_registration.json')['training_code_hashes']
++    C.verify(inherited)
++    own=[Path(__file__),Path(C.__file__),Path(__file__).with_name('data.py')]
++    if arm=='LAYOUT':own.append(Path(__file__).with_name('model.py'))
++    own += [C.REGISTRATION,C.OUT/'data/manifest.json',C.OUT/'data/schedule.json',C.OUT/'data/coefficients.json',C.OUT/'data/layout_records.json']
++    layout_sources={r['layout_npz']:r['layout_npz_sha256'] for r in C.read(C.OUT/'data/layout_records.json')['records']}
++    C.verify(layout_sources)
++    reg=dict(status='FROZEN',experiment=C.EXPERIMENT,arm=arm,updates=1000,batch=8,microbatch=1,
++        source=str(C.SOURCE),source_sha256=C.sha(C.SOURCE),
++        protected={**inherited,**layout_sources,**{str(p):C.sha(p) for p in own}},
++        limits=dict(train_forward=8000,train_backward=8000,optimizer_update=1000),
++        layout_dropout=.2,layout_information='SOURCE_PRIVILEGED_COARSE_REGIONS_NOT_C_ONLY',
++        base_optimizer='Inherited matching EXPOSURE AdamW',layout_optimizer='Fresh AdamW same lr/betas/eps, separate local cursor',
++        endpoint_selection='fixed1000',replay_allowance=0)
++    C.write(C.OUT/f'registrations/{arm}.json',reg)
++    return reg
++
++def require_cursor(ledger,step):
++    if type(step) is not int or not 0<=step<=1000:raise ValueError('Step outside fixed budget')
++    if ledger.limits!=dict(train_forward=8000,train_backward=8000,optimizer_update=1000):raise ValueError('Ledger limits changed')
++    expected=dict(train_forward=step*8,train_backward=step*8,optimizer_update=step)
++    if ledger.pending or ledger.failed or any(ledger.attempted[k]!=v or ledger.successful[k]!=v for k,v in expected.items()):
++        raise RuntimeError('Incomplete scientific cursor; replay is not authorized')
++    starts=[r for r in ledger.rows if r['event']=='CALL_BEGIN']
++    for kind in expected:
++        actual=[(r['context']['step'],r['context'].get('microbatch')) for r in starts if r['kind']==kind]
++        wanted=[(s,m) for s in range(1,step+1) for m in (range(8) if kind!='optimizer_update' else (None,))]
++        if actual!=wanted:raise RuntimeError('Scientific call sequence differs from complete cursor')
++
++def validate_stream(entries,coefficients):
++    if len(entries)!=1000 or len(coefficients)!=1000:raise ValueError('Exactly1000 paired updates required')
++    if [e['stage_step'] for e in entries]!=list(range(1,1001)):raise ValueError('Nonsequential schedule')
++    if [c['stage_step'] for c in coefficients]!=list(range(1,1001)):raise ValueError('Nonsequential coefficients')
++    for e in entries:
++        if len(e['samples'])!=8:raise ValueError('Exactly8 samples per update')
++        for start in (0,2,4,6):
++            a,b=e['samples'][start:start+2]
++            if a['parent_id']!=b['parent_id'] or a['case_id']!=b['case_id'] or a['layout_drop']!=b['layout_drop']:
++                raise ValueError('CLEAN/X_WIDTH paired parent/layout dropout changed')
++
++def validate_allocation(coefficient,counts,groups,gains,step):
++    if coefficient['stage_step']!=step or coefficient['micro_free_scalar_counts']!=counts or coefficient['micro_groups']!=groups:
++        raise ValueError('Actual samples differ from frozen coefficients')
++    if coefficient['denominator']!=sum(counts) or any(abs(a-b)>1e-12 for a,b in zip(coefficient['micro_gains'],gains)):
++        raise ValueError('Actual FM normalization differs')
++
++def check_layout_optimizer(model,opt,step):
++    import torch
++    if opt is None:return
++    ps=list(model.layout_branch.parameters())
++    g=opt.param_groups[0]
++    if [id(p) for p in ps]!=[id(p) for p in g['params']]:raise ValueError('Layout parameter identity')
++    if (g['lr'],tuple(g['betas']),g['eps'],g['weight_decay'])!=(1e-5,(.9,.95),1e-8,0.):raise ValueError('Layout optimizer contract')
++    for p in ps:
++        s=opt.state.get(p,{})
++        if step==0 and not s:continue
++        if set(s)!={'step','exp_avg','exp_avg_sq'} or float(s['step'])!=step:raise ValueError('Layout AdamW cursor')
++        if p.dtype!=torch.float32 or any(s[k].shape!=p.shape or s[k].dtype!=torch.float32 for k in ('exp_avg','exp_avg_sq')):raise ValueError('Layout optimizer dtype')
++
++def train(arm,resume=False):
++    regpath=C.OUT/f'registrations/{arm}.json';reg=C.read(regpath);C.verify(reg['protected'])
++    if C.sha(C.SOURCE)!=reg['source_sha256']:raise ValueError('Source file changed')
++    out=C.OUT/'training'/arm;out.mkdir(parents=True,exist_ok=True)
++    status=out/'status.json';prev=C.read(status) if status.exists() else None
++    if prev and prev['status']=='COMPLETE':
++        C.verify({prev['checkpoint']['path']:prev['checkpoint']['sha256']});return prev
++    if prev and (not resume or prev['status']!='INTERRUPTED_SAFE'):raise RuntimeError('Existing attempt requires explicit review')
++    if resume and not prev:raise RuntimeError('No safe checkpoint')
++    go=C.read(C.OUT/f'dispatch/{arm}_go.json')
++    if not go['authorized'] or go['registration_sha256']!=C.sha(regpath):raise ValueError('No matching resource GO')
++    rr=C.register_resource('TRAIN_DISPATCH_'+arm)
++    if rr['free_mib']<go['minimum_free_mib']:raise RuntimeError('RESOURCE_WAIT')
++    from r2.pilots.bench_four_routes_v1.exposure import training as E
++    from r2.pilots.bench_multilod_training_v1.data import load_case
++    from .data import training_layout
++    T,torch=E.T,E.torch
++    T.install_io(C.OUT,arm)
++    step=prev['step'] if prev else 0
++    attempt='attempt_'+str(time.time_ns());adir=out/attempt;adir.mkdir()
++    ledger=T.historical.CallLedger(out/'calls.jsonl',reg['limits'],arm,attempt);require_cursor(ledger,step)
++    observer=T.historical.GPUObserver(C.EXPERIMENT+'_'+arm,interval=2.)
++    state=dict(status='LOADING',arm=arm,step=step,target=1000,pid=os.getpid(),attempt=attempt)
++    stop={'signal':None}
++    def handler(sig,frame):stop['signal']=sig
++    handlers={sig:signal.signal(sig,handler) for sig in (signal.SIGINT,signal.SIGTERM)}
++    started=time.perf_counter();C.write(status,state,replace=True)
++    try:
++        with T.historical.exclusive_writer(out),observer:
++            E.runtime.configure_stable_runtime();torch.set_num_threads(2)
++            p=torch.load(C.SOURCE,map_location='cpu',weights_only=True,mmap=True)
++            original=C.read(C.PRIOR/'training_registration.json')
++            if p['schema']!='bench_four_routes_exposure_training_v1' or p['global_step']!=C.BASE_STEP:raise ValueError('Wrong source')
++            for field,hfield,fn in [('generator_state','source_generator_sha256',E.state_hash),('optimizer','source_optimizer_sha256',T.base.tree_hash),('rng','source_rng_sha256',T.base.tree_hash)]:
++                if fn(p[field])!=original[hfield]:raise ValueError('Source state '+field)
++            model,optimizer=E._build_restore(p,C.BASE_STEP,'cuda')
++            layout_opt=None
++            if arm=='LAYOUT':
++                from .model import attach_layout
++                model=attach_layout(model)
++                layout_opt=torch.optim.AdamW(model.layout_branch.parameters(),lr=1e-5,betas=(.9,.95),eps=1e-8,weight_decay=0.)
++            baseview=BaseParameters(model)
++            if prev:
++                C.verify({prev['checkpoint']['path']:prev['checkpoint']['sha256']})
++                p=torch.load(C.resolve(prev['checkpoint']['path']),map_location='cpu',weights_only=True,mmap=True)
++                if p['arm']!=arm or p['local_step']!=step or p['registration_sha256']!=C.sha(regpath) or p['execution']!=ledger.snapshot():raise ValueError('Resume cursor')
++                for field,hfield,fn in [('generator_state','generator_state_sha256',E.state_hash),('optimizer','optimizer_state_sha256',T.base.tree_hash),('rng','rng_sha256',T.base.tree_hash)]:
++                    if fn(p[field])!=p[hfield]:raise ValueError('Resume content hash '+field)
++                if arm=='LAYOUT' and T.base.tree_hash(p['layout_optimizer'])!=p['layout_optimizer_sha256']:raise ValueError('Resume layout optimizer content')
++                model.load_state_dict(p['generator_state'],strict=True);optimizer.load_state_dict(p['optimizer'])
++                if layout_opt is not None:layout_opt.load_state_dict(p['layout_optimizer'])
++            E.validate_optimizer(baseview,optimizer,C.BASE_STEP+step);check_layout_optimizer(model,layout_opt,step)
++            E.restore_rng(p['rng']);head_state=p['head_state'];del p
++            manifest=C.read(C.OUT/'data/manifest.json');cases={r['case_id']:load_case(r) for r in manifest['train']}
++            entries=C.read(C.OUT/'data/schedule.json')['steps'];coefficients=C.read(C.OUT/'data/coefficients.json')
++            validate_stream(entries,coefficients)
++            state['status']='TRAINING'
++            def save(immutable=False):
++                require_cursor(ledger,step)
++                names=E.validate_optimizer(baseview,optimizer,C.BASE_STEP+step);check_layout_optimizer(model,layout_opt,step)
++                g,o,rng=E._cpu_copy(model.state_dict()),E._cpu_copy(optimizer.state_dict()),E._cpu_copy(E.rng_state())
++                lo=None if layout_opt is None else E._cpu_copy(layout_opt.state_dict())
++                payload=dict(schema='bench_layout_oracle_training_v1',experiment=C.EXPERIMENT,arm=arm,stage='NATIVE',
++                    local_step=step,stage_step=step,global_step=C.BASE_STEP+step,native_total_step=C.NATIVE_BASE+step,seam_total_step=0,
++                    model_config=copy.deepcopy(E.MODEL_CONFIG),runtime_version=E.RUNTIME_VERSION if arm=='PLAIN' else model.layout_metadata()['version'],
++                    base_runtime_version=E.RUNTIME_VERSION,layout_metadata=None if arm=='PLAIN' else model.layout_metadata(),EMA=False,update_in_progress=False,
++                    generator_state=g,generator_state_sha256=E.state_hash(g),optimizer=o,optimizer_state_sha256=T.base.tree_hash(o),
++                    layout_optimizer=lo,layout_optimizer_sha256=None if lo is None else T.base.tree_hash(lo),
++                    optimizer_parameter_names=names,rng=rng,rng_sha256=T.base.tree_hash(rng),head_state=head_state,
++                    head_state_sha256=E.HEAD_STATE_SHA256,head_config=E.HEAD_CONFIG,head_step=0,head_calls=0,head_optimizer=None,
++                    registration_sha256=C.sha(regpath),execution=ledger.snapshot(),source_checkpoint_sha256=reg['source_sha256'])
++                name=f'checkpoint_step{step}.pt' if immutable else 'checkpoint_latest.pt'
++                receipt=E._save(out/name,payload,replace=not immutable);state['checkpoint']=receipt
++                if immutable:
++                    export={k:v for k,v in payload.items() if k not in ('optimizer','layout_optimizer','rng','optimizer_parameter_names','execution')}
++                    export.update(schema='bench_layout_oracle_generator_v1',state_sha256=payload['generator_state_sha256'],model_arm=arm,
++                        representation='NATIVE',training_checkpoint_sha256=receipt['sha256'])
++                    state['inference_export']=E._save(out/f'generator_step{step}.pt',export)
++                state.update(step=step,global_step=C.BASE_STEP+step,calls=ledger.snapshot());C.write(status,state,replace=True)
++                C.event(out/'checkpoint_history.jsonl',dict(step=step,receipt=receipt,immutable=immutable))
++            for entry,coefficient in zip(entries[step:],coefficients[step:]):
++                if stop['signal'] is not None:
++                    save();state.update(status='INTERRUPTED_SAFE',signal=stop['signal']);break
++                tick=time.perf_counter();current=entry['stage_step']
++                if current%25==1:
++                    rr=C.register_resource('TRAIN_'+arm+'_BEFORE_'+str(current))
++                    if rr['free_mib']<go['headroom_mib']:
++                        save();state.update(status='INTERRUPTED_SAFE',reason='resource_headroom');break
++                samples=[E.sample_for_training(cases[r['case_id']],r,'PLAIN') for r in entry['samples']]
++                for s in samples:E.verify_sample(s,'NATIVE')
++                ds=[int(s['free_coordinate_count']) for s in samples];denom=sum(ds)
++                groups=[r['replay_group'] for r in entry['samples']];weights=coefficient['reference_group_mse_weights']
++                mass={g:sum(d for d,gg in zip(ds,groups) if g==gg) for g in weights}
++                gains=[weights[g]*denom/mass[g] for g in groups]
++                validate_allocation(coefficient,ds,groups,gains,current)
++                input_seconds=time.perf_counter()-tick
++                optimizer.zero_grad(set_to_none=True)
++                if layout_opt is not None:layout_opt.zero_grad(set_to_none=True)
++                torch.cuda.reset_peak_memory_stats();objective=0.;layout_active=0;layout_diagnostics=[]
++                for mi,(sample,row,gain) in enumerate(zip(samples,entry['samples'],gains)):
++                    context=dict(arm=arm,step=current,microbatch=mi,condition_id=row['condition_id'])
++                    b=T.tensors(sample)
++                    if arm=='LAYOUT':
++                        tokens,valid=training_layout(cases[row['case_id']],row,sample)
++                        model.configure_layout(torch.as_tensor(tokens,device='cuda')[None],torch.as_tensor(valid,device='cuda')[None])
++                        layout_active+=int(valid.any())
++                    def observe(payload):
++                        if payload['site']=='layout_embedding':
++                            delta=payload['delta'].detach().float();hidden=payload['original_hidden'].detach().float()
++                            layout_diagnostics.append(dict(delta_rms=float(delta.square().mean().sqrt()),
++                                hidden_rms=float(hidden.square().mean().sqrt()),
++                                actual_changed_scalars=int((payload['hidden'].detach()!=payload['original_hidden'].detach()).sum())))
++                    with E.native_execution(model,coordinates=(b['x'],b['t']),autocast=True):
++                        pred,_=ledger.call('train_forward',lambda:model(b['x'],b['t'],b['y'],valid_mask=b['valid'],known_mask=b['known'],
++                            observer=observe if arm=='LAYOUT' and (current in (1,5,25) or current%50==0) else None).float(),context)
++                        base=E.corner_masked_fm_loss(pred,b['target'],b['valid'],b['fixed'],denominator=denom)
++                        loss=base*gain
++                        if not bool(torch.isfinite(loss)):raise FloatingPointError('Nonfinite FM')
++                        ledger.call('train_backward',loss.backward,context)
++                    objective+=float(loss.detach())
++                    C.event(out/'exposure.jsonl',dict(**context,parent_id=row['parent_id'],N=int(sample['N']),K=int(sample['K']),
++                        t=float(sample['t']),replay_group=row['replay_group'],gain=gain,loss=float(loss.detach()),
++                        noise_seed=row['noise_seed'],epsilon_seed=row['epsilon_seed'],time_seed=row['time_seed'],
++                        permutation_seed=row['permutation_seed'],alpha=row['alpha'],layout_drop=row['layout_drop']))
++                    del pred,base,loss,b
++                if any(p.grad is None for p in baseview.parameters()):raise RuntimeError('Unused inherited parameter')
++                if layout_opt is not None:
++                    # Exact no-layout batches still advance a zero-gradient fresh cursor.
++                    for p in model.layout_branch.parameters():
++                        if p.grad is None:p.grad=torch.zeros_like(p)
++                grad=float(torch.nn.utils.clip_grad_norm_(model.parameters(),1.,error_if_nonfinite=True))
++                def update():
++                    optimizer.step()
++                    if layout_opt is not None:layout_opt.step()
++                ledger.call('optimizer_update',update,dict(arm=arm,step=current))
++                step=current;E.validate_optimizer(baseview,optimizer,C.BASE_STEP+step);check_layout_optimizer(model,layout_opt,step)
++                if any(not bool(torch.isfinite(p).all()) for p in model.parameters()):raise FloatingPointError('Nonfinite parameter')
++                record=dict(arm=arm,step=step,global_step=C.BASE_STEP+step,objective=objective,gradient_norm=grad,denominator=denom,
++                    layout_active_instances=layout_active,reference_group_weights=weights,input_seconds=input_seconds,
++                    layout_diagnostics=layout_diagnostics,
++                    update_seconds=time.perf_counter()-tick,peak_allocated_bytes=torch.cuda.max_memory_allocated(),
++                    peak_reserved_bytes=torch.cuda.max_memory_reserved(),peak_scope='one formal full update, not process VRAM')
++                C.event(out/'training_log.jsonl',record);state.update(step=step,last=record,elapsed_seconds=time.perf_counter()-started)
++                if step==1000:save(immutable=True)
++                elif step%100==0:save()
++                C.write(status,state,replace=True)
++                if step in (1,5,25) or step%50==0:
++                    C.write(out/f'resources_step{step}.json',C.resources());print(record,flush=True)
++            else:state['status']='COMPLETE'
++            require_cursor(ledger,step);C.verify(reg['protected'])
++    except BaseException as exc:
++        state.update(status='FAILED',error=repr(exc),traceback=traceback.format_exc(),no_automatic_replay=True)
++        C.write(adir/'failure.json',state);raise
++    finally:
++        for sig,h in handlers.items():signal.signal(sig,h)
++        state.update(step=step,elapsed_seconds=time.perf_counter()-started,calls=ledger.snapshot(),resources=observer.summary())
++        C.write(status,state,replace=True);C.write(adir/'final_status.json',state)
++        C.write(adir/'resource_observation.json',dict(samples=observer.samples,summary=observer.summary()))
++    return state
++
++if __name__=='__main__':
++    p=argparse.ArgumentParser();p.add_argument('action',choices=['register','train']);p.add_argument('--arm',choices=list(C.UPDATES),required=True);p.add_argument('--resume',action='store_true');a=p.parse_args()
++    print(register(a.arm) if a.action=='register' else train(a.arm,a.resume))

@@ -1,0 +1,24 @@
+# Session A → Session B：现在绑定新数据并继续
+
+Session A正式交接；用户已要求B/C继续各自原职责。实验根：E:/MeshFlow/native_t1/runs/control_mvp48_v1（WSL /mnt/e/MeshFlow/native_t1/runs/control_mvp48_v1）。
+
+DATA_READY.json 已存在，status=READY，data_revision=repair_v2。SHA256：b5cd88c3a7488c86c567324845cff63fb1757d7b37993c20bfd5a6524e20145e
+最新契约：registration/data_contract_repair_v2.json；SHA256：78e3f856eda4aa15a1c689f395664ec1ac5dc0ece74111d5dc2f2be1ed54cc6f
+数据manifest：data/manifest.json；SHA256：5c8f33a3ca8ad04a5e56b46c9ba4306f719eb1d86d08be0a13e58be3a83d67cf
+独立审计：data/independent_repair_validation.json；status=PASS。
+
+请首先核验READY.files内的81个文件hash，不修改任何冻结文件。保留的DATA_BLOCKED.json属于严格原始版历史，已由READY.supersedes_blocked明确取代；不能仅因历史BLOCKED文件存在继续报数据不足。旧registration/data_contract.json、data_handoff.json、train/eval历史状态均不是本轮最新契约。
+
+48对象32train/8validation/8test；128训练C、16验证C、16测试C齐全；全部逐对象NPZ约649KB。最新data/load_sample.py API和dense retained row语义兼容既有B/C适配。source_face_ids/free_source_ids用于密集保留面行索引，原始追溯用original_source_face_ids等新增字段，勿混用。full_target/constraints已经是模型坐标；pre_OT乘2恰好等于model target，禁止再次缩放。
+
+用户已明确授权最小数据修复。40对象仅清理109个精确零面积面及571份重复三角形；原顶点/官方文件均未改变。original_N和N均128–256。每条接口清理前后均恰好原始两面共享边。不要在生成或评分过程中继续修补数据。
+
+A不会运行B/C的模型、OT、训练或评价；本交接不新增任何预算/arm/seed/replay。后续结果写入各自已授权目录。新增data_to_B/C及协调回执是冻结后的通信文件，不属于科学数据输入；DATA_READY及其已列文件不变。
+
+你当前registration/train_handoff.json和training/status.json仍是旧WAITING_DEPENDENCY。请读取现有train_binding.bind_data(root)实现，按自身流程绑定最新READY，生成registration/train_data_binding.json，accepted_contract_sha256应为上面的新契约hash；更新你自己的状态，保留历史证据。
+
+训练计划data/train_plan.json：1000 effective batch×8；T1和Geo_shared沿用相同冻结任务身份，Geo/Full从共同step500完整模型/AdamW/RNG/游标分支。按照你的既定PROTOCOL与失败契约执行，不因新数据额外增加更新、预检或重试。训练完成后由B发布TRAIN_READY及三个step1000终点；C使用你统一的model_mvp.load_mvp_checkpoint。
+
+独立权重阻塞仍在：/mnt/c/Users/warpwang/Downloads/last.pt 当前不存在。已按原资产元数据、整个仓库权重路径做只读核查，未找到匹配的官方Chair原文件。要求bytes=2084287208，SHA256=bda891a0f046ca6015f70f745fa24a8036c64dda12175b246d853c957f63b92d。output/120m-ot-v-bench/checkpoints/01000000.pt虽同大小但SHA=00fc5ddb5bc5690cd53fe4f092ee3320e23437a287464fa5639120c2bb82a505，是Bench，不能替代；也不能静默换历史微调权重。请在原Session B授权范围内解决官方Chair资产来源，并报告该独立阻塞。A没有下载/加载/复制权重。
+
+回执：请在registration/train_data_ack.json（B所有）或你自己的train_handoff.json写入status、data_ready_sha256、新contract_sha256、next_action及仍存阻塞。A会只读监测；不要修改registration/data_*。即使权重暂缺，也请先完成数据接收/绑定并准确区分DATA_READY与模型资产缺失。

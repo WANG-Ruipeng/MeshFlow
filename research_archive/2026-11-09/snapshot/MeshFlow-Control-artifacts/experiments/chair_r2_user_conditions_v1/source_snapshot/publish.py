@@ -1,0 +1,111 @@
+"""Publish the active review package, preserving all earlier candidate evidence."""
+from pathlib import Path
+from collections import Counter
+import csv,io,json,html,shutil,difflib
+from prepare import DEFAULT_OUT,read,write,sha,event
+from summarize import text_file,csv_file
+
+def main(out=DEFAULT_OUT):
+ out=Path(out); active=read(out/'active_conditions.json');rows=active['rows']
+ all_rows=read(out/'conditions.json')['rows'];held=read(out/'usability_review.json')['rows']
+ held_map={r['condition_id']:r for r in held};active_ids={r['condition_id'] for r in rows}
+ source_summary=read(out/'data_summary.json');q=read(out/'quality/condition_summary.json')['rows']
+ qmap={r['condition_id']:r['counts'] for r in q}
+ val=read(out/'validation_export.json');va=read(out/'validation_active.json')
+ train=[r for r in rows if r['split']=='train'];dev=[r for r in rows if r['split']=='dev']
+ summary=dict(source_candidate_train=122,source_candidate_dev=7,active_train_conditions=len(train),active_dev_conditions=len(dev),
+  train_parents=len({r['uid'] for r in train}),train_regions=len({r['region_id'] for r in train}),
+  active_train_by_part=dict(Counter(r['region_type'] for r in train)),active_train_by_tier=dict(Counter(r['tier'] for r in train)),
+  hold_train=5,hold_dev=1,old_dev_conditions=8,old_requests=16,
+  future_logical_outputs=84,future_new_generations_if_old16_reusable=68,
+  active_train_K_range=[min(r['K'] for r in train),max(r['K'] for r in train)],
+  active_train_face_fraction_range=[min(r['face_fraction'] for r in train),max(r['face_fraction'] for r in train)],
+  active_train_area_fraction_range=[min(r['parent_area_fraction'] for r in train),max(r['parent_area_fraction'] for r in train)],
+  source_export_checks=6154,active_subset_checks=669,check_failures=0,
+  quality_condition_incidence={s:{p:{kind:sum(qmap[r['condition_id']][p][kind]>0 for r in rows if r['split']==s)
+    for kind in ('confirmed_illegal_pair_count','unknown_pair_count')} for p in ('CC','CF','FF')} for s in ('train','dev')},
+  data_arrays_bytes=source_summary['source_CY_npz_bytes'],semantic_authority='AI_PROXY',
+  future_recipe='R2: Native/T1 + role + Geo; FM; full-course HYBRID=.25; reviewed C pool',
+  training_status='NOT_STARTED',model_calls=0,training_updates=0,OT_calls=0,new_Gaussian_draws=0,generated_meshes=0,
+  canonical_manifest='active_conditions.json',canonical_handoff='dataset_handoff_active.json',
+  initial_exports_preserved='conditions.json + data_summary.json + dataset_handoff.json describe the earlier122/7 candidate stage')
+ write(out/'FINAL_SUMMARY.json',summary)
+ with (out/'tables/conditions.csv').open(encoding='utf-8-sig',newline='') as f:all_table=list(csv.DictReader(f))
+ csv_file(out/'tables/active_conditions.csv',[r for r in all_table if r['condition_id'] in active_ids])
+ csv_file(out/'tables/condition_usage.csv',[dict(condition_id=r['condition_id'],split=r['split'],
+   active=r['condition_id'] in active_ids,status=held_map[r['condition_id']]['status'] if r['condition_id'] in held_map else 'ACTIVE_FOR_DATA_REVIEW',
+   reason=held_map[r['condition_id']]['reason'] if r['condition_id'] in held_map else 'Declared source region accepted; full condition quality risks retained',
+   image=f"gallery/conditions/{r['condition_id']}.png",npz=r['npz'],sha256=r['sha256']) for r in all_rows])
+ page=(out/'gallery/all_exported.html').read_text(encoding='utf-8')
+ page=page.replace('25个训练父 / 47个区域 / 122条去重条件；7条新DEV条件。','最终主池：25个训练父 / 47个区域 / 117条训练条件；6条新DEV条件。全部129条原候选仍可查看，其中6条细长边条仅保留为HOLD证据。')
+ page=page.replace('../tables/conditions.csv','../tables/active_conditions.csv').replace('../dataset_handoff.json','../dataset_handoff_active.json')
+ page=page.replace('<nav>集合','<nav>用途<select id="u"><option value="active">主池</option><option value="">所有候选</option><option value="held">HOLD证据</option></select>集合')
+ for r in all_rows:
+  cid=r['condition_id'];used=cid in active_ids
+  marker='data-uid="'+r['uid']+'"><h2>'+html.escape(cid)
+  page=page.replace(marker,'data-uid="'+r['uid']+'" data-usage="'+('active' if used else 'held')+'"><h2>'+html.escape(cid))
+  if not used:
+   page=page.replace('<h2>'+html.escape(cid)+'</h2>','<h2>HOLD · '+html.escape(cid)+'</h2><p style="color:#9a3b13">图审显示为窄边条／针状，仅保留为准备阶段证据，不进入本轮主池；不是模型生成失败。</p>')
+ page=page.replace('["s","p","t","q"]','["s","p","t","q","u"]').replace('let[s,p,t,q]=','let[s,p,t,q,u]=')
+ page=page.replace('(q&&!a.dataset.uid.includes(q)))','(q&&!a.dataset.uid.includes(q))||(u&&a.dataset.usage!==u))')
+ text_file(out/'gallery/index.html',page)
+ report="""# R2 用户式条件数据准备报告
+
+当前主池已经实际构造完成：**25个训练父、47个区域、117条训练C/Y；6条新DEV条件。** 后续训练统一以R2为基础：Native/T1 + role + Geo、FM、全程HYBRID（lambda=0.25）。拟定续训起点仍是主实验R2完整step6000；本轮没有加载任何模型、训练、OT、抽噪声或生成完整mesh。
+
+先打开 [检查图集](gallery/index.html)。默认显示主池，可切换到所有候选或HOLD证据。权威主清单是 [active_conditions.json](active_conditions.json)，未来训练交接见 [README_HANDOFF_ACTIVE.md](README_HANDOFF_ACTIVE.md) 和 [dataset_handoff_active.json](dataset_handoff_active.json)。
+
+|项目|实际结果|
+|---|---:|
+|核查来源父|26 train + 8 DEV|
+|主池训练父|25|
+|训练区域|25座面 + 22靠背|
+|最初导出去重训练条件|122（59座面 + 63靠背）|
+|图审后主池训练条件|117（56座面 + 61靠背）|
+|主池独立档位|small 23 / medium 47 / full 47|
+|主池新DEV|6（2座面 + 4靠背）|
+|旧DEV回归登记|8条件 × 原2噪声 = 16请求|
+|全量C/Y文件|129 NPZ，合计906,551字节；包含HOLD证据|
+
+构造方法：在原FP32完整M上保存核对区域R的原面ID。座面取上方承坐表面；靠背取朝向座位的承靠表面，明确区分背面、边框、下延支撑和装饰。曲面和镂空连贯结构可以保留。完整（full）只表示声明区域R完整，不表示整个解剖部件的所有正反面及厚度均包含。
+
+在R的原顶点ID完整共边图上，从固定边界角附近开始按图测地距离扩展，选择最接近R面积25%/50%的嵌套面前缀，再加完整R；只取整张原三角面。原面很粗时两档会相同，记录别名并去重。47个区域本可形成141档，去掉19个重复后得122条。构造和几何数值不依赖语义文本；seat/back标签只用于数据组织与审阅，不输入生成器。Y严格是M减去C的原面ID补集，保存了原始/保留面ID、顶点ID、角点排列及pre-OT坐标映射。
+
+**这不是固定40%面数数据集。** 最初候选训练K=1..54，N=133..245，K/N约0.41%..22.13%；25/50/100%是区域R的面积参考。后续“走R2”指继承模型和FM/HYBRID配方，并用本次新条件池替换旧C构造，不能继续用旧C20/C40比例去解释本池。
+
+来源审阅实际覆盖了34父的候选图；复杂区域另看原面ID/子集高亮图。语义判断全部标记**AI_PROXY**，不是人工语义标注或外部认证。程序验证覆盖全部129条C/Y；没有宣称逐张人工检查129张档位图。
+
+未采用的区域没有补造：
+
+|父ID前缀|区域|处理|
+|---|---|---|
+|103b|back|与扶手/侧壁缠连，含义边界不清，NA；保留seat|
+|400a|seat/back|曲壳跨座背且分区不明确，两类NA；这个父从未来两条续训共同子集同步排除|
+|5574|back|两个朝座位的面板在原完整边图不连通，NA；保留seat|
+|8e94|back|原大三角跨到座下，无法不切面地分离，NA；保留seat|
+|341b（DEV）|seat|区域接续处15对确认穿插，NA；原旧任务仍保留|
+
+导出后对低面积小档进一步实际看图，发现5条训练C和1条DEV C只剩细长边条／针状。已从主池中排除：21f-seat-small、21f-back-small、47da-seat-small、47da-back-small、73b-seat-small，以及DEV的c1b-seat-small。这是**构造完成后的输入图审**，没有看新模型输出。C/R低于10%仅用来定位需要重点查看的候选；不是通用几何非法阈值。没有删除这6份数据、图片或原阶段清单，理由及图哈希见 [usability_review.json](usability_review.json)。这些条带未来可用于单独的边沿输入任务，本轮不当作主示范。没有另选DEV填补缺口，因此新DEV只剩6条，小/中/完整覆盖也相应收窄。
+
+原26父中的14个已知相交/重叠父仍全部包含在25父共同池内；本轮没有用“检出缺陷”自动删父。25父合计仍有310对确认问题和3对未决问题，不能称为已经洗净的数据，也不能据此归因过去实验失败。
+
+|活动训练条件中的来源诊断|有确认问题的条件数|有未决问题的条件数|
+|---|---:|---:|
+|C内部（CC）|0|3|
+|C与Y（CF）|2|0|
+|Y内部（FF）|64|10|
+
+3ede座面中/全档与后侧支撑端盖有局部正面积共面重叠，保留WITH_RISK，完整座面共有6个问题面对；它不是一整层重复座面的证据。7f82靠背三档包含同一个未决面对192/195，保留UNKNOWN，没有把它算成无交。不同C会重复引用同一来源问题，逐条件出现次数不能相加当作独立缺陷数。6个活动DEV在此固定检测器下CC/CF/FF均无确认或未决对，这不认证来源完美。完整分区、原面对与旧检测器身份保留在 [quality/](quality/)；几何不会因改了清单而被修复。
+
+独立验证：初始129份导出6154项检查通过，活动主池再做669项子集检查，均0失败。C/Y及pre-OT来源逐位一致、面集合互斥完备、嵌套/去重/连通、原面/顶点/角点映射、train/DEV分离均通过；289个受保护文件哈希未变，包括34源网格、旧诊断依赖、旧回归输入与RAW。检查证据见 [validation_export.json](validation_export.json)、[validation_active.json](validation_active.json)。本轮只运行CPU流程：源诊断单进程2线程约23.0秒；最终条件129PNG渲染约37.75秒，接受区域64PNG约11.91秒；独立导出验证约3.15秒，活动池验证约0.49秒。数据查看/人工推理式AI审阅与文件操作另计，不能把这些CPU内核时间当作总用时。
+
+下一步的数据合同已经登记，**尚未执行训练**：两个分支用同一25父、同一完整M和R2完整step6000及AdamW状态，各续训1000步。旧条件对照保持R2的C20/C40混合及增强安排，新条件分支先均匀取父再均匀取该父可用新C，不按122或117行全局均匀采样。旧池共同子集有200条C20和195条C40，具体采样规则见交接文件。新K及free集合会变化，未来必须另建对应噪声和OT目标；当前没有物化它们。
+
+现有公开R2入口仍绑定旧26父、C20/C40及6000步恢复合同，**不能直接将本清单塞进去续训**。未来需独立续训分支支持已登记合同，不改变主干、FM、HYBRID、精度或引入B。新DEV每条件两噪声仅登记槽位；旧16请求保留原C/噪声及坏例。三模型新旧合计84个逻辑输出；若冻结主R2旧16份RAW身份及评分合同匹配，新增生成68份。已核对旧RAW身份，尚未确认可复用旧分数。DEV为反复使用的开发对象且来自官方训练split，不是独立泛化测试。
+
+本轮停止在数据准备和审阅包。持久化记忆已记录后续R2路线，没有自动切换旧采样默认、改loss、训练、提交或推送Git。原始候选阶段的conditions.json、data_summary.json、dataset_handoff.json保持原样；实际后续入口只引用active_conditions.json和dataset_handoff_active.json。
+"""
+ text_file(out/'DATA_PREPARATION_REPORT.md',report)
+ event(out,'REVIEW_REPORT_PUBLISHED',active_train=117,active_dev=6,training_updates=0,model_calls=0)
+ print(json.dumps(summary,ensure_ascii=False,indent=2))
+if __name__=='__main__':main()

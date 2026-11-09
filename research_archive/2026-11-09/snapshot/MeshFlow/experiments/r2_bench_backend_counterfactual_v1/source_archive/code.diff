@@ -1,0 +1,800 @@
+diff --git a/r2/pilots/bench_backend_counterfactual_v1/core.py b/r2/pilots/bench_backend_counterfactual_v1/core.py
+new file mode 100644
+--- /dev/null
++++ b/r2/pilots/bench_backend_counterfactual_v1/core.py
+@@ -0,0 +1,271 @@
++"""Frozen CPU-only GEO(RAW)/GEO(source) counterfactuals, with slot ledgers.
++
++Resume: python -B -m r2.pilots.bench_backend_counterfactual_v1.core run
++Complete task receipts are verified and reused. Partial attempts are never
++silently replayed. No model, optimizer, OT, random draw or new D0 is used.
++"""
++from __future__ import annotations
++import os
++os.environ['CUDA_VISIBLE_DEVICES']=''
++for _name in ('OMP_NUM_THREADS','MKL_NUM_THREADS','OPENBLAS_NUM_THREADS','NUMEXPR_NUM_THREADS'):
++    os.environ[_name]='1'
++import argparse
++import csv
++from datetime import datetime, timezone
++import hashlib
++import json
++from pathlib import Path
++import sys
++import time
++import traceback
++import numpy as np
++
++ROOT=Path(__file__).resolve().parents[3]
++sys.path.insert(0,str(ROOT/'r2/src'))
++OUT=ROOT/'experiments/r2_bench_backend_counterfactual_v1'
++OLD=ROOT/'experiments/r2_bench_seat_coverage_v1'
++VERSION='bench_backend_counterfactual_v1'
++LABELS=('NATIVE_S6000','COVERAGE_FINAL')
++PARENTS=('a8e987','27eb79')
++L=float(np.sqrt(3.)*2/.3762)
++
++def sha(path):return hashlib.sha256(Path(path).read_bytes()).hexdigest()
++def read(path):return json.loads(Path(path).read_text(encoding='utf-8-sig'))
++def arrays(path):
++    with np.load(path,allow_pickle=False) as z:return {k:z[k].copy() for k in z.files}
++def clean(value):
++    if isinstance(value,dict):return {str(k):clean(v) for k,v in value.items()}
++    if isinstance(value,(tuple,list)):return [clean(v) for v in value]
++    if isinstance(value,np.ndarray):return value.tolist()
++    if isinstance(value,np.generic):return value.item()
++    if isinstance(value,Path):return str(value)
++    return value
++def write(path,value):
++    p=Path(path);p.parent.mkdir(parents=True,exist_ok=True)
++    with p.open('x',encoding='utf-8') as f:json.dump(clean(value),f,indent=2,ensure_ascii=False,allow_nan=False)
++def npz(path,value):
++    with Path(path).open('xb') as f:np.savez_compressed(f,**value)
++def verify(files):
++    for p,h in files.items():
++        if sha(p)!=h:raise RuntimeError('Protected file changed: '+p)
++def log(event,**value):
++    p=OUT/'ledger.jsonl'
++    with p.open('a',encoding='utf-8') as f:
++        f.write(json.dumps(clean(dict(event=event,utc=datetime.now(timezone.utc).isoformat(),**value)),ensure_ascii=False)+'\n')
++        f.flush();os.fsync(f.fileno())
++def csv_write(path,records):
++    cols=list(dict.fromkeys(k for r in records for k in r))
++    with Path(path).open('x',encoding='utf-8-sig',newline='') as f:
++        w=csv.DictWriter(f,fieldnames=cols);w.writeheader();w.writerows(records)
++def dependencies():
++    from r2.pilots.seam_slot_c200_v1 import postprocess as P
++    from meshflow_control import geo_c,geo_io,source_winding
++    paths=[Path(__file__),Path(P.__file__),Path(P.G.__file__),Path(geo_c.__file__),Path(geo_io.__file__),Path(source_winding.__file__)]
++    assert 'torch' not in sys.modules,'Unexpected neural framework import'
++    return P,geo_c,geo_io,{str(p):sha(p) for p in paths}
++
++def prepare():
++    target=OUT/'manifest.json'
++    if target.exists():
++        m=read(target);verify(m['protected']);verify(m['source_hashes']);return m
++    P,geo,io,code=dependencies()
++    base=read(OLD/'eval_manifest.json')
++    qs=sorted([q for q in base['requests'] if q['parent_id'].startswith(PARENTS)],key=lambda q:(q['parent_id'],q['noise_index']))
++    assert len(qs)==4 and {q['noise_index'] for q in qs}=={0,1}
++    tasks=[];protected={str(OLD/'eval_manifest.json'):sha(OLD/'eval_manifest.json')}
++    for label in LABELS:
++        for q in qs:
++            original=OLD/'evaluation'/label/q['request_id']
++            job=label+'__'+q['request_id']+'__GEO_RAW';dest=OUT/'outputs'/job
++            paths=dict(raw_path=str(original/'raw/raw.npz'),proposal_path=str(original/'post/proposal.npz'),
++                pre_geo_path=str(original/'post/pre_geo.npz'),base_post_path=str(original/'post/post.npz'),
++                base_canonical_path=str(original/'post/post_canonical.npz'),geometry_path=str(original/'post/geometry.json'),
++                raw_receipt=str(original/'raw/receipt.json'),post_receipt=str(original/'post/receipt.json'),
++                proposal_receipt=str(original/'post/proposal_receipt.json'),
++                raw_score_dir=str(OLD/'evaluation/scores'/label/q['request_id']/'RAW'),
++                base_score_dir=str(OLD/'cpu'/label/q['request_id']/'BASE_POST'),
++                raw_score_path=str(OLD/'evaluation/scores'/label/q['request_id']/'RAW/score.json'),
++                base_score_path=str(OLD/'cpu'/label/q['request_id']/'BASE_POST/scores/score.json'))
++            source=original/'raw/source_condition.npz'
++            for p in list(paths.values())+[str(source),q['case_path']]:
++                p=Path(p)
++                if p.is_file():protected[str(p)]=sha(p)
++                elif not p.is_dir():raise FileNotFoundError(str(p))
++            tasks.append(dict(job_id=job,kind='RAW_GEO',label=label,request_id=q['request_id'],
++                condition_id=q['condition_id'],parent_id=q['parent_id'],N=q['N'],K=q['K'],request=q,
++                case_path=q['case_path'],source_condition_path=str(source),original=paths,output_dir=str(dest),
++                new_raw_path=paths['raw_path'],new_pre_geo_path=str(dest/'pre_geo.npz'),
++                new_post_path=str(dest/'post.npz'),new_geometry_path=str(dest/'geometry.json')))
++    for q in (q for q in qs if q['noise_index']==0):
++        template=next(x for x in tasks if x['label']==LABELS[0] and x['request_id']==q['request_id'])
++        job=q['condition_id']+'__SOURCE_GEO';dest=OUT/'outputs'/job
++        tasks.append(dict(job_id=job,kind='SOURCE_GEO',label='SOURCE_REFERENCE',request_id=q['condition_id']+'__source',
++            condition_id=q['condition_id'],parent_id=q['parent_id'],N=q['N'],K=q['K'],request=q,
++            case_path=q['case_path'],source_condition_path=template['source_condition_path'],original=template['original'],
++            output_dir=str(dest),new_raw_path=str(dest/'source_raw.npz'),new_pre_geo_path=str(dest/'pre_geo.npz'),
++            new_post_path=str(dest/'post.npz'),new_geometry_path=str(dest/'geometry.json'),
++            scope='Two independent source reference targets; no noise/model samples or open-generation success claim'))
++    m=dict(schema=VERSION,status='FROZEN',created_utc=datetime.now(timezone.utc).isoformat(),
++        budget=dict(RAW_GEO=8,SOURCE_GEO=2,GEO_calls=10,source_orientation_calls=10,model_calls=0,D0=0,training=0,new_noise=0,OT=0),
++        radius_model=geo.RADIUS,L=L,geo_config=geo.FIXED_CONFIG,source_hashes=code,protected=protected,tasks=tasks,
++        task_order='lexical parent then noise within NATIVE_S6000, COVERAGE_FINAL, then unique two SOURCE references',
++        stage_contract='RAW/D0_PROPOSAL/RESTORED_C and all-input MERGED before cleanup preserve each model own generated slot; POST only retains kept slots.',
++        source_contract='C+Y canonical triangle soup, same N/K/scale; source identities carried only for reference rows; no indexed shortcut',
++        limits=['Same slot tracks one output across backend stages, not semantic correspondence across models.',
++          'GEO(source) tests backend compatibility with two source reference meshes, not autonomous completion.',
++          'GEO(RAW) recomputes original GEO clusters from RAW; never reuses D0 clusters.',
++          'No sweep or threshold tuning; cached D0 models are not invoked.'])
++    OUT.mkdir(parents=True,exist_ok=True);write(target,m);log('REGISTERED',budget=m['budget'])
++    return m
++
++def source_raw(task):
++    """Repack exactly source C+Y into the Native triangle-soup identity contract."""
++    source=arrays(task['case_path']);template=arrays(task['original']['raw_path']);k=int(source['K']);n=int(source['N'])
++    C=source['C'];Y=source['Y'];full=source['full_target']
++    ids=np.concatenate((source['known_ids'],source['free_ids'])).astype(np.int64)
++    assert np.array_equal(np.sort(ids),np.arange(n))
++    assert np.array_equal(C,full[source['known_ids']]) and np.array_equal(Y,full[source['free_ids']])
++    assert np.array_equal(C,template['raw'][:k])
++    soup=np.concatenate((C,Y)).astype(np.float32);assert np.array_equal(soup,full[ids])
++    raw={key:value.copy() for key,value in template.items()}
++    # Preserve only C connectivity at the incoming stage. Free corners remain
++    # independent even when coordinates happen to match a source vertex.
++    vertices=np.concatenate((raw['C_vertices'],Y.reshape(-1,3)))
++    faces=np.concatenate((raw['C_faces_model'],np.arange(len(raw['C_vertices']),len(vertices)).reshape(-1,3)))
++    assert np.array_equal(vertices[faces],soup)
++    raw.update(raw=soup,output=soup.copy(),C=C.copy(),free=Y.copy(),vertices=vertices,faces=faces,
++        known_faces=np.asarray(k),input_faces=np.asarray(n),source_face_ids=np.arange(n,dtype=np.int64),
++        raw_slot_ids=np.arange(n,dtype=np.int64),source_corner_ids=np.tile(np.arange(3),(n,1)),
++        source_target_face_ids=ids,source_target_vertex_ids=source['source_face_vertex_ids'][ids],
++        source_target_original_corner_ids=source['source_corner_permutations'][ids],
++        identity_domain=np.asarray('SOURCE_C_THEN_Y_REFERENCE_NOT_GENERATED'))
++    assert not raw['raw_seam_slot_mask'].any() and (raw['raw_anchor_ids'][k:]<0).all()
++    receipt=dict(status='PASS',packing='C_then_Y_canonical_soup',N=n,K=k,
++        C_equals_production_input=True,full_target_partition_exact=True,source_face_permutation_bijective=True,
++        free_input_indexing='independent corner indices; no source-index shortcut',
++        source_target_face_ids=ids.tolist(),source_target_case_sha256=sha(task['case_path']))
++    return raw,receipt
++
++def geometry_quantities(triangles):
++    t=np.asarray(triangles,np.float64)
++    edges=np.stack((np.linalg.norm(t[:,1]-t[:,0],axis=1),np.linalg.norm(t[:,2]-t[:,1],axis=1),np.linalg.norm(t[:,0]-t[:,2],axis=1)),axis=1)
++    cross=np.linalg.norm(np.cross(t[:,1]-t[:,0],t[:,2]-t[:,0]),axis=1)
++    shortest=edges.min(axis=1);longest=edges.max(axis=1)
++    height=np.divide(cross,longest,out=np.zeros_like(cross),where=longest>0)
++    return shortest,height,cross*.5
++
++def merged(pre,canonical):
++    ids=canonical['corner_target_input_ids'];assert ids.shape==pre.shape[:2] and ids.min()>=0 and ids.max()<pre.size//3
++    corrected=pre.reshape(-1,3)[ids]
++    assert np.array_equal(corrected[canonical['source_face_ids']],canonical['output'])
++    return corrected
++
++def stage_records(task,stage,soup,slot_ids,kept=None,reasons=None,source_ids=None):
++    k=task['K'];n=task['N'];short,height,area=geometry_quantities(soup)
++    slot_ids=np.asarray(slot_ids);free=slot_ids>=k
++    metadata=dict(job_id=task['job_id'],kind=task['kind'],label=task['label'],request_id=task['request_id'],
++                  condition_id=task['condition_id'],parent_id=task['parent_id'],stage=stage,N=n,K=k)
++    rows=[]
++    for i,slot in enumerate(slot_ids):
++        rows.append(dict(metadata,input_slot_id=int(slot),is_C=bool(slot<k),
++            source_target_face_id=int(source_ids[slot]) if source_ids is not None else '',
++            shortest_edge=float(short[i]),minimum_altitude=float(height[i]),area=float(area[i]),
++            shortest_edge_L=float(short[i]/L),minimum_altitude_L=float(height[i]/L),area_L2=float(area[i]/L**2),
++            eventual_GEO_kept=bool(kept[slot]) if kept is not None else '',
++            eventual_GEO_reason=str(reasons[slot]) if reasons is not None else '',
++            identity_domain='SOURCE_C_THEN_Y_REFERENCE' if source_ids is not None else 'WITHIN_REQUEST_GENERATED_SLOT'))
++    summary=dict(metadata,present_total_faces=len(soup),present_free_faces=int(free.sum()),free_area=float(area[free].sum()),
++        free_area_L2=float(area[free].sum()/L**2),free_zero_area_faces=int((area[free]==0).sum()),
++        free_shortest_edge_p50=float(np.median(short[free])) if free.any() else None,
++        free_minimum_altitude_p50=float(np.median(height[free])) if free.any() else None,
++        original_free_denominator=n-k,post_kept_free_faces=int(kept[k:].sum()) if kept is not None else None,
++        post_deleted_free_faces=int((~kept[k:]).sum()) if kept is not None else None)
++    return rows,summary
++
++def one(task,manifest_sha):
++    P,geo,io,_=dependencies();dest=Path(task['output_dir']);receipt_path=dest/'receipt.json'
++    if receipt_path.exists():
++        r=read(receipt_path);assert r['manifest_sha256']==manifest_sha;verify(r['files']);return r
++    if dest.exists():raise RuntimeError('Unresolved CPU attempt, no silent replay: '+str(dest))
++    dest.mkdir(parents=True);write(dest/'attempt.json',dict(job_id=task['job_id'],manifest_sha256=manifest_sha,GEO_budget=1,model_calls=0))
++    tick=time.perf_counter();calls=0
++    try:
++        if task['kind']=='SOURCE_GEO':
++            raw,receipt=source_raw(task);npz(task['new_raw_path'],raw);write(dest/'source_packing.json',receipt)
++        else:raw=arrays(task['original']['raw_path'])
++        source=arrays(task['source_condition_path']);original_hash=hashlib.sha256(raw['raw'].tobytes()).hexdigest()
++        log('GEO_STARTED',job_id=task['job_id'],budget=1)
++        pre,canonical,post,geometry,oriented,anchors=P.geometry_from_proposal(raw,raw['raw'].copy(),source);calls=1
++        assert hashlib.sha256(raw['raw'].tobytes()).hexdigest()==original_hash
++        assert np.array_equal(pre,raw['raw']) and geometry['stats']['radius_model']==geo.RADIUS
++        if task['kind']=='SOURCE_GEO':
++            sf,sc=post['source_face_ids'],post['source_corner_ids']
++            post.update(identity_domain=np.asarray('SOURCE_C_THEN_Y_REFERENCE_NOT_GENERATED'),
++                source_target_face_ids=raw['source_target_face_ids'],
++                retained_source_target_face_ids=raw['source_target_face_ids'][sf],
++                retained_source_target_vertex_ids=raw['source_target_vertex_ids'][sf[:,None],sc],
++                retained_source_original_corner_ids=raw['source_target_original_corner_ids'][sf[:,None],sc])
++        log('GEO_RETURNED',job_id=task['job_id'],calls=1,deleted=geometry['stats']['deleted_free_faces'])
++        npz(dest/'pre_geo.npz',dict(output=pre,C=raw['raw'][:task['K']],known_faces=raw['known_faces'],
++            raw_anchor_ids=raw['raw_anchor_ids'],raw_seam_slot_mask=raw['raw_seam_slot_mask']))
++        npz(dest/'post_canonical.npz',canonical);npz(dest/'post.npz',post)
++        io.write_indexed_ply(dest/'post.ply',post['vertices'],post['faces'])
++        write(dest/'geometry.json',dict(stats=geometry['stats'],face_records=geometry['face_records']))
++        write(dest/'anchor_identity.json',anchors);write(dest/'source_restoration.json',oriented['restoration_summary'])
++        orient=oriented['orientation_result'];write(dest/'orientation.json',dict(summary=orient['summary'],components=orient['component_rows'],edges=orient['edge_rows']))
++        face_rows=[];stage_rows=[];n=task['N'];ids=np.arange(n)
++        source_ids=raw.get('source_target_face_ids') if task['kind']=='SOURCE_GEO' else None
++        stages=[]
++        if task['kind']=='RAW_GEO':
++            old_pre=arrays(task['original']['pre_geo_path'])['output'];old_can=arrays(task['original']['base_canonical_path'])
++            proposal=arrays(task['original']['proposal_path'])['official_unconstrained_proposal']
++            assert np.array_equal(old_pre[task['K']:],proposal[task['K']:])
++            assert np.array_equal(old_pre[:task['K']],raw['raw'][:task['K']])
++            stages=[('RAW',raw['raw'],ids,old_can),('D0_PROPOSAL',proposal,ids,old_can),
++                ('RESTORED_C',old_pre,ids,old_can),('D0_GEO_MERGED',merged(old_pre,old_can),ids,old_can),
++                ('BASE_POST',old_can['output'],old_can['source_face_ids'],old_can),
++                ('RAW_GEO_MERGED',merged(pre,canonical),ids,canonical),('RAW_GEO_POST',canonical['output'],canonical['source_face_ids'],canonical)]
++        else:
++            stages=[('SOURCE',raw['raw'],ids,canonical),('SOURCE_GEO_MERGED',merged(pre,canonical),ids,canonical),
++                ('SOURCE_GEO_POST',canonical['output'],canonical['source_face_ids'],canonical)]
++        for name,soup,slots,can in stages:
++            rr,ss=stage_records(task,name,soup,slots,can['source_face_kept'],can['source_face_reason'],source_ids)
++            face_rows.extend(rr);stage_rows.append(ss)
++        csv_write(dest/'per_face_stages.csv',face_rows);csv_write(dest/'stage_summary.csv',stage_rows)
++        assert 'torch' not in sys.modules
++        value=dict(status='COMPLETE',job_id=task['job_id'],kind=task['kind'],label=task['label'],request_id=task['request_id'],
++            manifest_sha256=manifest_sha,GEO_calls=1,orientation_calls=1,model_calls=0,D0_forwards=0,
++            seconds=time.perf_counter()-tick,post_sha256=sha(dest/'post.npz'),raw_path=task['new_raw_path'],
++            files={str(p):sha(p) for p in sorted(dest.iterdir()) if p.is_file()})
++        write(receipt_path,value);return value
++    except BaseException as error:
++        write(dest/'failure.json',dict(error=repr(error),traceback=traceback.format_exc(),returned_GEO_calls=calls,model_calls=0,no_silent_retry=True))
++        raise
++
++def run():
++    m=prepare();verify(m['protected']);verify(m['source_hashes'])
++    complete=OUT/'core_complete.json'
++    if complete.exists():
++        r=read(complete);verify(r['files']);return r
++    # Resource scheduling is owned by the root; the written receipt is required
++    # before the first geometry task, not guessed from library allocation.
++    if not list((OUT/'resources').glob('snapshot_*.json')):raise RuntimeError('Await root resource receipt before CPU execution')
++    tick=time.perf_counter();results=[one(task,sha(OUT/'manifest.json')) for task in m['tasks']]
++    assert len(results)==10 and sum(r['GEO_calls'] for r in results)==10
++    all_faces=[];all_stages=[]
++    for task in m['tasks']:
++        for name,store in [('per_face_stages.csv',all_faces),('stage_summary.csv',all_stages)]:
++            with (Path(task['output_dir'])/name).open(encoding='utf-8-sig',newline='') as f:store.extend(csv.DictReader(f))
++    csv_write(OUT/'per_face_stages.csv',all_faces);csv_write(OUT/'stage_summary.csv',all_stages)
++    verify(m['protected']);verify(m['source_hashes'])
++    value=dict(status='COMPLETE',tasks=10,RAW_GEO=8,SOURCE_GEO=2,GEO_calls=10,orientation_calls=10,
++        model_calls=0,D0_forwards=0,training=0,OT=0,new_noise=0,CPU_threads=1,CPU_workers=1,
++        seconds=time.perf_counter()-tick,face_stage_rows=len(all_faces),stage_summary_rows=len(all_stages),
++        files={str(Path(t['output_dir'])/'receipt.json'):sha(Path(t['output_dir'])/'receipt.json') for t in m['tasks']})
++    value['files'].update({str(OUT/name):sha(OUT/name) for name in ('manifest.json','per_face_stages.csv','stage_summary.csv')})
++    write(complete,value);log('CORE_COMPLETE',**{k:v for k,v in value.items() if k!='files'});return value
++
++if __name__=='__main__':
++    parser=argparse.ArgumentParser();parser.add_argument('command',choices=('prepare','run'));args=parser.parse_args()
++    result=prepare() if args.command=='prepare' else run()
++    print(json.dumps({k:v for k,v in result.items() if k not in ('files','tasks','protected','source_hashes')},ensure_ascii=False))
+
+diff --git a/r2/pilots/bench_backend_counterfactual_v1/evaluate.py b/r2/pilots/bench_backend_counterfactual_v1/evaluate.py
+new file mode 100644
+--- /dev/null
++++ b/r2/pilots/bench_backend_counterfactual_v1/evaluate.py
+@@ -0,0 +1,147 @@
++"""Bounded CPU scorer: eight GEO(RAW) and two source GEO outputs, no models.
++
++CF/FF/I call the unchanged production mathematics and its frozen C queries.
++Existing RAW and BASE_POST scores are read-only references, never rescored.
++"""
++from __future__ import annotations
++import os
++os.environ['CUDA_VISIBLE_DEVICES']=''
++for k in ('OMP_NUM_THREADS','MKL_NUM_THREADS','OPENBLAS_NUM_THREADS','NUMEXPR_NUM_THREADS'):os.environ[k]='1'
++import argparse,concurrent.futures,csv,json,multiprocessing,resource,sys,time,traceback
++from pathlib import Path
++import numpy as np
++from r2.pilots.bench_adaptation_strength_v1.common import read,resolve,sha,write_new
++from r2.tools.partial_edge_binding_v1 import metrics as ORIGINAL
++
++ROOT=Path(__file__).resolve().parents[3]
++OUT=ROOT/'experiments/r2_bench_backend_counterfactual_v1'
++VERSION='bench_backend_original_CF_FF_I_subset_v1'
++ILLEGAL={'proper_transverse_penetration','coplanar_positive_area_overlap'}
++
++
++def arrays(p):
++    with np.load(resolve(p),allow_pickle=False) as z:return {k:z[k].copy() for k in z.files}
++
++
++def csvwrite(path,rows):
++    with Path(path).open('x',encoding='utf-8-sig',newline='') as f:
++        w=csv.DictWriter(f,fieldnames=list(dict.fromkeys(k for r in rows for k in r)))
++        w.writeheader();w.writerows(rows)
++
++
++def unchanged_C(a,b):
++    return a.shape==b.shape and all(sorted(map(tuple,x))==sorted(map(tuple,y)) for x,y in zip(a,b))
++
++
++def score_one(job):
++    task,manifest_sha=job
++    dest=OUT/'scores'/task['job_id'];done=dest/'complete.json'
++    meshpath=resolve(task['new_post_path']);q=task['request'];K=int(task['K']);N=int(task['N'])
++    identity=dict(version=VERSION,job_id=task['job_id'],manifest_sha256=manifest_sha,mesh_sha256=sha(meshpath))
++    if done.exists():
++        result=read(done)
++        if result['identity']!=identity:raise ValueError('Completed score identity changed')
++        for p,h in result['files'].items():
++            if sha(p)!=h:raise ValueError('Completed score evidence changed')
++        return result
++    if dest.exists():raise RuntimeError('Incomplete scoring attempt retained; no silent retry: '+str(dest))
++    dest.mkdir(parents=True);write_new(dest/'attempt.json',dict(identity=identity,pid=os.getpid(),time=time.time(),new_model_calls=0))
++    start=time.perf_counter()
++    try:
++        mesh=arrays(meshpath);tri=np.asarray(mesh['output']);F=tri[K:]
++        inp=arrays(q['inference_npz']);cc=inp['C_vertices'][inp['C_faces_model']]
++        co=inp['C_vertices'][inp['C_faces_original']]
++        if tri.dtype!=np.float32 or not np.isfinite(tri).all() or not unchanged_C(tri[:K],cc):raise ValueError('C/finite/dtype contract failed')
++        if not np.array_equal(tri[:K],co):raise ValueError('Source C winding recovery differs')
++        helpers=ORIGINAL.helpers();mod=helpers;L=ORIGINAL.L
++        reference=helpers['old'].load_queries(q['query_descriptor'])
++        if len(F):metrics,cf,ff=mod['geometry'].scan_geometry(cc,F,L)
++        else:
++            cf,ff=helpers['Q']._empty_scans(K);metrics={}
++        trusted=mod['control'].trusted_cf(cc,F,L,cf_scan=cf)
++        im,vectors=mod['control'].conflict_metrics(F,dict(C=cc,L0=L),reference,trusted)
++        metrics.update(im)
++        if abs(im['ConflictCov_C']-im['ConflictCov_C_cross']-im['ConflictCov_C_dup']+im['ConflictCov_C_cross_and_dup'])>1e-12:raise ValueError('I union identity failed')
++        for kind,scan in (('CF',cf),('FF',ff)):
++            bad=[r for r in scan['contacts'] if r['classification'] in ILLEGAL]
++            affected={int(r['pair'][1]) for r in bad} if kind=='CF' else {int(x) for r in bad for x in r['pair']}
++            metrics.update({kind+'_illegal_pair_count':len(bad),kind+'_illegal_affected_free_fraction':len(affected)/len(F) if len(F) else None,
++                kind+'_proper_pair_count':scan['proper_pair_count'],kind+'_coplanar_pair_count':scan['coplanar_positive_area_pairs'],
++                kind+'_unresolved_or_degenerate_pair_count':scan['unresolved_or_degenerate_pairs']})
++        shapes={name:mod['shape'].shape_quality(part,L) for name,part in (('C',cc),('free',F),('whole',tri))}
++        for name,s in shapes.items():
++            metrics.update({name+'_total_surface_area':s['total_area'],name+'_minimum_angle_lt5_fraction':s['min_angle_lt5_fraction'],
++                name+'_near_degenerate_count':s['near_degenerate_area_count'],name+'_exact_zero_area_count':s['exact_zero_area_count']})
++        metrics.update(actual_free_faces=len(F),input_free_faces=N-K,deleted_free_faces=N-len(tri))
++        geometry=read(task['new_geometry_path'])
++        row=dict(job_id=task['job_id'],kind=task['kind'],label=task['label'],request_id=task['request_id'],
++            condition_id=task['condition_id'],parent_id=task['parent_id'],noise_index=q.get('noise_index'),stage='GEO_RAW' if task['kind']=='RAW_GEO' else 'SOURCE_GEO',
++            N=N,K=K,free_face_denominator=len(F),CF_tested_pair_denominator=K*len(F),FF_tested_pair_denominator=len(F)*(len(F)-1)//2,
++            C_query_count=len(reference['arrays']['C_points']),C_query_weight_denominator=float(reference['arrays']['C_weights'].sum()),**metrics)
++        result=dict(status='PASS',identity=identity,row=row,metric_status=dict(I=im['ConflictCov_C_status'],source_style='NA_NOT_UNIQUE_COMPLETION'),
++            original_definitions_unchanged=True,original_C_queries_reused=True,source_hashes=ORIGINAL.definition_hashes(),
++            geometry_receipt_path=task['new_geometry_path'],geometry_receipt_sha256=sha(task['new_geometry_path']),
++            model_calls=0,new_queries=0,full_CF_scans=1,full_FF_scans=1,seconds=time.perf_counter()-start,
++            peak_RSS_KiB=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
++        for name,value in (('score',result),('pairs',dict(CF=cf,FF=ff)),('shape_per_face',shapes)):
++            write_new(dest/(name+'.json'),value)
++        with (dest/'vectors.npz').open('xb') as f:np.savez_compressed(f,**vectors)
++        result['files']={str(p):sha(p) for p in dest.iterdir() if p.is_file()}
++        if 'torch' in sys.modules:raise RuntimeError('CPU scorer imported torch')
++        write_new(done,result)
++        print('SCORED',task['job_id'],round(result['seconds'],2),flush=True)
++        return result
++    except BaseException as exc:
++        write_new(dest/'failure.json',dict(error=repr(exc),traceback=traceback.format_exc(),automatic_retry=False))
++        raise
++
++
++def run(manifest_path,workers=2):
++    manifest_path=resolve(manifest_path);manifest=read(manifest_path);tasks=manifest['tasks']
++    if len(tasks)!=10 or sum(t['kind']=='RAW_GEO' for t in tasks)!=8:raise ValueError('Expected registered 8+2 CPU outputs')
++    done=OUT/'scores/COMPLETE.json'
++    if done.exists():
++        receipt=read(done)
++        for p,h in receipt['files'].items():
++            if sha(p)!=h:raise ValueError('Completed scoring product changed')
++        return receipt
++    workers=int(workers)
++    if not 1<=workers<=2:raise ValueError('CPU workers must remain within registered cap2')
++    tick=time.perf_counter();mh=sha(manifest_path);jobs=[(t,mh) for t in tasks]
++    with concurrent.futures.ProcessPoolExecutor(max_workers=workers,mp_context=multiprocessing.get_context('spawn')) as pool:
++        receipts=list(pool.map(score_one,jobs))
++    rows=[r['row'] for r in receipts];references=[]
++    for task in tasks:
++        if task['kind']!='RAW_GEO':continue
++        original=task['original'];label=task['label'];rid=task['request_id']
++        for stage,key,default in (
++            ('RAW','raw_score_path',ROOT/'experiments/r2_bench_seat_coverage_v1/evaluation/scores'/label/rid/'RAW/score.json'),
++            ('BASE_POST','base_score_path',ROOT/'experiments/r2_bench_seat_coverage_v1/cpu'/label/rid/'BASE_POST/scores/score.json')):
++            path=resolve(original.get(key,default));score=read(path)
++            rr=dict(job_id=task['job_id'],kind=task['kind'],label=label,request_id=rid,parent_id=task['parent_id'],
++                condition_id=task['condition_id'],stage=stage,origin='READ_ONLY_ORIGINAL_SCORE',source_score_path=str(path),source_score_sha256=sha(path))
++            rr.update(score['metrics'])
++            for k in ('free_face_denominator','CF_tested_pair_denominator','FF_tested_pair_denominator','C_query_weight_denominator','C_query_count'):rr[k]=score.get(k)
++            references.append(rr)
++    csvwrite(OUT/'scores/new_per_output.csv',rows)
++    csvwrite(OUT/'scores/original_reference_scores.csv',references)
++    comparisons=[]
++    metrics=('CF_illegal_affected_free_fraction','FF_illegal_affected_free_fraction','ConflictCov_C','free_total_surface_area','actual_free_faces','deleted_free_faces','free_minimum_angle_lt5_fraction')
++    for row in rows:
++        if row['kind']!='RAW_GEO':continue
++        for old in (r for r in references if r['job_id']==row['job_id']):
++            rec=dict(job_id=row['job_id'],label=row['label'],request_id=row['request_id'],parent_id=row['parent_id'],baseline_stage=old['stage'])
++            for k in metrics:
++                a,b=old.get(k),row.get(k);rec[k+'_before']=a;rec[k+'_after']=b
++                rec[k+'_delta']=b-a if a is not None and b is not None else None
++            comparisons.append(rec)
++    csvwrite(OUT/'scores/paired_differences.csv',comparisons)
++    result=dict(status='COMPLETE',outputs=10,raw_geo_outputs=8,source_geo_outputs=2,old_scores_reused=16,workers=workers,
++        model_calls=0,new_queries=0,seconds=time.perf_counter()-tick,failures=0,manifest_sha256=mh,
++        files={str(p):sha(p) for p in (OUT/'scores').rglob('*') if p.is_file() and p.name!='COMPLETE.json'})
++    write_new(done,result);return result
++
++
++if __name__=='__main__':
++    p=argparse.ArgumentParser();p.add_argument('--manifest',required=True);p.add_argument('--workers',type=int,default=2)
++    a=p.parse_args();r=run(a.manifest,a.workers);print(json.dumps({k:v for k,v in r.items() if k!='files'}))
+
+diff --git a/r2/pilots/bench_backend_counterfactual_v1/render.py b/r2/pilots/bench_backend_counterfactual_v1/render.py
+new file mode 100644
+--- /dev/null
++++ b/r2/pilots/bench_backend_counterfactual_v1/render.py
+@@ -0,0 +1,136 @@
++"""CPU raster/finite-section comparison of saved backend stages; no AI images."""
++from __future__ import annotations
++import os
++os.environ['CUDA_VISIBLE_DEVICES']=''
++for k in ('OMP_NUM_THREADS','MKL_NUM_THREADS','OPENBLAS_NUM_THREADS','NUMEXPR_NUM_THREADS'):os.environ[k]='1'
++import argparse,csv,html,io,json,resource,sys,time,traceback
++from pathlib import Path
++import numpy as np
++from .evaluate import ROOT,OUT,read,resolve,sha,write_new,arrays,csvwrite
++from r2.pilots.chair_multipart_seam_v1 import gallery as G
++D,H=G.D,G.H
++L=float(np.sqrt(3.)*2/.3762)
++
++
++def mesh_arrays(path,K):
++    data=arrays(path)
++    key=next((k for k in ('output','official_unconstrained_proposal','denoised','proposal','raw','triangles','full') if k in data),None)
++    if key is None:raise ValueError('No triangle array in '+str(path)+': '+str(list(data)))
++    tri=np.asarray(data[key]).reshape(-1,3,3)
++    if not np.isfinite(tri).all() or len(tri)<K:raise ValueError('Invalid stage geometry')
++    ids=np.asarray(data.get('source_face_ids',np.arange(len(tri))),np.int64)
++    if ids.shape!=(len(tri),):raise ValueError('Invalid stage face-identity map')
++    return tri,ids,key
++
++
++def stage_specs(task):
++    if task['kind']=='SOURCE_GEO':
++        return [('SOURCE_C_PLUS_Y',task['new_raw_path']),('SOURCE_GEO',task['new_post_path'])]
++    o=task['original']
++    return [('RAW',o['raw_path']),('D0_FULL_PROPOSAL',o['proposal_path']),
++            ('RESTORED_C_PRE_GEO',o['pre_geo_path']),('BASE_POST',o['base_post_path']),('GEO_RAW',task['new_post_path'])]
++
++
++def one(task,manifest_sha):
++    dest=OUT/'gallery'/task['job_id'];done=dest/'complete.json'
++    specs=stage_specs(task)
++    identity=dict(job_id=task['job_id'],manifest_sha256=manifest_sha,
++        sources={str(resolve(p)):sha(p) for _,p in specs},render_source_sha256=sha(__file__))
++    if done.exists():
++        result=read(done)
++        if result['identity']!=identity:raise ValueError('Saved rendering identity changed')
++        for p,h in result['files'].items():
++            if sha(p)!=h:raise ValueError('Saved rendering changed')
++        return result
++    if dest.exists():raise RuntimeError('Incomplete rendering attempt; no silent retry: '+str(dest))
++    dest.mkdir(parents=True);write_new(dest/'attempt.json',dict(identity=identity,time=time.time(),model_calls=0))
++    tick=time.perf_counter();plt=H._mpl();fig=None
++    try:
++        q=task['request'];K=int(task['K']);bound=q['gallery_bounds'];depth=q['gallery_depth_bounds']
++        inp=arrays(q['inference_npz']);co=inp['C_vertices'][inp['C_faces_original']]
++        ncols=len(specs)
++        fig=plt.figure(figsize=(5.35*ncols,13.8),dpi=140,facecolor='white')
++        grid=fig.add_gridspec(4,ncols,left=.025,right=.99,bottom=.07,top=.90,wspace=.18,hspace=.32)
++        sections=[];faces=[];cells=[]
++        for col,(stage,path) in enumerate(specs):
++            tri,ids,key=mesh_arrays(path,K)
++            role=np.full(len(tri),'BULK',dtype='<U6');role[:K]='C'
++            g=dict(C=tri[:K],F=tri[K:],C_original=co,tri=tri)
++            facts=dict(stage=stage,path=str(resolve(path)),array_key=key,faces=len(tri),views=[])
++            for fi,(face,sid) in enumerate(zip(tri,ids)):
++                record=dict(job_id=task['job_id'],stage=stage,output_face_id=fi,raw_slot_id=int(sid),role='C' if fi<K else 'FREE')
++                for vi in range(3):
++                    for ci,axis in enumerate('xyz'):record[f'v{vi}_{axis}']=float(face[vi,ci])
++                faces.append(record)
++            for row,az in enumerate((-60,120)):
++                raster,scope=G.role_raster(tri,role,K,D.basis(az,23),np.asarray(depth['center']),depth['span'])
++                ax=fig.add_subplot(grid[row,col]);ax.imshow(raster);ax.set_axis_off()
++                ax.set_title(stage+f' | az={az}\nN={len(tri)} / free={len(tri)-K}',fontsize=9)
++                if stage=='D0_FULL_PROPOSAL':ax.text(.02,.02,'Blue is proposed C (not preserved)',fontsize=7,color='#126b91',transform=ax.transAxes)
++                facts['views'].append(dict(azimuth=az,**scope))
++            for row,view in ((2,'front'),(3,'side')):
++                ax=fig.add_subplot(grid[row,col]);H.draw_section(ax,g,[],bound,L,view,1)
++                axis,project=(2,(0,1)) if view=='front' else (0,(2,1))
++                pos=bound['front_positions' if view=='front' else 'side_positions'][1]
++                for kind,part,offset in (('C',tri[:K],0),('FREE',tri[K:],K)):
++                    segments,localids=H.finite_sections(part,axis,pos,1e-12*L)
++                    for segment,localid in zip(segments,localids):
++                        fi=int(localid)+offset;mid=segment[:,project].mean(0)
++                        label=('C' if kind=='C' else 'f')+str(int(ids[fi]))
++                        # Every intersected free face has a readable identifier
++                        # in the accompanying CSV, including overlapping labels.
++                        if kind=='FREE':
++                            ax.text(mid[0],mid[1],label,fontsize=5,color='#303640',zorder=8,
++                                bbox=dict(facecolor='white',alpha=.75,edgecolor='none',pad=.3))
++                        sections.append(dict(job_id=task['job_id'],stage=stage,view=view,plane_axis=axis,plane_position=float(pos),
++                            output_face_id=fi,raw_slot_id=int(ids[fi]),role=kind,label=label,
++                            segment_start_x=float(segment[0,0]),segment_start_y=float(segment[0,1]),segment_start_z=float(segment[0,2]),
++                            segment_end_x=float(segment[1,0]),segment_end_y=float(segment[1,1]),segment_end_z=float(segment[1,2])))
++                ax.set_title(stage+f' | {view}={pos:.5f}',fontsize=9)
++            cells.append(facts)
++        fig.suptitle(task['label']+' | '+task['request_id']+'\n'
++            +'Saved CPU backend counterfactual | fixed cameras, source frame and original central section planes\n'
++            +'Blue C / gray free; D0 full-proposal column temporarily contains moved proposed C',fontsize=11)
++        fig.text(.5,.025,'Section IDs f<RAW-slot> are listed in sections_face_ids.csv and face_catalog.csv. Cut line ends alone do not certify a physical crack.\n'
++            +'Central cuts retain inherited C-local bounds; full surface views show the complete source-fixed frame. Source pages are references, not a required generated style.',ha='center',fontsize=8)
++        buffer=io.BytesIO();fig.savefig(buffer,format='png',dpi=140)
++        image_path=dest/'comparison.png'
++        with image_path.open('xb') as f:f.write(buffer.getvalue())
++        csvwrite(dest/'sections_face_ids.csv',sections);csvwrite(dest/'face_catalog.csv',faces)
++        result=dict(status='RENDER_COMPLETE_PENDING_ACTUAL_VIEW',identity=identity,job_id=task['job_id'],
++            path=str(image_path),image_sha256=sha(image_path),cells=cells,section_rows=len(sections),
++            face_catalog_rows=len(faces),seconds=time.perf_counter()-tick,model_calls=0,scoring_calls=0,
++            peak_RSS_KiB=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
++            files={str(p):sha(p) for p in dest.iterdir() if p.is_file()})
++        if 'torch' in sys.modules:raise RuntimeError('CPU renderer imported torch')
++        write_new(done,result);print('RENDERED',task['job_id'],round(result['seconds'],2),flush=True)
++        return result
++    except BaseException as exc:
++        write_new(dest/'failure.json',dict(error=repr(exc),traceback=traceback.format_exc(),automatic_retry=False))
++        raise
++    finally:
++        if fig is not None:plt.close(fig)
++
++
++def run(manifest_path):
++    manifest_path=resolve(manifest_path);m=read(manifest_path)
++    if len(m['tasks'])!=10:raise ValueError('Expected 8 output and 2 source pages')
++    tick=time.perf_counter();receipts=[one(t,sha(manifest_path)) for t in m['tasks']]
++    target=OUT/'gallery/index.html'
++    if not target.exists():
++        body='<meta charset="utf-8"><h1>Saved backend comparison: RAW versus D0/GEO</h1><p>Actual geometry rasterization and finite sections; no model calls. Fixed inherited cameras and planes. Source references are separate from generated outputs.</p>'
++        for r in receipts:
++            relative=Path(r['path']).relative_to(OUT/'gallery').as_posix()
++            base=relative.rsplit('/',1)[0]
++            body+='<h2>'+html.escape(r['job_id'])+'</h2><a href="'+base+'/sections_face_ids.csv">Section face IDs</a> · <a href="'+base+'/face_catalog.csv">All face coordinates</a><br><a href="'+relative+'"><img style="width:100%" loading="lazy" src="'+relative+'"></a>'
++        target.write_text(body,encoding='utf-8')
++    result=dict(status='RENDER_COMPLETE_PENDING_ACTUAL_VIEW',pages=len(receipts),workers=1,images=receipts,
++        seconds=time.perf_counter()-tick,model_calls=0,scoring_calls=0,failures=0)
++    done=OUT/'gallery/COMPLETE.json'
++    if not done.exists():write_new(done,result)
++    return result
++
++
++if __name__=='__main__':
++    p=argparse.ArgumentParser();p.add_argument('--manifest',required=True)
++    a=p.parse_args();r=run(a.manifest);print(json.dumps({k:v for k,v in r.items() if k!='images'}))
+
+diff --git a/r2/pilots/bench_backend_counterfactual_v1/resource_check.py b/r2/pilots/bench_backend_counterfactual_v1/resource_check.py
+new file mode 100644
+--- /dev/null
++++ b/r2/pilots/bench_backend_counterfactual_v1/resource_check.py
+@@ -0,0 +1,31 @@
++"""Read-only runtime measurements for the registered CPU-only comparison."""
++import json, os, subprocess, time
++from pathlib import Path
++import psutil
++
++def run():
++    root=Path(__file__).resolve().parents[3]/'experiments/r2_bench_backend_counterfactual_v1'
++    root.mkdir(parents=True,exist_ok=True)
++    def cmd(args):
++        p=subprocess.run(args,capture_output=True,text=True)
++        return {'returncode':p.returncode,'stdout':p.stdout,'stderr':p.stderr}
++    info={'utc':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),
++          'gpu':cmd(['nvidia-smi','--query-gpu=name,memory.total,memory.used,memory.free,utilization.gpu','--format=csv']),
++          'gpu_processes':cmd(['nvidia-smi','--query-compute-apps=pid,process_name,used_memory','--format=csv']),
++          'cpu_logical':psutil.cpu_count(),'cpu_physical':psutil.cpu_count(logical=False),
++          'ram':psutil.virtual_memory()._asdict(),'cpu_percent_1sec':psutil.cpu_percent(1),
++          'processes':[],'plan':{'GPU_workers':0,'core_workers':1,'score_workers_max':2,
++          'render_workers_max':1,'threads_per_process':1,'max_overlapping_CPU_workers':3,
++          'reason':'Only 10 new geometry jobs; independent scores/render may overlap; no neural calls.'}}
++    for p in psutil.process_iter(['pid','name','cmdline','memory_info','cpu_times']):
++        try:
++            if any(s in (p.info['name'] or '').lower() for s in ('python','blender')):
++                i=p.info;i['memory_info']=i['memory_info']._asdict();i['cpu_times']=i['cpu_times']._asdict()
++                info['processes'].append(i)
++        except (psutil.NoSuchProcess,psutil.AccessDenied):pass
++    path=root/'resources'/('snapshot_'+str(time.time_ns())+'.json');path.parent.mkdir(exist_ok=True)
++    path.write_text(json.dumps(info,ensure_ascii=False,indent=2),encoding='utf-8')
++    print(json.dumps({'path':str(path),'cpu_logical':info['cpu_logical'],'cpu_pct':info['cpu_percent_1sec'],
++        'available_GiB':info['ram']['available']/2**30,'gpu':info['gpu'],'active_python_count':len(info['processes'])}))
++
++if __name__=='__main__':run()
+
+diff --git a/r2/pilots/bench_backend_counterfactual_v1/run.py b/r2/pilots/bench_backend_counterfactual_v1/run.py
+new file mode 100644
+--- /dev/null
++++ b/r2/pilots/bench_backend_counterfactual_v1/run.py
+@@ -0,0 +1,60 @@
++"""Resumable bounded CPU entry; sealed runs only verify their receipts."""
++import os
++os.environ['CUDA_VISIBLE_DEVICES']=''
++for k in ('OMP_NUM_THREADS','MKL_NUM_THREADS','OPENBLAS_NUM_THREADS','NUMEXPR_NUM_THREADS'):os.environ[k]='1'
++import argparse,hashlib,json,subprocess,sys,time
++from pathlib import Path
++ROOT=Path(__file__).resolve().parents[3]
++OUT=ROOT/'experiments/r2_bench_backend_counterfactual_v1'
++CODE=Path(__file__).parent
++def read(p):return json.loads(Path(p).read_text('utf-8-sig'))
++def sha(p):return hashlib.sha256(Path(p).read_bytes()).hexdigest()
++def verify(entries):
++    for p,h in entries.items():
++        if sha(p)!=h:raise ValueError('Hash differs: '+p)
++def module(name,*args):
++    subprocess.run([sys.executable,'-B','-m','r2.pilots.bench_backend_counterfactual_v1.'+name,*args],cwd=ROOT,check=True)
++def seal():
++    m=read(OUT/'manifest.json');verify(m['protected']);verify(m['source_hashes'])
++    core=read(OUT/'core_complete.json');score=read(OUT/'scores/COMPLETE.json');gallery=read(OUT/'gallery/COMPLETE.json')
++    assert core['GEO_calls']==10 and core['model_calls']==0 and score['outputs']==10 and gallery['pages']==10
++    review=read(OUT/'gallery/visual_review.json');audit=read(OUT/'audits/reference_review.json')
++    if audit.get('status')!='PASS':raise ValueError('Independent review not passed')
++    assert (OUT/'support/per_output_stage.csv').exists() and (OUT/'REPORT.md').exists()
++    archive=OUT/'source_archive';archive.mkdir(exist_ok=False)
++    entries={}
++    for p in sorted(CODE.glob('*.py')):
++        dest=archive/p.name;dest.write_bytes(p.read_bytes());entries[str(p)]=sha(p)
++    diffs=[]
++    for p in sorted(CODE.glob('*.py')):
++        rel=p.relative_to(ROOT).as_posix();lines=p.read_text('utf-8').splitlines(True)
++        diffs.append('diff --git a/'+rel+' b/'+rel+'\nnew file mode 100644\n--- /dev/null\n+++ b/'+rel+'\n@@ -0,0 +1,'+str(len(lines))+' @@\n'+''.join('+'+s for s in lines))
++    (archive/'code.diff').write_text('\n'.join(diffs),encoding='utf-8')
++    (archive/'receipt.json').write_text(json.dumps({'scope':'Actual new experiment CPU code; original production dependencies indexed by manifest hashes.','files':entries},indent=2),encoding='utf-8')
++    result={'status':'COMPLETE','utc':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),
++        'RAW_GEO':8,'SOURCE_GEO':2,'GEO_calls':10,'new_scores':10,'old_scores_reused':16,'gallery_pages':10,
++        'model_calls':0,'D0_calls':0,'training_updates':0,'OT_calls':0,'new_noise':0,
++        'original_protected_files':len(m['protected']),'inputs':m['protected'],'source_files':entries,
++        'limits':'Two training parents only; no default change, commit/push, training, or extra evaluation.',
++        'files':{str(p):sha(p) for p in sorted(OUT.rglob('*')) if p.is_file() and p.name!='COMPLETE.json'}}
++    # Include nested COMPLETE receipts too; exclude only this future root file.
++    for p in OUT.rglob('COMPLETE.json'):
++        if p!=OUT/'COMPLETE.json':result['files'][str(p)]=sha(p)
++    (OUT/'COMPLETE.json').write_text(json.dumps(result,indent=2),encoding='utf-8')
++    print(json.dumps({'status':'COMPLETE','files':len(result['files']),'new_model_calls':0}))
++def run(seal_only=False):
++    done=OUT/'COMPLETE.json'
++    if done.exists():
++        r=read(done);verify(r['inputs']);verify(r['files']);verify(r['source_files'])
++        print(json.dumps({'status':'VERIFIED_COMPLETE','files':len(r['files']),'new_model_calls':0,'new_GEO_calls':0}));return
++    if seal_only:seal();return
++    if not list((OUT/'resources').glob('snapshot_*.json')):module('resource_check')
++    module('support')
++    module('core','run')
++    if not (OUT/'support/per_output_stage.csv').exists():module('support','--analyse')
++    module('evaluate','--manifest',str(OUT/'manifest.json'),'--workers','2')
++    module('render','--manifest',str(OUT/'manifest.json'))
++    module('summarize')
++    print(json.dumps({'status':'AWAIT_ACTUAL_VISUAL_REVIEW_AND_REPORT','new_model_calls':0}))
++if __name__=='__main__':
++    p=argparse.ArgumentParser();p.add_argument('--seal',action='store_true');a=p.parse_args();run(a.seal)
+
+diff --git a/r2/pilots/bench_backend_counterfactual_v1/summarize.py b/r2/pilots/bench_backend_counterfactual_v1/summarize.py
+new file mode 100644
+--- /dev/null
++++ b/r2/pilots/bench_backend_counterfactual_v1/summarize.py
+@@ -0,0 +1,29 @@
++"""Deterministic small tables, no geometry recomputation or model calls."""
++import csv,json,statistics
++from pathlib import Path
++ROOT=Path(__file__).resolve().parents[3]
++OUT=ROOT/'experiments/r2_bench_backend_counterfactual_v1'
++def rows(p):
++    with p.open(encoding='utf-8-sig',newline='') as f:return list(csv.DictReader(f))
++def run():
++    allrows=rows(OUT/'scores/original_reference_scores.csv')+rows(OUT/'scores/new_per_output.csv')
++    fields=['actual_free_faces','deleted_free_faces','free_total_surface_area','CF_illegal_affected_free_fraction',
++            'FF_illegal_affected_free_fraction','ConflictCov_C','free_minimum_angle_lt5_fraction']
++    result=[]
++    for label in ['NATIVE_S6000','COVERAGE_FINAL','SOURCE_REFERENCE']:
++        for stage in ['RAW','BASE_POST','GEO_RAW','SOURCE_GEO']:
++            rr=[r for r in allrows if r['label']==label and r['stage']==stage]
++            if not rr:continue
++            r={'label':label,'stage':stage,'outputs':len(rr),'parents':len(set(x['parent_id'] for x in rr))}
++            for field in fields:
++                vals=[float(x[field]) for x in rr if x.get(field) not in ('',None)]
++                r[field]=statistics.mean(vals) if len(vals)==len(rr) else None
++            r['FF_illegal_pairs_sum']=sum(int(x['FF_illegal_pair_count']) for x in rr)
++            r['CF_illegal_pairs_sum']=sum(int(x['CF_illegal_pair_count']) for x in rr)
++            result.append(r)
++    p=OUT/'summary.csv'
++    with p.open('w',newline='',encoding='utf-8') as f:
++        w=csv.DictWriter(f,fieldnames=list(result[0]));w.writeheader();w.writerows(result)
++    (OUT/'summary.json').write_text(json.dumps(result,indent=2),encoding='utf-8')
++    print(json.dumps(result,indent=2))
++if __name__=='__main__':run()
+
+diff --git a/r2/pilots/bench_backend_counterfactual_v1/support.py b/r2/pilots/bench_backend_counterfactual_v1/support.py
+new file mode 100644
+--- /dev/null
++++ b/r2/pilots/bench_backend_counterfactual_v1/support.py
+@@ -0,0 +1,85 @@
++"""Frozen RAW-only below-C candidate region; no semantic or GT matching claim."""
++import os
++os.environ['CUDA_VISIBLE_DEVICES']=''
++for k in ('OMP_NUM_THREADS','MKL_NUM_THREADS','OPENBLAS_NUM_THREADS','NUMEXPR_NUM_THREADS'):os.environ[k]='1'
++import argparse, csv, hashlib, json, time
++from pathlib import Path
++import numpy as np
++ROOT=Path(__file__).resolve().parents[3]
++OUT=ROOT/'experiments/r2_bench_backend_counterfactual_v1'
++OLD=ROOT/'experiments/r2_bench_seat_coverage_v1'
++L=9.208138264587333
++def read(p):return json.loads(Path(p).read_text('utf-8'))
++def sha(p):return hashlib.sha256(Path(p).read_bytes()).hexdigest()
++def arr(p):
++    with np.load(p,allow_pickle=False) as z:return {k:z[k] for k in z.files}
++def save(p,x):
++    p=Path(p);p.parent.mkdir(parents=True,exist_ok=True)
++    if p.exists():raise FileExistsError(p)
++    p.write_text(json.dumps(x,ensure_ascii=False,indent=2),encoding='utf-8')
++def table(p,rows):
++    p.parent.mkdir(parents=True,exist_ok=True)
++    with p.open('w',newline='',encoding='utf-8') as f:
++        w=csv.DictWriter(f,fieldnames=list(rows[0]));w.writeheader();w.writerows(rows)
++def prepare():
++    p=OUT/'support/registration.json'
++    if p.exists():
++        r=read(p)
++        for x in r['rows']:assert sha(x['raw_path'])==x['raw_sha256']
++        return r
++    qs=[q for q in read(OLD/'eval_manifest.json')['requests'] if q['parent_id'].startswith(('a8','27'))]
++    rows=[];faces=[]
++    for q in qs:
++        for label in ('NATIVE_S6000','COVERAGE_FINAL'):
++            rawpath=OLD/'evaluation'/label/q['request_id']/'raw/raw.npz'
++            a=arr(rawpath);k=int(a['known_faces']);tri=a['raw'].reshape(-1,3,3).astype(float)
++            ymin=float(tri[:k,:,1].min());chosen=[]
++            for i,t in enumerate(tri[k:],k):
++                low=float(t[:,1].min());mid=float(t[:,1].mean());yes=low<ymin-.02*L and mid<ymin
++                if yes:chosen.append(i)
++                faces.append(dict(label=label,request_id=q['request_id'],slot_id=i,raw_min_y=low,
++                    raw_centroid_y=mid,C_min_y=ymin,below_C_candidate=yes))
++            rows.append(dict(label=label,request_id=q['request_id'],parent_id=q['parent_id'],noise_index=q['noise_index'],
++                raw_path=str(rawpath),raw_sha256=sha(rawpath),K=k,N=len(tri),C_min_y=ymin,slots=chosen))
++    assert len(rows)==8
++    r=dict(status='FROZEN',utc=time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),rows=rows,
++        rule='free face minY < min(C.Y)-0.02L AND centroidY < min(C.Y)',L=L,
++        interpretation='RAW below-C candidate region, not exhaustive semantic leg labels; may include underside/walls and miss high-centroid frames.',
++        selection_inputs='Only original RAW and its C; no new GEO/POST outcome used; no cross-model slot correspondence.',
++        raw_gallery_review='Root actually viewed four original paired RAW pages (a8/27 n0/n1), nonblind AI_PROXY.',
++        observations={'a8_NATIVE':'panel end supports/crossbar; n1 box-like body',
++                      'a8_COVERAGE':'four thin leg-like supports visible in both noises',
++                      '27_NATIVE':'large back/end panels with low crossbar',
++                      '27_COVERAGE':'back panel plus slim end arm/leg frames in both noises'})
++    table(OUT/'support/raw_selection_per_face.csv',faces);save(p,r)
++    print(json.dumps({'stage':'SUPPORT_FROZEN','counts':[(x['label'],x['parent_id'][:2],x['noise_index'],len(x['slots'])) for x in rows]}))
++    return r
++def stats(tri):
++    tri=np.asarray(tri).reshape(-1,3,3)
++    if not len(tri):return dict(count=0,area=0.,x_span=0.,y_span=0.,z_span=0.,min_height_median=None,min_edge_median=None)
++    lens=np.linalg.norm(tri-np.roll(tri,1,axis=1),axis=2)
++    area=np.linalg.norm(np.cross(tri[:,1]-tri[:,0],tri[:,2]-tri[:,0]),axis=1)/2
++    return dict(count=len(tri),area=float(area.sum()),**dict(zip(('x_span','y_span','z_span'),np.ptp(tri.reshape(-1,3),axis=0).tolist())),
++        min_height_median=float(np.median(2*area/np.maximum(lens.max(1),1e-30))),min_edge_median=float(np.median(lens.min(1))))
++def analyse():
++    r=prepare();m=read(OUT/'manifest.json');lookup={(t['label'],t['request_id']):t for t in m['tasks'] if t['kind']=='RAW_GEO'}
++    rows=[];checks=[]
++    for x in r['rows']:
++        t=lookup[x['label'],x['request_id']];orig=t['original'];ids=np.array(x['slots'],dtype=int)
++        raw=arr(x['raw_path'])['raw'].reshape(-1,3,3)
++        prop=arr(orig['proposal_path'])['official_unconstrained_proposal'].reshape(-1,3,3)
++        pre=arr(orig['pre_geo_path'])['output'].reshape(-1,3,3)
++        checks.append(dict(label=x['label'],request_id=x['request_id'],free_proposal_equals_restored_pre=np.array_equal(prop[x['K']:],pre[x['K']:]),
++            max_C_restore_displacement=float(np.linalg.norm(prop[:x['K']]-pre[:x['K']],axis=-1).max())))
++        stages={'RAW':raw[ids],'D0_PROPOSAL':prop[ids],'PRE_GEO':pre[ids]}
++        for name,path in [('BASE_POST',orig['base_post_path']),('GEO_RAW',t['new_post_path'])]:
++            a=arr(path);mask=np.isin(a['source_face_ids'],ids);stages[name]=a['vertices'][a['faces'][mask]]
++        initial=stats(stages['RAW'])
++        for stage,tris in stages.items():
++            s=stats(tris);rows.append(dict(label=x['label'],request_id=x['request_id'],parent_id=x['parent_id'],noise_index=x['noise_index'],stage=stage,
++                **s,raw_selected_count=len(ids),raw_area=initial['area'],area_ratio_to_raw=s['area']/initial['area'] if initial['area'] else None))
++    table(OUT/'support/per_output_stage.csv',rows);save(OUT/'support/restoration_check.json',checks)
++    print(json.dumps({'stage':'SUPPORT_DONE','rows':len(rows),'all_free_restore_unchanged':all(x['free_proposal_equals_restored_pre'] for x in checks)}))
++if __name__=='__main__':
++    p=argparse.ArgumentParser();p.add_argument('--analyse',action='store_true');a=p.parse_args()
++    analyse() if a.analyse else prepare()

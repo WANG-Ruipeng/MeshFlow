@@ -1,0 +1,2952 @@
+--- /dev/null
++++ b/experiments/mf_h1_local0/loss_screen/calibration.py
+@@ -0,0 +1,146 @@
++"""One actual-velocity calibration and bounded zero-update CUDA wiring."""
++from .common import *
++from native_t1.geometry_checkpoint import load_geometry_checkpoint
++from native_t1.accounting import count_ot_calls
++from native_t1.data import native_collate,model_inputs
++from native_t1.model import native_execution
++from native_t1.training import masked_fm_loss
++import traceback
++
++def inc(c,k):c[k]=c.get(k,0)+1
++def velocity_grad(loss,v,c,retain_graph=False):
++ inc(c,'velocity_autograd_attempts')
++ grad=torch.autograd.grad(loss,v,retain_graph=retain_graph)[0]
++ inc(c,'velocity_autograd_returns')
++ if not bool(torch.isfinite(grad).all()):raise FloatingPointError('Nonfinite velocity gradient')
++ return grad
++def endpoint(v,b):
++ mask=b['loss_mask']
++ return (b['xt']+(1-b['t'][:,None,None])*v)[mask].reshape(-1,3,3)
++def forward(model,b,c):
++ with native_execution(model,coordinates=b['xt']):
++  inc(c,'forward_attempts');v=model(*model_inputs(b)).float();inc(c,'forward_returns')
++ return v
++def strict_initial(device='cuda'):
++ m,a=load_geometry_checkpoint(INITIAL,device=device)
++ if a['sha256']!=INITIAL_SHA or a['state_sha256']!=INITIAL_STATE or a['cumulative_updates']!=2500 or a['parameters']!=PARAMETERS:
++  raise RuntimeError('Common pure-FM G0 identity differs')
++ return m,a
++def preflight(r,out):
++ if 'calibration' in r:raise RuntimeError('Calibration may run once only')
++ tick=time.perf_counter();configure_stable_runtime()
++ c=r['counts']['calibration'];bank=TargetBank();stream=stream_for(r)
++ with count_ot_calls(c):samples=stream.next_effective_batch()
++ labels=[bank.sample(s) for s in samples]
++ r['calibration']=dict(status='RUNNING',candidates={},states=[],clone_start_sha256=seal(r['stream_start']),
++  clone_end_sha256=seal(stream.state_dict()),formal_stream_advanced=False,model_forward_budget=16)
++ # Canonical GT relation coverage without model/noise calls.
++ r['applicability']={}
++ for p in (0,1):
++  for K in (4,8,12):
++   lab=bank.case(p,K);target=prepare_target('L1',lab)
++   r['applicability'][f'P{p}_K{K}']=plain(target['counts'])
++ candidates=r['calibration']['candidates']
++ for arm in CANDIDATES:candidates[arm]=dict(status='PENDING',rows=[])
++ write(r,out)
++ model,load_audit=strict_initial();r['calibration']['load']=load_audit
++ target_cache={}
++ for arm in CANDIDATES:
++  try:
++   for i,lab in enumerate(labels):target_cache[i,arm]=prepare_target(arm,lab)
++  except Exception as exc:
++   candidates[arm].update(status='CALIBRATION_FAILED',reason='Target preparation failed',error=repr(exc))
++ values={};actual_batches=[]
++ try:
++  for i,sample in enumerate(samples):
++   for t in (.5,.75):
++    b=native_collate([sample],'cuda',t_override=t)
++    with torch.no_grad():v=forward(model,b,c)
++    values[f's{i}_t{str(t).replace(".","p")}_velocity']=v.cpu().numpy()
++    row=dict(index=len(actual_batches),sample_index=i,t=t,parent=int(sample['parent_index']),K=int(sample['K']),
++      source_mapping_sha256=labels[i]['mapping_sha256'],original_shared_hash=sample['shared_input_sha256'],
++      actual_xt_sha256=array_hash(b['xt'].cpu().numpy()),velocity_sha256=array_hash(v.cpu().numpy()))
++    r['calibration']['states'].append(row);actual_batches.append((i,t))
++    leaf=v.detach().requires_grad_(True)
++    fm=masked_fm_loss(leaf,b['u'],b['valid_mask'],b['known_mask'])
++    fmgrad=velocity_grad(fm,leaf,c);fmnorm=float(torch.linalg.vector_norm(fmgrad))
++    for arm in CANDIDATES:
++     rec=dict(state_index=row['index'],sample_index=i,t=t,FM_gradient_L2=fmnorm,FM=float(fm.detach()))
++     if candidates[arm]['status']=='CALIBRATION_FAILED':
++      rec.update(finite=False,status='NOT_RUN_AFTER_CANDIDATE_FAILURE')
++      candidates[arm]['rows'].append(rec);continue
++     try:
++      aux=evaluate_loss(arm,endpoint(leaf,b),target_cache[i,arm],r,'calibration')
++      grad=velocity_grad(aux['loss'],leaf,c)
++      rec.update(applicable=bool(aux['applicable']),loss=float(aux['loss'].detach()),gradient_L2=float(torch.linalg.vector_norm(grad)),
++        finite=True,diagnostics=plain(aux.get('diagnostics',{})),counts=plain(aux['counts']))
++     except Exception as e:
++      rec.update(finite=False,error=repr(e));candidates[arm]['status']='CALIBRATION_FAILED'
++     candidates[arm]['rows'].append(rec)
++    event('calibration_state',state=row['index']+1,total=16)
++    write(r,out)
++  np.savez_compressed(Path(out)/'calibration_velocities.npz',**values)
++  r['calibration']['velocity_archive']=record(Path(out)/'calibration_velocities.npz')
++  for arm,entry in candidates.items():
++   rows=entry['rows'];app=[x for x in rows if x.get('applicable') and x.get('finite')]
++   nonzero=[x['gradient_L2'] for x in app if x['gradient_L2']>0]
++   entry.update(applicable_states=len(app),total_states=16,applicable_fraction=len(app)/16,
++    zero_gradient_fraction=sum(x['gradient_L2']==0 for x in app)/len(app) if app else None)
++   if entry['status']=='CALIBRATION_FAILED':continue
++   if not app:entry['status']='NOT_APPLICABLE';continue
++   if not nonzero:entry['status']='CALIBRATION_FAILED';entry['reason']='No finite nonzero velocity gradient';continue
++   numerator=float(np.median([x['FM_gradient_L2'] for x in app]));denominator=float(np.median(nonzero))
++   entry.update(status='PASS',lambda_geometry=.1*numerator/denominator,
++     median_FM_gradient=numerator,median_nonzero_geometry_gradient=denominator)
++   entry['lambda']=entry.pop('lambda_geometry')
++   if not np.isfinite(entry['lambda']) or entry['lambda']<=0:
++    entry.update(status='CALIBRATION_FAILED',reason='Nonfinite or nonpositive calibration weight');entry.pop('lambda',None)
++  if c['forward_attempts']!=16 or c['forward_returns']!=16:raise RuntimeError('Calibration forward budget differs')
++  # Oracle checks use the same real labels and FP32 path, no model call.
++  oracle={}
++  for arm in CANDIDATES:
++   if candidates[arm]['status']!='PASS':
++    oracle[arm]=dict(status='NOT_RUN_AFTER_CALIBRATION_FAILURE');continue
++   errs=[]
++   try:
++    for i in range(8):
++     b=native_collate([samples[i]],'cuda',t_override=.75)
++     result=evaluate_loss(arm,endpoint(b['u'],b),target_cache[i,arm],r,'oracle_real')
++     errs.append(float(result['loss']))
++    oracle[arm]=dict(status='PASS',max_abs=max(abs(x) for x in errs),values=errs)
++    if max(abs(x) for x in errs)>2e-6:raise RuntimeError('Actual FP32 oracle did not reach numerical zero')
++   except Exception as exc:
++    oracle[arm]=dict(status='FAILED',values=errs,error=repr(exc))
++    candidates[arm].update(status='ORACLE_FAILED',reason=repr(exc))
++  r['preflight_oracle']=oracle
++  # One additional native forward/backward per applicable loss proves its
++  # gradient reaches the actual generator under strict deterministic BF16.
++  model.set_trainable(True).eval();wc=r['counts']['wiring'];r['wiring']={}
++  for arm in ARMS:
++   if arm!='L0' and candidates[arm]['status']!='PASS':
++    r['arms'][arm]['status']=candidates[arm]['status'];continue
++   i,t=actual_batches[0] if arm=='L0' else actual_batches[next(x['state_index'] for x in candidates[arm]['rows'] if x.get('finite') and x.get('applicable') and x['gradient_L2']>0)]
++   b=native_collate([samples[i]],'cuda',t_override=t);model.zero_grad(set_to_none=True)
++   try:
++    with native_execution(model,coordinates=b['xt']) as runtime:
++     inc(wc,'forward_attempts');v=model(*model_inputs(b)).float();inc(wc,'forward_returns')
++     if arm=='L0':loss=masked_fm_loss(v,b['u'],b['valid_mask'],b['known_mask'])
++     else:loss=evaluate_loss(arm,endpoint(v,b),target_cache[i,arm],r,'wiring')['loss']
++     inc(wc,'backward_attempts');loss.backward();inc(wc,'backward_returns')
++    groups={group:magnitude([p.grad for name,p in model.named_parameters() if predicate(name)]) for group,predicate in
++       [('backbone',lambda n:n.startswith('backbone.')),('Geo',lambda n:n.startswith('context_encoder.')),('role',lambda n:n=='role_embedding')]}
++    if not all(x['finite'] for x in groups.values()) or groups['backbone']['L2']<=0:raise RuntimeError('Auxiliary backward failed to reach finite backbone gradients')
++    r['wiring'][arm]=dict(status='PASS',gradients=groups,runtime=runtime,optimizer_updates=0)
++    r['arms'][arm]['status']='READY'
++   except Exception as e:
++    r['wiring'][arm]=dict(status='FAILED',error=repr(e),traceback=traceback.format_exc())
++    r['arms'][arm]['status']='WIRING_FAILED'
++   finally:
++    model.zero_grad(set_to_none=True);write(r,out)
++  after=state_sha256(model);r['wiring_state_sha256_after']=after
++  if after!=INITIAL_STATE:raise RuntimeError('Zero-update preflight changed generator parameters')
++  r['calibration']['status']='PASS';r['calibration']['seconds']=time.perf_counter()-tick
++  write(r,out)
++ finally:
++  del model,target_cache;release()
++ event('preflight_complete',weights={a:e.get('lambda') for a,e in candidates.items()},status={a:e['status'] for a,e in r['arms'].items()})
+--- /dev/null
++++ b/experiments/mf_h1_local0/loss_screen/checkpoint.py
+@@ -0,0 +1,68 @@
++"""Explicit full-generator checkpoints for the geometry-loss screen."""
++from native_t1.runtime import configure_stable_runtime
++from pathlib import Path
++import torch
++from models.equidit import DiT
++from models.utils import get_embedder
++from native_t1.model import NativeInpaintingModel
++from native_t1.context_geometry import ContextGeometryEncoder,ENCODER_METADATA
++from native_t1.checkpoint import DEFAULT_CONFIG
++from native_t1.portable_checkpoint import config_sha256,_read_config,NATIVE_META
++from native_t1.artifacts import state_sha256,file_sha256
++from .common import ARMS,INITIAL_SHA,INITIAL_STATE,PARAMETERS
++SCHEMA='native_t1_geo_loss_screen_v1'
++def cpu(value):
++ if torch.is_tensor(value):return value.detach().cpu()
++ if isinstance(value,dict):return {k:cpu(v) for k,v in value.items()}
++ if isinstance(value,tuple):return tuple(cpu(v) for v in value)
++ if isinstance(value,list):return [cpu(v) for v in value]
++ return value
++def validate(p,protocol_sha=None):
++ if p.get('schema')!=SCHEMA or p.get('arm') not in ARMS:raise ValueError('Explicit loss-screen schema/arm required')
++ if p.get('initial_checkpoint_sha256')!=INITIAL_SHA or p.get('initial_state_sha256')!=INITIAL_STATE:raise ValueError('Wrong common G0_2500')
++ step=p.get('additional_updates')
++ if step not in (250,500) or p.get('base_cumulative_updates')!=2500 or p.get('cumulative_updates')!=2500+step:raise ValueError('Update identity changed')
++ if p.get('native_meta')!=NATIVE_META or p.get('config_sha256')!=config_sha256(DEFAULT_CONFIG):raise ValueError('Architecture identity differs')
++ context=p.get('context',{})
++ if any(context.get(k)!=v for k,v in ENCODER_METADATA.items()) or context.get('context_mode')!='geo' or context.get('additional_parameters')!=149888:raise ValueError('Geo definition differs')
++ if p.get('batch_in_progress') is not False or p.get('optimizer_step_in_progress') is not False:raise ValueError('Incomplete update')
++ if p.get('gate')!='FP32_t>=0.5' or p.get('ramp')!='min(additional_step/50,1)':raise ValueError('Loss schedule differs')
++ if protocol_sha is not None and p.get('protocol_sha256')!=protocol_sha:raise ValueError('Protocol differs')
++ if not isinstance(p.get('model'),dict) or not p['model'] or any(not torch.is_tensor(v) or v.dtype!=torch.float32 for v in p['model'].values()):raise ValueError('Full FP32 state required')
++ if p.get('auxiliary_network_parameters')!=0 or p.get('optimizer_reset_at_start') is not True:raise ValueError('Unexpected auxiliary network/optimizer resume')
++ start=p['stream_start'];end=p['stream_state']
++ if (end['seed'],end['arm'])!=(start['seed'],start['arm']) or end['batch_index']!=start['batch_index']+step or end['sample_index']!=start['sample_index']+8*step:raise ValueError('Input stream differs')
++ return p
++def save(path,model,optimizer,stream,*,arm,step,r):
++ path=Path(path);path.parent.mkdir(parents=True,exist_ok=True)
++ tmp=path.with_suffix('.pt.partial')
++ if path.exists() or tmp.exists():raise FileExistsError(path)
++ payload=dict(schema=SCHEMA,arm=arm,native_meta=dict(NATIVE_META),model=cpu(model.state_dict()),
++ model_state_sha256=state_sha256(model),context=model.context_encoder.metadata(),
++ optimizer=cpu(optimizer.state_dict()),optimizer_reset_at_start=True,batch_in_progress=False,optimizer_step_in_progress=False,
++ initial_checkpoint_sha256=INITIAL_SHA,initial_state_sha256=INITIAL_STATE,
++ base_cumulative_updates=2500,additional_updates=step,cumulative_updates=2500+step,
++ config_sha256=config_sha256(DEFAULT_CONFIG),input_sha256=r['assets']['inputs']['sha256'],
++ stream_start=r['stream_start'],stream_state=stream.state_dict(),protocol_sha256=r['protocol_sha256'],
++ lambda_geometry=0. if arm=='L0' else r['calibration']['candidates'][arm]['lambda'],
++ gate='FP32_t>=0.5',ramp='min(additional_step/50,1)',auxiliary_network_parameters=0,
++ loss_definition=r['protocol']['losses'][arm],supervision_ids_are_model_inputs=False)
++ validate(payload,r['protocol_sha256'])
++ torch.save(payload,tmp);tmp.replace(path)
++ return dict(path=str(path.resolve()),bytes=path.stat().st_size,sha256=file_sha256(path),
++ state_sha256=payload['model_state_sha256'],schema=SCHEMA,cumulative_updates=2500+step)
++def load(path,*,device='cuda',protocol_sha=None):
++ path=Path(path);p=torch.load(path,map_location='cpu',weights_only=True,mmap=True);validate(p,protocol_sha)
++ config=_read_config(Path(DEFAULT_CONFIG));configure_stable_runtime()
++ with torch.device('meta'):model=NativeInpaintingModel(DiT(**config),trainable=False)
++ model.context_encoder=ContextGeometryEncoder('geo',seed=p['context']['initialization_seed'])
++ model.backbone.x_embedder.embed_fn,_=get_embedder(config['pe_freq'],input_dims=3)
++ keys=model.load_state_dict(p['model'],strict=True,assign=True)
++ actual=state_sha256(model)
++ if actual!=p['model_state_sha256'] or sum(x.numel() for x in model.parameters())!=PARAMETERS:raise ValueError('State hash/shape/count differs')
++ if any(not bool(torch.isfinite(v).all()) for v in model.state_dict().values()):raise ValueError('Nonfinite generator')
++ model.set_trainable(False).eval().to(device)
++ return model,dict(status='PASS',path=str(path.resolve()),sha256=file_sha256(path),state_sha256=actual,
++ arm=p['arm'],cumulative_updates=p['cumulative_updates'],strict=True,missing_keys=list(keys.missing_keys),
++ unexpected_keys=list(keys.unexpected_keys),parameters=PARAMETERS,auxiliary_network_parameters=0,
++ geometry_loss_modules_constructed=0,optimizer_restored=False)
+--- /dev/null
++++ b/experiments/mf_h1_local0/loss_screen/common.py
+@@ -0,0 +1,118 @@
++"""Shared assets, supervision identity mapping and accounting for the fixed loss screen."""
++from native_t1.runtime import configure_stable_runtime
++import copy,gc,hashlib,json,time
++from pathlib import Path
++import numpy as np
++import torch
++from native_t1.artifacts import atomic_json,file_sha256,state_sha256,array_hash
++from native_t1.data import load_archive,NativeTrainingStream
++REPO=Path(__file__).resolve().parents[3]
++PACKAGE=Path(__file__).resolve().parent
++INITIAL=REPO/'native_t1/checkpoints/tgeo_g0_cumulative2500.pt'
++INITIAL_SHA='3a66659e86586f54d2ec30ed3d4a18275ab69ba0f8cba2866ef67b340c481c0e'
++INITIAL_STATE='6fa39d1c8c1deade17467075160281dcf01948c45e90ca4a9ad111a7dd97c392'
++ORIGINAL_SOURCE_SHA='1b51c87a8f99ece10c4040ab20bd3b5e6d0d5bebf7cd3d5981311e6202f8360b'
++INPUTS=REPO/'output/t1_publish_20260930/chair_n112.npz'
++INPUT_SHA='7059671d55f2f3be8777d13e02a62255d8a0c0c7c1c1c5b4f3b24357091ba6fc'
++BANK=REPO/'native_t1/runs/geometry_context_revised_20260930_153000/registration/evaluation_inputs.npz'
++BANK_SHA='2a27cf5d576272947b6944f71b7f17ab32ca1489d43d267204303c114a82248e'
++HISTORY=REPO/'native_t1/runs/geometry_rep_alignment_20260930_205100/results.json'
++HISTORY_SHA='935ce942c9d0244757179c43d28d06e68090b8aa454c7e39d20fd62f8ca589de'
++HEAD='5ef35b421ad00ccd3a97867ce0e33e5f77f65b1c'
++ARMS=tuple('L'+str(i) for i in range(7))
++CANDIDATES=ARMS[1:]
++DEV_SEEDS=tuple(range(9901,9909))
++CONF_SEEDS=tuple(range(10001,10009))
++LOG_STEPS=(1,10,50,100,250,500)
++PARAMETERS=130401155
++def record(path):
++ p=Path(path).resolve()
++ return dict(path=str(p),bytes=p.stat().st_size,sha256=file_sha256(p))
++def seal(value):
++ return hashlib.sha256(json.dumps(value,sort_keys=True,separators=(',',':'),allow_nan=False).encode()).hexdigest()
++def write(r,out): atomic_json(Path(out)/'results.json',r)
++def event(name,**kw): print(json.dumps(dict(event=name,**kw),allow_nan=False),flush=True)
++def release():
++ gc.collect()
++ if torch.cuda.is_initialized():torch.cuda.empty_cache()
++def plain(value):
++ if torch.is_tensor(value):
++  if value.numel()!=1:raise TypeError('Only scalar diagnostics may be serialized')
++  return value.detach().item()
++ if isinstance(value,np.generic):return value.item()
++ if isinstance(value,dict):return {k:plain(v) for k,v in value.items()}
++ if isinstance(value,(tuple,list)):return [plain(v) for v in value]
++ return value
++def magnitude(values):
++ values=[v.detach().float() for v in values if v is not None]
++ if not values:return dict(RMS=0.,L2=0.,numel=0,nonzero=0,finite=True)
++ n=sum(v.numel() for v in values);s=sum(float(v.square().sum()) for v in values)
++ return dict(RMS=(s/n)**.5,L2=s**.5,numel=n,nonzero=sum(int(torch.count_nonzero(v)) for v in values),
++             finite=all(bool(torch.isfinite(v).all()) for v in values))
++def audit_batch(stream,samples,step,labels):
++ return dict(step=step,batch_index=stream.batch_index,sample_index=stream.sample_index,
++  shared=[s['shared_input_sha256'] for s in samples],C=[s['context_sha256'] for s in samples],
++  target_labels=[v['mapping_sha256'] for v in labels],parents=[s['parent_index'] for s in samples],
++  K=[s['K'] for s in samples],t=[float(s['t']) for s in samples],stream_sha256=seal(stream.state_dict()))
++def stream_for(r):
++ stream=NativeTrainingStream(load_archive(INPUTS,INPUT_SHA),seed=r['stream_start']['seed'])
++ stream.load_state_dict(copy.deepcopy(r['stream_start']))
++ if seal(stream.state_dict())!=r['protocol']['training']['initial_stream_sha256']:raise RuntimeError('Initial input RNG differs')
++ return stream
++
++class TargetBank:
++ """Labels only: trusted indexed GT is never returned by model_inputs."""
++ def __init__(self):
++  self.archive=load_archive(INPUTS,INPUT_SHA);self.parents={}
++  with np.load(INPUTS,allow_pickle=False) as f:
++   for p in (0,1):
++    V=f[f'parent{p}_source_vertices'].copy();F=f[f'parent{p}_source_face_vertex_ids'].copy()
++    Y=f[f'parent{p}_target'].reshape(112,3,3).copy()
++    if V.dtype!=np.float32 or F.dtype!=np.int64 or not np.array_equal(V[F].view(np.uint32),Y.view(np.uint32)):
++     raise RuntimeError('Trusted raw-indexed archive does not reconstruct actual target')
++    self.parents[p]=dict(V=V,F=F,Y=Y)
++ def sample(self,sample):
++  parent=int(sample['parent_index']);K=int(sample['K']);entry=self.parents[parent]
++  if int(sample['donor_index'])!=parent:raise ValueError('Only correct-context training')
++  ids=np.asarray(sample['source_face_ids']);corners=np.asarray(sample['corner_permutations'])
++  known=sample['known_mask'];valid=sample['valid_mask']
++  if sorted(ids.tolist())!=list(range(112)) or not valid.all() or int(known.sum())!=K:raise ValueError('N/mask/source map changed')
++  if not np.array_equal(np.sort(corners,axis=1),np.broadcast_to(np.arange(3),(112,3))):raise ValueError('Invalid corner map')
++  vids=np.take_along_axis(entry['F'][ids],corners,axis=1)
++  coordinates=entry['V'][vids];Y=sample['x1'].reshape(112,3,3);C=sample['context'].reshape(112,3,3)
++  if coordinates[~known].tobytes()!=Y[~known].tobytes() or coordinates[known].tobytes()!=C[known].tobytes():
++   raise RuntimeError('Source labels not aligned with actual target slots (OT must reorder Z only)')
++  L=self.archive.cases[parent,K].bbox_diagonal
++  return dict(free_gt=Y[~known].copy(),known=C[known].copy(),free_ids=vids[~known].copy(),known_ids=vids[known].copy(),
++   bbox_L=L,parent=parent,K=K,mapping_sha256=seal(dict(ids=array_hash(vids),Y=array_hash(Y[~known]),C=array_hash(C[known]),mask=array_hash(known))))
++ def case(self,parent,K):
++  case=self.archive.cases[parent,K];entry=self.parents[parent]
++  return dict(free_gt=case.free_target.reshape(-1,3,3).copy(),known=case.constraints.copy(),
++   free_ids=entry['F'][case.free_source_ids].copy(),known_ids=entry['F'][case.source_face_ids].copy(),
++   bbox_L=case.bbox_diagonal,parent=parent,K=K)
++def prepare_target(name,label):
++ if name in ('L1','L2','L3','L6'):
++  from .relation_losses import prepare_relations
++  return prepare_relations(label['free_gt'],label['known'],label['free_ids'],label['known_ids'],label['bbox_L'])
++ if name in ('L4','L5'):
++  from .distribution_losses import prepare_distribution_target
++  return prepare_distribution_target(torch.from_numpy(label['free_gt']),label['bbox_L'])
++ raise ValueError(name)
++def evaluate_loss(name,pred,target,r=None,stage=None):
++ if name in ('L1','L2','L3','L6'):
++  from .relation_losses import relation_loss
++  fn=relation_loss
++ else:
++  from .distribution_losses import distribution_loss
++  fn=distribution_loss
++ if r is not None:
++  ledger=r['loss_accounting'].setdefault(stage,{}).setdefault(name,dict(calls_attempted=0,calls_returned=0,counters={}))
++  ledger['calls_attempted']+=1
++ with torch.autocast(device_type=pred.device.type,enabled=False):
++  output=fn(name,pred,target)
++ if output['loss'].ndim or not bool(torch.isfinite(output['loss'])):raise FloatingPointError(name+' nonfinite/nonscalar geometry loss')
++ if r is not None:
++  ledger['calls_returned']+=1
++  for key,value in plain(output.get('counts',{})).items():
++   if isinstance(value,(int,float)) and not isinstance(value,bool):ledger['counters'][key]=ledger['counters'].get(key,0)+value
++ return output
+--- /dev/null
++++ b/experiments/mf_h1_local0/loss_screen/cpu_distribution_record.json
+@@ -0,0 +1,100 @@
++{
++  "schema": "loss_screen_distribution_cpu_record_v1",
++  "status": "PASS",
++  "provenance": "Summary of the first completed CPU tool stdout; no rerun and no reconstructed outputs.",
++  "original_full_stdout_stored_separately": false,
++  "model_forwards": 0,
++  "model_backwards": 0,
++  "optimizer_updates": 0,
++  "original_noise_OT_calls": 0,
++  "CPU_coordinate_autograd_calls": 8,
++  "loss_calls": 40,
++  "CUDA_initialized": false,
++  "actual_work": {
++    "sinkhorn_solve_attempts": 45,
++    "sinkhorn_solve_returns": 45,
++    "sinkhorn_iterations": 4320,
++    "kernel_matrix_attempts": 120,
++    "kernel_matrix_returns": 120
++  },
++  "source_sha256": {
++    "distribution_losses.py": "445e7044b045288fe6590968553c60d4ac4dd5e9f7503861ef14404cdbf1ada7",
++    "test_distribution_losses.py": "e4d8b5b243c19f033d8d81703e2d56df2b6c2b19aace7a7e4c6e904a12af288f"
++  },
++  "thresholds": {
++    "FP64_oracle_loss_abs": 1e-13,
++    "FP64_oracle_gradient_max": 1e-11,
++    "finite_difference_step": 1e-06,
++    "finite_difference_atol": 2e-07,
++    "finite_difference_rtol": 2e-05,
++    "FP64_permutation_atol": 1e-12,
++    "FP64_swap_atol": 1e-12,
++    "FP32_oracle_loss_abs": 1e-06,
++    "FP32_oracle_gradient_max": 1e-05,
++    "marginal_L1_diagnostic_tolerance": 0.001
++  },
++  "results": {
++    "GT_oracle_L4": {
++      "loss": 0.0,
++      "maximum_gradient": 5.664956351236761e-18,
++      "max_marginal_L1_residual": 2.220446049250313e-16
++    },
++    "GT_oracle_L5": {
++      "loss": 0.0,
++      "maximum_gradient": 1.7347234759768068e-16
++    },
++    "GT_and_bbox_gradients": "None; original caller tensor gradient fields not accumulated",
++    "oracle_velocity_endpoint": "Both losses below1e-13 after Xt+(1-t)*u in FP64",
++    "finite_difference_L4": {
++      "absolute_errors": [
++        7.502655181151896e-13,
++        2.713381819577365e-12
++      ],
++      "loss": 1.4887859023800546e-05,
++      "max_marginal_L1_residual": 0.02446472894375129,
++      "convergence_status": "NOT_CONVERGED_AT_FIXED_96"
++    },
++    "finite_difference_L5": {
++      "absolute_errors": [
++        2.819458444491829e-09,
++        4.563571742721706e-12
++      ],
++      "loss": 0.026652628619063812
++    },
++    "all_S3_and_face_permutation": {
++      "L4_max_abs": 1.0842021724855044e-18,
++      "L5_max_abs": 1.8388068845354155e-16
++    },
++    "L4_swap_max_abs": 4.336808689942018e-19,
++    "missing_patch_copied_area": {
++      "L4": 0.017482218888998622,
++      "L5": 0.31815676984636365,
++      "L4_max_marginal_L1_residual": 2.2551937118836518e-05
++    },
++    "doubled_entire_surface": {
++      "L4": 0.0,
++      "L5": 0.3653962040631878,
++      "L5_predicted_mass": 2.0
++    },
++    "FP32_oracle": {
++      "L4_loss": 0.0,
++      "L5_loss": 0.0,
++      "L4_gradient_max": 1.5424989063816952e-09,
++      "L5_gradient_max": 2.483527055119339e-07
++    },
++    "collapsed_predicted_triangle": {
++      "L4_loss": 0.0174822136759758,
++      "L5_loss": 0.17088823020458221,
++      "L4_gradient_max": 0.09646198898553848,
++      "L5_gradient_max": 0.41486191749572754,
++      "zero_area_faces": 1,
++      "L4_area_floors": 1
++    },
++    "cache_accounting": "L4 first3/cache2 solves; L5 first9/cache6 kernel matrices"
++  },
++  "limitations": [
++    "The perturbed FP64 two-face L4 fixture has2.446% unit-mass marginal L1 residual after96 iterations.",
++    "Finite residual is reported, not silently clamped or retried;1e-3 is diagnostic only, not an automatic candidate stop.",
++    "Full unrolled96-step function passes finite differences; this does not prove the balanced OT optimum was reached."
++  ]
++}
+\ No newline at end of file
+--- /dev/null
++++ b/experiments/mf_h1_local0/loss_screen/cpu_relation_record.json
+@@ -0,0 +1,67 @@
++{
++  "status": "PASS",
++  "tests": 10,
++  "failures": 0,
++  "errors": 0,
++  "seconds": 0.13163441400000409,
++  "command": "python -B -m experiments.mf_h1_local0.loss_screen.test_relation_losses",
++  "first_execution": true,
++  "repeated": false,
++  "counts": {
++    "prepare_calls": 29,
++    "relation_forward_calls": 138,
++    "independent_distance_forward_calls": 4,
++    "autograd_calls": 18,
++    "finite_difference_evaluations": 72,
++    "model_forwards": 0,
++    "OT_calls": 0,
++    "optimizer_updates": 0
++  },
++  "CUDA_initialized": false,
++  "source_sha256": "f5ff5f1ccea888d45a13c278a70f0cc0f46a6ed61f02434f323597308e4fe783",
++  "test_sha256": "cc26b97dfded621fb8a6e164f0b1eee43c445a1bd9e1b9558733b39ffda3f5d0",
++  "numerical_thresholds": {
++    "FP64_oracle_loss": 1e-25,
++    "FP64_oracle_gradient": 1e-12,
++    "finite_difference_step": 1e-06,
++    "finite_difference_atol": 3e-07,
++    "finite_difference_rtol": 2e-06,
++    "FP64_permutation_atol": 2e-12,
++    "FP32_FP64_atol": 2e-06
++  },
++  "formula": {
++    "side_ambiguity_le": 1e-06,
++    "prediction_normal_epsilon": 1e-08,
++    "surface_cross_squared_epsilon": 1e-24,
++    "surface_edge_squared_epsilon": 1e-24,
++    "tangential_weight": 0.05,
++    "gamma_s": [
++      0,
++      0.25,
++      0.5,
++      0.75,
++      1
++    ],
++    "band_r": [
++      0.1,
++      0.2
++    ],
++    "L6_weights": [
++      0.5,
++      0.5
++    ]
++  },
++  "fixtures": [
++    "GT_oracle_and_zero_contact_gradient",
++    "four_losses_coordinate_finite_difference",
++    "all_S3_and_face_permutation_with_source_labels",
++    "coplanar_side_NOT_APPLICABLE_threshold",
++    "90degree_preservation_and_translation_blind_spot",
++    "tangential_vs_transverse_ratio",
++    "finite_surface_missing_midpoint_and_unknown_band",
++    "nonmanifold_all_pairs_no_spatial_adjacency",
++    "degenerate_predictions_retained_finite",
++    "fixed_GT_C_detach_FP32_FP64_scale_invariance"
++  ],
++  "note": "138 loss forwards includes 72 finite difference evaluations; prepare29 includes one expected inconsistent-ID rejection. Raw max errors were not separately saved; all preregistered assertions passed."
++}
+\ No newline at end of file
+--- /dev/null
++++ b/experiments/mf_h1_local0/loss_screen/distribution_losses.py
+@@ -0,0 +1,228 @@
++"""Fixed L4/L5 surface measures for the seven-arm loss screen.
++
++No model or data loading, training, noise-target OT, or import-time computation.
++L4 uses the complete regularized primal objective, not only transport cost.
++The finite 96-step solver is differentiated in full; residuals are reported.
++Reference: https://www.kernel-operations.io/geomloss/api/pytorch-api.html
++OT_epsilon = <C,pi> + epsilon KL(pi, a tensor b), with generalized KL.
++The cost here is squared distance, NOT the GeomLoss default half squared cost.
++"""
++from contextlib import nullcontext
++import torch
++
++EPSILON = 0.0025
++SINKHORN_ITERATIONS = 96
++AREA_FLOOR = 1e-12
++NORMAL_EPSILON = 1e-8
++SPATIAL_SCALES = (0.02, 0.05, 0.10)
++NORMAL_SCALE = 0.5
++MARGINAL_L1_DIAGNOSTIC_TOLERANCE = 1e-3
++SCHEMA = 'loss_screen_distribution_target_v1'
++FORMULA = 'complete_KL_symmetric_log_sinkhorn96_and_area_normal_MMD_v1'
++_WORK_COUNTS = dict(sinkhorn_solve_attempts=0, sinkhorn_solve_returns=0, sinkhorn_iterations=0,
++                    kernel_matrix_attempts=0, kernel_matrix_returns=0)
++
++
++def work_counters():
++    """Process-local actual attempts/returns, including failed calls; no reset."""
++    return dict(_WORK_COUNTS)
++
++
++def _tensor(value, name):
++    if not isinstance(value, torch.Tensor) or value.dtype not in (torch.float32, torch.float64):
++        raise TypeError(name + ' must be an FP32/FP64 tensor.')
++    if value.ndim != 3 or value.shape[1:] != (3, 3) or len(value) == 0:
++        raise ValueError(name + ' must have nonempty [F,3,3] shape.')
++    if not bool(torch.isfinite(value).all()):
++        raise ValueError(name + ' contains nonfinite coordinates.')
++    return value
++
++
++def _autocast_off(device):
++    return torch.autocast(device_type=device.type, enabled=False) if device.type in ('cpu', 'cuda') else nullcontext()
++
++
++def _quadrature(triangles):
++    bary = triangles.new_tensor(((2/3, 1/6, 1/6), (1/6, 2/3, 1/6), (1/6, 1/6, 2/3)))
++    return (triangles[:, None, :, :] * bary[None, :, :, None]).sum(2).reshape(-1, 3)
++
++
++def _geometry(triangles):
++    cross = torch.linalg.cross(triangles[:, 1]-triangles[:, 0], triangles[:, 2]-triangles[:, 0], dim=-1)
++    twice_area = torch.linalg.vector_norm(cross, dim=-1)
++    area = twice_area * 0.5
++    normal = cross / twice_area.clamp_min(NORMAL_EPSILON)[:, None]
++    Q = (normal[:, :, None] * normal[:, None, :]).reshape(-1, 9)
++    return dict(points=_quadrature(triangles), areas=area, Q=Q.repeat_interleave(3, dim=0),
++                normal_floor_count=int((twice_area < NORMAL_EPSILON).sum().detach()),
++                zero_area_count=int((area == 0).sum().detach()))
++
++
++def _probability(areas):
++    floored = areas.clamp_min(AREA_FLOOR)
++    # Each triangle has three equal quadrature weights.
++    weights = (floored / (3*floored.sum())).repeat_interleave(3)
++    return weights, int((areas < AREA_FLOOR).sum().detach())
++
++
++def _squared_distances(x, y):
++    # Direct differences preserve an exact zero on the diagonal, without
++    # clamping cancellation from x^2 + y^2 - 2xy or differentiating sqrt(0).
++    return (x[:, None, :] - y[None, :, :]).square().sum(-1)
++
++
++def _sinkhorn(x, a, y, b):
++    """One symmetric, damped Jacobi log-Sinkhorn solve with a fixed budget.
++
++    log(pi) = log(a)+log(b)+(f+g-C)/epsilon. Simultaneous half updates
++    commute with swapping (x,a) and (y,b), including at finite iteration.
++    No potential, transport plan, weight or iteration is detached.
++    """
++    _WORK_COUNTS['sinkhorn_solve_attempts'] += 1
++    C = _squared_distances(x, y)
++    loga, logb = a.log(), b.log()
++    f, g = torch.zeros_like(a), torch.zeros_like(b)
++    for _ in range(SINKHORN_ITERATIONS):
++        _WORK_COUNTS['sinkhorn_iterations'] += 1
++        f_next = -EPSILON * torch.logsumexp(logb[None, :] + (g[None, :]-C)/EPSILON, dim=1)
++        g_next = -EPSILON * torch.logsumexp(loga[:, None] + (f[:, None]-C)/EPSILON, dim=0)
++        f, g = .5*(f+f_next), .5*(g+g_next)
++    logpi = loga[:, None]+logb[None, :]+(f[:, None]+g[None, :]-C)/EPSILON
++    pi = logpi.exp()
++    transport = (pi*C).sum()
++    # Generalized KL includes both linear mass terms at finite residual.
++    relative_log = logpi-loga[:, None]-logb[None, :]
++    entropy = (pi*relative_log).sum()-pi.sum()+a.sum()*b.sum()
++    objective = transport+EPSILON*entropy
++    if not bool(torch.isfinite(objective)):
++        raise FloatingPointError('Nonfinite fixed-budget Sinkhorn objective.')
++    with torch.no_grad():
++        row_error, col_error = pi.sum(1)-a, pi.sum(0)-b
++        row_l1, col_l1 = float(row_error.abs().sum()), float(col_error.abs().sum())
++        diagnostics = dict(objective=float(objective), transport_cost=float(transport),
++            generalized_KL=float(entropy), regularized_entropy=EPSILON*float(entropy),
++            plan_mass=float(pi.sum()), row_L1_residual=row_l1, column_L1_residual=col_l1,
++            row_Linf_residual=float(row_error.abs().max()), column_Linf_residual=float(col_error.abs().max()),
++            row_max_relative_residual=float((row_error.abs()/a).max()),
++            column_max_relative_residual=float((col_error.abs()/b).max()),
++            convergence_status='WITHIN_REGISTERED_DIAGNOSTIC_TOLERANCE' if max(row_l1, col_l1)<=MARGINAL_L1_DIAGNOSTIC_TOLERANCE else 'NOT_CONVERGED_AT_FIXED_96',
++            iterations=SINKHORN_ITERATIONS)
++    _WORK_COUNTS['sinkhorn_solve_returns'] += 1
++    return objective, diagnostics
++
++
++def _kernel_values(points_a, Q_a, points_b, Q_b):
++    position_cost = _squared_distances(points_a, points_b)
++    normal_cost = _squared_distances(Q_a, Q_b)
++    result=[]
++    for scale in SPATIAL_SCALES:
++        _WORK_COUNTS['kernel_matrix_attempts'] += 1
++        result.append((-position_cost/(2*scale*scale)-normal_cost/(2*NORMAL_SCALE*NORMAL_SCALE)).exp())
++        _WORK_COUNTS['kernel_matrix_returns'] += 1
++    return result
++
++
++def _weighted_kernel_values(x, wx, y, wy):
++    return torch.stack([(wx[:, None]*wy[None, :]*kernel).sum()
++        for kernel in _kernel_values(x['points'], x['Q'], y['points'], y['Q'])])
++
++
++def prepare_distribution_target(free_gt, bbox_L):
++    """Detach/clone fixed GT only. Preparation performs zero Sinkhorn solves.
++
++    The returned dictionary may be retained across updates for the same target.
++    Cache entries contain only detached GT measures, GT-GT constants and their
++    diagnostics. Every distribution_loss result counts actual solves performed
++    in that call, so cache reuse cannot be mistaken for another GT-GT solve.
++    """
++    free_gt = _tensor(free_gt, 'free_gt')
++    length = torch.as_tensor(bbox_L, dtype=free_gt.dtype, device=free_gt.device).detach().clone()
++    if length.numel()!=1 or not bool(torch.isfinite(length)) or float(length)<=0:
++        raise ValueError('bbox_L must be a finite positive fixed scalar.')
++    return dict(schema=SCHEMA, formula=FORMULA, free_gt=free_gt.detach().clone(), bbox_L=length.reshape(()),
++        preparation_counts=dict(sinkhorn_solves=0, sinkhorn_iterations=0, kernel_matrix_evaluations=0),
++        _cache={})
++
++
++def _target_on(target, prediction):
++    if target.get('schema')!=SCHEMA or target.get('formula')!=FORMULA:
++        raise ValueError('Unexpected distribution target schema/formula.')
++    if target['free_gt'].requires_grad or target['bbox_L'].requires_grad:
++        raise ValueError('GT and bbox supervision must remain detached.')
++    key=(str(prediction.device),str(prediction.dtype))
++    if key not in target['_cache']:
++        with torch.no_grad():
++            length=target['bbox_L'].to(device=prediction.device,dtype=prediction.dtype)
++            triangles=target['free_gt'].to(device=prediction.device,dtype=prediction.dtype)/length
++            geometry=_geometry(triangles)
++            geometry['probability'],geometry['area_floor_count']=_probability(geometry['areas'])
++            geometry['total_area']=geometry['areas'].sum()
++            geometry['bbox_L']=length
++            geometry['sinkhorn_self']=None
++            geometry['kernel_self']=None
++            target['_cache'][key]=geometry
++    return target['_cache'][key]
++
++
++def distribution_loss(name, pred_free, target):
++    """Return one unweighted per-sample mean, leaving g(t)/ramp/lambda outside.
++
++    All predicted positions, areas, probabilities and unsigned normals retain
++    their full gradient. FP32 production and FP64 fixtures use the same formula.
++    Negative finite divergence/MMD values are reported as-is, never clamped.
++    """
++    if name not in ('L4','L5'):raise ValueError('Only L4 and L5 are defined here.')
++    pred_free=_tensor(pred_free,'pred_free')
++    counts=dict(sinkhorn_solves=0,sinkhorn_iterations=0,GTGT_sinkhorn_solves=0,GTGT_sinkhorn_cache_hits=0,
++        kernel_matrix_evaluations=0,GTGT_kernel_matrix_evaluations=0,GTGT_kernel_cache_hits=0)
++    with _autocast_off(pred_free.device):
++        gt=_target_on(target,pred_free)
++        pred=_geometry(pred_free/gt['bbox_L'])
++        common=dict(formula=FORMULA,coordinate_normalization='fixed training bbox diagonal',
++            predicted_faces=len(pred_free),GT_faces=len(target['free_gt']),quadrature_points_per_face=3,
++            predicted_total_area_normalized=float(pred['areas'].sum().detach()),GT_total_area_normalized=float(gt['total_area']),
++            predicted_zero_area_count=pred['zero_area_count'],GT_zero_area_count=gt['zero_area_count'],
++            predicted_normal_floor_count=pred['normal_floor_count'],GT_normal_floor_count=gt['normal_floor_count'],
++            fixed_GT_requires_grad=False,negative_value_clamped=False)
++        if name=='L4':
++            weights,floors=_probability(pred['areas'])
++            counts.update(sinkhorn_solves=2,sinkhorn_iterations=2*SINKHORN_ITERATIONS)
++            pg,pg_d=_sinkhorn(pred['points'],weights,gt['points'],gt['probability'])
++            pp,pp_d=_sinkhorn(pred['points'],weights,pred['points'],weights)
++            if gt['sinkhorn_self'] is None:
++                with torch.no_grad():gt['sinkhorn_self']=_sinkhorn(gt['points'],gt['probability'],gt['points'],gt['probability'])
++                counts['sinkhorn_solves']+=1;counts['sinkhorn_iterations']+=SINKHORN_ITERATIONS;counts['GTGT_sinkhorn_solves']=1
++            else:counts['GTGT_sinkhorn_cache_hits']=1
++            gg,gg_d=gt['sinkhorn_self']
++            loss=pg-.5*pp-.5*gg
++            residual=max(d[key] for d in (pg_d,pp_d,gg_d) for key in ('row_L1_residual','column_L1_residual'))
++            diagnostics=dict(**common,epsilon=EPSILON,iterations_per_solve=SINKHORN_ITERATIONS,
++                entropy='generalized KL(pi || a tensor b), including -mass(pi)+mass(a)*mass(b)',
++                solver='simultaneous half-damped log-Sinkhorn, zero potentials, full unrolled differentiation',
++                area_floor=AREA_FLOOR,predicted_area_floor_count=floors,GT_area_floor_count=gt['area_floor_count'],
++                predicted_probability_mass=float(weights.sum().detach()),GT_probability_mass=float(gt['probability'].sum()),
++                solves=dict(pred_GT=pg_d,pred_pred=pp_d,GT_GT=gg_d),max_marginal_L1_residual=residual,
++                marginal_L1_diagnostic_tolerance=MARGINAL_L1_DIAGNOSTIC_TOLERANCE,
++                convergence_status='WITHIN_REGISTERED_DIAGNOSTIC_TOLERANCE' if residual<=MARGINAL_L1_DIAGNOSTIC_TOLERANCE else 'NOT_CONVERGED_AT_FIXED_96',
++                finite_iteration_approximation=True,negative_value=bool(loss.detach()<0))
++        else:
++            if float(gt['total_area'])<=0:
++                return dict(loss=pred_free.sum()*0,applicable=False,counts=counts,
++                    diagnostics=dict(**common,status='NOT_APPLICABLE_ZERO_GT_AREA'))
++            wp=(pred['areas']/(3*gt['total_area'])).repeat_interleave(3)
++            wg=(gt['areas']/(3*gt['total_area'])).repeat_interleave(3)
++            pp=_weighted_kernel_values(pred,wp,pred,wp)
++            pg=_weighted_kernel_values(pred,wp,gt,wg)
++            counts['kernel_matrix_evaluations']=6
++            if gt['kernel_self'] is None:
++                with torch.no_grad():gt['kernel_self']=_weighted_kernel_values(gt,wg,gt,wg)
++                counts['kernel_matrix_evaluations']+=3;counts['GTGT_kernel_matrix_evaluations']=3
++            else:counts['GTGT_kernel_cache_hits']=1
++            gg=gt['kernel_self'];per_scale=pp+gg-2*pg;loss=per_scale.mean()
++            diagnostics=dict(**common,spatial_scales=list(SPATIAL_SCALES),normal_scale=NORMAL_SCALE,normal_epsilon=NORMAL_EPSILON,
++                predicted_measure_mass=float(wp.sum().detach()),GT_measure_mass=float(wg.sum()),
++                predicted_mass_independently_normalized=False,area_floor_applied=False,
++                per_scale_MMD2=per_scale.detach().cpu().tolist(),pred_pred=pp.detach().cpu().tolist(),
++                pred_GT=pg.detach().cpu().tolist(),GT_GT=gg.detach().cpu().tolist(),negative_value=bool(loss.detach()<0))
++        if not bool(torch.isfinite(loss)):raise FloatingPointError(name+' produced a nonfinite loss.')
++        return dict(loss=loss,applicable=True,counts=counts,diagnostics=diagnostics)
+\ No newline at end of file
+--- /dev/null
++++ b/experiments/mf_h1_local0/loss_screen/driver.py
+@@ -0,0 +1,86 @@
++"""Bounded loss-screen execution. No import starts a model, OT, or training."""
++from .common import *
++import argparse,sys,subprocess,traceback,difflib
++from .distribution_losses import work_counters
++
++def freeze_sources(r,out):
++ if 'source_snapshot' in r:raise RuntimeError('Source freeze already registered')
++ files=set((REPO/'native_t1').glob('*.py'))|set((REPO/'models').glob('*.py'))|set(PACKAGE.glob('*.py'))
++ files|={REPO/'utils/ot_utils.py',REPO/'utils/common_utils.py'}
++ files|=set((REPO/'experiments/mf_h1_local0').glob('*metrics.py'))
++ files|=set((REPO/'experiments/mf_h1_local0').glob('*evaluation.py'))
++ files|={REPO/'experiments/mf_h1_local0/guided_native_geometry_audit.py'}
++ files={p for p in files if p.is_file() and p.name!='report.py'}
++ folder=Path(out)/'source';folder.mkdir()
++ manifest=[]
++ for p in sorted(files):
++  rel=p.relative_to(REPO);dest=folder/rel;dest.parent.mkdir(parents=True,exist_ok=True);dest.write_bytes(p.read_bytes())
++  manifest.append(dict(original_path=str(p),snapshot_path=str(dest),sha256=file_sha256(p)))
++ r['source_snapshot']=dict(files=manifest,sha256=seal(manifest),report_presentation_excluded=True)
++ r['source_freeze']=dict(status='FROZEN',sha256=r['source_snapshot']['sha256'])
++ r['CPU_fixtures']['orchestration_prior_checks']=dict(
++  evaluation_scalar_fixture_checks=6,sampling_array_count_selection_fixture_checks=10,
++  status='PASS',repeat_executions=0,model_calls=0,OT_calls=0,autograd_calls=0,
++  note='Evaluation fixture preceded the additional frozen-sampling-state guard; that guard was reviewed statically')
++ actual_diff(out);write(r,out)
++
++def actual_diff(out):
++ lines=[]
++ for p in sorted(PACKAGE.glob('*')):
++  if not p.is_file() or p.suffix not in ('.py','.json'):continue
++  rel=p.relative_to(REPO).as_posix()
++  chunk=difflib.unified_diff([],p.read_text(encoding='utf-8').splitlines(keepends=True),fromfile='/dev/null',tofile='b/'+rel)
++  for line in chunk:lines.append(line if line.endswith('\n') else line+'\n\\ No newline at end of file\n')
++ (Path(out)/'code.diff').write_text(''.join(lines),encoding='utf-8')
++
++def accounting(r):
++ return dict(model_forward_attempts=sum(v.get('forward_attempts',0) for v in [r['counts']['calibration'],r['counts']['wiring'],*r['counts']['training'].values()]),
++   note='Sampling counts recorded separately by native clamped sampler; CPU fixtures remain separately itemized',
++   training_updates=sum(x['completed_updates'] for x in r['arms'].values()),
++   distribution_process=work_counters())
++
++def main():
++ parser=argparse.ArgumentParser();parser.add_argument('--out',required=True);parser.add_argument('--stage',choices=['all','preflight','train','development','confirmation','report'],default='all');a=parser.parse_args()
++ out=Path(a.out).resolve()
++ if REPO not in out.parents or out.parent!=REPO/'experiments/mf_h1_local0/outputs' or not out.name.startswith('loss_screen_'):raise ValueError('Isolated new output path required')
++ if a.stage in ('all','preflight'):
++  from .registration import register
++  r=register(out);freeze_sources(r,out)
++ else:
++  r=json.loads((out/'results.json').read_text())
++  from .training import source_guard
++  source_guard(r)
++  if seal(r['protocol'])!=r['protocol_sha256'] or seal(json.loads((out/'protocol.json').read_text()))!=r['protocol_sha256']:
++   raise RuntimeError('Frozen protocol differs on stage restart')
++ try:
++  if a.stage in ('all','preflight'):
++   from .calibration import preflight
++   preflight(r,out)
++  if a.stage in ('all','train'):
++   from .training import train_all
++   train_all(r,out)
++   if r['arms']['L0']['status']!='PASS':raise RuntimeError('No complete fresh L0; formal comparison blocked')
++  if a.stage in ('all','development'):
++   from .sampling import sample_phase
++   from .evaluation import evaluate_phase,select_candidates
++   sample_phase(r,out,'development');evaluate_phase(r,out,'development');select_candidates(r,out);write(r,out)
++  if a.stage in ('all','confirmation'):
++   from .sampling import sample_phase,replay_once
++   from .evaluation import evaluate_phase
++   sample_phase(r,out,'confirmation');evaluate_phase(r,out,'confirmation');replay_once(r,out);write(r,out)
++  if a.stage in ('all','report'):
++   from .report import write_report
++   if any(r.get('sampling_phases',{}).get(phase,{}).get('status') not in ('PASS','PASS_WITH_FAILED_CANDIDATES') for phase in ('development','confirmation')):
++    raise RuntimeError('Cannot report completed execution before both fixed sampling phases')
++   if set(r.get('summaries',{}))!={'development','confirmation'} or r.get('selection',{}).get('status')!='FROZEN' or r.get('sampling_replay',{}).get('status')!='PASS':
++    raise RuntimeError('Completed scoring, frozen selection and one replay are required')
++   r['status']='PASS_EXECUTION';r['stopped_at_registered_budget']=True
++   write_report(r,out)
++ except Exception as exc:
++  r['status']='INTERRUPTED_OR_FAILED';r.setdefault('execution_errors',[]).append(dict(stage=a.stage,error=repr(exc),traceback=traceback.format_exc()))
++  event('execution_failure',stage=a.stage,error=repr(exc));raise
++ finally:
++  r['actual_accounting']=accounting(r);write(r,out);actual_diff(out)
++ if a.stage=='all':event('execution_stopped',updates=r['training_total_updates'],status=r['status'])
++
++if __name__=='__main__':main()
+--- /dev/null
++++ b/experiments/mf_h1_local0/loss_screen/evaluation.py
+@@ -0,0 +1,343 @@
++"""Fixed-budget seven-arm loss screen: unchanged offline geometry and selection.
++
++No model, OT, training, repair, or geometry gradient is called by this module.
++Full CF/FF auditing is only performed when the root explicitly calls evaluate_phase.
++"""
++from __future__ import annotations
++import csv
++import hashlib
++import json
++from pathlib import Path
++import time
++import traceback
++import numpy as np
++
++from ..tgeo_m10_evaluation import (
++    load_bank, _input_audit, _path, _sha, _write, audit_new_seeds,
++    score_output, audit_context, cross_binding, summarize_values, concentration,
++    scalar_metrics, _counts, _summary, AREA_METRIC,
++)
++from ..t1_gated_factorial_evaluation import QUALITY_METRICS
++from ..native_inpainting_metrics import array_sha
++from ..guided_native_geometry_audit import _sha_array
++
++MODELS=tuple("L"+str(j) for j in range(7))
++DEVELOPMENT_SEEDS=tuple(range(9901,9909))
++CONFIRMATION_SEEDS=tuple(range(10001,10009))
++RMS="remainder_symmetric_RMS_bbox_pct"
++GAMMA="boundary_RMS_bbox_pct"
++PUBLIC_G0_STATE="6fa39d1c8c1deade17467075160281dcf01948c45e90ca4a9ad111a7dd97c392"
++PROTOCOL=dict(
++    method="exploratory fixed-budget direct geometry loss screen",
++    initialization="User override: common G0 cumulative2500; seven fresh500-update arms end cumulative3000",
++    baseline="Fresh L0 cumulative3000; prior G0 cumulative2500 is historical context only, excluded from ranking",
++    aggregation="Within each parent/patch average registered noises, then equal mean of six cells",
++    selection="Independent global best non-L0 RMS and Gamma slots; require strict improvement over L0; deduplicate, never fill with runner-up",
++    exact_tie_break="Registered model order L1,L2,L3,L4,L5,L6",
++    paired_sign="candidate minus reference; no marginal-median subtraction",
++    confirmation="New noise on previously seen parents/patches, not new-object or independent-training-seed replication",
++    quality="Report tradeoffs; no post-hoc composite score or additional quality selection threshold")
++
++
++def audit_seeds(seeds,out):
++    return audit_new_seeds(seeds,out)
++
++
++def _seeds(r,phase):
++    if phase not in ("development","confirmation"):raise ValueError("Unknown phase")
++    protocol=r.get("protocol",{}); evaluation=protocol.get("evaluation",{})
++    value=evaluation.get(phase,{}).get("seeds") if isinstance(evaluation.get(phase),dict) else None
++    if value is None:value=evaluation.get(phase+"_seeds",protocol.get(phase+"_seeds"))
++    if value is None:value=DEVELOPMENT_SEEDS if phase=="development" else CONFIRMATION_SEEDS
++    seeds=tuple(int(s) for s in value)
++    if len(seeds)!=8 or len(set(seeds))!=8:raise ValueError("Eight distinct registered seeds required")
++    return seeds
++
++
++def _expected(models,seeds):
++    return {(m,p,j,s) for m in models for p in (0,1) for j in (0,1,2)
++            for s in (seeds if j==0 else seeds[:2])}
++
++
++def _identity(row):
++    return row["model"],int(row["parent"]),int(row["patch"]),int(row["seed"])
++
++
++def _seal(value):
++    return hashlib.sha256(json.dumps(value,sort_keys=True,separators=(",",":"),allow_nan=False).encode()).hexdigest()
++
++
++def _metric_reference_checks(metrics,bank,parent,patch):
++    extra=metrics["t1_native_confirmation"]
++    if metrics["K"]!=12 or metrics["total_faces"]!=112 or metrics["free_faces"]!=100 or extra["C_PRESERVED"]!="PASS":
++        raise ValueError("C/K/N/free score identity differs")
++    if extra["nan_coordinate_count"] or extra["inf_coordinate_count"] or not extra["all_coordinates_finite"]:
++        raise ValueError("Nonfinite recorded geometry")
++    for target in (0,1):
++        prefix=f"parent{target}_patch{patch}_"
++        if metrics["remainder"]["cross"][target]["target_sample_sha256"]!=array_sha(bank["arrays"][prefix+"pairwise_target_points"]):
++            raise ValueError("Pairwise target512 differs from frozen reference")
++        if metrics["common_unknown_R12"]["cross"][target]["target_point_sha256"]!=array_sha(bank["arrays"][prefix+"coverage_points"]):
++            raise ValueError("Coverage target512 differs from frozen reference")
++    prefix=f"parent{parent}_patch{patch}_"; boundary=metrics["guided_geometry_audit"]["boundary"]
++    if boundary["point_sha256"]!=_sha_array(bank["arrays"][prefix+"boundary_points"]) or boundary["weight_sha256"]!=_sha_array(bank["arrays"][prefix+"boundary_weights"]):
++        raise ValueError("Gamma points or weights differ")
++    for scope,count in (("CF",1200),("FF",4950),("CC",66)):
++        if extra["detector_views"][scope]["verified"]["tested_pairs"]!=count:
++            raise ValueError("Independent pair denominator differs: "+scope)
++
++
++def _raw(row,bank,parent):
++    path=_path(row["raw_path"])
++    if _sha(path)!=row["raw_sha256"]:raise ValueError("Raw file identity differs")
++    with np.load(path,allow_pickle=False) as z:
++        full=z["output"].copy();states=z["path"].copy()
++    if full.dtype!=np.float32 or full.size!=112*9 or states.dtype!=np.float32 or states.size!=51*112*9:
++        raise ValueError("Raw FP32 N112/51-state shape differs")
++    full=full.reshape(112,3,3);states=states.reshape(51,112,3,3)
++    C=bank["cases_by_key"][parent,12]["constraints"]
++    if not np.isfinite(states).all() or states[-1].tobytes()!=full.tobytes() or any(x[:12].tobytes()!=C.tobytes() for x in states):
++        raise ValueError("Nonfinite, changed C, or endpoint not final state")
++    return full
++
++
++def aggregate_results(rows,phase,models,seeds,*,candidate_status=None,pairings=None):
++    """Complete eligible models only; pure scalar/JSON arithmetic."""
++    rows=list(rows);models=tuple(models);seeds=tuple(seeds)
++    if "L0" not in models or len(set(models))!=len(models):raise ValueError("Unique models and L0 required")
++    index={_identity(x):x for x in rows}
++    if set(index)!=_expected(models,seeds) or len(index)!=len(rows):raise ValueError("Incomplete/duplicate phase matrix")
++    if any(x.get("phase")!=phase or x.get("K",12)!=12 for x in rows):raise ValueError("Phase/K mismatch")
++    pairs=list(pairings) if pairings is not None else [(m,"L0") for m in models if m!="L0"]
++    result=dict(schema="loss_screen_phase_summary_v1",phase=phase,models=list(models),seeds=list(seeds),
++        patches={},macros={},candidate_status=candidate_status or {},protocol=PROTOCOL,geometry_calls=0,model_calls=0)
++    for patch in (0,1,2):
++        ss=seeds if patch==0 else seeds[:2]
++        block=dict(patch=patch,seeds=list(ss),models={},paired={},bindings=[])
++        for model in models:
++            group=dict(parents={},binding={})
++            for parent in (0,1):
++                values=[dict(seed=s,**scalar_metrics(index[model,parent,patch,s]["metrics"])) for s in ss]
++                names=[k for k in values[0] if k!="seed"]
++                group["parents"][str(parent)]=dict(per_seed=values,metrics={k:_summary(values,k) for k in names})
++            binding=[dict(seed=s,**cross_binding(index[model,0,patch,s]["metrics"],index[model,1,patch,s]["metrics"])) for s in ss]
++            group["binding"]=dict(per_seed=binding,metrics={k:summarize_values(binding,k,higher_better=True) for k in ("Delta0","Delta1","B")},
++                both_positive_count=sum(x["both_directions_positive"] for x in binding),concentration=concentration(binding))
++            block["bindings"].extend(dict(model=model,patch=patch,seed=x["seed"],metrics=x) for x in binding)
++            block["models"][model]=group
++        for candidate,reference in pairs:
++            pair=dict(candidate=candidate,reference=reference,parents={},binding={})
++            for parent in ("0","1"):
++                old=block["models"][reference]["parents"][parent]["per_seed"];new=block["models"][candidate]["parents"][parent]["per_seed"]
++                values=[dict(seed=a["seed"],**{k:b[k]-a[k] if a[k] is not None and b[k] is not None else None for k in a if k!="seed"}) for a,b in zip(old,new)]
++                names=[k for k in values[0] if k!="seed"]
++                pair["parents"][parent]=dict(per_seed_candidate_minus_reference=values,metrics={k:_summary(values,k) for k in names},
++                    improvement_counts={k:_counts(values,k) for k in names})
++            old=block["models"][reference]["binding"]["per_seed"];new=block["models"][candidate]["binding"]["per_seed"]
++            values=[dict(seed=a["seed"],**{k:b[k]-a[k] for k in ("Delta0","Delta1","B")}) for a,b in zip(old,new)]
++            pair["binding"]=dict(per_seed_candidate_minus_reference=values,
++                metrics={k:summarize_values(values,k,higher_better=True) for k in ("Delta0","Delta1","B")},
++                higher_B_count=sum(x["B"]>0 for x in values),concentration=concentration(values))
++            block["paired"][candidate+"_minus_"+reference]=pair
++        result["patches"][str(patch)]=block
++    names=list(next(iter(result["patches"]["0"]["models"].values()))["parents"]["0"]["metrics"])
++    for model in models:
++        macro={}
++        for key in names:
++            cells=[dict(parent=p,patch=j,n=len(seeds) if j==0 else 2,mean=result["patches"][str(j)]["models"][model]["parents"][str(p)]["metrics"][key]["mean"])
++                for p in (0,1) for j in (0,1,2)]
++            available=all(c["mean"] is not None and np.isfinite(c["mean"]) for c in cells)
++            macro[key]=dict(six_cells=cells,macro_mean=float(np.mean([c["mean"] for c in cells])) if available else None,
++                all_six_cells_available=available,cell_weight=1/6,output_weighting="First noise mean within cell, then six equal cells")
++        result["macros"][model]=macro
++    result["macro_pairs"]={}
++    for candidate,reference in pairs:
++        result["macro_pairs"][candidate+"_minus_"+reference]={key:dict(
++            difference=result["macros"][candidate][key]["macro_mean"]-result["macros"][reference][key]["macro_mean"]
++                if result["macros"][candidate][key]["macro_mean"] is not None and result["macros"][reference][key]["macro_mean"] is not None else None,
++            six_cell_differences=[dict(parent=a["parent"],patch=a["patch"],difference=b["mean"]-a["mean"] if a["mean"] is not None and b["mean"] is not None else None)
++                for a,b in zip(result["macros"][reference][key]["six_cells"],result["macros"][candidate][key]["six_cells"])])
++            for key in names}
++    json.dumps(result,allow_nan=False);return result
++
++
++def _historical_reference(r,banks):
++    record=r["assets"]["historical_G0_results"];path=_path(record["path"])
++    if _sha(path)!=record["sha256"]:raise ValueError("Historical results identity changed")
++    source=json.loads(path.read_text(encoding="utf-8-sig"))
++    if source["status"]!="PASS_EXECUTION":raise ValueError("Historical G0 run incomplete")
++    cp=source["arms"]["G0"]["checkpoints"]["500"]
++    if cp.get("state_sha256",cp.get("generator_state_sha256"))!=PUBLIC_G0_STATE or cp["cumulative_updates"]!=2500:
++        raise ValueError("Historical G0 tensor/update identity differs")
++    prior=[x for x in source["scores"] if x["model"]=="G0"]
++    raw={_identity(x):x for x in source["generated"] if x["model"]=="G0"}
++    if len(prior)!=24 or {_identity(x) for x in prior}!=_expected(("G0",),DEVELOPMENT_SEEDS):
++        raise ValueError("Historical G0 exact24 development matrix missing")
++    rows=[];compact=[]
++    for row in prior:
++        j=int(row["patch"]);p=int(row["parent"]);_raw(raw[_identity(row)],banks[j],p)
++        path=_path(row["metrics_path"])
++        if _sha(path)!=row["metrics_sha256"]:raise ValueError("Historical metric file changed")
++        payload=json.loads(path.read_text(encoding="utf-8"));metrics=payload["metrics"]
++        if payload["model"]!="G0" or _identity(payload)!=_identity(row) or payload["raw_sha256"]!=raw[_identity(row)]["raw_sha256"]:
++            raise ValueError("Historical score identity differs")
++        _metric_reference_checks(metrics,banks[j],p,j)
++        values=scalar_metrics(metrics)
++        if values!=row["scalars"]:raise ValueError("Historical saved scalar definitions differ")
++        identity=dict(phase="development",model="G0_initial",parent=p,patch=j,patch_group="original" if j==0 else "new",
++            seed=int(row["seed"]),K=12,raw_path=row["raw_path"],raw_sha256=raw[_identity(row)]["raw_sha256"],reused=True,ranked=False)
++        rows.append(dict(identity,metrics=metrics))
++        compact.append(dict(identity,scalars=values,metrics_path=row["metrics_path"],metrics_sha256=row["metrics_sha256"]))
++    return rows,compact,dict(status="PASS",source_results=record,source_model="G0",state_sha256=PUBLIC_G0_STATE,
++        rows_reused=24,models_constructed=0,new_geometry_scores=0,source_checkpoint_path_required=False,
++        scope="Historical cumulative2500 reference only; fresh L0 cumulative3000 is the baseline for ranking")
++
++
++def _csv(path,rows):
++    names=sorted({k for row in rows for k in row.get("scalars",{})})
++    identity=["phase","model","parent","patch","seed","K","status","reused","ranked","raw_path","metrics_path"]
++    with Path(path).open("x",encoding="utf-8",newline="") as stream:
++        writer=csv.DictWriter(stream,fieldnames=identity+names);writer.writeheader()
++        for row in rows:writer.writerow({**{k:row.get(k) for k in identity},**row.get("scalars",{})})
++    return dict(path=str(Path(path).resolve()),sha256=_sha(path),bytes=Path(path).stat().st_size)
++
++
++def evaluate_phase(r,out,phase):
++    """Explicit fresh scoring only after each planned model has finished its phase."""
++    tick=time.perf_counter();out=_path(out);seeds=_seeds(r,phase)
++    if r.get("summaries",{}).get(phase):raise RuntimeError("No automatic phase rescoring")
++    models=MODELS if phase=="development" else tuple(["L0"]+r["selection"]["selected_models"])
++    if phase=="confirmation" and _seal({k:v for k,v in r["selection"].items() if k not in ("selection_sha256","artifact")})!=r["selection"]["selection_sha256"]:
++        raise ValueError("Frozen selection changed")
++    generated=[x for x in r.get("generated",[]) if x.get("phase")==phase]
++    if any(x["model"] not in models or x.get("reused",False) for x in generated):raise ValueError("Unexpected/reused main output")
++    identities=[_identity(x) for x in generated]
++    if len(identities)!=len(set(identities)) or not set(identities)<=_expected(models,seeds):raise ValueError("Unexpected or duplicate output identity")
++    record=r["assets"]["evaluation_inputs"];banks=load_bank(record["path"],record["sha256"])
++    directory=out/"audit"/phase;directory.mkdir(parents=True,exist_ok=False)
++    counts=dict(model_calls=0,geometry_autograd_calls=0,optimizer_updates=0,OT_calls=0,repairs=0)
++    input_records=[]
++    for patch,bank in banks.items():
++        bank["input_topology"]=_input_audit(bank,patch,counts)
++        bank["context_audits"]={p:audit_context(bank["cases_by_key"][p,12]["constraints"],bank["cases_by_key"][p,12]["bbox_diagonal"],counts) for p in (0,1)}
++        input_records.append(_write(directory/f"input_patch{patch}.json",dict(input_topology=bank["input_topology"],context_audits=bank["context_audits"],reference_audit=bank["reference_audit"])))
++    full_rows=[];compact=[];statuses={};eligible=[]
++    for model in models:
++        arm=r.get("arms",{}).get(model,{})
++        rows=[x for x in generated if x["model"]==model]
++        sampling_status=r.get("sampling_phases",{}).get(phase,{}).get("models_audit",{}).get(model,{}).get("status")
++        status=dict(sampling_status=sampling_status,training_status=arm.get("status","NOT_RECORDED"),completed_updates=arm.get("completed_updates"),
++            output_count=len(rows),expected_outputs=24,errors=[])
++        statuses[model]=status
++        if sampling_status!="PASS" or arm.get("status")!="PASS" or arm.get("completed_updates")!=500 or {_identity(x) for x in rows}!=_expected((model,),seeds):
++            status.update(status="INELIGIBLE_INCOMPLETE_OR_FAILED",reason="Require passing frozen-state sampling, fresh500-update endpoint, and complete registered24 outputs")
++            if model=="L0":raise RuntimeError("Fresh baseline failed or incomplete")
++            continue
++        start_index=len(full_rows)
++        for row in rows:
++            started=time.perf_counter();p=int(row["parent"]);j=int(row["patch"])
++            identity=dict(phase=phase,model=model,parent=p,patch=j,patch_group="original" if j==0 else "new",
++                seed=int(row["seed"]),K=12,raw_path=row["raw_path"],raw_sha256=row["raw_sha256"],reused=False,ranked=True)
++            try:
++                raw=_raw(row,banks[j],p);metrics=score_output(raw,banks[j],p,ledger=counts)
++                _metric_reference_checks(metrics,banks[j],p,j);values=scalar_metrics(metrics)
++                if any(values[k] is None or not np.isfinite(values[k]) for k in (RMS,GAMMA,AREA_METRIC)):
++                    raise ValueError("Nonfinite required endpoint metric")
++                artifact=_write(directory/f"{model}_P{p}_patch{j}_seed{row['seed']}.json",dict(identity,status="PASS",metrics=metrics,scoring_seconds=time.perf_counter()-started))
++                full_rows.append(dict(identity,metrics=metrics))
++                compact.append(dict(identity,status="PASS",scalars=values,metrics_path=artifact["path"],metrics_sha256=artifact["sha256"],
++                    metrics_bytes=artifact["bytes"],scoring_seconds=time.perf_counter()-started))
++            except Exception as error:
++                failure=dict(identity,status="FAIL_EVALUATION",error=repr(error),traceback=traceback.format_exc(),scoring_seconds=time.perf_counter()-started)
++                artifact=_write(directory/f"{model}_P{p}_patch{j}_seed{row['seed']}_FAILED.json",failure)
++                status["errors"].append(dict(seed=row["seed"],parent=p,patch=j,error=repr(error),artifact=artifact))
++                compact.append(dict(identity,status="FAIL_EVALUATION",scalars={},metrics_path=artifact["path"],metrics_sha256=artifact["sha256"]))
++            print(json.dumps(dict(event="loss_screen_offline_score",phase=phase,model=model,parent=p,patch=j,seed=row["seed"],scored_or_failed=len(compact))),flush=True)
++        if status["errors"]:
++            del full_rows[start_index:]
++            status.update(status="INELIGIBLE_EVALUATION_FAILURE",reason="All observed rows retained; partial performance is not ranked")
++            if model=="L0":raise RuntimeError("Baseline evaluation failed; cannot form screen")
++        else:
++            eligible.append(model);status["status"]="ELIGIBLE"
++    summary=aggregate_results(full_rows,phase,eligible,seeds,candidate_status=statuses)
++    if phase=="development":
++        old,old_compact,audit=_historical_reference(r,banks)
++        current=[x for x in full_rows if x["model"]=="L0"]
++        reference=aggregate_results(current+old,"development",("L0","G0_initial"),seeds,pairings=[("L0","G0_initial")])
++        r["historical_reference"]=dict(audit=audit,scores=old_compact,summary=reference,ranked=False)
++    r.setdefault("scores",[]).extend(compact)
++    r.setdefault("summaries",{})[phase]=summary
++    csv_record=_csv(out/f"compact_per_output_{phase}.csv",compact)
++    if phase=="development":_csv(out/"compact_historical_G0_initial.csv",r["historical_reference"]["scores"])
++    r.setdefault("evaluation_ledger",{})[phase]=dict(status="PASS",counts=counts,seconds=time.perf_counter()-tick,
++        input_audits=input_records,scored_or_failed=len(compact),eligible_models=eligible,candidate_status=statuses,
++        complete_pairs_per_output=dict(CF=1200,FF=4950,CC_cached=66),immutable_context_audits=6,
++        historical_reused_outputs=24 if phase=="development" else 0,historical_new_scores=0,compact_csv=csv_record)
++    return r["evaluation_ledger"][phase]
++
++
++def selection_from_summary(summary,checkpoints=None):
++    """Prespecified exact ranking; quality remains visible, never a hidden gate."""
++    if summary["phase"]!="development" or "L0" not in summary["models"]:raise ValueError("Complete development baseline required")
++    candidates=[m for m in MODELS[1:] if m in summary["models"] and summary["candidate_status"].get(m,{}).get("status")=="ELIGIBLE"]
++    slots={};selected=[]
++    for slot,metric in (("remaining_RMS",RMS),("Gamma_RMS",GAMMA)):
++        baseline=summary["macros"]["L0"][metric]["macro_mean"]
++        ranked=sorted(candidates,key=lambda m:(summary["macros"][m][metric]["macro_mean"],MODELS.index(m)))
++        ranking=[dict(model=m,macro_mean=summary["macros"][m][metric]["macro_mean"],
++            minus_L0=summary["macros"][m][metric]["macro_mean"]-baseline,
++            six_cells=summary["macros"][m][metric]["six_cells"]) for m in ranked]
++        winner=ranked[0] if ranked and summary["macros"][ranked[0]][metric]["macro_mean"]<baseline else None
++        slots[slot]=dict(metric=metric,L0_macro_mean=baseline,ranking=ranking,selected=winner,
++            reason="STRICT_IMPROVEMENT_OVER_L0" if winner else "EMPTY_NO_STRICT_IMPROVEMENT")
++        if winner and winner not in selected:selected.append(winner)
++    return dict(schema="loss_screen_selection_v1",status="FROZEN",slots=slots,selected_models=selected,
++        confirmation_models=["L0"]+selected,maximum_candidates=2,no_runner_up_backfill=True,
++        exact_tie_break=PROTOCOL["exact_tie_break"],candidate_status=summary["candidate_status"],
++        development_macros=summary["macros"],checkpoint_identities=checkpoints or {},
++        selection_used_confirmation=False,quality_filter="Only numerical/C/N validity gate; all coverage/intersection/angle tradeoffs remain reported")
++
++
++def select_candidates(r,out):
++    if r.get("selection"):raise RuntimeError("Selection is one-shot")
++    identities={m:r["arms"][m]["checkpoints"]["500"] for m in r["summaries"]["development"]["models"]}
++    value=selection_from_summary(r["summaries"]["development"],identities)
++    value["selection_sha256"]=_seal(value)
++    value["artifact"]=_write(_path(out)/"selection.json",value)
++    r["selection"]=value;return value
++
++
++def run_cpu_tests():
++    """One bounded synthetic scalar fixture suite; never a real geometry audit."""
++    seeds=DEVELOPMENT_SEEDS;rows=[]
++    for model in ("L0","L1","L2"):
++        for p in (0,1):
++            for j in (0,1,2):
++                for seed in (seeds if j==0 else seeds[:2]):
++                    own={"L0":10.,"L1":9.,"L2":11.}[model]+j
++                    gamma={"L0":10.,"L1":8.,"L2":9.}[model]+p
++                    cross=[dict(symmetric_rms_bbox_pct=own+(t!=p),predicted_to_target_rms_bbox_pct=own,target_to_predicted_rms_bbox_pct=own) for t in (0,1)]
++                    common=[dict(rms_bbox_pct=own+(t!=p),fraction_target_points_within_1pct_bbox=.5) for t in (0,1)]
++                    metrics=dict(K=12,variant="raw",parent_index=p,remainder=dict(own=cross[p],cross=cross),
++                        whole=dict(surface=cross[p]),common_unknown_R12=dict(own=common[p],cross=common),
++                        guided_geometry_audit=dict(boundary=dict(rms_bbox_pct=gamma,p95_bbox_pct=gamma,coverage_fraction=.5)),
++                        t1_native_confirmation=dict(free_shape_quality=dict(total_area=1.)))
++                    rows.append(dict(phase="development",model=model,parent=p,patch=j,seed=seed,K=12,metrics=metrics))
++    statuses={m:dict(status="ELIGIBLE") for m in ("L0","L1","L2")}
++    result=aggregate_results(rows,"development",("L0","L1","L2"),seeds,candidate_status=statuses)
++    assert np.isclose(result["macros"]["L0"][RMS]["macro_mean"],11.)
++    flat_mean=np.mean([x["metrics"]["remainder"]["own"]["symmetric_rms_bbox_pct"] for x in rows if x["model"]=="L0"])
++    assert not np.isclose(flat_mean,11.)
++    selected=selection_from_summary(result)
++    assert selected["selected_models"]==["L1"] and selected["slots"]["Gamma_RMS"]["selected"]=="L1"
++    result["macros"]["L1"][RMS]["macro_mean"]=10.;result["macros"]["L2"][GAMMA]["macro_mean"]=7.
++    assert selection_from_summary(result)["selected_models"]==["L1","L2"]
++    result["macros"]["L1"][RMS]["macro_mean"]=11.;result["macros"]["L2"][RMS]["macro_mean"]=11.
++    result["macros"]["L1"][GAMMA]["macro_mean"]=20.;result["macros"]["L2"][GAMMA]["macro_mean"]=20.
++    assert selection_from_summary(result)["selected_models"]==[]
++    try:aggregate_results(rows+[rows[0]],"development",("L0","L1","L2"),seeds,candidate_status=statuses)
++    except ValueError:pass
++    else:raise AssertionError("Duplicate accepted")
++    pair=result["patches"]["0"]["paired"]["L1_minus_L0"]["parents"]["0"]
++    assert pair["improvement_counts"][RMS]["better"]==8
++    return dict(status="PASS",checks=6,model_calls=0,geometry_calls=0,OT_calls=0,autograd_calls=0)
+--- /dev/null
++++ b/experiments/mf_h1_local0/loss_screen/registration.py
+@@ -0,0 +1,257 @@
++"""CPU-only registration for the fixed 2500-to-3000 seven-arm loss screen.
++
++The caller must invoke register exactly once on a nonexistent directory. This
++module never initializes a model, executes noise OT, runs fixtures again, or
++freezes an unfinished driver. Root orchestration supplies the final source pin.
++"""
++from .common import (REPO,PACKAGE,INITIAL,INITIAL_SHA,INITIAL_STATE,ORIGINAL_SOURCE_SHA,
++    INPUTS,INPUT_SHA,BANK,BANK_SHA,HISTORY,HISTORY_SHA,ARMS,CANDIDATES,DEV_SEEDS,CONF_SEEDS,
++    LOG_STEPS,PARAMETERS,record,seal,write)
++from datetime import datetime,timezone
++from pathlib import Path
++from types import SimpleNamespace
++import copy
++import json
++import os
++import platform
++import shutil
++import subprocess
++import sys
++import time
++import numpy as np
++import torch
++from native_t1.artifacts import atomic_json,file_sha256,state_sha256
++from native_t1.data import load_archive,NativeTrainingStream
++from native_t1.geometry_checkpoint import validate_geometry_checkpoint
++from native_t1.checkpoint import DEFAULT_CONFIG
++from native_t1.portable_checkpoint import config_sha256
++
++
++def _git(*arguments):
++    return subprocess.run(['git','-C',str(REPO),*arguments],check=True,capture_output=True,text=True).stdout.rstrip('\n')
++
++
++def _agents():
++    # Only ancestor AGENTS apply to the experiment package. Save their content
++    # if present; never interpret a source file as an executable instruction.
++    records=[]
++    for directory in reversed((PACKAGE,*PACKAGE.parents)):
++        path=directory/'AGENTS.md'
++        if path.is_file():records.append(dict(**record(path),text=path.read_text(encoding='utf-8-sig')))
++    return dict(status='FOUND' if records else 'NONE_FOUND_ON_APPLICABLE_ANCESTOR_CHAIN',files=records,
++        searched=[str(x/'AGENTS.md') for x in reversed((PACKAGE,*PACKAGE.parents))])
++
++
++def _checked_record(path,expected):
++    result=record(path)
++    if result['sha256']!=expected:raise ValueError('Asset SHA256 differs: '+str(path))
++    return result
++
++
++def _initial(history):
++    asset=_checked_record(INITIAL,INITIAL_SHA)
++    checkpoint=torch.load(INITIAL,map_location='cpu',weights_only=True,mmap=True)
++    validate_geometry_checkpoint(checkpoint,config_sha256(DEFAULT_CONFIG))
++    if checkpoint['cumulative_updates']!=2500 or checkpoint['model_state_sha256']!=INITIAL_STATE:
++        raise ValueError('Expected pure-FM G0 cumulative2500, not an auxiliary endpoint.')
++    export=checkpoint.get('export',{})
++    if (export.get('source_arm')!='G0' or export.get('source_file_sha256')!=ORIGINAL_SOURCE_SHA
++        or export.get('source_state_sha256')!=INITIAL_STATE or export.get('auxiliary_modules_present') is not False
++        or export.get('tensor_arithmetic_performed') is not False or export.get('training_updates_added')!=0):
++        raise ValueError('Public G0 tensor-only export provenance differs.')
++    if checkpoint['optimizer'] or export.get('optimizer_state_present') is not False:
++        raise ValueError('Public G0 must have stripped optimizer; all arms create fresh AdamW.')
++    state=checkpoint['model']
++    if any(v.device.type!='cpu' or v.dtype!=torch.float32 for v in state.values()):
++        raise ValueError('Initial generator must contain only CPU FP32 tensors.')
++    if sum(v.numel() for v in state.values())!=PARAMETERS:
++        raise ValueError('Generator parameter count differs.')
++    # Existing identity algorithm without constructing a torch.nn.Module.
++    actual=state_sha256(SimpleNamespace(state_dict=lambda:state))
++    if actual!=INITIAL_STATE:raise ValueError('Actual initial tensor hash differs.')
++    if any(not bool(torch.isfinite(v).all()) for v in state.values()):
++        raise ValueError('Initial generator has nonfinite tensors.')
++    stream=copy.deepcopy(checkpoint['stream_state'])
++    if (stream['seed'],stream['arm'],stream['batch_index'],stream['sample_index'])!=(1010,'Native_correct',1000,8000):
++        raise ValueError('Must continue saved G0 RNG after batch1000/sample8000.')
++    old=history['arms']['G0'];oldcp=old['checkpoints']['500']
++    if (history['status']!='PASS_EXECUTION' or old['status']!='PASS' or old['completed_updates']!=500
++        or oldcp['sha256']!=ORIGINAL_SOURCE_SHA or oldcp['state_sha256']!=actual or oldcp['cumulative_updates']!=2500
++        or seal(old['final_stream_state'])!=seal(stream)):
++        raise ValueError('Original G0 endpoint/RNG metadata does not match its portable export.')
++    archive=load_archive(INPUTS,INPUT_SHA)
++    restored=NativeTrainingStream(archive,seed=1010)
++    restored.load_state_dict(copy.deepcopy(stream))
++    if seal(restored.state_dict())!=seal(stream):raise ValueError('Input RNG roundtrip differs.')
++    asset.update(state_sha256=actual,schema=checkpoint['schema'],cumulative_updates=2500,
++        parameters=PARAMETERS,state_tensors=len(state),optimizer_state_present=False,
++        CPU_metadata_and_tensor_identity='PASS',strict_model_key_shape_load='DEFERRED_TO_ROOT_GPU_PREFLIGHT',
++        stream_sha256=seal(stream),stream_batch_index=1000,stream_sample_index=8000,
++        stream_seed=1010,stream_arm='Native_correct',stream_restored_without_sampling=True,
++        export=copy.deepcopy(export),context=copy.deepcopy(checkpoint['context']))
++    del state,checkpoint,restored,archive
++    return asset,stream
++
++
++def _fixtures():
++    result={}
++    for name in ('relation','distribution'):
++        path=PACKAGE/('cpu_'+name+'_record.json')
++        item=json.loads(path.read_text(encoding='utf-8'))
++        if item.get('status')!='PASS' or item.get('CUDA_initialized') is not False:
++            raise ValueError('Completed CPU-only formula fixture record missing: '+name)
++        if name=='distribution':
++            hashes=item['source_sha256']
++        else:hashes={'relation_losses.py':item['source_sha256'],'test_relation_losses.py':item['test_sha256']}
++        for source,digest in hashes.items():
++            if file_sha256(PACKAGE/source)!=digest:raise ValueError('CPU fixture no longer matches source: '+source)
++        result[name]=dict(artifact=record(path),result=item)
++    return dict(status='PASS_REUSED_COMPLETED_CPU_FIXTURES',rerun_at_registration=False,
++        records=result,registration_model_calls=0,registration_OT_calls=0,registration_autograd_calls=0,
++        prior_CPU_coordinate_autograd_calls=result['relation']['result']['counts']['autograd_calls']+result['distribution']['result']['CPU_coordinate_autograd_calls'],
++        prior_CPU_loss_and_solver_work_is_not_training=True,
++        L4_fixed96_warning='Perturbed two-face fixture marginal L1 residual .02446472894375129; finite approximation, not converged within1e-3.')
++
++
++def _loss_definitions():
++    return {
++      'L0':dict(name='masked free-coordinate flow matching',formula='sum_valid_free_xyz (v-u)^2 / sum_effective8_valid_free_coordinates',auxiliary=None),
++      'L1':dict(name='GT adjacent local side consistency',formula='mean_applicable_interface_pairs_and7points relu(-s*((p-a) dot n)/L)^2',
++        relations='Trusted GT source shared edges between known and free; fixed across predictions',
++        sign='sign((GT free off-edge vertex - known edge reference) dot known unit normal)',
++        sign_ambiguous_abs_le=1e-6,sign_ambiguity_units='full-object bbox L',
++        points='Three vertices, three edge midpoints, centroid',positive_contact_gap=0.,
++        inapplicable='Coplanar/ambiguous signed relationships counted, not assigned arbitrary side',
++        limitations='Not global SDF, IPC, or nonadjacent triangle collision prevention'),
++      'L2':dict(name='GT adjacent unoriented dihedral preservation',formula='GT_edge_length_weighted_mean ((n_pred_i dot n_pred_j)^2-(n_GT_i dot n_GT_j)^2)^2',
++        relations='Every actual GT shared-edge incident-face pair with >=1 free face; known-known excluded',
++        known_normals='Fixed C',prediction_normal_epsilon=1e-8,normal_epsilon_units='cross product after division of coordinates by L',
++        weights='Only fixed GT edge length, never predicted proximity',
++        limitations='Translation, topology separation, sign and concavity ambiguities remain'),
++      'L3':dict(name='Along-interface-edge tangential relaxation',formula='GT_edge_length_weighted_mean_endpoints (||r_perp/L||^2+.05*||r_parallel/L||^2)',
++        parallel='tau*tau^T*r; tau is fixed GT shared-edge unit tangent',tangential_weight=.05,
++        relations='Trusted known-free source edge endpoints, with normal multiple-edge incidence weighting',
++        limitations='No projection, welding, or exact-edge guarantee'),
++      'L4':dict(name='Area-weighted surface Sinkhorn divergence',formula='OT_eps(pred,GT)-.5*OT_eps(pred,pred)-.5*OT_eps(GT,GT)',
++        quadrature=[[2/3,1/6,1/6],[1/6,2/3,1/6],[1/6,1/6,2/3]],
++        probability='clamp_min(A_normalized,1e-12)/3, then normalize each measure to unit mass; predicted area retains gradient',
++        normalized_area_floor=1e-12,cost='||p/L-q/L||^2 (no factor1/2)',epsilon=.0025,
++        regularized_objective='sum(pi*C)+epsilon*[sum pi*(log(pi)-log(a)-log(b))-sum(pi)+sum(a)*sum(b)]',
++        solver='96 fixed simultaneous half-damped Jacobi log-domain updates from zero dual potentials; full unrolled differentiation',
++        iterations=96,GTGT_cache='Only detached GT-GT constant may be reused; actual solve/cache counts separate',
++        marginal_residuals='Each solve row/column L1, Linf and max relative residual',
++        marginal_L1_diagnostic_tolerance=.001,finite_residual_automatically_stops_arm=False,
++        nonfinite_objective_or_gradient_stops_arm=True,negative_values_clamped=False,
++        reference='https://www.kernel-operations.io/geomloss/api/pytorch-api.html',
++        limitations='Finite-iteration approximate balanced OT; independent probability normalization does not constrain total area'),
++      'L5':dict(name='Multiscale area and unsigned-normal surface measure',
++        formula='mean_sigma [sum wp*wp*k(pred,pred)+sum wg*wg*k(GT,GT)-2*sum wp*wg*k(pred,GT)]',
++        quadrature='Same three symmetric barycentric points as L4',
++        weights='w_pred=A_pred/(3*A_GT_total), w_GT=A_GT/(3*A_GT_total), with detached GT total area; prediction is not mass-renormalized',
++        Q='n*n^T; normalized cross product with epsilon1e-8',normal_epsilon=1e-8,
++        kernel='exp(-||p/L-q/L||^2/(2*sigma_x^2))*exp(-||Q-R||_F^2/(2*sigma_Q^2))',
++        sigma_x=[.02,.05,.10],sigma_Q=.5,predicted_area_normal_position_gradients=True,
++        GTGT_cache='Detached GT-GT kernels only; actual kernel counts separate',negative_values_clamped=False,
++        limitations='Finite quadrature, unsigned normal and surface-measure approximation, not exact topology or self-intersection guarantee'),
++      'L6':dict(name='Known-free boundary and unknown-side band coverage',formula='.5*GT_edge_length_weighted_mean_gamma dist(point,S(pred_free))^2/L^2 + .5*GT_edge_length_weighted_mean_band dist(point,S(pred_free))^2/L^2',
++        relations='Only actual trusted GT known-free shared edges, not all open C edges',s=[0.,.25,.5,.75,1.],r=[.1,.2],
++        band='(1-r)*((1-s)*a+s*b)+r*c_free_GT',weights=[.5,.5],
++        surface='Differentiable finite predicted free triangles only; fixed C excluded',
++        distance_squared_denominator_epsilon=1e-24,nearest_triangle='Piecewise differentiable choice; selected distance is not detached',
++        limitations='Finite local samples, barycentric rather than fixed physical band; may sacrifice remote coverage')}
++
++
++def register(out):
++    """Validate CPU assets and register once; zero model/OT/autograd/updates."""
++    tick=time.perf_counter();out=Path(out).resolve()
++    if out.exists():raise FileExistsError('Registration refuses an existing output: '+str(out))
++    if not out.is_relative_to(REPO.resolve()) or not out.name.startswith('loss_screen_'):
++        raise ValueError('Use a new loss_screen_* output directory inside this workspace.')
++    if torch.cuda.is_initialized():raise RuntimeError('Registration must run before CUDA initialization.')
++    missing=[str(p) for p in (INITIAL,INPUTS,BANK,HISTORY,Path(DEFAULT_CONFIG)) if not p.is_file()]
++    if missing:raise FileNotFoundError('Missing required assets; no fallback: '+', '.join(missing))
++    agents=_agents();git=dict(HEAD=_git('rev-parse','HEAD'),status_porcelain=_git('status','--porcelain=v1','--untracked-files=normal'),
++        reference_public_commit='5ef35b421ad00ccd3a97867ce0e33e5f77f65b1c',mutations_performed=False)
++    assets=dict(inputs=_checked_record(INPUTS,INPUT_SHA),evaluation_inputs=_checked_record(BANK,BANK_SHA),
++        historical_G0_results=_checked_record(HISTORY,HISTORY_SHA),chair_config=record(DEFAULT_CONFIG))
++    history=json.loads(HISTORY.read_text(encoding='utf-8'))
++    assets['initial_checkpoint'],stream=_initial(history)
++    fixtures=_fixtures()
++    fixtures['additional_read_only_sanity']=dict(provenance='Root completed once before registration; original message record, no rerun',
++        input_sha256=INPUT_SHA,prepare_relations_calls=6,loss_calls=0,model_calls=0,OT_calls=0,autograd_calls=0,CUDA_initialized=False,
++        cases=[dict(parent=p,K=K,interface_relations=interfaces,L1_applicable_relations=applicable,GT_nonmanifold_edges=0)
++            for p,K,interfaces,applicable in ((0,4,6,4),(0,8,8,4),(0,12,12,6),(1,4,6,2),(1,8,10,4),(1,12,14,8))])
++    from .evaluation import audit_seeds,PROTOCOL as EVALUATION_PROTOCOL
++    seed_audit=audit_seeds(CONF_SEEDS,out)
++    if seed_audit['status']!='PASS':
++        raise ValueError('Confirmation seeds previously recorded; no automatic seed replacement: '+json.dumps(seed_audit,allow_nan=False))
++    initial_stream_sha=seal(stream)
++    protocol=dict(method='Exploratory fixed-budget six direct geometric-loss candidates plus fresh pure-FM baseline',
++        user_override='All seven arms start at the same pure G0 cumulative2500 and add500 updates; final cumulative3000. Prior2500 G0 is not the new L0.',
++        initial=dict(checkpoint_sha256=INITIAL_SHA,state_sha256=INITIAL_STATE,cumulative_updates=2500,parameters=PARAMETERS),
++        training=dict(arms=list(ARMS),candidates=list(CANDIDATES),additional_updates_each=500,total_update_cap=3500,
++            initial_stream_sha256=initial_stream_sha,stream_seed=1010,stream_start_batch=1000,stream_start_sample=8000,
++            stream_end_batch=1500,stream_end_sample=12000,effective_batch=8,microbatch=1,train_K=[4,8,12],parents=[0,1],num_faces=112,
++            optimizer='AdamW',fresh_optimizer_each_arm=True,lr=1e-5,betas=[.9,.95],weight_decay=0.,gradient_clip=1.,
++            full_generator_role_Geo_trainable=True,modules_eval=True,scheduler=False,new_EMA=False,
++            target_noise='Original free-only nested Hungarian OT permutes only Z; actual target/source face and corner identities follow target slots',
++            FM_denominator='Original total effective-batch valid free coordinates',
++            geometry_denominator='Each sample defined mean; sum over all eight samples divided by8, with inactive samples contributing0',
++            xt='(1-t)*Z+t*Y',u='Y-Z',predicted_endpoint='Xt+(1-t)*v, free faces only',
++            auxiliary='ramp(s)*lambda_j*I[t>=.5]*L_j(Yhat,C,Y)',ramp='min(additional_step/50,1)',gate='FP32_t>=0.5',
++            inverse_time_compensation=False,flow_time_distribution='Original logit-normal',
++            coordinate_scale='Only loss coordinates divide by fixed full-GT bbox diagonal; model/input coordinates unchanged',
++            precision='Original BF16 generator; FP32 parameters/integration/geometric computation with geometric autocast disabled',
++            deterministic_algorithms=True,warn_only=False,CUBLAS_WORKSPACE_CONFIG=':4096:8',TF32=False,SDPA='math',
++            logs_at_steps=list(LOG_STEPS),save_steps=[250,500],cumulative_checkpoint_steps=[2750,3000],endpoint_selection='Fixed step500, no best checkpoint'),
++        losses=_loss_definitions(),
++        calibration=dict(common_initial_cumulative_updates=2500,clone_samples=8,fixed_times=[.5,.75],model_forwards=16,
++            saved_velocities='One generator velocity per registered state; then independent velocity leaves, no extra generator calls per loss',
++            lambda_formula='.1*median(||dL_FM/dv||)/median_nonzero(||dL_j/dv||), on applicable finite states',
++            target_gradient_fraction=.1,invalid='No finite nonzero denominator stops candidate; never invent fallback lambda',
++            times_calibrated=1,weight_scan=False,formal_stream_advanced=False,velocity_gradient_call_cap=112,
++            training_velocity_gradient_ratio_steps=[100,500],training_ratio_microbatch_index=0,
++            interpretation='Initial output-space scale only, not whole-model or sustained10% gradient guarantee'),
++        failure_policy=dict(candidate_local=True,numerical_nonfinite='Stop affected candidate and preserve exception/counts; continue unrelated candidates',
++            all_relations_inapplicable='NOT_APPLICABLE, no forced training',finite_L4_residual='Report finite96-step approximation;1e-3 diagnostic does not automatically stop or trigger retries',
++            existing_BF16_permutation_failure='Preserve historical FAIL and tolerance; authorized baseline-inheritance contract; no new historical diagnosis'),
++        evaluation=dict(architecture='Original strict T1+Geo generator only, no losses/GT/heads/guidance/repair during sampling',
++            development=dict(seeds=list(DEV_SEEDS),seen_noise=True,models=list(ARMS),max_outputs=168),
++            confirmation=dict(seeds=list(CONF_SEEDS),models='L0 plus at most two frozen selected candidates',max_outputs=72),
++            parents=[0,1],patches=[0,1,2],patch0_noises=8,patch1_noises=2,patch2_noises=2,outputs_per_model=24,
++            N=112,K=12,free_faces=100,euler_steps=50,C_bitwise_states=51,shared_raw_free_Gaussian=True,initial_noise_GT_OT=False,
++            per_patch_reference='Each patch own free GT complement, original fixed evaluation points and thresholds',
++            original_patches='Previously observed parents and patches; confirmation introduces only new noise',
++            historical_G0='Reference-only24 old outputs may be reused, never counted as fresh L0 or ranked'),
++        selection=dict(**EVALUATION_PROTOCOL,max_candidates=2,
++            primary_metrics=['remainder_symmetric_RMS_bbox_pct','boundary_RMS_bbox_pct'],
++            eligibility='Exclude numerical failure, changed C or wrong face count',
++            macro='Noise mean within each parent/patch, then equal weight for six parent/patch cells',
++            select='Take independently best nonbaseline RMS and independently best nonbaseline Gamma; each must strictly beat L0; deduplicate same winner; no runner-up replacement',
++            missing_improvement='Leave slot empty',freeze_before_confirmation=True,retune_after_confirmation=False),
++        budgets=dict(optimizer_updates=3500,training_model_forwards=28000,training_model_backwards=28000,
++            calibration_model_forwards=16,calibration_velocity_autograd_calls=112,wiring_model_forwards_max=7,wiring_model_backwards_max=7,
++            real_GT_oracle_loss_calls_max=48,teacher_model_forwards=0,development_formal_rollouts_max=168,
++            confirmation_formal_rollouts_max=72,formal_rollouts_max=240,replay_rollouts_max=3,
++            sampling_model_forwards_max=12150,all_model_forwards_max=40173,
++            original_noise_OT_training_pairs_max=28000,original_noise_OT_calibration_pairs=8,
++            distribution_internal_solves='Actual per-call accounting, separate from original noise OT; GT-GT cache reuse distinguished'),
++        limitations=['Exploratory selection over six candidates, not independent discovery','Two trained parents and already-observed patches',
++            'No independent training-seed replication','No loss guarantees watertightness, shared topology or absence of intersections'],
++        stop='No seventh candidate, combinations, changed lambda/time/steps, automatic extension, commit or push')
++    protocol_sha=seal(protocol);disk=shutil.disk_usage(REPO)
++    r=dict(schema='native_t1_geometry_loss_screen_results_v1',status='INITIALIZED',output_dir=str(out),
++        created_utc=datetime.now(timezone.utc).isoformat(),protocol=protocol,protocol_sha256=protocol_sha,
++        assets=assets,stream_start=stream,git=git,AGENTS=agents,CPU_fixtures=fixtures,confirmation_seed_audit=seed_audit,
++        environment=dict(python=sys.version,platform=platform.platform(),torch=torch.__version__,torch_cuda_build=torch.version.cuda,
++            numpy=np.__version__,CUDA_initialized=False,cpu_count=os.cpu_count(),disk_total_bytes=disk.total,disk_free_bytes=disk.free,
++            GPU_inventory='DEFERRED_TO_ROOT_PREFLIGHT'),
++        counts=dict(calibration={},wiring={},training={},sampling={}),loss_accounting={},
++        arms={arm:dict(status='PENDING',completed_updates=0,checkpoints={},logs=[]) for arm in ARMS},
++        generated=[],replays=[],timing={},source_freeze=dict(status='PENDING_ROOT_FINALIZATION'),
++        registration=dict(status='PASS',seconds=time.perf_counter()-tick,model_calls=0,OT_calls=0,autograd_calls=0,optimizer_updates=0,
++            official_checkpoint_read=False,initial_public_checkpoint_CPU_mmap=True,initial_stream_generated_samples=0,fixtures_reexecuted=False))
++    out.mkdir(parents=True,exist_ok=False)
++    atomic_json(out/'protocol.json',protocol)
++    write(r,out)
++    return r
+\ No newline at end of file
+--- /dev/null
++++ b/experiments/mf_h1_local0/loss_screen/relation_losses.py
+@@ -0,0 +1,268 @@
++"""Fixed L1/L2/L3/L6 supervision from trusted, permuted GT source vertex IDs.
++
++These are training-only objectives. No source identity enters a generator.
++Coordinates in every objective are divided by the fixed full-object bbox L.
++Targets are detached; prediction geometry is never detached or cached.
++
++Blind spots: L1 only tests the GT-selected adjacent local half-space (coplanar
++relations are inapplicable). L2 cannot detect translations, adjacency breaks,
++or normal-sign/convexity changes. L3 permits tangential motion with weight .05
++and does not guarantee exact shared edges. L6 samples a finite local boundary
++and barycentric band, measures only to the free surface, and does not ensure
++global coverage or topology. None is a general collision or watertightness loss.
++
++Numerical policy is fixed before fixtures: side ambiguity <=1e-6 normalized
++length; predicted normals use cross/clamp(norm,1e-8); finite-surface distance
++uses all three finite edges and an interior plane candidate. Cross norm squared
++<=1e-24 disables only the interior candidate, not the degenerate triangle or
++its edges. Squared edge denominators use the same 1e-24 lower bound. No NaN,
++Inf, or zero GT edge/triangle is accepted. Nonmanifold edge incidence is kept:
++each incident-face pair with at least one free face contributes independently.
++"""
++from itertools import combinations
++import math
++
++import numpy as np
++import torch
++
++
++SIDE_EPS = 1e-6
++NORMAL_EPS = 1e-8
++DISTANCE_DENOM_EPS = 1e-24
++TANGENTIAL_WEIGHT = 0.05
++S_VALUES = (0., .25, .5, .75, 1.)
++R_VALUES = (.1, .2)
++FORMULA_SPEC = dict(
++    version="gt_relation_losses_v1", coordinate_scale="fixed_full_GT_bbox_diagonal",
++    side_ambiguity_le=SIDE_EPS, normal_cross_norm_epsilon=NORMAL_EPS,
++    surface_cross_squared_epsilon=DISTANCE_DENOM_EPS,
++    surface_edge_squared_epsilon=DISTANCE_DENOM_EPS,
++    tangential_weight=TANGENTIAL_WEIGHT, gamma_s=list(S_VALUES),
++    band_r=list(R_VALUES), L6_weights=[.5, .5],
++    shared_edge_policy="all_incident_face_pairs_with_at_least_one_free",
++    L1_weighting="equal_applicable_interface_relations_and_seven_points",
++    L2_L3_L6_weighting="fixed_GT_edge_length_normalized_within_sample")
++
++
++def _geometry(value, name, *, dtype=None, device=None):
++    value = torch.as_tensor(value, dtype=dtype, device=device).detach().clone()
++    if value.ndim != 3 or value.shape[1:] != (3, 3):
++        raise ValueError(name + " must be [faces,3,3]")
++    if value.dtype not in (torch.float32, torch.float64):
++        raise ValueError(name + " must use FP32 or FP64")
++    if not bool(torch.isfinite(value).all()):
++        raise ValueError(name + " must be finite")
++    return value
++
++
++def _ids(value, faces, name):
++    value = torch.as_tensor(value).detach().cpu()
++    if value.shape != (faces, 3) or value.dtype not in (torch.int32, torch.int64):
++        raise ValueError(name + " must be integer [faces,3]")
++    array = value.numpy().astype(np.int64, copy=False)
++    if np.any(array < 0) or any(len(set(row.tolist())) != 3 for row in array):
++        raise ValueError(name + " needs three distinct nonnegative source IDs per face")
++    return array
++
++
++def _cross(triangles):
++    return torch.linalg.cross(triangles[:, 1]-triangles[:, 0],
++                              triangles[:, 2]-triangles[:, 0], dim=-1)
++
++
++def _normal(triangles):
++    cross = _cross(triangles)
++    length = torch.linalg.vector_norm(cross, dim=-1)
++    return cross / length.clamp_min(NORMAL_EPS)[:, None], length
++
++
++def prepare_relations(free_gt, known, free_vertex_ids, known_vertex_ids, bbox_L):
++    """Prepare detached targets; IDs must follow actual target face/corner slots.
++
++    May run on CPU and the returned target can be reused for this exact label
++    layout. relation_loss transfers only fixed target tensors to pred's device.
++    Source IDs are used only here. Same-ID coordinates must agree bitwise.
++    """
++    free = _geometry(free_gt, "free_gt")
++    fixed = _geometry(known, "known", dtype=free.dtype, device=free.device)
++    if not len(free):
++        raise ValueError("At least one free face is required")
++    scale = float(bbox_L.detach().cpu()) if isinstance(bbox_L, torch.Tensor) else float(bbox_L)
++    if not math.isfinite(scale) or scale <= 0:
++        raise ValueError("bbox_L must be a positive finite fixed scalar")
++    fids = _ids(free_vertex_ids, len(free), "free_vertex_ids")
++    kids = _ids(known_vertex_ids, len(fixed), "known_vertex_ids")
++    all_ids = np.concatenate((fids, kids), axis=0)
++    source_triangles = torch.cat((free, fixed), dim=0)
++    coordinates = {}
++    edge_faces = {}
++    for face, ids in enumerate(all_ids):
++        for corner, vid in enumerate(ids):
++            old = coordinates.setdefault(int(vid), source_triangles[face, corner])
++            if not torch.equal(old, source_triangles[face, corner]):
++                raise ValueError("Same source vertex ID has inconsistent coordinates")
++        for a, b in ((0, 1), (1, 2), (2, 0)):
++            key = tuple(sorted((int(ids[a]), int(ids[b]))))
++            edge_faces.setdefault(key, []).append(face)
++    normalized = source_triangles / scale
++    clean_cross = _cross(normalized)
++    cross_length = torch.linalg.vector_norm(clean_cross, dim=-1)
++    if bool((cross_length == 0).any()):
++        raise ValueError("Degenerate clean GT face cannot define the registered relation")
++    normals = clean_cross / cross_length[:, None]
++    pairs, lengths, reference_cos2 = [], [], []
++    interfaces, interface_corners, endpoints, tangents = [], [], [], []
++    interface_lengths, directions, applicable, gamma, band = [], [], [], [], []
++    nfree = len(free)
++    for edge in sorted(edge_faces):
++        a, b = (coordinates[v] / scale for v in edge)
++        length = torch.linalg.vector_norm(b-a)
++        if float(length) == 0:
++            raise ValueError("Zero GT edge cannot define a relation")
++        for i, j in combinations(sorted(edge_faces[edge]), 2):
++            if i >= nfree and j >= nfree:
++                continue
++            pairs.append((i, j)); lengths.append(length)
++            reference_cos2.append(torch.dot(normals[i], normals[j]).square())
++            if (i < nfree) == (j < nfree):
++                continue
++            fi, ki = (i, j) if i < nfree else (j, i)
++            corners = [int(np.flatnonzero(all_ids[fi] == vid)[0]) for vid in edge]
++            off = next(k for k in range(3) if k not in corners)
++            third = normalized[fi, off]
++            # GT normals are true units even for clean small triangles; the
++            # prediction epsilon belongs to L2, not the L1 side convention.
++            known_unit = _cross(normalized[ki:ki+1])[0] / cross_length[ki]
++            signed = torch.dot(third-a, known_unit)
++            good = abs(float(signed)) > SIDE_EPS
++            interfaces.append(fi); interface_corners.append(corners)
++            endpoints.append(torch.stack((a, b))); tangents.append((b-a)/length)
++            interface_lengths.append(length)
++            directions.append(known_unit * torch.sign(signed)); applicable.append(good)
++            ss = free.new_tensor(S_VALUES)
++            edge_points = (1-ss[:, None])*a + ss[:, None]*b
++            gamma.append(edge_points)
++            band.append(torch.cat([(1-r)*edge_points+r*third for r in R_VALUES], dim=0))
++
++    def floats(values, shape):
++        return torch.stack(values).detach() if values else free.new_empty(shape)
++    def integers(values, shape):
++        return torch.tensor(values, dtype=torch.long, device=free.device).reshape(shape)
++    interface_count = len(interfaces)
++    counts = dict(free_faces=nfree, known_faces=len(fixed), source_edges=len(edge_faces),
++                  boundary_source_edges=sum(len(v)==1 for v in edge_faces.values()),
++                  nonmanifold_source_edges=sum(len(v)>2 for v in edge_faces.values()),
++                  max_source_edge_incidence=max(map(len, edge_faces.values())),
++                  adjacent_pairs_at_least_one_free=len(pairs),
++                  free_free_pairs=sum(i<nfree and j<nfree for i,j in pairs),
++                  known_free_interface_relations=interface_count,
++                  L1_applicable_relations=sum(applicable),
++                  L1_inapplicable_coplanar_or_ambiguous=interface_count-sum(applicable),
++                  gamma_points=5*interface_count, band_points=10*interface_count,
++                  clean_normal_epsilon_faces=int((cross_length <= NORMAL_EPS).sum()),
++                  duplicate_face_vertex_sets=len(all_ids)-len({tuple(sorted(row)) for row in all_ids}))
++    return dict(formula_version=FORMULA_SPEC["version"], bbox_L=scale,
++                free_gt=(free/scale).detach(), known=(fixed/scale).detach(),
++                known_normals=normals[nfree:].detach(),
++                pair_faces=integers(pairs, (-1,2)),
++                pair_lengths=floats(lengths, (0,)),
++                pair_gt_cos2=floats(reference_cos2, (0,)),
++                interface_free_faces=integers(interfaces, (-1,)),
++                interface_free_corners=integers(interface_corners, (-1,2)),
++                interface_endpoints=floats(endpoints, (0,2,3)),
++                interface_tangents=floats(tangents, (0,3)),
++                interface_lengths=floats(interface_lengths, (0,)),
++                interface_correct_normals=floats(directions, (0,3)),
++                interface_applicable=torch.tensor(applicable,dtype=torch.bool,device=free.device),
++                gamma=floats(gamma, (0,5,3)), band=floats(band, (0,10,3)), counts=counts)
++
++
++def point_triangle_distance_sq(points, triangles):
++    """Differentiable [Q,F] squared distances to finite triangle surfaces.
++
++    The selected closest feature/triangle is piecewise differentiable. Exact
++    degenerate triangles remain finite segments/points; they are never dropped.
++    Coordinates are already bbox-normalized. No CPU geometry library is used.
++    """
++    if points.ndim != 2 or points.shape[1] != 3 or triangles.ndim != 3 or triangles.shape[1:] != (3,3):
++        raise ValueError("Expected points[Q,3], triangles[F,3,3]")
++    a, b, c = (triangles[:, j][None] for j in range(3))
++    p = points[:, None]
++    edge_values = []
++    for start, end in ((a,b),(b,c),(c,a)):
++        edge = end-start
++        fraction = ((p-start)*edge).sum(-1) / edge.square().sum(-1).clamp_min(DISTANCE_DENOM_EPS)
++        closest = start + fraction.clamp(0,1)[...,None]*edge
++        edge_values.append((p-closest).square().sum(-1))
++    ab, ac, ap = b-a, c-a, p-a
++    cross = torch.linalg.cross(ab, ac, dim=-1)
++    denominator = cross.square().sum(-1)
++    safe = denominator.clamp_min(DISTANCE_DENOM_EPS)
++    d00, d01, d11 = ab.square().sum(-1), (ab*ac).sum(-1), ac.square().sum(-1)
++    d20, d21 = (ap*ab).sum(-1), (ap*ac).sum(-1)
++    u = (d11*d20-d01*d21)/safe
++    v = (d00*d21-d01*d20)/safe
++    interior = (denominator > DISTANCE_DENOM_EPS) & (u >= 0) & (v >= 0) & (u+v <= 1)
++    plane = (ap*cross).sum(-1).square()/safe
++    plane = torch.where(interior, plane, torch.full_like(plane, float('inf')))
++    return torch.stack(edge_values+[plane], dim=-1).min(dim=-1).values
++
++
++def relation_loss(name, pred_free, target):
++    """Return one sample mean; caller alone applies time gate/ramp/lambda/1/8.
++
++    Counts are small Python integers, except dynamic prediction-degeneracy
++    counters, which stay scalar tensors on-device until the caller records them.
++    """
++    if name not in ('L1','L2','L3','L6'):
++        raise ValueError("Unsupported registered relation loss: "+str(name))
++    if not isinstance(pred_free, torch.Tensor) or pred_free.dtype not in (torch.float32,torch.float64):
++        raise ValueError("Prediction must be a FP32/FP64 tensor")
++    if pred_free.shape != target['free_gt'].shape:
++        raise ValueError("Prediction face/corner layout differs from prepared GT labels")
++    if target.get('formula_version') != FORMULA_SPEC['version']:
++        raise ValueError("Wrong fixed formula version")
++    counts = dict(target['counts'])
++    count = counts['L1_applicable_relations'] if name=='L1' else (
++        counts['adjacent_pairs_at_least_one_free'] if name=='L2' else counts['known_free_interface_relations'])
++    if count == 0:
++        return dict(loss=pred_free.sum()*0, applicable=False, counts=counts)
++    def fixed(key):
++        value=target[key]
++        return value.detach().to(device=pred_free.device, dtype=pred_free.dtype if value.is_floating_point() else value.dtype)
++    with torch.autocast(device_type=pred_free.device.type, enabled=False):
++        x = pred_free / target['bbox_L']
++        if name == 'L1':
++            selected = fixed('interface_free_faces')[fixed('interface_applicable')]
++            triangle = x[selected]
++            points = torch.cat((triangle, (triangle+triangle.roll(-1,dims=1))*.5,
++                                triangle.mean(dim=1,keepdim=True)), dim=1)
++            a=fixed('interface_endpoints')[fixed('interface_applicable'),0]
++            normal=fixed('interface_correct_normals')[fixed('interface_applicable')]
++            signed=((points-a[:,None])*normal[:,None]).sum(-1)
++            loss=torch.relu(-signed).square().mean()
++        elif name == 'L2':
++            free_normal,length = _normal(x)
++            normal=torch.cat((free_normal,fixed('known_normals')),dim=0)
++            pair=fixed('pair_faces')
++            value=(normal[pair[:,0]]*normal[pair[:,1]]).sum(-1).square()
++            weight=fixed('pair_lengths')
++            loss=((value-fixed('pair_gt_cos2')).square()*weight).sum()/weight.sum()
++            counts['prediction_normal_epsilon_faces']=(length[:len(x)]<=NORMAL_EPS).sum().detach()
++        elif name == 'L3':
++            face=fixed('interface_free_faces');corners=fixed('interface_free_corners')
++            residual=x[face[:,None],corners]-fixed('interface_endpoints')
++            tangent=fixed('interface_tangents')[:,None]
++            parallel=(residual*tangent).sum(-1,keepdim=True)*tangent
++            value=((residual-parallel).square().sum(-1)+TANGENTIAL_WEIGHT*parallel.square().sum(-1)).mean(-1)
++            weight=fixed('interface_lengths')
++            loss=(value*weight).sum()/weight.sum()
++        else:
++            points=torch.cat((fixed('gamma'),fixed('band')),dim=1)
++            distance=point_triangle_distance_sq(points.reshape(-1,3),x).min(dim=-1).values.reshape(-1,15)
++            weight=fixed('interface_lengths')
++            gamma=(distance[:,:5].mean(-1)*weight).sum()/weight.sum()
++            band=(distance[:,5:].mean(-1)*weight).sum()/weight.sum()
++            loss=.5*gamma+.5*band
++            counts['prediction_surface_edge_fallback_faces']=(_cross(x).square().sum(-1)<=DISTANCE_DENOM_EPS).sum().detach()
++    return dict(loss=loss, applicable=True, counts=counts)
+--- /dev/null
++++ b/experiments/mf_h1_local0/loss_screen/report.py
+@@ -0,0 +1,369 @@
++"""Present saved loss-screen results; no model or geometry recomputation."""
++from __future__ import annotations
++import csv
++import json
++from pathlib import Path
++import time
++import numpy as np
++from .evaluation import MODELS, RMS, GAMMA, _path, _seeds, _sha
++
++NAMES={'L0':'原 masked FM','L1':'GT 局部侧向一致性','L2':'GT 相邻面无向夹角',
++ 'L3':'边界线切向放松','L4':'表面 Sinkhorn divergence','L5':'面积—无向法向测度','L6':'边界/未知侧薄带覆盖'}
++SURFACE=(RMS,'free_to_R12_RMS_bbox_pct','R12_to_free_RMS_bbox_pct',
++ 'fixed_R12_coverage_RMS_bbox_pct','fixed_R12_coverage_within_1pct_fraction',
++ GAMMA,'boundary_p95_bbox_pct','boundary_coverage_fraction','whole_symmetric_RMS_bbox_pct')
++QUALITY=('CF_proper_affected_free_fraction','CF_proper_pair_count','FF_illegal_pair_count',
++ 'CF_coplanar_pair_count','FF_coplanar_pair_count','CF_unresolved_or_degenerate_pair_count',
++ 'FF_unresolved_or_degenerate_pair_count','free_minimum_angle_lt5_fraction','free_angle_p05_degrees',
++ 'free_q_gt10_fraction','free_near_degenerate_count','free_exact_zero_area_count','free_total_surface_area',
++ 'nan_coordinate_count','inf_coordinate_count','exact_C_free_shared_edge_count',
++ 'exact_C_free_shared_vertex_count','C_inherited_nonmanifold_vertex_count',
++ 'new_free_related_nonmanifold_vertex_count','C_current_winding_conflict_count',
++ 'free_related_current_winding_conflict_count')
++PAIR_METRICS=SURFACE[:8]+QUALITY[:3]+('free_minimum_angle_lt5_fraction','free_q_gt10_fraction','free_total_surface_area')
++
++
++def _fmt(v):
++    if v is None:return 'NOT_RECORDED'
++    if isinstance(v,bool):return str(v)
++    if isinstance(v,(int,np.integer)):return str(int(v))
++    if isinstance(v,(float,np.floating)):return f'{v:.6g}' if np.isfinite(v) else 'NONFINITE'
++    if isinstance(v,(dict,list,tuple)):v=json.dumps(v,ensure_ascii=False,separators=(',',':'))
++    return str(v).replace('|','\\|').replace('\n',' ')
++
++
++def _table(headers,rows):
++    return ['| '+' | '.join(headers)+' |','| '+' | '.join('---' for _ in headers)+' |']+[
++        '| '+' | '.join(_fmt(v) for v in row)+' |' for row in rows]
++
++
++def _record(path):
++    path=Path(path).resolve();return dict(path=str(path),sha256=_sha(path),bytes=path.stat().st_size)
++
++
++def _dist(v):
++    if not v or not v.get('finite_count'):return 'NOT_RECORDED'
++    worst=v.get('worst');worst=worst.get('value') if isinstance(worst,dict) else worst
++    return ' / '.join(_fmt(v.get(k)) for k in ('mean','median'))+' / '+('N/A' if worst is None else _fmt(worst))
++
++
++def _paired(v,k):
++    counts=v.get('improvement_counts',{}).get(k,{}) or {}
++    return _dist(v.get('metrics',{}).get(k))+f"; {counts.get('better','N/A')}/{counts.get('available','N/A')}"
++
++
++def _scalars(v,prefix='',depth=0):
++    if not isinstance(v,dict):return [(prefix,v)]
++    rows=[]
++    for k,x in v.items():
++        name=prefix+'.'+k if prefix else k
++        if isinstance(x,dict) and depth<3:rows.extend(_scalars(x,name,depth+1))
++        elif not isinstance(x,(dict,list,tuple)):rows.append((name,x))
++    return rows
++
++
++def _validate(r):
++    if not r.get('summaries',{}).get('development'):raise ValueError('Completed development summary required')
++    for phase,s in r['summaries'].items():
++        if set(s['patches'])!={'0','1','2'} or 'L0' not in s['models']:raise ValueError('Separate patches and fresh L0 required')
++        for m in s['models']:
++            for j in (0,1,2):
++                for p in ('0','1'):
++                    if len(s['patches'][str(j)]['models'][m]['parents'][p]['per_seed'])!=(8 if j==0 else 2):raise ValueError('Cell count differs')
++    if 'confirmation' in r['summaries'] and r['summaries']['confirmation']['models']!=r['selection']['confirmation_models']:
++        raise ValueError('Confirmation differs from frozen selection')
++
++
++def _phase(s):
++    models=s['models'];phase=s['phase'];lines=[f'## {phase}：六单元等权宏平均','',
++        '每个 parent/patch 先平均噪声，再等权平均六单元；不让原片8噪声淹没额外片2噪声。宏平均只用于预登记排序，不能遮盖下面单片代价。','']
++    keys=(RMS,GAMMA,'free_to_R12_RMS_bbox_pct','R12_to_free_RMS_bbox_pct','boundary_p95_bbox_pct','boundary_coverage_fraction','CF_proper_affected_free_fraction','FF_illegal_pair_count')
++    lines+=_table(['模型']+list(keys),[[m]+[s['macros'][m][k]['macro_mean'] for k in keys] for m in models])+['']
++    for k in (RMS,GAMMA):
++        cells=s['macros']['L0'][k]['six_cells'];lines += [k+' 六单元分解：','']
++        lines+=_table(['模型']+[f"P{x['parent']}/patch{x['patch']} (n={x['n']})" for x in cells]+['宏均值'],
++            [[m]+[x['mean'] for x in s['macros'][m][k]['six_cells']]+[s['macros'][m][k]['macro_mean']] for m in models])+['']
++    lines += ['数值表为均值 / 中位数 / 最差值。误差单位 % bbox 对角线 L，比例为[0,1]。free总面积为原坐标面积，无预设好坏方向。R12是继承字段名，各patch实际使用自己的100面GT补集。','']
++    for j in (0,1,2):
++        b=s['patches'][str(j)]
++        for p in ('0','1'):
++            lines += [f"### {phase} / P{p} / patch{j} / n={len(b['seeds'])}",'']
++            for title,keys in (('表面指标',SURFACE),('独立质量指标',QUALITY)):
++                lines+=_table([title]+models,[[k]+[_dist(b['models'][m]['parents'][p]['metrics'].get(k)) for m in models] for k in keys])+['']
++            names=list(b['paired'])
++            if names:
++                lines += ['逐seed候选−参考：均差 / 配对中位差 / 最差差；改善次数。配对中位差不等于边际中位数相减；面积不判胜负。','']
++                lines+=_table(['指标']+names,[[k]+[_paired(b['paired'][name]['parents'][p],k) for name in names] for k in PAIR_METRICS])+['']
++        lines += [f'### {phase} / patch{j} 条件绑定','',
++            '交叉四格复用既有输出。Delta0=E01−E00、Delta1=E10−E11、B为二者平均；正绑定在基线已存在，应看相对L0增量。','']
++        rows=[]
++        for m in models:
++            for x in b['models'][m]['binding']['per_seed']:rows.append([m,x['seed']]+[x.get(k) for k in ('E00','E01','E11','E10','Delta0','Delta1','B')])
++        lines+=_table(['模型','seed','E00','E01','E11','E10','Delta0','Delta1','B'],rows)+['']
++        lines+=_table(['模型','B均值/中位/最差','两方向同时正'],[[m,_dist(b['models'][m]['binding']['metrics']['B']),b['models'][m]['binding']['both_positive_count']] for m in models])+['']
++        lines+=_table(['配对','B增量均值/中位/最差','B增加次数'],[[name,_dist(v['binding']['metrics']['B']),v['binding']['higher_B_count']] for name,v in b['paired'].items()])+['']
++    return lines
++
++
++def _training(r):
++    lines=['## 训练、标定与自身目标诊断','',
++        'step1/10/50/100/250/500是不同训练batch，不能把稀疏日志当固定状态收敛曲线。step500 forward使用新增499步、累计2999步权重；日志在第500次更新后记录。自身目标比较仅限这最后一批同8样本，不是保存的3000步终点teacher评价，也不是全分布或自由生成证据。','',
++        'lambda仅由初始化输出速度空间的一次校准固定。初始10%不保证后续速度梯度或参数梯度仍是10%。inactive样本仍计入effective8分母。','']
++    c=r.get('calibration',{})
++    lines+=_table(['标定字段','值'],_scalars({k:v for k,v in c.items() if k not in ('rows','states','candidates')}))+['']
++    for m in MODELS[1:]:
++        if m in c.get('candidates',{}):lines += [f'### {m} 标定','']+_table(['字段','值'],_scalars(c['candidates'][m]))+['']
++    last={}
++    for m in MODELS:
++        ds=r.get('arms',{}).get(m,{}).get('logs',[]);rows=[]
++        for d in ds:
++            rows.append([d.get('step'),d.get('cumulative_updates'),d.get('FM'),d.get('gated_geometry_mean'),
++                d.get('weighted_geometry'),d.get('total'),d.get('ramp'),d.get('lambda_geometry'),
++                d.get('active_samples'),d.get('applicable_active_samples'),d.get('free_coordinate_denominator')])
++            if d.get('step')==500:last[m]=d
++        lines += [f'### {m} 训练日志','']+_table(['新增步','更新后累计步','FM','gated辅助均值','加权辅助项','总loss','ramp','lambda','active/8','适用active','FM分母'],rows)+['']
++        lines += _table(['步','micro0实际速度梯度比'],
++            [[d.get('step'),d.get('velocity_gradient_ratio')] for d in ds if d.get('step') in (100,500)])+['']
++        lines += _table(['步','参数组','梯度L2','梯度有限','更新L2','更新有限'],
++            [[d.get('step'),group,g.get('L2'),g.get('finite'),
++                d.get('parameter_updates',{}).get(group,{}).get('L2'),
++                d.get('parameter_updates',{}).get(group,{}).get('finite')]
++             for d in ds for group,g in d.get('gradients',{}).items()])+['']
++    lines += ['### 最后一次训练批的自身目标对照（更新前权重累计2999）','',
++        '对照只使用L0同一批已保存输出上的只读probe；核对paired_stream_sha256且probe未失败才列差值。gated_mean按整批8平均，未按active数补偿。这里不追加模型前向。','']
++    baseline=last.get('L0',{});comparison=[]
++    for m in MODELS[1:]:
++        d=last.get(m,{});p=(baseline.get('loss_probes') or {}).get(m,{})
++        same=bool(d and baseline.get('paired_stream_sha256')==d.get('paired_stream_sha256'))
++        valid=same and p.get('status')!='FAILED' and p.get('gated_mean') is not None and d.get('gated_geometry_mean') is not None
++        comparison.append([m,'COMPARABLE_LAST_BATCH' if valid else 'NOT_COMPARABLE',p.get('gated_mean'),
++            d.get('gated_geometry_mean'),d['gated_geometry_mean']-p['gated_mean'] if valid else None,
++            p.get('active_samples'),p.get('applicable_active_samples'),d.get('applicable_active_samples')])
++    lines+=_table(['臂','身份检查','L0同目标probe','候选gated目标','候选−L0','active','L0适用active','候选适用active'],comparison)+['']
++    lines += ['字段命名注：L0 step500 loss_probes.raw_active_mean 实际保存 active 样本 loss 之和，并非 active 均值；原JSON字段原样保留。上述自身目标比较使用 gated_mean=sum(g·Lj)/8，其计算正确；该命名问题不影响训练或比较。','']
++    if r.get('applicability'):lines += ['### GT关系适用性','']+_table(['parent/K','计数'],list(r['applicability'].items()))+['']
++    return lines+['完整逐参数日志、数值诊断与stream记录在results.json。自身目标降低不推出完整补全、低相交或水密。','']
++
++def render_report(r,figures=()):
++    _validate(r);lines=['# LOSS_SCREEN_REPORT','',
++        '本轮七臂从共同G0累计2500起步，各新增500，成功终点累计3000。L0为新训基线，旧G0仅作额外训练历史对照。开发筛选后确认仍是已见对象/patch上的新噪声，不是新对象泛化或独立训练seed复现。','']
++    if r.get('interpretation',{}).get('headline'):lines += ['**'+str(r['interpretation']['headline'])+'**','']
++    questions=('哪个loss实际改善了自己的目标？','哪个loss同时改善完整补全？','有没有通过减少覆盖来降低相交？','结果是否依赖少数seed？','开发排序是否在确认集保留？','哪些候选不适用、数值失败或没有净收益？')
++    answers=r.get('interpretation',{}).get('answers',[])
++    for i,q in enumerate(questions):
++        a=answers.get(str(i+1)) if isinstance(answers,dict) else answers[i] if i<len(answers) else None
++        lines += [f'{i+1}. **{q}** '+(str(a) if a is not None else '待登记综合解释；下列完整结果保留全部候选与质量代价，不自动宣布赢家。'),'']
++    if r.get('interpretation',{}).get('next_step'):lines += [str(r['interpretation']['next_step']),'']
++    lines += ['## 候选状态与冻结选择',''];rows=[]
++    statuses=r['summaries']['development'].get('candidate_status',{})
++    for m in MODELS:
++        a=r.get('arms',{}).get(m,{});c=r.get('calibration',{}).get('candidates',{}).get(m,{});s=statuses.get(m,{})
++        rows.append([m,NAMES[m],a.get('status','NOT_RUN'),a.get('completed_updates',0),c.get('lambda',0. if m=='L0' else None),s.get('status','NOT_ELIGIBLE'),s.get('reason',a.get('error',a.get('reason',c.get('reason'))))])
++    lines+=_table(['臂','目标','训练状态','更新','lambda','排序资格','原因'],rows)+['']
++    selection=r.get('selection',{})
++    lines += ['开发9901–9908已观察。两个槽分别取全体非L0中最低剩余RMS与最低Gamma，且各自主指标必须严格优于L0；同臂赢两槽只确认一臂，不补第二名。数值/C/N失效臂不排名。','']
++    lines+=_table(['槽','主指标','L0宏均值','选中','理由'],[[k,v.get('metric'),v.get('L0_macro_mean'),v.get('selected'),v.get('reason')] for k,v in selection.get('slots',{}).items()])+['']
++    lines += [f"确认模型：{_fmt(selection.get('confirmation_models'))}；selection SHA256：{_fmt(selection.get('selection_sha256'))}。",'',
++        '所有权重与排序冻结后才运行10001–10008。每对象原片n=8；额外patch1/2各n=2，分别报告。无质量复合总分，不合并开发/确认。','']
++    for phase in ('development','confirmation'):
++        s=r.get('summaries',{}).get(phase)
++        lines += _phase(s) if s else [f'## {phase}','','NOT_RUN；未用缺失结果补充筛选。','']
++    h=r.get('historical_reference')
++    if h:
++        lines += ['## L0_3000 − G0_initial_2500：额外纯FM训练收益','',
++            '只读复用旧G0的24份开发原始输出及保存评分，核对身份但不重算几何、不新增生成。旧G0不参加七臂主排名，也不是等预算候选。','']
++        for j in (0,1,2):
++            p=h['summary']['patches'][str(j)]['paired']['L0_minus_G0_initial']
++            lines += [f'### patch{j}','']+_table(['指标','P0配对差','P1配对差'],[[k]+[_paired(p['parents'][x],k) for x in ('0','1')] for k in PAIR_METRICS])+['']
++    lines+=_training(r)+_formulas()+_assets(r)
++    lines += ['## 固定首噪声原始输出','',
++        '每阶段固定首seed，full112/free100；同阶段每父对象跨模型/patch共同边界、正交相机。不裁剪坏例，不投影、焊合或修补。首seed图不代表均值或尾部。','']
++    for f in figures:lines += [f"### {f['phase']} / patch{f['patch']} / seed{f['seed']}",'',f"![原始full/free]({Path(f['path']).name})",'',f"可视检查：{f.get('visual_review','PENDING_CALLER_REVIEW')}。",'']
++    return '\n'.join(lines+['逐输出与逐候选CSV、完整audit JSON、原始NPZ和hash保留。完成固定筛选与最多两个候选确认后停止，不组合赢家、不调权重重跑、不追加训练。',''])
++
++
++def _formulas():
++    return ['## 六项公式与解释边界','',
++        '路径Xt=(1−t)Z+tY，u=Y−Z，Yhat=Xt+(1−t)v。监督只用自由Yhat，坐标除固定训练GT bbox对角线L。g(t)=I[t≥0.5]，ramp(s)=min(s/50,1)，总loss为原FM+ramp·lambda·mean_8(g·L_j)。无逆(1−t)²补偿。几何FP32/autocast disabled，主干原BF16；GT源ID不进入推理。','',
++        '| 臂 | 定义与固定参数 | 限制 |','| --- | --- | --- |',
++        '| L1 | GT真实known-free接口确定侧别；每对应预测面7点，平均relu(−s·(p−a)·n/L)²；GT侧距离≤1e−6L不适用 | 无正间隙，保留共面盲区，不是全局SDF或IPC |',
++        '| L2 | GT共享边长加权[(n̂_i·n̂_j)²−(n_i·n_j)²]²，至少一侧free | 无向平面夹角；不保证凹凸、连接或非相交，预测平移盲区保留 |',
++        '| L3 | GT接口边两端点，边长加权(||r_perp/L||²+0.05||r_parallel/L||²) | 放松沿边界线移动；不吸附/投影，不保证精确共边 |',
++        '| L4 | 三点求积+可微面积归一质量，OTε(pred,GT)−½OTε(pred,pred)−½OTε(GT,GT)，含熵项 | ε=.05²，96次log-domain迭代，边际残差记录；有限迭代近似，不约束总面积 |',
++        '| L5 | 三点求积权重A_pred/(3A_GT,total)，空间核乘Q=nnᵀ无向法向核的测度差 | σx=.02/.05/.10，σQ=.5；非归一总质量、面积梯度保留；不保证拓扑或唯一表面 |',
++        '| L6 | 真实接口边界与未知侧薄带到自由预测有限三角表面的距离²各占½ | s=0/.25/.5/.75/1，r=.1/.2，不测C并集；局部覆盖可能牺牲其他区域 |','',
++        '相对未经修正的原始几何直觉，本轮明确使用GT固定局部关系、无向夹角、非零切向权重、完整去偏Sinkhorn定义、非归一面积总质量及真实未知侧监督。六项不要求检测所有缺陷。精确epsilon、退化触发、适用关系与公式fixture以冻结代码和results注册记录为准，报告不另改阈值。','']
++
++
++def _assets(r):
++    lines=['## 身份、资源与分项账本','',
++        '共同公开G0累计2500，恢复seed1010输入流batch1000/sample8000；fresh AdamW lr1e−5、betas(.9,.95)、wd0、clip1、effective8/micro1。成功臂均新增500、累计3000。250 checkpoint只归档，无250步完整生成。','',
++        '模型/role/Geo全量训练；推理严格原T1+Geo、50步Euler、N112/K12/free100，全部51状态固定C。采样无辅助loss、GT、属性头、几何梯度、焊接或修补。旧BF16重排FAIL沿用baseline-inheritance原样保留，不放宽旧容差。','']
++    rows=[]
++    for m,a in r.get('arms',{}).items():
++        for step,c in a.get('checkpoints',{}).items():rows.append([m,step,c.get('cumulative_updates'),c.get('path'),c.get('bytes'),c.get('sha256'),c.get('state_sha256',c.get('model_state_sha256'))])
++    lines+=_table(['臂','新增步','累计步','路径','bytes','文件SHA256','stateSHA256'],rows)+['']
++    for name in ('final_work_accounting','counts','diagnostic_counts','timing','timing_summary','protection','independent_raw_audit'):
++        if r.get(name):lines += [f'### {name}','']+_table(['字段','值'],_scalars(r[name]))+['']
++    for phase,ledger in r.get('evaluation_ledger',{}).items():
++        lines += [f'### {phase} 独立离线审计','']+_table(['字段','值'],_scalars({k:v for k,v in ledger.items() if k not in ('input_audits','candidate_status')}))+['']
++    lines += ['真实输出每份CF1200对、FF4950对，C-only66对按固定上下文缓存；距离、共面重叠、unresolved/degenerate与严格判交分别记录。精确FP32索引拓扑保留继承异常，无焊接改变口径。水密修补或全局几何保证：NOT_RUN。模型、原nested OT、loss内部求解与离线审计分账，复用旧G0不增加采样/评分。','']
++    return lines+_audit_tables(r)
++
++
++def _candidate_csv(r,path):
++    fields=['phase','model','training_status','eligibility','completed_updates','selected','metric','macro_mean','minus_L0']+[f'P{p}_patch{j}_mean' for p in (0,1) for j in (0,1,2)]
++    rows=[]
++    for phase,s in r.get('summaries',{}).items():
++        for m in (MODELS if phase=='development' else s['models']):
++            a=r.get('arms',{}).get(m,{});state=s.get('candidate_status',{}).get(m,{})
++            base=dict(phase=phase,model=m,training_status=a.get('status','NOT_RUN'),eligibility=state.get('status','NOT_ELIGIBLE'),completed_updates=a.get('completed_updates',0),selected=m in r.get('selection',{}).get('selected_models',[]))
++            if m not in s['models']:rows.append(base);continue
++            for key,v in s['macros'][m].items():
++                own=v.get('macro_mean');ref=s['macros']['L0'][key].get('macro_mean')
++                rows.append(dict(base,metric=key,macro_mean=own,minus_L0=own-ref if own is not None and ref is not None else None,
++                    **{f"P{x['parent']}_patch{x['patch']}_mean":x['mean'] for x in v['six_cells']}))
++    with Path(path).open('x',encoding='utf-8',newline='') as stream:
++        writer=csv.DictWriter(stream,fieldnames=fields);writer.writeheader();writer.writerows(rows)
++    return dict(**_record(path),rows=len(rows))
++
++
++def _figures(r,out,*,overwrite=False):
++    import matplotlib
++    matplotlib.use('Agg')
++    import matplotlib.pyplot as plt
++    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
++    records=[]
++    for phase,s in r.get('summaries',{}).items():
++        seed=_seeds(r,phase)[0];models=list(MODELS) if phase=='development' else s['models']
++        chosen={(x['model'],int(x['parent']),int(x['patch'])):x for x in r.get('generated',[]) if x.get('phase')==phase and x['seed']==seed}
++        arrays={}
++        for key,row in chosen.items():
++            path=_path(row['raw_path'])
++            if _sha(path)!=row['raw_sha256']:raise ValueError('Raw plot hash differs')
++            with np.load(path,allow_pickle=False) as z:v=z['output'].copy()
++            if v.dtype==np.float32 and v.size==112*9 and np.isfinite(v).all():arrays[key]=v.reshape(112,3,3)
++        bounds={}
++        for p in (0,1):
++            points=np.concatenate([v.reshape(-1,3) for (m,parent,j),v in arrays.items() if parent==p])
++            lo=points.min(0);hi=points.max(0);bounds[p]=((lo+hi)/2,max(float((hi-lo).max())*.55,1e-6))
++        for j in (0,1,2):
++            fig=plt.figure(figsize=(max(10,len(models)*3.1),12))
++            for p in (0,1):
++                for free in (False,True):
++                    for col,m in enumerate(models):
++                        ax=fig.add_subplot(4,len(models),(p*2+int(free))*len(models)+col+1,projection='3d');v=arrays.get((m,p,j))
++                        if v is not None:
++                            ax.add_collection3d(Poly3DCollection(v[12:],facecolors='#7eabc7',edgecolors='#405266',linewidths=.24,alpha=.9))
++                            if not free:ax.add_collection3d(Poly3DCollection(v[:12],facecolors='#f0a348',edgecolors='#804800',linewidths=.5))
++                        else:ax.text2D(.15,.45,'NOT_RUN / INVALID',transform=ax.transAxes)
++                        center,radius=bounds[p]
++                        ax.set_xlim(center[0]-radius,center[0]+radius);ax.set_ylim(center[1]-radius,center[1]+radius);ax.set_zlim(center[2]-radius,center[2]+radius)
++                        ax.set_box_aspect((1,1,1));ax.set_proj_type('ortho');ax.view_init(elev=18,azim=-60,vertical_axis='y');ax.set_axis_off()
++                        ax.set_title(f"P{p} | {m} | {'free100' if free else 'full112'}",fontsize=8)
++            fig.suptitle(f'{phase} | fixed seed {seed} | patch {j} | raw, no repair\nIdentical per-parent bounds across models and patches',fontsize=11)
++            fig.subplots_adjust(left=.01,right=.99,bottom=.005,top=.94,wspace=.01,hspace=.06)
++            path=Path(out)/f'{phase}_seed{seed}_patch{j}_full_free.png'
++            if path.exists() and not overwrite:raise FileExistsError(path)
++            fig.savefig(path,dpi=170,facecolor='white');plt.close(fig)
++            records.append(dict(**_record(path),phase=phase,patch=j,seed=seed,panels=4*len(models),camera=dict(elev=18,azim=-60,vertical_axis='y',projection='ortho'),visual_review='PENDING_CALLER_REVIEW'))
++    return records
++
++
++def write_report(r,out):
++    """Root calls once; this function never writes results.json."""
++    tick=time.perf_counter();_validate(r);out=_path(out);path=out/'LOSS_SCREEN_REPORT.md';csv_path=out/'compact_per_candidate.csv'
++    if path.exists() or csv_path.exists():raise FileExistsError('No automatic report overwrite')
++    candidate_csv=_candidate_csv(r,csv_path);figures=_figures(r,out);text=render_report(r,figures)
++    if '????' in text:raise ValueError('Corrupted report text')
++    with path.open('x',encoding='utf-8') as stream:stream.write(text)
++    r['report']=dict(**_record(path),candidate_csv=candidate_csv,figures=figures,seconds=time.perf_counter()-tick,model_calls=0,geometry_calls=0,OT_calls=0,autograd_calls=0)
++    return r['report']
++
++
++def _audit_tables(r):
++    """Presentation of recorded identities, timings and work; no new experiments."""
++    lines=['### 共同起点与资产','']
++    assets=r.get('assets',{});initial=assets.get('initial_checkpoint',{});export=initial.get('export',{})
++    lines+=_table(['资产','路径','bytes','文件SHA256'],
++        [[name,x.get('path'),x.get('bytes'),x.get('sha256')] for name,x in assets.items() if isinstance(x,dict)])+['']
++    lines += [
++        '公开副本和原G0文件的文件hash不同：公开副本重新封装为生成器及已保存输入RNG，移除了优化器状态，未进行张量运算或新增更新。原文件已清理；本轮加载实际存在的公开副本，核对相同generator state与保存的训练流，再创建fresh AdamW。不能将两种文件hash不同误称为不同初始化，也不能声称恢复原优化器动量。','']
++    lines+=_table(['身份字段','值'],[
++        ['public_file_sha256',initial.get('sha256')],['source_file_sha256',export.get('source_file_sha256')],
++        ['public_generator_state_sha256',initial.get('state_sha256')],['source_generator_state_sha256',export.get('source_state_sha256')],
++        ['saved_stream_sha256',initial.get('stream_sha256')],['stream_seed',initial.get('stream_seed')],
++        ['stream_batch/sample',[initial.get('stream_batch_index'),initial.get('stream_sample_index')]],
++        ['formal_restore_hash',r.get('protocol',{}).get('training',{}).get('initial_stream_sha256')],
++        ['CPU_tensor_metadata_check',initial.get('CPU_metadata_and_tensor_identity')],
++        ['actual_GPU_strict_load',r.get('calibration',{}).get('load',{}).get('strict')],
++        ['actual_GPU_missing/unexpected',[r.get('calibration',{}).get('load',{}).get('missing_keys'),r.get('calibration',{}).get('load',{}).get('unexpected_keys')]]])+['']
++    lines += ['### 实际环境与运行配置','']
++    env=r.get('environment',{})
++    lines+=_table(['环境','记录'],_scalars(env))+['']
++    runtime_keys=('cublas_workspace_config','deterministic_algorithms','deterministic_warn_only',
++        'tf32_matmul','tf32_cudnn','sdpa_math_enabled','sdpa_flash_enabled','sdpa_mem_efficient_enabled',
++        'cuda_autocast_dtype','parameter_dtype','native_precision','all_modules_eval','trainable_parameters')
++    runtime_rows=[]
++    for m,a in r.get('arms',{}).items():
++        logs=a.get('logs',[])
++        if logs:
++            runtime=logs[-1].get('runtime',{})
++            runtime_rows.extend([m,logs[-1].get('step'),k,runtime.get(k)] for k in runtime_keys)
++    lines+=_table(['臂','最近预登记步','实际断言字段','值'],runtime_rows)+['']
++    lines+=_table(['臂','起点state SHA','起点stream SHA','500批stream SHA','fresh optimizer'],
++        [[m,a.get('initial_identity',{}).get('state_sha256'),a.get('initial_stream_sha256'),a.get('paired_stream_sha256'),a.get('fresh_optimizer')] for m,a in r.get('arms',{}).items()])+['']
++    lines += ['### CPU检查与额外梯度记账','']
++    fixtures=r.get('CPU_fixtures',{})
++    cpurows=[]
++    for name,record in fixtures.get('records',{}).items():
++        result=record.get('result',{});counts=result.get('counts',{})
++        cpurows.append([name,result.get('status'),result.get('tests'),
++            counts.get('autograd_calls',result.get('CPU_coordinate_autograd_calls',0)),
++            counts.get('finite_difference_evaluations'),record.get('artifact',{}).get('sha256')])
++    lines+=_table(['检查组','状态','tests','CPU坐标autograd','有限差分函数评价','记录SHA'],cpurows)+['']
++    lines+=_table(['额外检查字段','记录'],_scalars({k:v for k,v in fixtures.items() if k!='records'}))+['']
++    gradientrows=[['CPU公式坐标梯度',fixtures.get('prior_CPU_coordinate_autograd_calls'),fixtures.get('prior_CPU_coordinate_autograd_calls')]]
++    for name,c in r.get('counts',{}).items():
++        if name=='training':
++            for m,a in c.items():
++                gradientrows.append([m+'训练输出叶子梯度诊断',a.get('velocity_autograd_attempts',0),a.get('velocity_autograd_returns',0)])
++                gradientrows.append([m+'全模型反向',a.get('backward_attempts',0),a.get('backward_returns',0)])
++        elif isinstance(c,dict):
++            if 'velocity_autograd_attempts' in c:gradientrows.append([name+'输出叶子梯度',c.get('velocity_autograd_attempts'),c.get('velocity_autograd_returns')])
++            if 'backward_attempts' in c:gradientrows.append([name+'全模型反向',c.get('backward_attempts'),c.get('backward_returns')])
++    lines+=_table(['梯度调用类别','attempts','returns'],gradientrows)+['']
++    lines += ['CPU公式梯度、输出速度叶子梯度与实际全模型反向分开记录；前两者不计为训练更新，也不额外调用模型。fixture在登记时复用已完成记录，没有重复整套检查。','']
++    lines += ['### 同更新预算不等于同算力预算','',
++        '各臂均固定500更新，但辅助loss的求解与反向成本不同。model_update_seconds包括模型前向、几何loss、反向、梯度裁剪、更新和必要诊断；CPU_OT_and_stream_seconds为原CPU nested OT及输入流处理，supervision_prepare_seconds为监督准备，checkpoint_seconds单列。wall_seconds还包含其他开销，不能用模型更新耗时声称纯网络吞吐。','']
++    keys=('CPU_OT_and_stream_seconds','supervision_prepare_seconds','model_update_seconds','checkpoint_seconds','wall_seconds')
++    lines+=_table(['臂','完成更新']+list(keys),[[m,a.get('completed_updates',0)]+[a.get('timing',{}).get(k) for k in keys] for m,a in r.get('arms',{}).items()])+['']
++    lines += ['### loss内部求解与kernel工作量','',
++        '下面是已返回loss调用的内部计数；每阶段进程级attempt/return另表记录，可捕获失败中的部分计算。阶段/臂累计计数不应与进程快照再次相加；原noise-target OT与这里Sinkhorn辅助求解是不同操作。','']
++    workkeys=('sinkhorn_solves','sinkhorn_iterations','GTGT_sinkhorn_solves','GTGT_sinkhorn_cache_hits','kernel_matrix_evaluations','GTGT_kernel_matrix_evaluations','GTGT_kernel_cache_hits')
++    rows=[]
++    for stage,arms in r.get('loss_accounting',{}).items():
++        for arm,entry in arms.items():
++            counters=entry.get('counters',{})
++            rows.append([stage,arm,entry.get('calls_attempted',0),entry.get('calls_returned',0)]+[counters.get(k,0) for k in workkeys])
++    lines+=_table(['阶段','目标','loss attempts','loss returns']+list(workkeys),rows)+['']
++    lines+=_table(['进程阶段','实际工作快照'],list(r.get('stage_process_solver_counts',{}).items()))+['']
++    lines += ['### L4有限迭代近似的残差观察','',
++        'L4固定96次迭代，没有按残差追加迭代或重新标定。CPU扰动两面fixture边际L1残差为0.02446472894375129（未达到1e−3诊断参考）；这与通过有限差分检查不矛盾：检查验证固定96步函数的梯度，不证明达到平衡OT最优解。','']
++    calibration_rows=r.get('calibration',{}).get('candidates',{}).get('L4',{}).get('rows',[])
++    vals=[x.get('diagnostics',{}).get('max_marginal_L1_residual') for x in calibration_rows]
++    vals=[x for x in vals if isinstance(x,(int,float))]
++    lines+=_table(['记录范围','有记录状态/样本数','范围内最大边际L1残差'],[
++        ['初始化16个实际velocity标定状态',len(vals),max(vals) if vals else None]])+['']
++    observations=[]
++    for log in r.get('arms',{}).get('L4',{}).get('logs',[]):
++        vals=[x.get('max_marginal_L1_residual') for x in log.get('numerical_diagnostics',[])]
++        vals=[x for x in vals if isinstance(x,(int,float))]
++        observations.append([log.get('step'),len(vals),max(vals) if vals else None])
++    lines+=_table(['预登记训练步','记录的active micro数','该步观测最大残差'],observations)+['']
++    lines += ['训练残差只覆盖1/10/50/100/250/500六个预登记日志中实际active样本；不是全500步最大值或全部训练样本的统计。其他训练步仅聚合调用/solver工作量，不重建未保存残差。','']
++    seed=r.get('confirmation_seed_audit',{})
++    lines += ['### 新噪声登记小注','',
++        'seed查重在本run目录创建前执行。旧路径helper将不存在的POSIX输出目录显示为混合平台的excluded_current_run；该时刻没有本轮文件可排除，三个实际扫描根目录正确，历史seed查重结论不受此元数据瑕疵影响。后续已存在的bank/raw/输出目录均保持正确POSIX路径，无评分口径变化。','']
++    lines+=_table(['seed审计字段','值'],[(k,seed.get(k)) for k in ('status','seeds','roots','excluded_current_run','files_examined','json_documents_examined','seconds')])+['']
++    return lines
+--- /dev/null
++++ b/experiments/mf_h1_local0/loss_screen/sampling.py
+@@ -0,0 +1,365 @@
++"""Budgeted orchestration around the unchanged Native T1+Geo Euler sampler.
++
++No geometry loss, GT endpoint, target/noise OT, auxiliary head, guidance, or
++repair participates in generation. Training-only relation modules are not
++imported. Every sampler's local counts are merged exactly once; no additional
++model forward hook is attached. Failure records retain partial actual counts.
++"""
++from pathlib import Path
++import time
++import traceback
++import json
++import numpy as np
++import torch
++
++from native_t1.artifacts import array_hash, file_sha256, state_sha256
++from native_t1.sampling import make_noise, clamped_sample, new_counts
++from .common import ARMS, write, event, release, record, seal
++
++FORMAL_CAP = 240
++REPLAY_CAP = 3
++
++
++def _ledger(r):
++    counts = r.setdefault('counts', {}).setdefault('sampling', {})
++    for key in new_counts():
++        counts.setdefault(key, 0)
++    for key in ('formal_output_attempts', 'formal_outputs_saved', 'replay_output_attempts',
++                'replay_outputs_verified', 'generation_attempts', 'generation_returns',
++                'dispatch_attempts', 'dispatch_failures', 'noise_generation_calls',
++                'noise_generation_returns'):
++        counts.setdefault(key, 0)
++    counts.setdefault('generation_wall_seconds', 0.)
++    counts.setdefault('native_sampling_seconds', 0.)
++    return counts
++
++
++def _phase_models(r, phase):
++    if phase == 'development':
++        if set(r.get('arms', {})) != set(ARMS):
++            raise ValueError('All seven arm statuses must be recorded before development')
++        if any(v.get('status') in ('STARTING','RUNNING','PENDING','TRAINING') for v in r['arms'].values()):
++            raise ValueError('Finish the fixed training screen before generation')
++        models=tuple(m for m in ARMS if r['arms'][m].get('status')=='PASS')
++    elif phase == 'confirmation':
++        selection=r.get('selection', {})
++        if selection.get('status')!='FROZEN':
++            raise ValueError('Confirmation requires a frozen development selection')
++        body={k:v for k,v in selection.items() if k not in ('selection_sha256','artifact')}
++        if seal(body)!=selection.get('selection_sha256'):
++            raise ValueError('Frozen selection seal changed')
++        selected=selection.get('selected_models')
++        if not isinstance(selected,list) or len(selected)>2 or len(set(selected))!=len(selected) or any(m not in ARMS[1:] for m in selected):
++            raise ValueError('At most two distinct registered nonbaseline candidates')
++        models=tuple(['L0']+selected)
++        if selection.get('confirmation_models')!=list(models):
++            raise ValueError('Frozen confirmation model list is inconsistent')
++        for model in models:
++            if selection.get('checkpoint_identities',{}).get(model)!=r['arms'][model]['checkpoints']['500']:
++                raise ValueError('Selected checkpoint identity changed: '+model)
++    else:
++        raise ValueError('Expected development or confirmation')
++    if 'L0' not in models:
++        raise ValueError('The fresh L0 baseline must complete training')
++    for model in models:
++        arm=r['arms'][model]
++        if arm.get('status')!='PASS' or arm.get('completed_updates')!=500 or '500' not in arm.get('checkpoints',{}):
++            raise ValueError('Require a PASS additional500/cumulative3000 endpoint: '+model)
++        if arm['checkpoints']['500'].get('cumulative_updates')!=3000:
++            raise ValueError('Wrong endpoint update identity')
++    return models
++
++
++def _bank(r):
++    from .evaluation import load_bank
++    info=r['assets']['evaluation_inputs']
++    return load_bank(info['path'],info['sha256'])
++
++
++def _historical_noise_checks(r, noises, seeds):
++    """Read only old original Gaussians where present; never use old GT or OT."""
++    info=r.get('assets',{}).get('historical_G0_results')
++    if info is None:
++        return dict(status='NOT_AVAILABLE',checked=0,reason='No registered historical result asset')
++    path=Path(info['path'])
++    if file_sha256(path)!=info['sha256']:
++        raise ValueError('Historical G0 results changed')
++    saved=json.loads(path.read_text(encoding='utf-8-sig'))
++    checked=[];missing=[]
++    for seed in seeds:
++        rows=[v for v in saved.get('generated',[]) if v.get('model')=='G0' and int(v['seed'])==seed]
++        if not rows:
++            missing.append(dict(seed=seed,reason='No historical output with this seed'));continue
++        row=sorted(rows,key=lambda v:(int(v['patch']),int(v['parent'])))[0]
++        raw=Path(row['raw_path'])
++        if file_sha256(raw)!=row['raw_sha256']:
++            raise ValueError('Historical raw identity changed')
++        with np.load(raw,allow_pickle=False) as archive:
++            if 'initial_gaussian' not in archive:
++                missing.append(dict(seed=seed,reason='Historical raw has no initial_gaussian'));continue
++            old=archive['initial_gaussian']
++            if old.dtype!=np.float32 or old.shape!=(1,112,9) or old.tobytes()!=noises[seed].tobytes():
++                raise ValueError('Original same-seed Gaussian differs from historical G0')
++        checked.append(dict(seed=seed,raw_path=str(raw),raw_sha256=row['raw_sha256'],bitwise=True))
++    return dict(status='PASS',checked=len(checked),records=checked,not_available=missing,
++                GT_or_OT_used=False)
++
++
++def _noises(r, out, phase, seeds, *, create):
++    key=phase+'_noise';info=r['assets'].get(key)
++    if info is None:
++        if not create:
++            raise ValueError('Replay requires the registered fixed phase noise file')
++        path=Path(out)/(phase+'_noise.npz')
++        if path.exists():
++            raise FileExistsError('Unregistered noise file already exists: '+str(path))
++        noises={};counts=_ledger(r)
++        for seed in seeds:
++            counts['noise_generation_calls']+=1
++            noises[seed]=make_noise(seed).numpy().copy()
++            counts['noise_generation_returns']+=1
++        historical=_historical_noise_checks(r,noises,seeds)
++        with path.open('xb') as stream:
++            np.savez_compressed(stream,**{f'noise_seed{s}':noises[s] for s in seeds})
++        r['assets'][key]=record(path)
++        r.setdefault('noise_audits',{})[phase]=dict(status='PASS',seeds=list(seeds),
++            generator='native_t1.sampling.make_noise: private CPU torch.Generator(seed)',
++            source='original Gaussian, never OT-matched',historical=historical,
++            reused_across_models_and_contexts=True)
++        write(r,out)
++        info=r['assets'][key]
++    path=Path(info['path'])
++    if file_sha256(path)!=info['sha256']:
++        raise ValueError('Fixed phase noise archive changed')
++    with np.load(path,allow_pickle=False) as archive:
++        if set(archive.files)!={f'noise_seed{s}' for s in seeds}:
++            raise ValueError('Fixed Gaussian archive keys differ from registered seeds')
++        result={s:archive[f'noise_seed{s}'].copy() for s in seeds}
++    for seed,value in result.items():
++        if value.dtype!=np.float32 or value.shape!=(1,112,9) or not np.isfinite(value).all():
++            raise ValueError('Fixed Gaussian must be finite FP32[1,112,9]')
++        value.setflags(write=False)
++    return result
++
++
++def _load_endpoint(r, model_name):
++    from .checkpoint import load
++    info=r['arms'][model_name]['checkpoints']['500']
++    if file_sha256(info['path'])!=info['sha256']:
++        raise ValueError('Endpoint file hash changed: '+model_name)
++    model,audit=load(info['path'],protocol_sha=r['protocol_sha256'])
++    if audit['arm']!=model_name or audit['state_sha256']!=info['state_sha256'] or audit['cumulative_updates']!=3000:
++        raise ValueError('Strict endpoint identity differs: '+model_name)
++    if audit['sha256']!=info['sha256'] or audit['auxiliary_network_parameters']!=0 or audit['geometry_loss_modules_constructed']!=0:
++        raise ValueError('Unexpected inference network or checkpoint')
++    return model,audit
++
++
++def _validate_arrays(raw, states, noise, C):
++    if raw.dtype!=np.float32 or raw.shape!=(112,9) or states.dtype!=np.float32 or states.shape!=(51,112,9):
++        raise ValueError('Expected raw FP32[112,9] and all51 FP32 states')
++    if C.dtype!=np.float32 or C.shape not in ((12,3,3),(12,9)):
++        raise ValueError('Registered original K12 C required')
++    if noise.dtype!=np.float32 or noise.shape!=(1,112,9):
++        raise ValueError('Registered FP32 original Gaussian required')
++    if not np.isfinite(raw).all() or not np.isfinite(states).all() or not np.isfinite(noise).all() or not np.isfinite(C).all():
++        raise ValueError('Nonfinite generated or input coordinates')
++    expected=np.broadcast_to(C.reshape(1,12,9),(51,12,9))
++    if states[:,:12].tobytes()!=expected.tobytes():
++        raise ValueError('C changed in one of the 51 stored states')
++    if states[0,12:].tobytes()!=noise[0,12:].tobytes():
++        raise ValueError('Free initial noise differs from original Gaussian slots')
++    if states[-1].tobytes()!=raw.tobytes():
++        raise ValueError('Raw endpoint differs from final trajectory state')
++
++
++def _merge_counts(total, local):
++    for key in new_counts():
++        total[key]+=int(local[key])
++
++
++def _sample_one(r,out,model,model_name,parent,patch,seed,phase,noise,C,*,reference=None):
++    totals=_ledger(r);replay=reference is not None
++    capkey='replay_output_attempts' if replay else 'formal_output_attempts'
++    if totals[capkey]>=(REPLAY_CAP if replay else FORMAL_CAP):
++        raise RuntimeError('Hard generation budget exceeded before dispatch')
++    identity=dict(phase=phase,model=model_name,parent=parent,patch=patch,seed=seed,K=12)
++    path=Path(out)/'raw'/phase/f'{model_name}_P{parent}_patch{patch}_seed{seed}.npz'
++    if not replay and path.exists():
++        raise FileExistsError(path)
++    local=new_counts();attempt=dict(identity,replay=replay,status='DISPATCHED',counts=local)
++    r.setdefault('sampling_attempts',[]).append(attempt)
++    totals[capkey]+=1;totals['dispatch_attempts']+=1
++    started=time.perf_counter();native_seconds=0.
++    try:
++        write(r,out)
++        z=torch.from_numpy(noise.copy()).cuda()
++        fixed=torch.from_numpy(C.copy()).cuda()
++        totals['generation_attempts']+=1
++        raw,states,audit=clamped_sample(model,z,fixed,local)
++        totals['generation_returns']+=1;native_seconds=float(audit['seconds'])
++        if (local['model_forward_attempts'],local['model_forward_returns'],local['euler_updates'],
++                local['complete_rollouts'],local['rollout_attempts'])!=(50,50,50,1,1):
++            raise RuntimeError('Original 50-step sampler did not complete exactly once')
++        if any(local[k]!=0 for k in ('model_backward_calls','optimizer_updates','geometry_gradient_calls','postprocessing_repairs')):
++            raise RuntimeError('Generation executed forbidden backward/update/geometry/repair')
++        _validate_arrays(raw,states,noise,C)
++        row=dict(identity,reused=False,ranked=not replay,sampling=audit,
++                 C_all51_bitwise=True,known_all51_bitwise=True,total_faces=112,free_faces=100,
++                 output_sha256=array_hash(raw),path_sha256=array_hash(states),
++                 noise_sha256=audit['noise_sha256'],initial_gaussian_sha256=array_hash(noise),
++                 fixed_noise_asset=r['assets'][phase+'_noise'],
++                 geometry_loss_calls=0,geometry_gradient_calls=0,OT_calls=0,
++                 auxiliary_network_parameters=0,postprocessing_repairs=0)
++        if replay:
++            if file_sha256(reference['raw_path'])!=reference['raw_sha256']:
++                raise ValueError('Replay reference raw changed')
++            with np.load(reference['raw_path'],allow_pickle=False) as old:
++                if old['initial_gaussian'].tobytes()!=noise.tobytes() or old['path'].tobytes()!=states.tobytes() or old['output'].tobytes()!=raw.tobytes():
++                    raise RuntimeError('Fresh strict reload trajectory is not bitwise identical')
++            row.update(reference_path=reference['raw_path'],reference_sha256=reference['raw_sha256'],
++                       all51_bitwise_equal=True,fresh_model_load=True)
++            r.setdefault('replays',[]).append(row);totals['replay_outputs_verified']+=1
++        else:
++            path.parent.mkdir(parents=True,exist_ok=True)
++            with path.open('xb') as stream:
++                np.savez_compressed(stream,output=raw,path=states,initial_gaussian=noise)
++            # Verify the persisted original Gaussian, not only an in-memory hash.
++            with np.load(path,allow_pickle=False) as saved:
++                if saved['initial_gaussian'].tobytes()!=noise.tobytes():
++                    raise RuntimeError('Saved initial Gaussian differs from fixed phase archive')
++            row.update(raw_path=str(path.resolve()),raw_sha256=file_sha256(path))
++            r.setdefault('generated',[]).append(row);totals['formal_outputs_saved']+=1
++        attempt['status']='PASS'
++        event('loss_screen_sample',**identity,replay=replay,formal_saved=totals['formal_outputs_saved'])
++        return row
++    except BaseException as error:
++        attempt.update(status='FAILED',error=repr(error),traceback=traceback.format_exc(),automatic_retry=False)
++        totals['dispatch_failures']+=1
++        raise
++    finally:
++        _merge_counts(totals,local)
++        elapsed=time.perf_counter()-started
++        totals['generation_wall_seconds']+=elapsed;totals['native_sampling_seconds']+=native_seconds
++        attempt.update(wall_seconds=elapsed,native_sampling_seconds=native_seconds)
++        write(r,out)
++
++
++def sample_phase(r,out,phase):
++    """Generate each eligible fixed500-update endpoint once; never resume/retry."""
++    from .evaluation import _seeds,_expected,_identity
++    out=Path(out);models=_phase_models(r,phase);seeds=_seeds(r,phase)
++    phases=r.setdefault('sampling_phases',{})
++    if phase in phases or any(x.get('phase')==phase for x in r.get('generated',[])):
++        raise RuntimeError('Phase already dispatched; no automatic repeated generation')
++    totals=_ledger(r)
++    if totals['formal_output_attempts']+24*len(models)>FORMAL_CAP:
++        raise RuntimeError('Registered phase would exceed total formal budget')
++    block=dict(status='STARTING',phase=phase,models=list(models),seeds=list(seeds),
++               expected_outputs=24*len(models),completed_outputs=0,models_audit={},
++               automatic_retry=False)
++    phases[phase]=block;started=time.perf_counter();write(r,out)
++    try:
++        banks=_bank(r);noises=_noises(r,out,phase,seeds,create=True)
++        for name in models:
++            model=None;entry=dict(status='STARTING',completed_outputs=0)
++            block['models_audit'][name]=entry
++            try:
++                model,loaded=_load_endpoint(r,name);entry['load']=loaded
++                for patch in (0,1,2):
++                    for parent in (0,1):
++                        C=banks[patch]['cases_by_key'][parent,12]['constraints']
++                        for seed in (seeds if patch==0 else seeds[:2]):
++                            _sample_one(r,out,model,name,parent,patch,seed,phase,noises[seed],C)
++                            entry['completed_outputs']+=1;block['completed_outputs']+=1
++                entry['state_after']=state_sha256(model)
++                if entry['state_after']!=loaded['state_sha256']:
++                    raise RuntimeError('Frozen generator changed during sampling')
++                rows=[v for v in r['generated'] if v['phase']==phase and v['model']==name]
++                if len(rows)!=24 or {_identity(v) for v in rows}!=_expected((name,),seeds):
++                    raise RuntimeError('Registered model output matrix incomplete or duplicated')
++                entry['status']='PASS'
++            except BaseException as error:
++                entry.update(status='STOPPED',error=repr(error),traceback=traceback.format_exc(),automatic_retry=False)
++                if name=='L0' or not isinstance(error,Exception):
++                    raise
++                # A failed candidate is retained but not retried or ranked by a
++                # partial matrix. Other independently trained candidates proceed.
++            finally:
++                if model is not None and 'state_after' not in entry:
++                    try:
++                        entry['state_after']=state_sha256(model)
++                        entry['frozen_state_unchanged']=entry['state_after']==entry.get('load',{}).get('state_sha256')
++                    except Exception as error:
++                        entry['state_hash_after_failure_error']=repr(error)
++                model=None;release();write(r,out)
++        block['status']='PASS' if all(v['status']=='PASS' for v in block['models_audit'].values()) else 'PASS_WITH_FAILED_CANDIDATES'
++        block['failed_models']=[m for m,v in block['models_audit'].items() if v['status']!='PASS']
++        return block
++    except BaseException as error:
++        block.update(status='STOPPED',error=repr(error),traceback=traceback.format_exc())
++        raise
++    finally:
++        block['seconds']=time.perf_counter()-started;write(r,out)
++
++
++def replay_once(r,out):
++    """One prespecified fresh-load L0/P0/patch0/development-first-seed replay."""
++    from .evaluation import _seeds
++    if 'sampling_replay' in r or r.get('replays'):
++        raise RuntimeError('The one registered replay was already attempted')
++    seeds=_seeds(r,'development');seed=seeds[0]
++    matches=[v for v in r.get('generated',[]) if (v.get('phase'),v['model'],int(v['parent']),int(v['patch']),int(v['seed']))==('development','L0',0,0,seed)]
++    if len(matches)!=1:
++        raise ValueError('Fixed baseline replay reference is absent or duplicated')
++    _phase_models(r,'development')
++    block=dict(status='STARTING',model='L0',parent=0,patch=0,seed=seed,selection_by_result=False)
++    r['sampling_replay']=block;model=None;started=time.perf_counter();write(r,out)
++    try:
++        banks=_bank(r);noises=_noises(r,Path(out),'development',seeds,create=False)
++        model,loaded=_load_endpoint(r,'L0');block['load']=loaded
++        row=_sample_one(r,out,model,'L0',0,0,seed,'development',noises[seed],
++                        banks[0]['cases_by_key'][0,12]['constraints'],reference=matches[0])
++        after=state_sha256(model)
++        if after!=loaded['state_sha256']:
++            raise RuntimeError('Fresh replay changed frozen generator')
++        block.update(status='PASS',state_after=after,all51_bitwise_equal=True,row=row)
++        return block
++    except BaseException as error:
++        block.update(status='STOPPED',error=repr(error),traceback=traceback.format_exc(),automatic_retry=False)
++        raise
++    finally:
++        block['seconds']=time.perf_counter()-started;model=None;release();write(r,out)
++
++
++def run_cpu_fixtures():
++    """Only scalar/count/array guards, no model construction, sampling, or RNG."""
++    raw=np.zeros((112,9),np.float32);noise=np.ones((1,112,9),np.float32)
++    C=np.arange(108,dtype=np.float32).reshape(12,3,3)/100
++    states=np.zeros((51,112,9),np.float32);states[:,:12]=C.reshape(12,9)
++    states[0,12:]=noise[0,12:];raw[:12]=C.reshape(12,9)
++    _validate_arrays(raw,states,noise,C)
++    for kind in ('C','noise','endpoint','nonfinite','shape'):
++        a=raw.copy();b=states.copy()
++        if kind=='C':b[17,0,0]+=1
++        elif kind=='noise':b[0,12,0]+=1
++        elif kind=='endpoint':a[-1,0]+=1
++        elif kind=='nonfinite':b[12,15,0]=np.nan
++        else:b=b[:50]
++        try:_validate_arrays(a,b,noise,C)
++        except ValueError:pass
++        else:raise AssertionError('Guard accepted '+kind)
++    r={};totals=_ledger(r);local=new_counts();local.update(model_forward_attempts=7,model_forward_returns=6,euler_updates=5,rollout_attempts=1)
++    _merge_counts(totals,local)
++    assert totals['model_forward_attempts']==7 and totals['model_forward_returns']==6 and totals['euler_updates']==5 and totals['complete_rollouts']==0
++    arms={m:dict(status='PASS',completed_updates=500,checkpoints={'500':dict(path=m,sha256=m,state_sha256=m,cumulative_updates=3000)}) for m in ARMS}
++    value={'arms':arms};assert _phase_models(value,'development')==ARMS
++    selected=dict(status='FROZEN',selected_models=['L2','L6'],confirmation_models=['L0','L2','L6'],checkpoint_identities={m:arms[m]['checkpoints']['500'] for m in ('L0','L2','L6')})
++    selected['selection_sha256']=seal(selected);value['selection']=selected
++    assert _phase_models(value,'confirmation')==('L0','L2','L6')
++    selected['selected_models']=['L1']
++    try:_phase_models(value,'confirmation')
++    except ValueError:pass
++    else:raise AssertionError('Changed selection accepted')
++    return dict(status='PASS',checks=10,model_forwards=0,model_constructions=0,sampling_calls=0,
++                OT_calls=0,autograd_calls=0,optimizer_updates=0,random_draws=0)
+--- /dev/null
++++ b/experiments/mf_h1_local0/loss_screen/test_distribution_losses.py
+@@ -0,0 +1,120 @@
++"""Small CPU formula fixtures; never model, training, or original noise OT."""
++import json
++import itertools
++import torch
++from . import distribution_losses as module
++
++
++def run_cpu_tests():
++    before=module.work_counters()
++    rows=[];gradient_calls=0;loss_calls=0
++    def loss(name,pred,target):
++        nonlocal loss_calls
++        loss_calls+=1
++        return module.distribution_loss(name,pred,target)
++    def grad(value,inputs):
++        nonlocal gradient_calls
++        gradient_calls+=1
++        return torch.autograd.grad(value,inputs,allow_unused=True)
++    gt=torch.tensor([[[-.15,0,0],[-.05,0,0],[-.10,.08,0]],
++                     [[.05,0,.03],[.15,0,.03],[.10,.08,.03]]],dtype=torch.float64,requires_grad=True)
++    bbox=torch.tensor(1.,dtype=torch.float64,requires_grad=True)
++    target=module.prepare_distribution_target(gt,bbox)
++    assert module.work_counters()==before
++    assert not target['free_gt'].requires_grad and not target['bbox_L'].requires_grad
++    for name in ('L4','L5'):
++        pred=gt.detach().clone().requires_grad_(True)
++        result=loss(name,pred,target)
++        derivative,gt_derivative,bbox_derivative=grad(result['loss'],(pred,gt,bbox))
++        assert abs(float(result['loss']))<1e-13
++        assert torch.isfinite(derivative).all() and float(derivative.abs().max())<1e-11
++        assert gt_derivative is None and bbox_derivative is None
++        rows.append(dict(check='GT_oracle_and_fixed_labels',loss_name=name,loss=float(result['loss'].detach()),
++            maximum_gradient=float(derivative.abs().max()),GT_gradient=None,bbox_gradient=None,counts=result['counts'],
++            max_marginal_L1_residual=result['diagnostics'].get('max_marginal_L1_residual')))
++    # Oracle v=u yields exactly the original clean free endpoint algebraically.
++    noise=gt.detach()-.125;t=.75
++    xt=(1-t)*noise+t*gt.detach();oracle=xt+(1-t)*(gt.detach()-noise)
++    assert torch.allclose(oracle,gt.detach(),atol=1e-15,rtol=0)
++    for name in ('L4','L5'):
++        oracle_result=loss(name,oracle,target)
++        assert abs(float(oracle_result['loss']))<1e-13
++    perturbed=gt.detach().clone()
++    perturbed[0,1,2]+=.011;perturbed[1,2,1]+=.009
++    for name in ('L4','L5'):
++        pred=perturbed.clone().requires_grad_(True)
++        result=loss(name,pred,target);derivative,=grad(result['loss'],(pred,))
++        assert torch.isfinite(derivative).all() and float(derivative.abs().max())>0
++        differences=[]
++        for index in ((0,1,2),(1,2,1)):
++            delta=1e-6;plus=perturbed.clone();minus=perturbed.clone();plus[index]+=delta;minus[index]-=delta
++            finite_difference=(float(loss(name,plus,target)['loss'])-float(loss(name,minus,target)['loss']))/(2*delta)
++            analytical=float(derivative[index]);error=abs(analytical-finite_difference)
++            assert error < 2e-7+2e-5*abs(finite_difference), (name,index,analytical,finite_difference)
++            differences.append(dict(index=list(index),analytical=analytical,finite_difference=finite_difference,absolute_error=error))
++        rows.append(dict(check='FP64_finite_difference_full_vertices_areas_normals',loss_name=name,loss=float(result['loss'].detach()),
++            differences=differences,max_marginal_L1_residual=result['diagnostics'].get('max_marginal_L1_residual')))
++    # Every S3 corner permutation and a nontrivial face permutation preserve
++    # the geometric measure, including orientation reversal of Q=n nT.
++    for name in ('L4','L5'):
++        reference=float(loss(name,perturbed,target)['loss'])
++        errors=[]
++        for order in itertools.permutations(range(3)):
++            permuted=perturbed.flip(0)[:,list(order)]
++            errors.append(abs(float(loss(name,permuted,target)['loss'])-reference))
++        assert max(errors)<1e-12, (name,errors)
++        rows.append(dict(check='face_and_all_S3_permutations',loss_name=name,max_absolute_difference=max(errors)))
++    # A fresh opposite target verifies swap symmetry at the actual 96 steps.
++    reverse=module.prepare_distribution_target(perturbed,1.)
++    forward=float(loss('L4',perturbed,target)['loss'])
++    backward=float(loss('L4',gt.detach(),reverse)['loss'])
++    assert abs(forward-backward)<1e-12
++    rows.append(dict(check='finite_budget_L4_swap_symmetry',absolute_difference=abs(forward-backward)))
++    # Missing a spatial patch and copying the other one preserve total area
++    # but must be visible to both measures. Duplicating the entire soup makes
++    # L4 blind to total mass, while L5 must respond to its doubled mass.
++    duplicate_one=gt.detach()[[0,0]];duplicate_all=gt.detach().repeat(2,1,1)
++    for name in ('L4','L5'):
++        missing=loss(name,duplicate_one,target);doubled=loss(name,duplicate_all,target)
++        assert float(missing['loss'])>1e-5
++        if name=='L4':assert abs(float(doubled['loss']))<1e-12
++        else:assert float(doubled['loss'])>1e-5 and abs(doubled['diagnostics']['predicted_measure_mass']-2)<1e-12
++        rows.append(dict(check='missing_patch_copied_area_and_doubled_total_area',loss_name=name,
++            missing_patch_loss=float(missing['loss']),doubled_surface_loss=float(doubled['loss']),
++            doubled_mass=doubled['diagnostics'].get('predicted_measure_mass'),
++            missing_patch_marginal_L1_residual=missing['diagnostics'].get('max_marginal_L1_residual')))
++    # Production FP32 path and a collapsed predicted triangle: no deleting
++    # problematic faces. L4 records its floor and L5 keeps zero area naturally.
++    target32=module.prepare_distribution_target(gt.detach().float(),1.)
++    for name in ('L4','L5'):
++        pred=gt.detach().float().requires_grad_(True)
++        result=loss(name,pred,target32);derivative,=grad(result['loss'],(pred,))
++        assert abs(float(result['loss']))<1e-6 and torch.isfinite(derivative).all()
++        assert float(derivative.abs().max())<1e-5
++        collapsed=gt.detach().float();collapsed[0]=collapsed[0,0].clone();collapsed.requires_grad_(True)
++        damaged=loss(name,collapsed,target32);damaged_grad,=grad(damaged['loss'],(collapsed,))
++        assert torch.isfinite(damaged_grad).all()
++        assert damaged['diagnostics']['predicted_zero_area_count']==1
++        if name=='L4':assert damaged['diagnostics']['predicted_area_floor_count']==1
++        rows.append(dict(check='FP32_oracle_and_degenerate_prediction',loss_name=name,oracle_loss=float(result['loss'].detach()),
++            oracle_gradient_max=float(derivative.abs().max()),degenerate_loss=float(damaged['loss'].detach()),
++            degenerate_gradient_max=float(damaged_grad.abs().max()),degenerate_diagnostics=damaged['diagnostics']))
++    # Verify returned per-call accounting distinguishes an actual self solve
++    # from reading a cached GT-GT scalar, without caching predicted geometry.
++    current=loss('L4',perturbed,target)
++    assert current['counts']['sinkhorn_solves']==2 and current['counts']['GTGT_sinkhorn_cache_hits']==1
++    current5=loss('L5',perturbed,target)
++    assert current5['counts']['kernel_matrix_evaluations']==6 and current5['counts']['GTGT_kernel_cache_hits']==1
++    after=module.work_counters()
++    actual={key:after[key]-before[key] for key in before}
++    assert actual['sinkhorn_solve_attempts']==actual['sinkhorn_solve_returns']
++    assert actual['kernel_matrix_attempts']==actual['kernel_matrix_returns']
++    return dict(status='PASS',rows=rows,loss_calls=loss_calls,CPU_coordinate_autograd_calls=gradient_calls,
++        actual_work=actual,GT_requires_grad_after=gt.requires_grad,GT_accumulated_grad_is_None=gt.grad is None,
++        original_noise_OT_calls=0,model_forwards=0,model_backwards=0,optimizer_updates=0,
++        CUDA_initialized=torch.cuda.is_initialized(),negative_divergence_clamping=False,
++        finite_difference_dtype='torch.float64',production_fixture_dtype='torch.float32')
++
++
++if __name__=='__main__':
++    print(json.dumps(run_cpu_tests(),sort_keys=True))
+\ No newline at end of file
+--- /dev/null
++++ b/experiments/mf_h1_local0/loss_screen/test_relation_losses.py
+@@ -0,0 +1,206 @@
++"""Bounded CPU fixtures for registered relation losses; no model or OT calls."""
++import itertools
++import json
++import time
++import unittest
++
++import numpy as np
++import torch
++
++from experiments.mf_h1_local0.loss_screen.relation_losses import (
++    FORMULA_SPEC, prepare_relations, relation_loss, point_triangle_distance_sq)
++
++LEDGER = dict(prepare_calls=0, relation_forward_calls=0,
++              independent_distance_forward_calls=0, autograd_calls=0,
++              finite_difference_evaluations=0, model_forwards=0, OT_calls=0,
++              optimizer_updates=0)
++
++
++def prep(*args):
++    LEDGER['prepare_calls'] += 1
++    return prepare_relations(*args)
++
++
++def loss(name, value, target):
++    LEDGER['relation_forward_calls'] += 1
++    return relation_loss(name, value, target)
++
++
++def grad(value, inputs, **kwargs):
++    LEDGER['autograd_calls'] += 1
++    return torch.autograd.grad(value, inputs, **kwargs)
++
++
++def distance(points, triangles):
++    LEDGER['independent_distance_forward_calls'] += 1
++    return point_triangle_distance_sq(points, triangles)
++
++
++def fixture(dtype=torch.float64, two=True):
++    vertices=torch.tensor([[0.,0.,0.],[1.,0.,0.],[0.,1.,0.],
++                           [.25,0.,1.],[1.,1.,.5]],dtype=dtype)
++    fi=torch.tensor([[1,0,3],[1,3,4]] if two else [[1,0,3]])
++    ki=torch.tensor([[0,1,2]])
++    return vertices[fi],vertices[ki],fi,ki
++
++
++class RelationLossTests(unittest.TestCase):
++    def test_oracle_zero_and_contact_gradients(self):
++        gt,C,fi,ki=fixture();target=prep(gt,C,fi,ki,1.)
++        # Endpoint oracle: Xt+(1-t)*(Y-Z)=Y, tested in FP64.
++        z=torch.arange(gt.numel(),dtype=gt.dtype).reshape_as(gt)/37
++        oracle=(.25*z+.75*gt)+.25*(gt-z)
++        self.assertTrue(torch.allclose(oracle,gt,atol=1e-15,rtol=0))
++        for name in ('L1','L2','L3','L6'):
++            pred=oracle.clone().requires_grad_();out=loss(name,pred,target)
++            self.assertTrue(out['applicable']);self.assertLess(abs(float(out['loss'])),1e-25)
++            gradient=grad(out['loss'],pred)[0]
++            self.assertTrue(torch.isfinite(gradient).all());self.assertLess(float(gradient.abs().max()),1e-12)
++        # Exactly on the known plane has no positive artificial contact margin.
++        pred=gt.clone();pred[...,2]=0;pred.requires_grad_()
++        value=loss('L1',pred,target)['loss'];gradient=grad(value,pred)[0]
++        self.assertEqual(float(value),0.);self.assertEqual(int(torch.count_nonzero(gradient)),0)
++
++    def test_all_four_finite_differences(self):
++        gt,C,fi,ki=fixture(two=False);target=prep(gt,C,fi,ki,1.)
++        perturb=torch.tensor([[[.031,.052,-.44],[-.023,.027,-.39],[.044,.31,-.21]]],dtype=gt.dtype)
++        for name in ('L1','L2','L3','L6'):
++            x=(gt+perturb).requires_grad_();value=loss(name,x,target)['loss']
++            analytic=grad(value,x)[0].detach().numpy();numeric=np.empty_like(analytic)
++            h=1e-6
++            for index in np.ndindex(numeric.shape):
++                plus=x.detach().clone();minus=x.detach().clone();plus[index]+=h;minus[index]-=h
++                numeric[index]=(float(loss(name,plus,target)['loss'])-float(loss(name,minus,target)['loss']))/(2*h)
++                LEDGER['finite_difference_evaluations']+=2
++            np.testing.assert_allclose(analytic,numeric,atol=3e-7,rtol=2e-6,err_msg=name)
++            self.assertGreater(float(np.linalg.norm(analytic)),1e-8)
++
++    def test_source_labels_follow_faces_and_all_S3_corners(self):
++        gt,C,fi,ki=fixture();pred=gt+torch.tensor([[[.01,.04,-.22],[.05,.08,-.17],[.03,.12,.15]],
++                                                [[.07,-.03,.06],[-.04,.07,-.08],[.02,.09,-.05]]],dtype=gt.dtype)
++        target=prep(gt,C,fi,ki,1.7)
++        expected={name:float(loss(name,pred,target)['loss']) for name in ('L1','L2','L3','L6')}
++        for permutation in itertools.permutations(range(3)):
++            p=list(permutation);face=torch.tensor([1,0]);cp=list(reversed(p))
++            revised=prep(gt[face][:,p],C[:,cp],fi[face][:,p],ki[:,cp],1.7)
++            for name,reference in expected.items():
++                actual=float(loss(name,pred[face][:,p],revised)['loss'])
++                self.assertAlmostEqual(actual,reference,delta=2e-12,msg=name)
++
++    def test_L1_coplanar_is_inapplicable_no_forced_side(self):
++        gt,C,fi,ki=fixture(two=False);gt=gt.clone();gt[0,2]=torch.tensor([.25,-1.,0.])
++        target=prep(gt,C,fi,ki,1.)
++        self.assertEqual(target['counts']['L1_inapplicable_coplanar_or_ambiguous'],1)
++        pred=(gt+1).requires_grad_();out=loss('L1',pred,target)
++        self.assertFalse(out['applicable']);self.assertEqual(float(out['loss']),0.)
++        self.assertEqual(int(torch.count_nonzero(grad(out['loss'],pred)[0])),0)
++        # Threshold is <=1e-6 L, with no post hoc tolerance or sign assignment.
++        for height,applicable in [(1e-6,False),(1.01e-6,True)]:
++            clean=gt.clone();clean[0,2,2]=height
++            t=prep(clean,C,fi,ki,1.)
++            self.assertEqual(bool(t['counts']['L1_applicable_relations']),applicable)
++
++    def test_L2_right_angle_and_translation_blind_spot(self):
++        gt,C,fi,ki=fixture(two=False);target=prep(gt,C,fi,ki,1.)
++        self.assertAlmostEqual(float(target['pair_gt_cos2'][0]),0.,delta=1e-15)
++        flattened=gt.clone();flattened[0,2]=torch.tensor([.25,-1.,0.])
++        self.assertAlmostEqual(float(loss('L2',flattened,target)['loss']),1.,delta=1e-14)
++        self.assertLess(float(loss('L2',gt+torch.tensor([5.,2.,-3.]),target)['loss']),1e-25)
++
++    def test_L3_tangential_to_transverse_ratio(self):
++        gt,C,fi,ki=fixture(two=False);target=prep(gt,C,fi,ki,1.)
++        parallel=(gt+torch.tensor([.2,0.,0.])).requires_grad_()
++        transverse=(gt+torch.tensor([0.,.2,0.])).requires_grad_()
++        a=loss('L3',parallel,target)['loss'];b=loss('L3',transverse,target)['loss']
++        self.assertAlmostEqual(float(a/b),.05,delta=1e-12)
++        ga=grad(a,parallel)[0];gb=grad(b,transverse)[0]
++        self.assertEqual(int(torch.count_nonzero(ga[...,1:])),0)
++        self.assertEqual(int(torch.count_nonzero(gb[...,[0,2]])),0)
++        self.assertAlmostEqual(float(ga.norm()/gb.norm()),.05,delta=1e-12)
++
++    def test_L6_finite_surface_missing_midpoint_and_band(self):
++        gt,C,fi,ki=fixture(two=False)
++        extra=torch.tensor([[[3.,0.,0.],[4.,0.,0.],[3.,1.,0.]]],dtype=gt.dtype)
++        clean=torch.cat((gt,extra));ids=torch.cat((fi,torch.tensor([[5,6,7]])))
++        target=prep(clean,C,ids,ki,1.)
++        # Both GT interface endpoints exist in the prediction; its middle does not.
++        pred=torch.tensor([[[0.,0.,0.],[.05,0.,0.],[0.,.05,0.]],
++                           [[1.,0.,0.],[.95,0.,0.],[1.,.05,0.]]],dtype=gt.dtype)
++        q=torch.tensor([[0.,0.,0.],[.5,0.,0.],[1.,0.,0.]],dtype=gt.dtype)
++        d=distance(q,pred).min(-1).values
++        self.assertEqual(float(d[0]),0.);self.assertEqual(float(d[2]),0.)
++        self.assertGreater(float(d[1]),.19)
++        self.assertGreater(float(loss('L6',pred,target)['loss']),.01)
++        one=prep(gt,C,fi,ki,1.)
++        flat=gt.clone();flat[0,2]=torch.tensor([.25,-1.,0.])
++        self.assertLess(float(distance(one['gamma'].reshape(-1,3),flat).min(-1).values.max()),1e-25)
++        self.assertGreater(float(distance(one['band'].reshape(-1,3),flat).min(-1).values.mean()),.01)
++        self.assertGreater(float(loss('L6',flat,one)['loss']),.005)
++        # Point is on the infinite supporting plane but outside the finite triangle.
++        query=torch.tensor([[4.,4.,0.]],dtype=gt.dtype)
++        self.assertGreater(float(distance(query,C)[0,0]),20.)
++
++    def test_nonmanifold_edges_keep_all_pairs_and_no_proximity_labels(self):
++        gt,C,fi,ki=fixture(two=False)
++        second=torch.tensor([[[0.,0.,0.],[1.,0.,0.],[.5,0.,-1.]]],dtype=gt.dtype)
++        clean=torch.cat((gt,second));ids=torch.cat((fi,torch.tensor([[0,1,4]])))
++        target=prep(clean,C,ids,ki,1.);counts=target['counts']
++        self.assertEqual(counts['nonmanifold_source_edges'],1)
++        self.assertEqual(counts['adjacent_pairs_at_least_one_free'],3)
++        self.assertEqual(counts['known_free_interface_relations'],2)
++        self.assertEqual(counts['free_free_pairs'],1)
++        for name in ('L1','L2','L3','L6'):
++            self.assertLess(float(loss(name,clean,target)['loss']),1e-25)
++        # Same geometric positions with separate true IDs do not invent adjacency.
++        separate=prep(gt,C,fi,ki+100,1.)
++        for name in ('L1','L2','L3','L6'):
++            self.assertFalse(loss(name,gt,separate)['applicable'])
++        inconsistent=C.clone();inconsistent[0,0,0]=.1
++        with self.assertRaisesRegex(ValueError,'inconsistent'):
++            prep(gt,inconsistent,fi,ki,1.)
++
++    def test_degenerate_prediction_is_finite_not_deleted(self):
++        gt,C,fi,ki=fixture(two=False);target=prep(gt,C,fi,ki,1.)
++        for name,key in [('L2','prediction_normal_epsilon_faces'),('L6','prediction_surface_edge_fallback_faces')]:
++            pred=torch.zeros_like(gt,requires_grad=True);out=loss(name,pred,target)
++            self.assertTrue(out['applicable']);self.assertTrue(torch.isfinite(out['loss']))
++            self.assertEqual(int(out['counts'][key]),1)
++            self.assertTrue(torch.isfinite(grad(out['loss'],pred)[0]).all())
++
++    def test_fixed_GT_C_detach_precision_and_scale(self):
++        gt,C,fi,ki=fixture();gt.requires_grad_();C.requires_grad_()
++        target=prep(gt,C,fi,ki,2.3)
++        self.assertTrue(all(not v.requires_grad for v in target.values() if isinstance(v,torch.Tensor)))
++        for name in ('L1','L2','L3','L6'):
++            pred=(gt.detach()+torch.tensor([.12,.07,-.3],dtype=gt.dtype)).requires_grad_()
++            value=loss(name,pred,target)['loss'];g=grad(value,(pred,gt,C),allow_unused=True)
++            self.assertIsNone(g[1]);self.assertIsNone(g[2]);self.assertTrue(torch.isfinite(g[0]).all())
++            scaled=prep(gt.detach()*7,C.detach()*7,fi,ki,2.3*7)
++            self.assertAlmostEqual(float(loss(name,pred.detach()*7,scaled)['loss']),float(value),delta=2e-12)
++            fp32=prep(gt.detach().float(),C.detach().float(),fi,ki,2.3)
++            with torch.autocast('cpu',dtype=torch.bfloat16):
++                out=loss(name,pred.detach().float(),fp32)
++            self.assertEqual(out['loss'].dtype,torch.float32)
++            self.assertAlmostEqual(float(out['loss']),float(value),delta=2e-6)
++
++
++def run_cpu_tests():
++    for key in LEDGER:LEDGER[key]=0
++    start=time.perf_counter()
++    suite=unittest.defaultTestLoader.loadTestsFromTestCase(RelationLossTests)
++    result=unittest.TextTestRunner(verbosity=2).run(suite)
++    report=dict(status='PASS' if result.wasSuccessful() else 'FAIL',tests=result.testsRun,
++                failures=len(result.failures),errors=len(result.errors),seconds=time.perf_counter()-start,
++                counts=dict(LEDGER),formula_spec=FORMULA_SPEC,
++                numerical_thresholds=dict(FP64_oracle_loss=1e-25,FP64_oracle_gradient=1e-12,
++                    finite_difference_step=1e-6,finite_difference_atol=3e-7,finite_difference_rtol=2e-6,
++                    FP64_permutation_atol=2e-12,FP32_FP64_atol=2e-6),
++                CUDA_initialized=torch.cuda.is_initialized())
++    return report
++
++
++if __name__=='__main__':
++    torch.set_num_threads(1)
++    result=run_cpu_tests()
++    print(json.dumps(result,sort_keys=True))
++    raise SystemExit(0 if result['status']=='PASS' else 1)
+--- /dev/null
++++ b/experiments/mf_h1_local0/loss_screen/training.py
+@@ -0,0 +1,161 @@
++"""Seven identical-stream, fixed 500-update branches; no generation in training."""
++from .common import *
++from .calibration import strict_initial,inc,endpoint,velocity_grad
++from . import checkpoint
++from native_t1.training import make_optimizer,masked_fm_loss
++from native_t1.data import native_collate,model_inputs
++from native_t1.model import native_execution
++from native_t1.accounting import count_ot_calls
++from .distribution_losses import work_counters
++import traceback
++
++def source_guard(r):
++ for item in r['source_snapshot']['files']:
++  if file_sha256(item['original_path'])!=item['sha256']:raise RuntimeError('Frozen computation source changed: '+item['original_path'])
++
++def grouped(model,before=None):
++ predicates={'Geo':lambda n:n.startswith('context_encoder.'),'role':lambda n:n=='role_embedding',
++  'velocity_head':lambda n:n.startswith('backbone.final_layer.'),'first_layer':lambda n:n.startswith('backbone.layers.0.')}
++ ans={}
++ for label,predicate in predicates.items():
++  entries=[(n,p) for n,p in model.named_parameters() if predicate(n)]
++  vals=[p.grad for n,p in entries] if before is None else [p.detach()-before[n] for n,p in entries]
++  ans[label]=magnitude(vals)
++ return ans
++
++def tracked_state(model):
++ return {n:p.detach().clone() for n,p in model.named_parameters()
++  if n.startswith(('context_encoder.','backbone.final_layer.','backbone.layers.0.')) or n=='role_embedding'}
++
++def diagnostic_leaf(arm,v,b,target,denom,weight,ramp,active,r,stage):
++ c=r['counts']['training'][arm]
++ leaf=v.detach().requires_grad_(True)
++ fm=masked_fm_loss(leaf,b['u'],b['valid_mask'],b['known_mask'],denominator=denom)
++ gf=velocity_grad(fm,leaf,c);nf=float(torch.linalg.vector_norm(gf))
++ aux=evaluate_loss(arm,endpoint(leaf,b),target,r,stage)
++ ga=velocity_grad(aux['loss']/8,leaf,c);na=float(torch.linalg.vector_norm(ga))
++ return dict(FM_microbatch_gradient_L2=nf,geometry_microbatch_gradient_L2=na,
++  raw_ratio=na/nf if nf else None,weighted_ratio=weight*ramp*float(active)*na/nf if nf else None,
++  applied_gate=bool(active),lambda_geometry=weight,ramp=ramp,t=float(b['t'][0]),
++  actual_velocity_sha256=array_hash(v.detach()),microbatch_index=0,
++  normalization='FM original effective coordinate denominator; auxiliary per-sample mean /8')
++
++def train_one(r,out,arm,bank):
++ entry=r['arms'][arm]
++ if entry['status']!='READY':return
++ source_guard(r)
++ c=r['counts']['training'].setdefault(arm,{})
++ model=None;optimizer=None
++ try:
++  model,identity=strict_initial();model.set_trainable(True).eval()
++  optimizer=make_optimizer(model)
++  if optimizer.state:raise RuntimeError('Fresh optimizer unexpectedly contains moments')
++  if any(p.dtype!=torch.float32 or not p.requires_grad for p in model.parameters()):raise RuntimeError('Full FP32 generator not trainable')
++  if model.training:raise RuntimeError('Dropout must stay off')
++  stream=stream_for(r);entry.update(status='TRAINING',initial_identity=identity,fresh_optimizer=True,
++   initial_stream_sha256=seal(stream.state_dict()),logs=[],stream_audit=[],timing=dict(CPU_OT_and_stream_seconds=0.,
++   model_update_seconds=0.,supervision_prepare_seconds=0.,checkpoint_seconds=0.))
++  weight=0. if arm=='L0' else r['calibration']['candidates'][arm]['lambda']
++  rootdir=Path(out)/arm;rootdir.mkdir(exist_ok=False)
++  entry['lambda']=weight;write(r,out);tick=time.perf_counter()
++  for step in range(1,501):
++   if sum(x['completed_updates'] for x in r['arms'].values())>=3500:raise RuntimeError('Global update budget exhausted')
++   ot_tick=time.perf_counter()
++   with count_ot_calls(c):samples=stream.next_effective_batch()
++   entry['timing']['CPU_OT_and_stream_seconds']+=time.perf_counter()-ot_tick
++   prep_tick=time.perf_counter();labels=[bank.sample(s) for s in samples]
++   audit=audit_batch(stream,samples,step,labels)
++   if arm!='L0' and audit!=r['arms']['L0']['stream_audit'][step-1]:raise RuntimeError('Paired formal stream mismatch before update')
++   entry['stream_audit'].append(audit)
++   targets=[prepare_target(arm,lab) for lab in labels] if arm!='L0' else None
++   entry['timing']['supervision_prepare_seconds']+=time.perf_counter()-prep_tick
++   denom=9*sum(int((s['valid_mask']&~s['known_mask']).sum()) for s in samples)
++   if denom not in (7524,7452,7488):raise RuntimeError('Original FM denominator differs')
++   log_now=step in LOG_STEPS;before=tracked_state(model) if log_now else None
++   fm_total=0.;geom_total=0.;active_count=0;applicable_count=0;ratio=None
++   probes={name:dict(gated_mean=0.,raw_active_mean=0.,active_samples=0,applicable_active_samples=0) for name in CANDIDATES} if arm=='L0' and step==500 else None
++   numerical=[];ramp=min(step/50.,1.);optimizer.zero_grad(set_to_none=True)
++   entry['batch_in_progress']=step;write(r,out) if step==1 else None
++   update_tick=time.perf_counter()
++   for micro,(s,lab) in enumerate(zip(samples,labels)):
++    b=native_collate([s],'cuda');active=bool(b['t'][0]>=.5);active_count+=int(active)
++    with native_execution(model,coordinates=b['xt']) as runtime:
++     inc(c,'forward_attempts');v=model(*model_inputs(b)).float();inc(c,'forward_returns')
++     fm=masked_fm_loss(v,b['u'],b['valid_mask'],b['known_mask'],denominator=denom)
++     total=fm
++     if arm!='L0' and active:
++      result=evaluate_loss(arm,endpoint(v,b),targets[micro],r,'train_'+arm)
++      applicable_count+=int(result['applicable']);geom_total+=float(result['loss'].detach())/8
++      total=total+weight*ramp*result['loss']/8
++      if log_now:numerical.append(dict(microbatch=micro,**plain(result.get('diagnostics',{})),counts=plain(result['counts'])))
++     if not bool(torch.isfinite(total)):raise FloatingPointError('Nonfinite total objective')
++     if arm!='L0' and step in (100,500) and micro==0:
++      ratio=diagnostic_leaf(arm,v,b,targets[micro],denom,weight,ramp,active,r,'velocity_ratio_'+arm)
++     if probes is not None and active:
++      with torch.no_grad():
++       yhat=endpoint(v.detach(),b)
++       for name in CANDIDATES:
++        if r['arms'][name]['status']!='READY':
++         probes[name]['status']='NOT_RUN_AFTER_CANDIDATE_FAILURE';continue
++        try:
++         pr=evaluate_loss(name,yhat,prepare_target(name,lab),r,'L0_objective_probe')
++         probes[name]['gated_mean']+=float(pr['loss'])/8
++         probes[name]['raw_active_mean']+=float(pr['loss'])
++         probes[name]['active_samples']+=1;probes[name]['applicable_active_samples']+=int(pr['applicable'])
++        except Exception as exc:
++         probes[name]['status']='FAILED';probes[name]['error']=repr(exc)
++         r['arms'][name].update(status='OBJECTIVE_PROBE_FAILED',error=repr(exc))
++     inc(c,'backward_attempts');total.backward();inc(c,'backward_returns')
++    fm_total+=float(fm.detach())
++   gradient_groups=grouped(model) if log_now else None
++   gradnorm=float(torch.nn.utils.clip_grad_norm_(list(model.parameters()),1.,error_if_nonfinite=True))
++   entry['optimizer_step_in_progress']=True
++   inc(c,'optimizer_step_attempts');optimizer.step();inc(c,'optimizer_updates')
++   entry['completed_updates']=step;entry['optimizer_step_in_progress']=False;entry['batch_in_progress']=False
++   torch.cuda.synchronize()
++   if not bool(torch.stack([torch.isfinite(p).all() for p in model.parameters()]).all()):raise FloatingPointError('Nonfinite updated generator')
++   entry['timing']['model_update_seconds']+=time.perf_counter()-update_tick
++   if log_now:
++    row=dict(step=step,cumulative_updates=2500+step,FM=fm_total,gated_geometry_mean=geom_total,
++     geometry_normalization='Unweighted by lambda/ramp; gate applied; sum per-sample means divided by all8',
++     raw_active_geometry_mean=geom_total*8/active_count if active_count and arm!='L0' else None,
++     weighted_geometry=weight*ramp*geom_total,total=fm_total+weight*ramp*geom_total,
++     active_samples=active_count,applicable_active_samples=applicable_count,effective_batch=8,microbatch=1,
++     free_coordinate_denominator=denom,lambda_geometry=weight,ramp=ramp,grad_norm_before_clip=gradnorm,
++     gradients=gradient_groups,parameter_updates=grouped(model,before),velocity_gradient_ratio=ratio,runtime=runtime,
++     numerical_diagnostics=numerical,loss_probes=probes,paired_stream_sha256=seal(audit))
++    entry['logs'].append(row);del before
++    event('training_log',arm=arm,step=step,FM=fm_total,weighted_geometry=row['weighted_geometry'],grad_norm=gradnorm)
++   if step in (250,500):
++    cp_tick=time.perf_counter();streamhash=seal(stream.state_dict())
++    entry['checkpoints'][str(step)]=checkpoint.save(rootdir/f'additional_step{step}_cumulative_step{2500+step}.pt',
++      model,optimizer,stream,arm=arm,step=step,r=r)
++    if seal(stream.state_dict())!=streamhash:raise RuntimeError('Saving advanced training RNG')
++    entry['timing']['checkpoint_seconds']+=time.perf_counter()-cp_tick
++   if step%25==0 or log_now:
++    entry['elapsed_seconds']=time.perf_counter()-tick;write(r,out)
++    if not log_now:event('training_progress',arm=arm,updates=step,seconds=round(entry['elapsed_seconds'],2))
++  entry.update(status='PASS',final_stream_state=stream.state_dict(),paired_stream_sha256=seal(entry['stream_audit']))
++  entry['timing']['wall_seconds']=time.perf_counter()-tick
++  if entry['completed_updates']!=500 or c.get('optimizer_updates')!=500 or c.get('forward_returns')!=4000 or c.get('OT_returns')!=4000:
++   raise RuntimeError('Completed training accounting differs')
++  source_guard(r);event('arm_complete',arm=arm,seconds=entry['timing']['wall_seconds'],endpoint=entry['checkpoints']['500'])
++ except Exception as exc:
++  entry.update(status='FAILED',error=repr(exc),traceback=traceback.format_exc())
++  event('arm_failed',arm=arm,updates=entry['completed_updates'],error=repr(exc))
++ finally:
++  entry['distribution_solver_process_counts_at_exit']=work_counters()
++  if optimizer is not None:del optimizer
++  if model is not None:del model
++  release();write(r,out)
++
++def train_all(r,out):
++ bank=TargetBank()
++ for arm in ARMS:
++  if arm!='L0' and r['arms']['L0']['status']!='PASS':
++   if r['arms'][arm]['status']=='READY':r['arms'][arm].update(status='BLOCKED_BASELINE_FAILURE')
++   continue
++  train_one(r,out,arm,bank)
++ r['training_total_updates']=sum(x['completed_updates'] for x in r['arms'].values())
++ if r['training_total_updates']>3500:raise RuntimeError('Update budget exceeded')
++ write(r,out)

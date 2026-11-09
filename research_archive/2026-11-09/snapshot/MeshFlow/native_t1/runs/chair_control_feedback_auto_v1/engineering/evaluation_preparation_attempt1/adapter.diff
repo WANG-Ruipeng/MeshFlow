@@ -1,0 +1,118 @@
+--- initial_adapter.py
++++ final_adapter.py
+@@ -7,6 +7,7 @@
+ """
+ from __future__ import annotations
+ import argparse
++import hashlib
+ from concurrent.futures import ProcessPoolExecutor
+ import json
+ import os
+@@ -93,7 +94,9 @@
+             ref = dict(old['reference']); ref['arrays'] = arrays(old_npz)
+             if digest(old_npz) != old['npz_sha256']: raise ValueError('Legacy reference NPZ mismatch')
+             for key, value in ref['arrays'].items():
+-                if assets.array_hash(value) != old['arrays_sha256'][key]: raise ValueError('Legacy outer array hash mismatch')
++                contiguous = np.ascontiguousarray(value)
++                old_hash = hashlib.sha256(str((contiguous.shape,str(contiguous.dtype))).encode()+contiguous.tobytes()).hexdigest()
++                if old_hash != old['arrays_sha256'][key]: raise ValueError('Legacy outer array hash mismatch')
+             origin = dict(kind='EXACT_HISTORICAL_ARRAYS', json=str(old_meta), npz=str(old_npz))
+         else:
+             ref = control.prepare_reference(condition, request['condition_id'], density='main')
+@@ -125,11 +128,14 @@
+         if oldmeta or oldnpz:
+             if not oldmeta or not oldnpz: raise ValueError('Incomplete legacy query pair')
+             saved = read_json(oldmeta)
+-            if saved['identity'] != expected or digest(oldnpz) != saved['npz_sha256']: raise ValueError('Old QY identity mismatch')
++            match = all(saved['identity'].get(k)==expected[k] for k in ('condition_id','GT_free_sha256','version'))
++            if expected['common_sha256'] is not None: match = match and saved['identity'].get('common_sha256')==expected['common_sha256']
++            if not match or digest(oldnpz) != saved['npz_sha256']: raise ValueError('Old QY identity mismatch')
+             qb = arrays(oldnpz)
+             for key, value in qb.items():
+                 if quality.array_sha(value) != saved['array_hashes'][key]: raise ValueError('Old QY array hash mismatch')
+-            origin = str(oldnpz)
++            qb = {k:v for k,v in qb.items() if k=='Q_Y2048' or (k=='Q_common2048' and expected['common_sha256'] is not None)}
++            origin = dict(npz=str(oldnpz),selection='Exact QY2048 only; historical optional common/dense arrays excluded when outside this registered condition')
+         else:
+             qb = {'Q_Y2048': quality.sample_mesh_surface(condition['GT_free'], 2048,
+                    np.random.RandomState(quality.seed('Q_Y', request['condition_id'], 2048)))}
+@@ -211,7 +217,8 @@
+         facts['initial_noise_bitwise'] = _same(np.asarray(z).reshape(n,9)[k:],np.asarray(bank['z']).reshape(n,9)[k:])
+     # A cached RAW cannot demonstrate its entire historical path on its own.
+     # Explicit archived audits may establish those facts, but never infer them.
+-    for source in (result.get('contracts',{}),result.get('geometry_contracts',{}),result.get('export_audit',{})):
++    for source in (result,result.get('contracts',{}),result.get('geometry_contracts',{}),result.get('export_audit',{})):
++        if not isinstance(source,dict):continue
+         for key in facts:
+             if facts[key] is None and isinstance(source.get(key),bool): facts[key] = source[key]
+     for key in ('export_audit_path','audit_path'):
+@@ -219,6 +226,16 @@
+             audit = read_json(resolve(result[key]))
+             for name in facts:
+                 if facts[name] is None and isinstance(audit.get(name),bool): facts[name]=audit[name]
++    export = result.get('export_audit',result.get('export',{}))
++    if isinstance(export,str): export = read_json(resolve(export))
++    if not export and result.get('export_audit_path'): export = read_json(resolve(result['export_audit_path']))
++    if export and export.get('schema')=='chair_feedback_lossless_export_v1':
++        npz,ply=resolve(export['npz']),resolve(export['ply'])
++        if digest(npz)!=export['npz_sha256'] or digest(ply)!=export['ply_sha256']:raise ValueError('Export changed')
++        saved=arrays(npz);loaded,faces=assets.read_binary_ply(ply)
++        known=np.asarray(saved['known_mask'],bool)
++        facts['NPZ_C_bitwise']=bool(_same(saved['output'].reshape(n,9),output) and _same(saved['output'][known].reshape(k,9),c))
++        facts['PLY_C_bitwise']=bool(_same(loaded.reshape(n,9),output) and _same(loaded[faces['known'].astype(bool)].reshape(k,9),c))
+     return facts
+ 
+ 
+@@ -229,10 +246,13 @@
+     rawpath = resolve(raw_path); base = {k:request.get(k) for k in
+         ('request_id','uid','condition_id','split','candidate','noise_seed','N','K','source_task_id','source_case_id')}
+     base.update(label=label, model_calls=0, human_usable=None, user_study='NOT_RUN')
+-    if not rawpath.exists(): return dict(base,status='NOT_RUN',reason='Registered raw missing')
++    if not rawpath.exists():
++        if rawpath.with_name('failure.json').exists():
++            return quality.clean(quality.failure_metrics(dict(base,status='GENERATION_FAILED',reason=read_json(rawpath.with_name('failure.json')))))
++        return dict(base,status='NOT_RUN',reason='Registered raw missing; no silent substitution from historical START cache')
+     sources = identities(); condition = _condition(request,out)
+     resultpath = rawpath.with_name('result.json'); result = read_json(resultpath) if resultpath.exists() else {}
+-    identity = dict(raw_sha256=digest(rawpath),condition_sha256=request['condition_sha256'],sources=sources,
++    identity = dict(raw_sha256=digest(rawpath),result_sha256=digest(resultpath) if resultpath.exists() else None,condition_sha256=request['condition_sha256'],sources=sources,
+                     request_id=rid,label=label,split=pool,bank_sha256=digest(resolve(request['bank_npz'])))
+     if result.get('raw_sha256') and result['raw_sha256'] != identity['raw_sha256']: raise ValueError('Result raw hash differs')
+     if dest.exists():
+@@ -267,8 +287,9 @@
+             statuses=control_result['statuses'],audit=control_result['audit'],vectors_sha256=digest(cp.with_suffix('.npz'))))
+         row.update(control_result['metrics'],control_statuses=control_result['statuses'],
+             control_vectors_path=str(cp.with_suffix('.npz')),control_vectors_sha256=digest(cp.with_suffix('.npz')))
+-    row.update(adapter_seconds=time.perf_counter()-tick,scoring_sources=sources,
+-               raw_path=str(rawpath),raw_sha256=identity['raw_sha256'])
++    row.update(adapter_seconds=time.perf_counter()-tick,scoring_sources=sources,checkpoint_sha256=result.get('checkpoint_sha256'),
++               result_path=str(resultpath) if resultpath.exists() else None,result_sha256=identity['result_sha256'],
++               raw_path=str(rawpath),raw_sha256=identity['raw_sha256'],geometry_sha256=quality.array_sha(raw['raw']))
+     freeze_json(dest,dict(identity=identity,metrics=quality.clean(row)))
+     return quality.clean(row)
+ 
+@@ -295,9 +316,6 @@
+     folder = out/'evaluation'/label/pool; raw_root = resolve(raw_root); jobs=[]
+     for request in requests:
+         raw = raw_root/request['request_id']/'raw.npz'
+-        if label=='START' and not raw.exists() and request.get('raw_cache'):
+-            cache=request['raw_cache'];raw=resolve(cache['path'])
+-            if digest(raw)!=cache['sha256']:raise ValueError('START RAW cache changed')
+         jobs.append((request,str(raw),str(out),label))
+     tick=time.perf_counter()
+     if workers==1: rows=list(map(_score_job,jobs))
+@@ -305,11 +323,12 @@
+         with ProcessPoolExecutor(max_workers=workers) as executor: rows=list(executor.map(_score_job,jobs))
+     write_json(folder/'per_output.json',rows);write_csv(folder/'per_output_metrics.csv',rows)
+     summary=summarize(rows,requests)
+-    summary.update(label=label,pool=pool,seconds=time.perf_counter()-tick,cpu_workers=workers,model_calls=0,
++    summary.update(label=label,pool=pool,invocation_seconds=time.perf_counter()-tick,cpu_workers=workers,model_calls=0,
++                   original_scoring_worker_seconds=sum(r.get('adapter_seconds',0) for r in rows),
+                    manifest_sha256=digest(resolve(manifest)) if isinstance(manifest,(str,Path)) else None)
+     write_json(folder/'summary.json',summary);write_csv(folder/'per_parent_metrics.csv',summary['parents'])
+     write_csv(folder/'per_noise_metrics.csv',summary['noise'])
+-    print('CPU evaluation',label,pool,summary['status'],len(rows),round(summary['seconds'],3),flush=True)
++    print('CPU evaluation',label,pool,summary['status'],len(rows),round(summary['invocation_seconds'],3),flush=True)
+     return summary
+ 
+ 

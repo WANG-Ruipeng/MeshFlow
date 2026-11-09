@@ -1,0 +1,1649 @@
+--- /dev/null
++++ b/r2/tools/c_restore_bounded_v1/blend.py
+@@ -0,0 +1,118 @@
++"""Bounded local C-restoration blend; pure NumPy, no solve/model/RNG/IO.
++
++The radius and free safety cap match the previous RBF diagnostic.  This
++version uses nonnegative subconvex weights, including support fade when their
++sum is below one.  These bounds are not a collision or connectivity guarantee.
++"""
++from __future__ import annotations
++import numpy as np
++
++VERSION='c_restore_bounded_wendland_blend_v1'
++RADIUS_L=0.10
++FREE_CAP_L=0.02
++
++def definition():
++    return dict(version=VERSION,kernel='Wendland C2: (1-q)^4*(4*q+1) for 0<=q<1, else 0',
++        radius_L=RADIUS_L,free_cap_L=FREE_CAP_L,
++        weights='Every source vertex ID has total observation weight 1; all proposal corner copies retained.',
++        formula='b_i=C_i-C_hat_i; s_i(x)=k(x,C_hat_i)/multiplicity(source_id_i); alpha_i=s_i/max(1,sum_j s_j); u=sum_i alpha_i*b_i',
++        support_fade='sum alpha = min(sum s,1); no support gives exactly zero displacement',
++        arithmetic='FP64 kernel/weights/blend; FP32 output; no matrix solve and no random numbers',
++        theoretical_bound='norm(u(x)) <= max(norm(b_i) for s_i(x)>0); maximum of empty set is zero',
++        actual_bound='norm(F_out_FP32-F_hat_FP32) <= min(0.02L,max participating norm(b)); checked in FP64 after rounding',
++        clipping='Radial projection to per-corner bound, then one conservative FP32 nextafter toward the original free corner only where rounding exceeds the bound. Failure raises; no fallback deformation.',
++        output='Original C bytes copied unchanged; free faces and corner order unchanged',
++        limitations='No source/free correspondence, shared-edge, winding, semantic-use, collision, or fold-free guarantee')
++
++def kernel(x,centers,radius):
++    x=np.asarray(x,dtype=np.float64).reshape(-1,3)
++    centers=np.asarray(centers,dtype=np.float64).reshape(-1,3)
++    if not np.isfinite(radius) or radius<=0:raise ValueError('Positive finite kernel radius required')
++    q=np.linalg.norm(x[:,None,:]-centers[None,:,:],axis=2)/radius
++    t=np.maximum(1.0-q,0.0)
++    return np.where(q<1.0,t**4*(4.0*q+1.0),0.0)
++
++def _stats(x):
++    a=np.asarray(x,dtype=np.float64).reshape(-1)
++    return dict(count=len(a),mean=float(a.mean()) if len(a) else None,
++        rms=float(np.sqrt(np.mean(a*a))) if len(a) else None,
++        p95=float(np.quantile(a,.95)) if len(a) else None,max=float(a.max()) if len(a) else None)
++
++def coordinate_restore(C,proposal,C_source_vertex_ids,*,L):
++    """Return (output, diagnostic, details), matching the old geometry API.
++
++    C and full unconstrained proposal must be FP32 triangle arrays (K,3,3)
++    and (N,3,3), 0<K<N.  IDs must be original integers (K,3).  Details are
++    arrays suitable for individual NPZ files; diagnostics contain JSON values.
++    Caller arrays are read-only inputs.  Original C bytes are preserved.
++    """
++    C=np.asarray(C);proposal=np.asarray(proposal);ids=np.asarray(C_source_vertex_ids)
++    if C.dtype!=np.float32 or proposal.dtype!=np.float32:raise TypeError('Require actual FP32 C and proposal')
++    if C.ndim!=3 or C.shape[1:]!=(3,3) or len(C)==0:raise ValueError('C must be nonempty (K,3,3)')
++    if proposal.ndim!=3 or proposal.shape[1:]!=(3,3) or len(proposal)<=len(C):raise ValueError('Require both C and free faces')
++    if ids.shape!=C.shape[:2] or not np.issubdtype(ids.dtype,np.integer):raise ValueError('Original integer source IDs required')
++    if not np.isfinite(C).all() or not np.isfinite(proposal).all() or not np.isfinite(L) or L<=0:raise ValueError('Nonfinite geometry/scale')
++    K=len(C);radius=RADIUS_L*float(L);cap=FREE_CAP_L*float(L)
++    if not np.isfinite(radius) or radius<=0 or not np.isfinite(cap) or cap<=0:raise ValueError('Invalid scaled radius/cap')
++    centers=proposal[:K].reshape(-1,3).astype(np.float64);target=C.reshape(-1,3).astype(np.float64)
++    flat_ids=ids.reshape(-1).astype(np.int64);unique,inverse,counts=np.unique(flat_ids,return_inverse=True,return_counts=True)
++    weights=1.0/counts[inverse];b=target-centers;b_norm=np.linalg.norm(b,axis=1)
++    original=C.reshape(-1,3)
++    for j in range(len(unique)):
++        ii=np.flatnonzero(inverse==j)
++        if any(original[i].tobytes()!=original[ii[0]].tobytes() for i in ii):raise ValueError('Original source-ID coordinates disagree')
++    free=proposal[K:].reshape(-1,3)
++    values=kernel(free,centers,radius);s=values*weights[None,:]
++    support_sum=s.sum(axis=1);denominator=np.maximum(1.0,support_sum)
++    alpha=s/denominator[:,None];alpha_sum=alpha.sum(axis=1)
++    supported=s>0.0;support_count=supported.sum(axis=1)
++    max_b=np.max(np.where(supported,b_norm[None,:],0.0),axis=1)
++    bound=np.minimum(cap,max_b);unclipped=alpha@b;norms=np.linalg.norm(unclipped,axis=1)
++    if not np.isfinite(unclipped).all() or not np.isfinite(norms).all():raise ArithmeticError('Nonfinite local blend')
++    # The subconvex bound is exact mathematically. The projection also removes
++    # any floating-point accumulation excess before the output rounding check.
++    clipped_mask=norms>bound
++    factor=np.ones(len(free),dtype=np.float64)
++    np.divide(bound,norms,out=factor,where=clipped_mask)
++    clipped=unclipped*factor[:,None]
++    corrected=free.copy();changed=np.any(clipped!=0,axis=1)
++    corrected[changed]=(free[changed].astype(np.float64)+clipped[changed]).astype(np.float32)
++    actual=corrected.astype(np.float64)-free.astype(np.float64)
++    rounding_adjust=np.linalg.norm(actual,axis=1)>bound
++    corrected[rounding_adjust]=np.nextafter(corrected[rounding_adjust],free[rounding_adjust])
++    actual=corrected.astype(np.float64)-free.astype(np.float64);actual_norm=np.linalg.norm(actual,axis=1)
++    if not np.isfinite(corrected).all() or np.any(actual_norm>bound):raise ArithmeticError('Actual FP32 displacement bound not satisfied')
++    if np.any(actual[support_count==0]!=0):raise ArithmeticError('No-support corner moved')
++    if np.any(alpha<0) or np.any(alpha_sum>1+8*np.finfo(np.float64).eps):raise ArithmeticError('Invalid subconvex blend weights')
++    output=proposal.copy();output[:K]=C;output[K:]=corrected.reshape(-1,3,3)
++    duplicate=[]
++    for j,vid in enumerate(unique):
++        ii=np.flatnonzero(inverse==j);cc=centers[ii]
++        duplicate.append(dict(source_vertex_id=int(vid),copies=len(ii),total_weight=float(weights[ii].sum()),
++            proposal_split_diameter=float(np.linalg.norm(cc[:,None,:]-cc[None,:,:],axis=2).max()),
++            target_displacement_max=float(b_norm[ii].max())))
++    diag=dict(status='PASS',definition=definition(),L=float(L),radius_model=radius,free_cap_model=cap,
++        anchor_corners=len(centers),source_vertices=len(unique),free_corners=len(free),
++        C_bytes_preserved=output[:K].tobytes()==C.tobytes(),all_original_corner_observations_used=True,
++        duplicates=duplicate,duplicate_source_vertex_groups=int(sum(counts>1)),
++        split_source_vertex_groups=sum(r['proposal_split_diameter']>0 for r in duplicate),
++        support_sum=_stats(support_sum),alpha_sum=_stats(alpha_sum),
++        supported_free_corners=int(sum(support_count>0)),no_support_free_corners=int(sum(support_count==0)),
++        free_support_participating_b_max_norm=_stats(max_b),free_actual_bound_norm=_stats(bound),
++        free_unclipped_displacement_norm=_stats(norms),free_applied_FP32_displacement_norm=_stats(actual_norm),
++        clipped_free_corners=int(sum(clipped_mask)),safety_cap_active_free_corners=int(sum(norms>cap)),
++        theoretical_bound_roundoff_clipped_free_corners=int(sum((norms>max_b)&(norms<=cap))),
++        FP32_cap_rounding_adjusted_corners=int(rounding_adjust.sum()),
++        removed_by_clipping_norm=_stats(np.linalg.norm(unclipped-clipped,axis=1)),
++        minimum_actual_bound_margin=float(np.min(bound-actual_norm)),
++        model_calls=0,new_noise=0,matrix_solves=0)
++    details=dict(anchor_source_vertex_ids=flat_ids,anchor_proposal_model=centers,anchor_target_model=target,
++        anchor_weight=weights,anchor_displacement_target=b,anchor_displacement_target_norm=b_norm,
++        free_kernel=values,free_weighted_support=s,free_alpha=alpha,free_support_sum=support_sum,
++        free_alpha_sum=alpha_sum,free_support_count=support_count,free_supported=supported,
++        free_participating_b_max_norm=max_b,free_actual_bound=bound,
++        free_displacement_unclipped=unclipped,free_displacement_clipped=clipped,
++        free_clip_factor=factor,free_clipped=clipped_mask,free_safety_cap_active=norms>cap,
++        free_FP32_cap_rounding_adjusted=rounding_adjust,free_actual_displacement_FP32=actual,
++        free_actual_displacement_norm=actual_norm,free_actual_bound_margin=bound-actual_norm)
++    return output,diag,details
+--- /dev/null
++++ b/r2/tools/c_restore_bounded_v1/blend_checks.py
+@@ -0,0 +1,160 @@
++"""Meaningful CPU fixtures only; never loads the real panel or any model."""
++from __future__ import annotations
++import hashlib,importlib.util,json,os,sys,time
++from pathlib import Path
++import numpy as np
++
++CODE=Path(__file__).resolve().parent
++ROOT=CODE.parents[2]
++OUT=ROOT/'experiments/r2_c_restore_bounded_v1/blend_checks'
++spec=importlib.util.spec_from_file_location('_bounded_blend_checks_subject',CODE/'blend.py')
++B=importlib.util.module_from_spec(spec);spec.loader.exec_module(B)
++
++def one_anchor(center,target,free):
++    center=np.asarray(center,dtype=np.float32);target=np.asarray(target,dtype=np.float32)
++    C=np.repeat(target[None,:],3,axis=0).reshape(1,3,3)
++    proposal=np.concatenate([np.repeat(center[None,:],3,axis=0),np.asarray(free,dtype=np.float32).reshape(-1,3)]).reshape(-1,3,3)
++    return C,proposal,np.zeros((1,3),dtype=np.int64)
++
++def run_subject(C,P,ids,L=1.):
++    before=[a.tobytes() for a in (C,P,ids)]
++    for a in (C,P,ids):a.flags.writeable=False
++    result=B.coordinate_restore(C,P,ids,L=L)
++    assert [a.tobytes() for a in (C,P,ids)]==before,'Caller arrays mutated'
++    O,d,a=result;K=len(C)
++    assert O.dtype==np.float32 and O.shape==P.shape
++    assert O[:K].tobytes()==C.tobytes(),'C bits changed'
++    actual=O[K:].astype(np.float64).reshape(-1,3)-P[K:].astype(np.float64).reshape(-1,3)
++    assert np.array_equal(actual,a['free_actual_displacement_FP32'])
++    assert np.all(np.linalg.norm(actual,axis=1)<=a['free_actual_bound'])
++    assert np.all(np.linalg.norm(actual,axis=1)<=.02*L)
++    assert np.isfinite(O).all()
++    return result
++
++def kernel_compact_symmetric():
++    x=np.array([[0,0,0],[.05,0,0],[.1,0,0],[.2,0,0],[-.05,0,0]],dtype=float)
++    observed=B.kernel(x,[[0,0,0]],.1).reshape(-1)
++    assert np.array_equal(observed,np.array([1.,.1875,0.,0.,.1875]))
++    return dict(observed=observed.tolist())
++
++def zero_b_and_no_support():
++    C,P,ids=one_anchor([0,0,0],[-0.,0,0],[[.02,0,0],[-.02,0,0],[0,.02,0]])
++    O,d,a=run_subject(C,P,ids)
++    assert O[1:].tobytes()==P[1:].tobytes() and not a['free_displacement_unclipped'].any()
++    C,P,ids=one_anchor([0,0,0],[0,.01,0],[[-1,0,0],[1,0,0],[0,1,0]])
++    O,d,a=run_subject(C,P,ids)
++    assert O[1:].tobytes()==P[1:].tobytes() and d['no_support_free_corners']==3
++    assert np.array_equal(a['free_actual_bound'],np.zeros(3))
++    return dict(zero_displacement_control=True,no_support_corners=3,signed_zero_C_preserved=True)
++
++def single_anchor_support_fade():
++    C,P,ids=one_anchor([0,0,0],[0,.005,0],[[.05,0,0],[.099,0,0],[-.05,0,0]])
++    O,d,a=run_subject(C,P,ids)
++    # At half radius a single source has scalar Wendland value exactly 3/16
++    # for exact 0.05; account only for the fixture's actual FP32 x value.
++    x=float(P[1,0,0]);q=x/.1;expected=(1-q)**4*(4*q+1)*float(C[0,0,1])
++    assert O[1,0,1]==np.float32(expected)
++    assert np.isclose(a['free_alpha_sum'][0],3/16,rtol=1e-7)
++    assert 0<a['free_alpha_sum'][1]<a['free_alpha_sum'][0]<1
++    assert 0<O[1,1,1]<O[1,0,1]<C[0,0,1]
++    assert d['clipped_free_corners']==0
++    return dict(half_radius_alpha_sum=float(a['free_alpha_sum'][0]),near_boundary_alpha_sum=float(a['free_alpha_sum'][1]),unwanted_full_normalization_rejected=True)
++
++def multiplicity_invariance():
++    centers=np.array([[0,0,0],[2,0,0],[4,0,0]],dtype=np.float32)
++    targets=centers.copy();targets[:,1]=[.002,.004,.006]
++    free=np.array([[.05,0,0],[2.05,0,0],[4.05,0,0]],dtype=np.float32)
++    C=targets.reshape(1,3,3);P=np.concatenate([centers,free]).reshape(2,3,3);ids=np.array([[0,1,2]],dtype=np.int64)
++    a,_,ad=run_subject(C,P,ids)
++    # Uneven replication: source 0 is represented four times, sources 1/2 once.
++    order=np.array([0,0,0,0,1,2])
++    C2=targets[order].reshape(2,3,3);P2=np.concatenate([centers[order],free]).reshape(3,3,3);ids2=np.array([[0,0,0],[0,1,2]],dtype=np.int64)
++    b,bd,bdet=run_subject(C2,P2,ids2)
++    assert a[1:].tobytes()==b[2:].tobytes()
++    assert np.allclose(ad['free_alpha_sum'],bdet['free_alpha_sum'],rtol=0,atol=0)
++    assert all(x['total_weight']==1. for x in bd['duplicates'])
++    return dict(unique_sources=3,corner_counts=[3,6],uneven_duplicate_count=4,identical_free_output=True)
++
++def conflicting_copies_retained():
++    C=np.zeros((1,3,3),dtype=np.float32)
++    centers=np.array([[-.01,0,0],[.01,0,0],[0,0,0]],dtype=np.float32)
++    free=np.array([[0,0,0],[.02,0,0],[1,0,0]],dtype=np.float32)
++    P=np.concatenate([centers,free]).reshape(2,3,3);ids=np.zeros((1,3),dtype=np.int64)
++    O,d,a=run_subject(C,P,ids)
++    assert np.array_equal(a['anchor_proposal_model'],centers.astype(float))
++    assert a['free_displacement_unclipped'][0,0]==0. and O[1,0].tobytes()==P[1,0].tobytes()
++    assert a['free_displacement_unclipped'][1,0]<0
++    assert d['split_source_vertex_groups']==1 and d['anchor_corners']==3
++    assert np.all(a['anchor_weight']==1/3)
++    return dict(conflicting_observations=3,symmetric_cancellation=True,off_center_blend_not_zero=True)
++
++def dense_support_subconvex_bound():
++    centers=np.zeros((6,3),dtype=np.float32)
++    target=np.array([[.01,0,0],[0,.01,0],[0,0,.01],[-.005,0,0],[0,-.003,0],[0,0,-.004]],dtype=np.float32)
++    free=np.array([[0,0,0],[.02,0,0],[.08,0,0]],dtype=np.float32)
++    C=target.reshape(2,3,3);P=np.concatenate([centers,free]).reshape(3,3,3);ids=np.arange(6,dtype=np.int64).reshape(2,3)
++    O,d,a=run_subject(C,P,ids)
++    assert a['free_support_sum'][0]==6 and abs(a['free_alpha_sum'][0]-1)<=2e-16
++    assert np.allclose(a['free_displacement_unclipped'][0],target.astype(float).mean(0),rtol=0,atol=2e-18)
++    assert 0<a['free_alpha_sum'][2]<1
++    assert np.all(np.linalg.norm(a['free_displacement_unclipped'],axis=1)<=a['free_participating_b_max_norm'])
++    assert np.all(a['free_actual_displacement_norm']<=a['free_participating_b_max_norm'])
++    return dict(dense_support_sum=6,alpha_sum=float(a['free_alpha_sum'][0]),sparse_alpha_sum=float(a['free_alpha_sum'][2]),convex_norm_bound=True)
++
++def cap_after_FP32_rounding():
++    C,P,ids=one_anchor([.25,0,0],[.45,0,0],[[.25,0,0],[.251,0,0],[.26,0,0]])
++    O,d,a=run_subject(C,P,ids)
++    assert d['safety_cap_active_free_corners']==3
++    assert d['FP32_cap_rounding_adjusted_corners']>=1
++    naive=float(np.float32(.25+.02))-float(np.float32(.25))
++    assert naive>.02 and float(a['free_actual_displacement_norm'][0])<=.02
++    assert O[1,0,0]==np.nextafter(np.float32(.27),np.float32(.25))
++    assert np.array_equal(a['free_actual_bound'],np.full(3,.02))
++    return dict(naive_FP32_step=naive,actual_FP32_step=float(a['free_actual_displacement_norm'][0]),cap_active=3,rounding_adjusted=d['FP32_cap_rounding_adjusted_corners'])
++
++def invalid_input_contracts():
++    C,P,ids=one_anchor([0,0,0],[0,.01,0],[[0,0,0],[.01,0,0],[.02,0,0]])
++    cases=[(C.astype(float),P,ids,1.,TypeError),(C,P,ids.astype(float),1.,ValueError),(C,P,ids,0.,ValueError)]
++    bad=C.copy();bad[0,1,0]=.1;cases.append((bad,P,ids,1.,ValueError))
++    badp=P.copy();badp[1,0,0]=np.nan;cases.append((C,badp,ids,1.,ValueError))
++    for c,p,i,L,expected in cases:
++        try:B.coordinate_restore(c,p,i,L=L)
++        except expected:pass
++        else:raise AssertionError('Invalid input not rejected')
++    return dict(invalid_cases_rejected=len(cases))
++
++TESTS=[
++ ('kernel_compact_symmetric',kernel_compact_symmetric,'Check hand-computable Wendland values, strict compact support, and negative-coordinate symmetry.'),
++ ('zero_b_and_no_support',zero_b_and_no_support,'Negative controls must not move free corners; signed-zero C bytes are retained.'),
++ ('single_anchor_support_fade',single_anchor_support_fade,'Prevent accidental normalization to one outside dense support; near-radius response must fade.'),
++ ('multiplicity_invariance',multiplicity_invariance,'Uneven repeated source IDs must not increase their total influence.'),
++ ('conflicting_copies_retained',conflicting_copies_retained,'Keep split proposal observations and allow opposing contributions to cancel instead of last-copy selection.'),
++ ('dense_support_subconvex_bound',dense_support_subconvex_bound,'Dense support becomes a convex mean, sparse support stays subconvex, and the participating displacement norm bound holds.'),
++ ('cap_after_FP32_rounding',cap_after_FP32_rounding,'Catch a real FP32 rounding overshoot of .02L and enforce the actual stored displacement bound.'),
++ ('invalid_input_contracts',invalid_input_contracts,'Reject dtype/scale/source-ID inconsistency and nonfinite geometry rather than silently changing definitions.')]
++
++def main():
++    start=time.perf_counter();rng_before=np.random.get_state();oldsolve=np.linalg.solve
++    def forbidden(*a,**kw):raise AssertionError('Matrix solve is prohibited for local blend')
++    np.linalg.solve=forbidden;results=[];failure=None
++    try:
++        for name,fn,reason in TESTS:
++            try:results.append(dict(name=name,status='PASS',reason=reason,evidence=fn()))
++            except Exception as exc:
++                results.append(dict(name=name,status='FAIL',reason=reason,error=repr(exc)));failure=exc;break
++    finally:np.linalg.solve=oldsolve
++    rng_after=np.random.get_state()
++    rng_unchanged=all(np.array_equal(a,b) for a,b in zip(rng_before,rng_after))
++    assert rng_unchanged
++    report=dict(status='PASS' if failure is None else 'FAIL',checks=len(results),tests=results,
++        input_immutability='Read-only NumPy inputs and byte checks enforced in every successful fixture',
++        RNG_unchanged=rng_unchanged,matrix_solve_interceptor=True,model_calls=0,real_panel_outputs=0,
++        numpy_version=np.__version__,seconds=time.perf_counter()-start,
++        source_hashes={str(p):hashlib.sha256(p.read_bytes()).hexdigest() for p in (Path(__file__),CODE/'blend.py')})
++    OUT.mkdir(parents=True,exist_ok=True);path=OUT/'completion.json';temp=path.with_suffix('.json.tmp')
++    with temp.open('w',encoding='utf-8') as f:json.dump(report,f,indent=2,allow_nan=False);f.write('\n');f.flush();os.fsync(f.fileno())
++    os.replace(temp,path)
++    print(json.dumps(dict(status=report['status'],checks=len(results),seconds=report['seconds'],output=str(path))))
++    if failure is not None:raise failure
++
++if __name__=='__main__':main()
+--- /dev/null
++++ b/r2/tools/c_restore_bounded_v1/common.py
+@@ -0,0 +1,108 @@
++"""Independent CPU-only continuation; historical sources and results are read-only."""
++from pathlib import Path
++import csv, hashlib, json, os, subprocess, time
++ROOT=Path(__file__).resolve().parents[3]
++CODE=Path(__file__).parent
++OUT=ROOT/'experiments/r2_c_restore_bounded_v1'
++OLD=ROOT/'experiments/r2_c_restore_coupling_v1'
++VERSION='R2_C_RESTORE_BOUNDED_AND_ORIENTATION_V1'
++
++def sha(p):
++ h=hashlib.sha256()
++ with Path(p).open('rb') as f:
++  for b in iter(lambda:f.read(8<<20),b''):h.update(b)
++ return h.hexdigest()
++def read(p):return json.loads(Path(p).read_text(encoding='utf-8-sig'))
++def rows(p):
++ with Path(p).open(encoding='utf-8-sig',newline='') as f:return list(csv.DictReader(f))
++def checked(p):
++ p=Path(p).absolute()
++ if any(q.is_symlink() for q in (p,*p.parents)):raise ValueError('Symlink output')
++ p=p.resolve()
++ if not p.is_relative_to(OUT.resolve()) or p==OUT.resolve():raise ValueError('Write outside experiment: '+str(p))
++ return p
++def atomic(p,fn,binary=False):
++ p=checked(p);p.parent.mkdir(parents=True,exist_ok=True);tmp=p.with_name(p.name+'.tmp')
++ with tmp.open('wb' if binary else 'w',**({} if binary else {'encoding':'utf-8','newline':''})) as f:
++  fn(f);f.flush();os.fsync(f.fileno())
++ tmp.replace(p)
++def clean(v):
++ import numpy as np
++ if isinstance(v,dict):return {str(k):clean(a) for k,a in v.items()}
++ if isinstance(v,(tuple,list)):return [clean(a) for a in v]
++ if isinstance(v,np.ndarray):return clean(v.tolist())
++ if isinstance(v,np.generic):return clean(v.item())
++ if isinstance(v,float) and not np.isfinite(v):return None
++ return v
++def write(p,obj):atomic(p,lambda f:json.dump(clean(obj),f,indent=2,ensure_ascii=False,allow_nan=False))
++def textfile(p,s):atomic(p,lambda f:f.write(s))
++def save_npz(p,**arrays):
++ import numpy as np
++ atomic(p,lambda f:np.savez_compressed(f,**arrays),True)
++def csvwrite(p,data):
++ data=clean(data);fields=list(dict.fromkeys(k for r in data for k in r)) or ['status']
++ def dump(f):
++  w=csv.DictWriter(f,fields);w.writeheader();w.writerows(data)
++ atomic(p,dump)
++def payload(p):
++ import numpy as np
++ with np.load(p,allow_pickle=False) as a:return {k:a[k].copy() for k in a.files}
++def same(a,b):return a.shape==b.shape and a.dtype==b.dtype and a.tobytes()==b.tobytes()
++def event(kind,**kw):
++ p=checked(OUT/'ledger.jsonl');p.parent.mkdir(parents=True,exist_ok=True)
++ with p.open('a',encoding='utf-8') as f:
++  f.write(json.dumps(clean(dict(utc=time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),event=kind,**kw)),allow_nan=False)+'\n');f.flush();os.fsync(f.fileno())
++def resources():
++ def call(args):
++  r=subprocess.run(args,text=True,capture_output=True,timeout=20);return dict(code=r.returncode,stdout=r.stdout,stderr=r.stderr)
++ return dict(gpu=call(['nvidia-smi','--query-gpu=name,memory.total,memory.used,memory.free,utilization.gpu','--format=csv,noheader,nounits']),gpu_processes=call(['nvidia-smi','--query-compute-apps=pid,process_name,used_memory','--format=csv']),cpu_cores=os.cpu_count(),loadavg=list(os.getloadavg()),memory=Path('/proc/meminfo').read_text(),cpu_processes=call(['ps','-eo','pid,pcpu,pmem,comm','--sort=-pcpu']))
++def verify(mapping):
++ for p,h in mapping.items():
++  if sha(p)!=h:raise ValueError('Protected input/source changed: '+p)
++ return len(mapping)
++def registration():
++ reg=read(OUT/'registration.json');verify(reg['runner_hashes']);return reg
++
++def prepare():
++ path=OUT/'registration.json'
++ if path.exists():
++  reg=registration();verify(reg['protected']);return reg
++ from . import blend, orientation
++ from r2.pilots.anchor_aware_denoiser_v1 import evaluation as E
++ old=read(OLD/'registration.json');sr=read(OLD/'score_registration.json')
++ verify(old['protected']);verify(old['runner_hashes']);verify(sr['protected'])
++ OUT.mkdir(parents=True,exist_ok=True)
++ protected=dict(old['protected']);protected.update(sr['protected'])
++ for base in (OLD,ROOT/'r2/tools/c_restore_coupling_v1'):
++  for p in base.rglob('*'):
++   if p.is_file() and '__pycache__' not in str(p):protected[str(p)]=sha(p)
++ for p in (ROOT/'AGENTS.md',ROOT/'native_t1/docs/control_metrics.md'):protected[str(p)]=sha(p)
++ baselines=[E.canonical_identity(r) for r in rows(OLD/'post_index.csv') if r['method'] in ('D0_BASE','RBF')]
++ assert len(baselines)==24
++ for r in baselines:
++  d=read(r['diagnostic_path']);assert d['status']=='PASS'
++  assert d['identity']['post_sha256']==sha(r['post_path'])
++  for p in [r['post_path'],r['denoised_path'],r['diagnostic_path'],d['quality']['pair_audit_path'],*d['quality']['files']]:protected[str(p)]=sha(p)
++ runners=['common.py','run.py','evaluation.py','orientation.py','orientation_checks.py','blend.py','blend_checks.py']
++ reg=dict(version=VERSION,status='REGISTERED',records=old['records'],baselines=baselines,
++  fixed_L=old['fixed_L'],settings=old['settings'],postprocess_config=old['postprocess_config'],
++  parent_registration_sha256=sha(OLD/'registration.json'),protected=protected,
++  runner_hashes={str(CODE/n):sha(CODE/n) for n in runners},methods=['D0_BASE','RBF','BLEND'],
++  blend_definition=blend.definition(),orientation_definition=orientation.definition(),
++  budget=dict(new_model_forwards=0,training_updates=0,new_noise=0,new_generator_outputs=0,
++   new_blend_outputs=12,new_GEO_C=12,new_POST_quality=12,reused_quality=24,
++   orientation_POST_outputs=36,full_PRE_quality=0,comparison_figures=24),
++  protocol=dict(selection='Same six USER_MIX parents x two frozen noises; no selection by new results',
++   order='First orientation D0/RBF, then12BLEND, GEO_C, quality, BLEND orientation; all36 receive same solver',
++   raw_and_old_outputs_readonly=True,C_bitwise_and_winding=True,geometry_no_new_parameters=True,
++   quality_after_orientation='Reused orientation-independent scalar/geometry evidence; exact triangle vertex sets checked; no full rescoring of flip-only outputs',
++   graph_after_orientation='Existing legal pair classifications reused; only winding and constrained feasibility newly calculated',
++   boundary='All original C source-topology open vertices; descriptive, no must-join interface registered',
++   orientation_not_outward_or_manifold_certification=True,full_PRE_quality='NA_NOT_BUDGETED',
++   workers='CPU measured first job; max2 workers and2threads each; GPU0',
++   replay='Completed receipts reused after hashes; incomplete attempted scientific stage blocks, no automatic retry',
++   stop='Fixed panel, full per-output evidence, visual review, report, small ZIP; no defaults/commit/push/scan'))
++ write(OUT/'resources_before_experiment.json',resources())
++ write(path,reg);event('REGISTERED',registration_sha256=sha(path),budget=reg['budget'])
++ textfile(OUT/'README_RESUME.md','Run in WSL from /mnt/e/MeshFlow:\n\n`/mnt/e/MeshFlow-Control-artifacts/venv/bin/python -B -m r2.tools.c_restore_bounded_v1.run --stage all`\n\nCPU only. Successful stages are hash-verified and reused. An incomplete attempted scientific stage blocks rather than silently replaying. Originals remain read-only. Final reporting/audit/packaging never dispatch models.\n')
++ return reg
+--- /dev/null
++++ b/r2/tools/c_restore_bounded_v1/evaluation.py
+@@ -0,0 +1,217 @@
++"""Fixed12 CPU evaluation. No calls to historical runners or model modules."""
++import os
++for _k in ('OMP_NUM_THREADS','OPENBLAS_NUM_THREADS','MKL_NUM_THREADS','NUMEXPR_NUM_THREADS'):os.environ[_k]='2'
++os.environ['CUDA_VISIBLE_DEVICES']=''
++import concurrent.futures, multiprocessing, resource, sys, time, html
++from pathlib import Path
++import numpy as np
++from . import common as C
++from r2.pilots.anchor_aware_denoiser_v1 import evaluation as E
++from r2.tools.c_restore_coupling_v1 import evaluation as H
++
++def meta(r):return dict(E.meta(E.canonical_identity(r)),method=r['method'])
++def start(kind,r):
++ p=C.OUT/'events'/r['method']/r['request_id']/(kind+'_started.json')
++ if p.exists():raise RuntimeError('Unfinished attempted stage; no implicit retry: '+str(p))
++ C.write(p,dict(stage=kind,**meta(r),utc=time.time()))
++def finish(kind,r,**kw):C.write(C.OUT/'events'/r['method']/r['request_id']/(kind+'_complete.json'),dict(stage=kind,**meta(r),**kw))
++
++def orientation_one(r):
++ from .orientation import orient_fixed_C
++ d=C.read(r['diagnostic_path']);a=C.payload(r['post_path']);K=int(r['K'])
++ dest=C.OUT/'oriented'/r['method']/r['request_id'];receipt=dest/'receipt.json'
++ ident=dict(**meta(r),post_sha256=C.sha(r['post_path']),diagnostic_sha256=C.sha(r['diagnostic_path']),registration_sha256=C.sha(C.OUT/'registration.json'))
++ if receipt.exists():
++  q=C.read(receipt);assert q['identity']==ident and q['status']=='PASS';C.verify(q['files']);return q
++ if dest.exists():raise RuntimeError('Incomplete orientation output')
++ start('ORIENTATION',r);tick=time.perf_counter()
++ result=orient_fixed_C(a['vertices'],a['faces'],K);f=result['faces'];flips=result['flips'];tri=a['vertices'][f]
++ perm=np.tile(np.arange(3,dtype=np.int64),(len(f),1));perm[flips]=[0,2,1]
++ assert C.same(f[:K],a['faces'][:K]) and C.same(tri[:K],a['output'][:K])
++ assert np.array_equal(np.sort(f,axis=1),np.sort(a['faces'],axis=1))
++ assert C.same(tri,np.take_along_axis(a['output'],perm[:,:,None],axis=1))
++ # Preserve source face identity; corner identities follow the reversal explicitly.
++ source_corners=np.take_along_axis(a['source_corner_ids'],perm,axis=1)
++ C.save_npz(dest/'oriented.npz',output=tri,vertices=a['vertices'],faces=f,C=tri[:K],free=tri[K:],
++  source_face_ids=a['source_face_ids'],source_corner_ids=source_corners,flips=flips,corner_permutation=perm)
++ _,_,PC,_=E.helpers();PC.write_indexed_ply(C.checked(dest/'oriented.ply'),a['vertices'],f)
++ v2,f2=PC.read_indexed_ply(dest/'oriented.ply');assert C.same(v2,a['vertices']) and C.same(f2,f)
++ pairs=C.read(d['quality']['pair_audit_path'])
++ after,edge_rows,reached=E.actual_valid_graph(a['vertices'],f,K,pairs);after.update(H.opposite_reach(tri,K,edge_rows))
++ before=d['topology']
++ for key in ('C_F_shared_edge_count','C_F_valid_edge_count','graph_valid_edges','reached_free_faces','nonmanifold_edges','boundary_edges'):
++  assert after[key]==before[key],(key,after[key],before[key])
++ assert abs(after['reached_free_area_fraction']-before['reached_free_area_fraction'])<1e-12
++ C.csvwrite(dest/'components.csv',result['component_rows']);C.csvwrite(dest/'constraints.csv',result['edge_rows'])
++ C.csvwrite(dest/'valid_edges_after.csv',edge_rows)
++ C.write(dest/'orientation_details.json',dict(summary=result['summary'],components=result['component_rows'],edges=result['edge_rows']))
++ eq=dict(C_bytes_and_winding_preserved=True,vertex_array_bytes_unchanged=True,face_count_unchanged=True,
++  every_unordered_index_triangle_unchanged=True,source_face_ids_unchanged=True,source_corner_mapping_updated=True,
++  quality_reference_path=r['diagnostic_path'],quality_reference_POST_sha256=d['quality']['identity']['processed_sha256'],
++  quality_scalar_status='REUSED_UNORIENTED_GEOMETRY_EQUIVALENCE; no claim of a new scorer execution',
++  orientability_not_outward_or_manifold_certification=True)
++ q=dict(status='PASS',identity=ident,summary=result['summary'],before=before,after=after,equivalence=eq,
++  reached_free_output_face_ids=reached,seconds=time.perf_counter()-tick,
++  files={str(p):C.sha(p) for p in dest.iterdir() if p.is_file()})
++ C.write(receipt,q);finish('ORIENTATION',r,seconds=q['seconds'],receipt_sha256=C.sha(receipt));return q
++
++def orient_baselines(reg):
++ for r in reg['baselines']:orientation_one(r)
++ C.write(C.OUT/'baseline_orientation_completion.json',dict(status='PASS',outputs=24,new_model_forwards=0))
++
++def postprocess(reg):
++ _,_,PC,config=E.helpers();assert config==reg['postprocess_config']
++ output=list(reg['baselines'])
++ for orig in reg['records']:
++  r=dict(orig,method='BLEND');rid=r['request_id'];den=C.OUT/'pre_geo/BLEND'/rid/'denoised.npz'
++  rec=C.read(den.with_name('receipt.json'));assert rec['status']=='PASS' and rec['output_sha256']==C.sha(den)
++  dest=C.OUT/'outputs/BLEND'/rid;rp=dest/'postprocess.json'
++  if rp.exists():
++   pp=C.read(rp);assert pp['status']=='PASS' and pp['input']['file_sha256']==C.sha(den)
++   for n,v in pp['files'].items():assert C.sha(dest/n)==v['sha256']
++  else:
++   staging=C.checked(dest.with_name(dest.name+'.staging'))
++   if dest.exists() or staging.exists():raise RuntimeError('Incomplete GEO; no automatic replay')
++   start('GEO',r);pp=PC.run(den,int(r['K']),staging,input_key='output')
++   C.write(staging/'postprocess.json',E.rewrite_paths(pp,staging,dest));os.replace(staging,dest)
++   finish('GEO',r,seconds=pp['seconds'])
++  a=C.payload(dest/'post.npz');raw=C.payload(r['raw_path'])['raw'].reshape(-1,3,3)
++  assert C.same(a['output'][:int(r['K'])],raw[:int(r['K'])]) and C.same(a['vertices'][a['faces']],a['output'])
++  v,f=PC.read_indexed_ply(dest/'post.ply');assert C.same(v,a['vertices']) and C.same(f,a['faces'])
++  output.append(dict(r,denoised_path=str(den),post_path=str(dest/'post.npz'),post_sha256=C.sha(dest/'post.npz'),
++   post_ply=str(dest/'post.ply'),diagnostic_path=str(C.OUT/'diagnostics/BLEND'/rid/'diagnostic.json')))
++ C.write(C.OUT/'post_index.json',output);C.csvwrite(C.OUT/'post_index.csv',output)
++ C.write(C.OUT/'post_completion.json',dict(status='PASS',new_GEO_C=12,reused_POST=24,outputs=36))
++ return output
++
++def score_one(r):
++ tick=time.perf_counter();r=E.canonical_identity(r);diag=Path(r['diagnostic_path']);post=Path(r['post_path']);den=Path(r['denoised_path'])
++ identity=dict(**meta(r),post_sha256=C.sha(post),input_sha256=C.sha(den),registration_sha256=C.sha(C.OUT/'registration.json'))
++ if diag.exists():
++  d=C.read(diag);assert d['identity']==identity and d['status']=='PASS';C.verify(d['quality']['files']);return dict(path=str(diag),seconds=0,reused=True,peak_RSS_KiB=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
++ A,Q,_,_=E.helpers();dest=C.OUT/'scores/BLEND'/r['request_id'];qr=dest/'quality.json'
++ if qr.exists():
++  quality=C.read(qr);assert quality['identity']['processed_sha256']==C.sha(post);C.verify(quality['files'])
++ else:
++  staging=C.checked(dest.with_name(dest.name+'.staging'))
++  if dest.exists() or staging.exists():raise RuntimeError('Incomplete quality attempt')
++  start('QUALITY',r);quality=Q.score_quality(r,post,staging/'details');quality=E.rewrite_paths(quality,staging,dest)
++  C.write(staging/'quality.json',quality);os.replace(staging,dest);finish('QUALITY',r,seconds=quality['seconds'])
++ a=C.payload(post);pre=C.payload(den)['output'];K=int(r['K'])
++ top,edges,reached=E.actual_valid_graph(a['vertices'],a['faces'],K,C.read(quality['pair_audit_path']));top.update(H.opposite_reach(a['output'],K,edges))
++ pret,preedges,prereached,prepairs=H.exact_pre_graph(pre,K,Q,A.L);pret.update(H.opposite_reach(pre,K,preedges))
++ bv,bm,ba=H.boundary(r,a['output'],A);pv,pm,pba=H.boundary(r,pre,A)
++ C.csvwrite(diag.parent/'valid_edges_POST.csv',edges);C.csvwrite(diag.parent/'valid_edges_PRE.csv',preedges)
++ C.write(diag.parent/'PRE_edge_local_pairs.json',prepairs)
++ shape=Q._old().cpu_math()['shape'].shape_quality(pre[K:],A.L)
++ d=dict(status='PASS',identity=identity,quality=quality,quality_reused=False,topology=top,
++  pre_GEO_topology=pret,reached_free_output_face_ids=reached,pre_GEO_reached_free_face_ids=prereached,
++  vertices=bv,metrics=bm,boundary_audit=ba,pre_GEO_vertices=pv,pre_GEO_metrics=pm,
++  pre_GEO_quality_status='NA_NOT_BUDGETED',pre_GEO_shape=shape,
++  seconds=time.perf_counter()-tick,peak_RSS_KiB=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
++ C.write(diag,d)
++ if 'torch' in sys.modules:raise RuntimeError('CPU-only contract violated: torch imported')
++ return dict(path=str(diag),seconds=d['seconds'],reused=False,peak_RSS_KiB=d['peak_RSS_KiB'])
++
++def score(reg,rows):
++ starttime=time.perf_counter();new=[r for r in rows if r['method']=='BLEND']
++ C.write(C.OUT/'resources_before_score.json',C.resources())
++ first=score_one(new[0]);res=C.resources();C.write(C.OUT/'resources_after_first_score.json',res)
++ mem={line.split(':')[0]:int(line.split()[1])*1024 for line in res['memory'].splitlines() if line.split()[1].isdigit()}
++ peak=first['peak_RSS_KiB']*1024
++ workers=2 if (os.cpu_count() or 1)>=4 and mem['MemAvailable']>max(4<<30,3*peak) and res['loadavg'][0]<(os.cpu_count() or 1)-2 else 1
++ C.write(C.OUT/'CPU_dispatch.json',dict(workers=workers,threads_per_worker=2,first_authorized_job=first,
++  available_RAM_bytes=mem['MemAvailable'],loadavg=res['loadavg'],GPU_workers=0,
++  reason='Measured first authorized quality job; CPU/RAM/load guard; at most two independent remaining jobs',
++  timing_scope='CPU scoring concurrent wall time; not an isolated benchmark'))
++ with concurrent.futures.ProcessPoolExecutor(max_workers=workers,mp_context=multiprocessing.get_context('spawn')) as pool:
++  receipts=[first,*pool.map(score_one,new[1:],chunksize=1)]
++ for r in new:orientation_one(r)
++ C.write(C.OUT/'score_completion.json',dict(status='PASS',new_POST_quality=12,reused_quality=24,
++  receipts=receipts,CPU_workers=workers,seconds=time.perf_counter()-starttime,new_model_forwards=0))
++ C.write(C.OUT/'resources_after_score.json',C.resources())
++ return receipts
++
++def aggregate(rows):
++ vm=[];verts=[];qualities=[];tops=[];ors=[];dist=[];decisions=[];components=[];constraints=[];mech=[]
++ for r in rows:
++  m=meta(r);d=C.read(r['diagnostic_path']);K=int(r['K']);a=C.payload(r['post_path'])
++  op=C.OUT/'oriented'/r['method']/r['request_id'];o=C.read(op/'receipt.json')
++  qualities.append(dict(**m,phase='POST',**d['quality']['metrics'],free_face_denominator=d['quality']['free_face_denominator']))
++  for phase,tk,mk,vk in [('PRE_GEO','pre_GEO_topology','pre_GEO_metrics','pre_GEO_vertices'),('POST','topology','metrics','vertices')]:
++   tops.append(dict(**m,phase=phase,**d[tk]));vm.extend(dict(**m,phase=phase,**v) for v in d[mk]);verts.extend(dict(**m,phase=phase,**v) for v in d[vk])
++   ds=[v['distance_model'] for v in d[vk]]
++   dist.append(dict(**m,phase=phase,boundary_vertices=len(ds),distance_mean_model=float(np.mean(ds)),distance_p95_model=float(np.quantile(ds,.95)),distance_max_model=max(ds)))
++  tops.append(dict(**m,phase='POST_ORIENTED',**o['after']))
++  ors.append(dict(**m,**o['summary'],before_opposed_edges=o['before']['C_F_valid_opposite_winding_edge_count'],after_opposed_edges=o['after']['C_F_valid_opposite_winding_edge_count'],
++   before_opposed_reach=o['before']['opposite_winding_reached_free_area_fraction'],after_opposed_reach=o['after']['opposite_winding_reached_free_area_fraction'],
++   unoriented_reach=o['before']['reached_free_area_fraction'],seconds=o['seconds']))
++  components.extend(dict(**m,**v) for v in C.rows(op/'components.csv'));constraints.extend(dict(**m,**v) for v in C.rows(op/'constraints.csv'))
++  q=d['quality']['metrics'];strict=next(v for v in d['metrics'] if v['setting']=='raw_tau_1e-6');loose=next(v for v in d['metrics'] if v['setting']=='L_tau_0.02')
++  decisions.append(dict(**m,CF=q['CF_proper_affected_free_fraction'],CF_illegal=q['CF_illegal_affected_free_fraction'],FF=q['FF_illegal_affected_free_fraction'],I=q['ConflictCov_C'],
++   small_angle_lt5=q['free_minimum_angle_lt5_fraction'],strict_AVMR=strict['VMR'],strict_PMR=strict['perfect'],AVMR_02L=loose['VMR'],
++   distance_mean_model=float(np.mean([v['distance_model'] for v in d['vertices']])),pre_distance_mean_model=float(np.mean([v['distance_model'] for v in d['pre_GEO_vertices']])),
++   valid_edges=d['topology']['C_F_valid_edge_count'],opposed_before=d['topology']['C_F_valid_opposite_winding_edge_count'],opposed_after=o['after']['C_F_valid_opposite_winding_edge_count'],
++   reachable_area=d['topology']['reached_free_area_fraction'],opposed_reach_before=d['topology']['opposite_winding_reached_free_area_fraction'],opposed_reach_after=o['after']['opposite_winding_reached_free_area_fraction'],
++   free_faces=len(a['output'])-K,deleted_free_faces=int(r['N'])-len(a['output'])))
++  if r['method']=='BLEND':
++   b=C.read(Path(r['denoised_path']).with_name('diagnostics.json'));mech.append(dict(**m,**{k:v for k,v in b.items() if isinstance(v,(str,int,float,bool)) or v is None}))
++ tables={'AVMR_PMR_per_output':vm,'boundary_vertices':verts,'quality_per_output':qualities,'topology_per_output':tops,'orientation_per_output':ors,
++  'boundary_distance_per_output':dist,'decision_per_output':decisions,'orientation_components':components,'orientation_constraints':constraints,'blend_mechanism':mech}
++ for name,data in tables.items():C.csvwrite(C.OUT/(name+'.csv'),data)
++ numerics=[k for k,v in decisions[0].items() if isinstance(v,(int,float)) and k not in E.META]
++ summaries=[]
++ for group,key in [('ALL',None),('REGION','region_type'),('PARENT','parent_id'),('NOISE','candidate')]:
++  for method in ('D0_BASE','RBF','BLEND'):
++   vals=sorted({r[key] for r in decisions}) if key else ['ALL']
++   for value in vals:
++    subset=[r for r in decisions if r['method']==method and (not key or r[key]==value)]
++    summaries.append(dict(group=group,value=value,method=method,n=len(subset),**{k:float(np.mean([r[k] for r in subset])) for k in numerics},
++     outputs_with_valid_edges=sum(r['valid_edges']>0 for r in subset),outputs_with_opposed_edges_before=sum(r['opposed_before']>0 for r in subset),outputs_with_opposed_edges_after=sum(r['opposed_after']>0 for r in subset)))
++ C.csvwrite(C.OUT/'decision_summary.csv',summaries)
++ paired=[]
++ for r in decisions:
++  if r['method']=='D0_BASE':continue
++  for base in ('D0_BASE','RBF'):
++   if base==r['method']:continue
++   ref=next(x for x in decisions if x['request_id']==r['request_id'] and x['method']==base)
++   paired.append(dict(**meta(r),reference=base,**{k+'_delta':r[k]-ref[k] for k in numerics}))
++ C.csvwrite(C.OUT/'paired_per_parent_noise.csv',paired)
++ # Preserve complete per-threshold reductions, with parent/noise/region splits.
++ vnums=['boundary_vertex_count','matched_count','VMR','perfect']
++ vsummary=H.summary(vm,('method','phase','domain','setting','threshold_model','scale','tau'),vnums)
++ C.csvwrite(C.OUT/'AVMR_PMR_summary.csv',vsummary)
++ C.write(C.OUT/'aggregate_completion.json',dict(status='PASS',outputs=36,orientation_outputs=36,POST_quality_new=12,POST_quality_reused=24,AVMR_rows=len(vm),full_PRE_quality='NA_NOT_BUDGETED'))
++
++def render(rows):
++ import matplotlib.pyplot as plt
++ from PIL import Image
++ G=E.module('_bounded_existing_renderer',C.ROOT/'r2/tools/student_multistep_denoise_v1/gallery.py')
++ reg=C.registration();gdir=C.OUT/'gallery';gdir.mkdir(exist_ok=True);tick=time.perf_counter();receipts=[];cards=[]
++ methods=('D0_BASE','RBF','BLEND')
++ for orig in reg['records']:
++  rid=orig['request_id'];K=int(orig['K']);group={r['method']:r for r in rows if r['request_id']==rid}
++  meshes={m:C.payload(group[m]['post_path'])['output'] for m in methods}
++  xyz=np.concatenate([x.reshape(-1,3) for x in meshes.values()]).astype(float);lo,hi=xyz.min(0),xyz.max(0)
++  bounds=dict(center_model_xyz=((lo+hi)/2).tolist(),span=float((hi-lo).max())*1.12,bounds_model_xyz=[lo.tolist(),hi.tolist()])
++  for vi,camera in enumerate(((22.,-60.),(22.,120.))):
++   png=gdir/(rid+'__v'+str(vi)+'.png');jpg=png.with_suffix('.jpg');receipt=png.with_suffix('.json')
++   identity=dict(request_id=rid,methods=methods,camera=camera,bounds=bounds,source_hashes={group[m]['post_path']:C.sha(group[m]['post_path']) for m in methods})
++   identity=C.clean(identity)
++   if receipt.exists():
++    q=C.read(receipt);assert q['identity']==identity;assert C.sha(png)==q['png_sha256'] and C.sha(jpg)==q['jpg_sha256']
++   else:
++    fig=plt.figure(figsize=(18,6),dpi=140)
++    for j,m in enumerate(methods):
++     ax=fig.add_subplot(1,3,j+1,projection='3d');G.draw(ax,meshes[m],K,bounds,camera)
++     ax.set_title(m+' | F='+str(len(meshes[m])-K),fontsize=14)
++    fig.suptitle(orig['parent_id']+' | '+orig['region_type']+' '+orig['tier']+' | n'+str(orig['candidate'])+' | view '+str(vi+1),fontsize=14)
++    fig.text(.5,.018,'Blue: original C | Gray: free | Same camera/scale | Pre-flip POST; orientation changes no surface geometry',ha='center',fontsize=11)
++    fig.subplots_adjust(left=0,right=1,top=.89,bottom=.04,wspace=0)
++    C.atomic(png,lambda f:fig.savefig(f,format='png',dpi=140),True);plt.close(fig)
++    with Image.open(png) as im:C.atomic(jpg,lambda f:im.convert('RGB').save(f,format='JPEG',quality=85,optimize=True),True)
++    q=dict(status='COMPLETE',identity=identity,png=str(png),jpg=str(jpg),png_sha256=C.sha(png),jpg_sha256=C.sha(jpg));C.write(receipt,q)
++   receipts.append(q)
++  cards.append('<section><h2>'+html.escape(rid)+'</h2>'+''.join('<a href="'+rid+'__v'+str(v)+'.jpg"><img style="width:99%" src="'+rid+'__v'+str(v)+'.jpg"></a>' for v in (0,1))+'</section>')
++ C.textfile(gdir/'index.html','<!doctype html><meta charset="utf-8"><title>Bounded C restoration</title><h1>12 fixed paired requests</h1><p>Three POST methods, two matched views. Geometry before winding repair.</p>'+''.join(cards))
++ C.write(gdir/'manifest.json',dict(status='PASS',images=24,requests=12,receipts=receipts,seconds=time.perf_counter()-tick))
+--- /dev/null
++++ b/r2/tools/c_restore_bounded_v1/independent_audit.py
+@@ -0,0 +1,341 @@
++"""Independent saved-artifact verification; NumPy only, no model/GEO/scorer calls."""
++from __future__ import annotations
++import argparse, collections, csv, hashlib, json, os, time
++from pathlib import Path
++for _k in ('OMP_NUM_THREADS','OPENBLAS_NUM_THREADS','MKL_NUM_THREADS','NUMEXPR_NUM_THREADS'):
++    os.environ[_k]='1'
++os.environ['CUDA_VISIBLE_DEVICES']=''
++import numpy as np
++
++ROOT=Path(__file__).resolve().parents[3]
++OUT=ROOT/'experiments/r2_c_restore_bounded_v1'
++AUDIT=OUT/'independent_audit'
++
++def sha(path):
++    h=hashlib.sha256()
++    with Path(path).open('rb') as f:
++        for b in iter(lambda:f.read(8<<20),b''):h.update(b)
++    return h.hexdigest()
++def read(p):return json.loads(Path(p).read_text(encoding='utf-8-sig'))
++def rows(p):
++    with Path(p).open(encoding='utf-8-sig',newline='') as f:return list(csv.DictReader(f))
++def arrays(p):
++    with np.load(p,allow_pickle=False) as z:return {k:z[k].copy() for k in z.files}
++def same(a,b):return a.shape==b.shape and a.dtype==b.dtype and a.tobytes()==b.tobytes()
++def norm(a):return np.sqrt(np.sum(np.asarray(a,dtype=np.float64)**2,axis=-1))
++def near(a,b,atol=2e-12,rtol=2e-11):
++    assert np.shape(a)==np.shape(b) and np.allclose(a,b,atol=atol,rtol=rtol,equal_nan=False),'Numerical mismatch'
++def checked(p):
++    p=Path(p).absolute()
++    assert not any(q.is_symlink() for q in (p,*p.parents)),'Symlink output'
++    p=p.resolve();assert p!=AUDIT.resolve() and p.is_relative_to(AUDIT.resolve()),'Outside owned audit'
++    return p
++def atomic(p,fn):
++    p=checked(p);p.parent.mkdir(parents=True,exist_ok=True);temp=checked(p.with_name(p.name+'.tmp'))
++    with temp.open('w',encoding='utf-8',newline='') as f:fn(f);f.flush();os.fsync(f.fileno())
++    temp.replace(p)
++def write(p,obj):atomic(p,lambda f:json.dump(obj,f,ensure_ascii=False,indent=2,allow_nan=False))
++def csvwrite(p,data):
++    def emit(f):
++        fields=list(dict.fromkeys(k for r in data for k in r)) or ['status']
++        w=csv.DictWriter(f,fields);w.writeheader();w.writerows(data)
++    atomic(p,emit)
++def verify(mapping):
++    for p,h in mapping.items():assert sha(p)==h,p
++    return len(mapping)
++
++def check_blend(c,proposal,ids,output,detail,diag,L):
++    """Reconstruct source multiplicity, subconvex field, cap and FP32 endpoint."""
++    k=len(c);centers=proposal[:k].reshape(-1,3).astype(float)
++    targets=c.reshape(-1,3).astype(float);free=proposal[k:].reshape(-1,3)
++    flat_ids=ids.reshape(-1);counts=collections.Counter(map(int,flat_ids))
++    weights=np.array([1.0/counts[int(i)] for i in flat_ids]);b=targets-centers;bn=norm(b)
++    q=norm(free.astype(float)[:,None,:]-centers[None,:,:])/(.1*L)
++    kernel=np.zeros(q.shape,dtype=float);inside=q<1.;s0=1.-q[inside]
++    kernel[inside]=(s0*s0)*(s0*s0)*(4.*q[inside]+1.)
++    s=kernel*weights[None,:];support=s>0;ss=s.sum(1);alpha=s/np.maximum(1.,ss)[:,None]
++    bmax=np.max(np.where(support,bn[None,:],0.),axis=1);bound=np.minimum(.02*L,bmax)
++    field=np.einsum('ij,jk->ik',alpha,b,optimize=False)
++    expected=dict(anchor_source_vertex_ids=flat_ids,anchor_proposal_model=centers,
++        anchor_target_model=targets,anchor_weight=weights,anchor_displacement_target=b,
++        anchor_displacement_target_norm=bn,free_kernel=kernel,free_weighted_support=s,
++        free_alpha=alpha,free_support_sum=ss,free_alpha_sum=alpha.sum(1),
++        free_support_count=support.sum(1),free_supported=support,
++        free_participating_b_max_norm=bmax,free_actual_bound=bound)
++    for name,value in expected.items():near(detail[name],value)
++    near(detail['free_displacement_unclipped'],field)
++    # Different independent contraction order can differ by FP64 roundoff.
++    # Once verified, replay the saved field to require bitwise FP32 endpoints.
++    field=detail['free_displacement_unclipped'];length=norm(field);clip=length>bound
++    factor=np.ones(len(free));factor[clip]=bound[clip]/length[clip]
++    applied=field*factor[:,None];endpoint=free.copy();moving=np.any(applied!=0,axis=1)
++    endpoint[moving]=(free[moving].astype(float)+applied[moving]).astype(np.float32)
++    rounding=norm(endpoint.astype(float)-free)>bound
++    endpoint[rounding]=np.nextafter(endpoint[rounding],free[rounding])
++    actual=endpoint.astype(float)-free;actual_norm=norm(actual)
++    for name,value in dict(free_clip_factor=factor,free_clipped=clip,
++        free_displacement_clipped=applied,free_safety_cap_active=length>.02*L,
++        free_FP32_cap_rounding_adjusted=rounding,free_actual_displacement_FP32=actual,
++        free_actual_displacement_norm=actual_norm,free_actual_bound_margin=bound-actual_norm).items():near(detail[name],value)
++    assert same(output[:k],c) and same(output[k:].reshape(-1,3),endpoint)
++    no_support=support.sum(1)==0
++    assert same(output[k:].reshape(-1,3)[no_support],free[no_support])
++    assert np.all(actual_norm<=bound) and np.all(alpha>=0) and np.all(alpha.sum(1)<=1+8*np.finfo(float).eps)
++    assert np.all(length<=bmax+32*np.finfo(float).eps*np.maximum(1.,bmax))
++    for vertex in counts:
++        copies=np.flatnonzero(flat_ids==vertex)
++        assert all(same(c.reshape(-1,3)[i],c.reshape(-1,3)[copies[0]]) for i in copies)
++        near(weights[copies].sum(),1.)
++    for key,value in dict(anchor_corners=len(centers),source_vertices=len(counts),free_corners=len(free),
++        supported_free_corners=int((~no_support).sum()),no_support_free_corners=int(no_support.sum()),
++        clipped_free_corners=int(clip.sum()),safety_cap_active_free_corners=int((length>.02*L).sum()),
++        FP32_cap_rounding_adjusted_corners=int(rounding.sum()),model_calls=0,new_noise=0,matrix_solves=0).items():assert diag[key]==value,key
++    near(diag['minimum_actual_bound_margin'],float(np.min(bound-actual_norm)))
++    return dict(C_bitwise=True,source_ID_weights_verified=True,subconvex_formula_verified=True,
++        output_reconstructed_bitwise=True,unclipped_bound_verified=True,actual_FP32_bound_verified=True,
++        no_support_corners=int(no_support.sum()),supported_corners=int((~no_support).sum()),
++        safety_cap_active_corners=int((length>.02*L).sum()),rounding_adjusted_corners=int(rounding.sum()),
++        max_free_displacement=float(actual_norm.max()),minimum_actual_bound_margin=float(np.min(bound-actual_norm)))
++
++
++class ParityUnionFind:
++    """Independent union-by-size XOR relation checker, not the solver's BFS."""
++    def __init__(self,n):
++        self.parent=list(range(n));self.size=[1]*n;self.parity=[0]*n
++    def find(self,x):
++        if self.parent[x]!=x:
++            p=self.parent[x];root,parity=self.find(p)
++            self.parity[x]^=parity;self.parent[x]=root
++        return self.parent[x],self.parity[x]
++    def union(self,a,b,wanted):
++        ra,pa=self.find(a);rb,pb=self.find(b)
++        if ra==rb:return (pa^pb)==wanted
++        if self.size[ra]<self.size[rb]:ra,rb=rb,ra
++        self.parent[rb]=ra;self.parity[rb]=pa^pb^wanted;self.size[ra]+=self.size[rb]
++        return True
++
++def check_orientation(vertices,faces,K,oriented,components,edge_rows,summary):
++    n=len(faces);tri=vertices[faces].astype(float)
++    area=.5*norm(np.cross(tri[:,1]-tri[:,0],tri[:,2]-tri[:,0]))
++    degenerate=np.array([len(set(map(int,f)))<3 for f in faces])|(area==0)
++    incidence=collections.defaultdict(list);dups=collections.Counter(tuple(sorted(map(int,f))) for f in faces)
++    for i,face in enumerate(faces):
++        for corner in range(3):
++            a,b=map(int,(face[corner],face[(corner+1)%3]))
++            incidence[tuple(sorted((a,b)))].append((i,corner,a,b))
++    assert len(edge_rows)==len(incidence)
++    edges=[];uf=ParityUnionFind(n)
++    for eid,((a,b),entries) in enumerate(sorted(incidence.items())):
++        ids=[x[0] for x in entries];reason=[]
++        if a==b:reason.append('SELF_LOOP_EDGE')
++        if len(entries)==1:reason.append('BOUNDARY_SINGLE_INCIDENCE')
++        elif len(entries)>2:reason.append('NONMANIFOLD_MORE_THAN_TWO_INCIDENCES')
++        elif len(entries)!=2:reason.append('NOT_TWO_INCIDENCES')
++        if len(entries)==2 and len(set(ids))!=2:reason.append('TWO_INCIDENCES_SAME_FACE')
++        if any(degenerate[i] for i in set(ids)):reason.append('DEGENERATE_INCIDENT_FACE')
++        eligible=not reason
++        opposite=(entries[0][2]==entries[1][3] and entries[0][3]==entries[1][2]) if len(entries)==2 and len(set(ids))==2 and a!=b else None
++        required=int(not opposite) if eligible else None
++        domain='C_F' if any(i<K for i in ids) and any(i>=K for i in ids) else 'C_C' if all(i<K for i in ids) else 'F_F'
++        row=edge_rows[eid]
++        for key,value in dict(edge_id=eid,vertex_u=a,vertex_v=b,incidence=len(entries),distinct_incident_faces=len(set(ids)),
++            incident_face_ids=ids,incident_local_edges=[x[1] for x in entries],incident_directions=[[x[2],x[3]] for x in entries],
++            domain=domain,original_opposite_direction=opposite,eligible_constraint=eligible,required_flip_XOR=required,exclusion_reasons=reason).items():assert row[key]==value,(eid,key)
++        near(row['length'],float(norm(vertices[a].astype(float)-vertices[b])))
++        edges.append((ids,eligible,required,opposite,domain,reason))
++        if eligible:uf.union(ids[0],ids[1],required)
++    groups=collections.defaultdict(list)
++    for i in range(n):groups[uf.find(i)[0]].append(i)
++    groups=sorted(groups.values(),key=lambda g:g[0]);assert len(groups)==len(components)
++    membership={i:cid for cid,g in enumerate(groups) for i in g}
++    flips=np.zeros(n,bool);parity_conflicts=0;anchor_conflicts=0;satisfiable_count=0
++    for cid,members in enumerate(groups):
++        c=components[cid];assert c['face_ids']==members and c['component_id']==cid and c['root_face']==members[0]
++        constraints=[(eid,e) for eid,e in enumerate(edges) if e[1] and membership[e[0][0]]==cid]
++        excluded=[eid for eid,e in enumerate(edges) if not e[1] and any(i in members for i in e[0])]
++        root_parity=uf.find(members[0])[1];relative={i:uf.find(i)[1]^root_parity for i in members}
++        conflict=any((relative[e[0][0]]^relative[e[0][1]])!=e[2] for _,e in constraints)
++        anchors=[i for i in members if i<K];gauges=sorted({relative[i] for i in anchors})
++        fixed_conflict=None if conflict else len(gauges)>1
++        bad=[i for i in members if degenerate[i]];satisfiable=not conflict and not fixed_conflict and not bad
++        parity_conflicts+=conflict;anchor_conflicts+=fixed_conflict is True;satisfiable_count+=satisfiable
++        assert c['parity_conflict']==conflict and c['fixed_C_anchor_conflict']==fixed_conflict
++        assert c['C_face_ids']==anchors and c['degenerate_face_ids']==bad and c['satisfiable']==satisfiable
++        assert c['eligible_constraint_edges']==len(constraints) and c['excluded_incident_edge_ids']==excluded
++        if not conflict:assert c['C_anchor_required_gauges']==gauges
++        if satisfiable:
++            gauge=gauges[0] if anchors else 0
++            for i in members:flips[i]=relative[i]^gauge
++            assert c['gauge']==gauge
++        expected_status='SATISFIABLE_ANCHORED' if satisfiable and anchors else 'SATISFIABLE_UNANCHORED_GAUGE_ONLY' if satisfiable else 'UNCHANGED_PARITY_CONFLICT' if conflict else 'UNCHANGED_FIXED_C_CONFLICT' if fixed_conflict else 'UNCHANGED_DEGENERATE_FACE'
++        assert c['repair_status']==expected_status
++        assert c['flipped_free_face_ids']==[i for i in members if flips[i]]
++        assert c['outward_orientation_certified'] is False
++    changed=faces.copy();changed[flips]=faces[flips][:,[0,2,1]]
++    perm=np.tile(np.array([0,1,2],np.int8),(n,1));perm[flips]=[0,2,1]
++    assert same(oriented['vertices'],vertices) and same(oriented['faces'],changed)
++    assert np.array_equal(oriented['flips'],flips) and np.array_equal(oriented['corner_permutation'],perm)
++    assert same(changed[:K],faces[:K]) and not flips[:K].any()
++    assert np.array_equal(np.sort(changed,axis=1),np.sort(faces,axis=1))
++    assert same(oriented['output'],vertices[changed]) and same(oriented['C'],vertices[faces[:K]])
++    assert same(oriented['free'],vertices[changed[K:]])
++    opposite_after=0;cf_before=0;cf_after=0;unsatisfied=0;eligible_count=0
++    for eid,(ids,eligible,required,opposite,domain,reason) in enumerate(edges):
++        saved=edge_rows[eid];assert saved['incident_faces_flipped']==[bool(flips[i]) for i in ids]
++        new_opposite=(bool(opposite)^bool(flips[ids[0]])^bool(flips[ids[1]])) if opposite is not None else None
++        assert saved['repaired_opposite_direction']==new_opposite
++        if eligible:
++            satisfied=(int(flips[ids[0]])^int(flips[ids[1]]))==required
++            assert saved['repaired_constraint_satisfied']==satisfied
++            eligible_count+=1;opposite_after+=bool(new_opposite);unsatisfied+=not satisfied
++            if domain=='C_F':cf_before+=bool(opposite);cf_after+=bool(new_opposite)
++    for key,value in dict(vertices=len(vertices),faces=n,C_faces=K,free_faces=n-K,constraint_components=len(groups),
++        satisfiable_components=satisfiable_count,parity_conflict_components=parity_conflicts,
++        fixed_C_anchor_conflict_components=anchor_conflicts,degenerate_faces=int(degenerate.sum()),
++        nonmanifold_edges=sum(len(e)>2 for e in incidence.values()),boundary_edges=sum(len(e)==1 for e in incidence.values()),
++        duplicate_indexed_face_groups=sum(count>1 for count in dups.values()),eligible_two_incidence_edges=eligible_count,
++        opposite_two_incidence_edges_after=opposite_after,opposite_C_F_edges_before=cf_before,opposite_C_F_edges_after=cf_after,
++        unsatisfied_eligible_edges_after=unsatisfied,flipped_free_faces=int(flips.sum()),outward_orientation_certified=False,model_calls=0).items():assert summary[key]==value,key
++    near(summary['flipped_free_surface_area'],float(area[flips].sum()))
++    return dict(components=len(groups),edges=len(edges),eligible_constraints=eligible_count,
++        parity_conflicts=parity_conflicts,fixed_C_conflicts=anchor_conflicts,flipped_free_faces=int(flips.sum()),
++        source_geometry_unchanged=True,C_bytes_and_winding_unchanged=True,independent_XOR_union_find='PASS',
++        deterministic_free_flip_solution='PASS',unsatisfied_eligible_edges_after=unsatisfied)
++
++def audit():
++    from r2.tools.c_restore_coupling_v1.independent_audit import graph_audit, reduction, eq, num
++    started=time.monotonic();reg=read(OUT/'registration.json');done=read(OUT/'execution_completion.json')
++    assert done['status']=='PASS' and done['torch_imported'] is False
++    for key,value in dict(new_model_forwards=0,training_updates=0,new_generator_outputs=0,new_noise=0,
++        new_blend_outputs=12,new_GEO_C=12,new_POST_quality=12,orientation_outputs=36).items():assert done[key]==value,key
++    records=reg['records'];assert len(records)==12 and len({r['parent_id'] for r in records})==6
++    verify(reg['runner_hashes'])
++    # Root already read every protected byte before and after execution; avoid a
++    # third large-weight pass. Independently rehash every nonweight asset here.
++    small={p:h for p,h in reg['protected'].items() if Path(p).suffix.lower() not in {'.pt','.pth','.ckpt'}}
++    weight_receipts={p:h for p,h in reg['protected'].items() if p not in small}
++    verify(small)
++    assert done['original_files_unchanged']==len(reg['protected']) and done['frozen_sources_unchanged']
++    for kind,count in [('ORIENTATION',36),('GEO',12),('QUALITY',12)]:
++        for suffix in ['started','complete']:assert len(list((OUT/'events').glob('*/*/'+kind+'_'+suffix+'.json')))==count
++    ledger=[json.loads(s) for s in (OUT/'ledger.jsonl').read_text().splitlines() if s]
++    for name in ['BLEND_STARTED','BLEND_COMPLETE']:
++        ll=[e['request_id'] for e in ledger if e['event']==name]
++        assert len(ll)==len(set(ll))==12 and set(ll)=={r['request_id'] for r in records}
++    blends=[]
++    for r in records:
++        folder=OUT/'pre_geo/BLEND'/r['request_id'];saved=arrays(folder/'denoised.npz')
++        source=arrays(r['condition_source']);raw=arrays(r['raw_path']);base=arrays(r['D0_denoised_path'])
++        proof=read(folder/'receipt.json');verify(proof['files']);assert proof['output_sha256']==sha(folder/'denoised.npz')
++        assert proof['identity']['registration_sha256']==sha(OUT/'registration.json')
++        assert same(source['C'],raw['C']) and same(saved['C'],raw['C'])
++        assert same(saved['official_unconstrained_proposal'],base['official_unconstrained_proposal'])
++        details=arrays(folder/'details.npz');diag=read(folder/'diagnostics.json')
++        blends.append(dict(request_id=r['request_id'],status='PASS',**check_blend(source['C'],saved['official_unconstrained_proposal'],source['C_source_vertex_ids'],saved['output'],details,diag,reg['fixed_L'])))
++    controls=read(OUT/'blend_checks/completion.json');assert controls['status']=='PASS' and controls['checks']==8 and controls['model_calls']==0
++    verify(controls['source_hashes'])
++    controls=read(OUT/'orientation_checks/completion.json');assert controls['status']=='PASS' and len(controls['cases'])==7 and controls['model_calls']==0
++    verify(controls['source_hashes']);verify(controls['files'])
++    index=read(OUT/'post_index.json');assert len(index)==36 and collections.Counter(r['method'] for r in index)=={'D0_BASE':12,'RBF':12,'BLEND':12}
++    audits=[];edge_checks=0;boundary_checks=0;decision_checks=0
++    decisions=rows(OUT/'decision_per_output.csv');dm={(r['method'],r['request_id']):r for r in decisions};assert len(dm)==36
++    metrics_rows=rows(OUT/'AVMR_PMR_per_output.csv');mm={(r['method'],r['request_id'],r['phase'],r['setting']):r for r in metrics_rows};assert len(mm)==576
++    topology_table={(r['method'],r['request_id'],r['phase']):r for r in rows(OUT/'topology_per_output.csv')}
++    for r in index:
++        rid=r['request_id'];method=r['method'];k=int(r['K']);post=arrays(r['post_path']);pre=arrays(r['denoised_path'])['output'];raw=arrays(r['raw_path'])['raw'].reshape(-1,3,3)
++        assert sha(r['post_path'])==r['post_sha256'] and same(post['output'],post['vertices'][post['faces']])
++        assert same(post['output'][:k],raw[:k]) and same(pre[:k],raw[:k])
++        d=read(r['diagnostic_path']);verify(d['quality']['files'])
++        assert d['status']=='PASS' and d['identity']['post_sha256']==sha(r['post_path']) and d['pre_GEO_quality_status']=='NA_NOT_BUDGETED'
++        assert d['quality']['identity']['processed_sha256']==sha(r['post_path'])
++        assert d['quality']['free_face_denominator']==len(post['output'])-k
++        folder=OUT/'oriented'/method/rid;proof=read(folder/'receipt.json');od=read(folder/'orientation_details.json');oriented=arrays(folder/'oriented.npz')
++        assert proof['identity']['post_sha256']==sha(r['post_path']) and proof['identity']['registration_sha256']==sha(OUT/'registration.json')
++        verify(proof['files']);assert proof['summary']==od['summary']
++        checked_orientation=check_orientation(post['vertices'],post['faces'],k,oriented,od['components'],od['edges'],od['summary'])
++        assert same(oriented['source_face_ids'],post['source_face_ids'])
++        assert same(oriented['source_corner_ids'],np.take_along_axis(post['source_corner_ids'],oriented['corner_permutation'],axis=1))
++        assert same(oriented['output'],np.take_along_axis(post['output'],oriented['corner_permutation'][:,:,None],axis=1))
++        assert proof['equivalence']['quality_reference_POST_sha256']==sha(r['post_path'])
++        assert proof['equivalence']['quality_scalar_status']=='REUSED_UNORIENTED_GEOMETRY_EQUIVALENCE; no claim of a new scorer execution'
++        pairs=read(d['quality']['pair_audit_path'])
++        edge_checks+=graph_audit(oriented['output'],oriented['vertices'],oriented['faces'],k,rows(folder/'valid_edges_after.csv'),proof['after'],pairs)
++        for key,value in proof['after'].items():
++            if isinstance(value,(int,float)) or value is None:eq(topology_table[method,rid,'POST_ORIENTED'].get(key),value)
++        source=arrays(r['condition_source']);source_ids=source['C_source_vertex_ids'];cedges=collections.Counter()
++        coords={}
++        for face,ids in zip(source['C'],source_ids):
++            for corner,vid in enumerate(ids):
++                if int(vid) in coords:assert same(coords[int(vid)],face[corner])
++                coords[int(vid)]=face[corner]
++            for u,v in zip(ids,np.roll(ids,-1)):cedges[tuple(sorted((int(u),int(v))))]+=1
++        bid=sorted({v for e,count in cedges.items() if count==1 for v in e})
++        for phase,tri,vkey,mkey in [('POST',post['output'],'vertices','metrics'),('PRE_GEO',pre,'pre_GEO_vertices','pre_GEO_metrics')]:
++            verts=d[vkey];assert [v['source_vertex_id'] for v in verts]==bid
++            pts=np.asarray([coords[v] for v in bid],float);free=tri[k:].reshape(-1,3).astype(float)
++            d2=((pts[:,None,:]-free[None,:,:])**2).sum(2);nearest=d2.argmin(1);dist=np.sqrt(d2[np.arange(len(bid)),nearest])
++            for i,(v,value) in enumerate(zip(verts,dist)):
++                near([v['x'],v['y'],v['z']],pts[i]);eq(v['distance_model'],value);eq(v['distance_L_fraction'],value/reg['fixed_L'])
++                assert int(v['nearest_free_face'])*3+int(v['nearest_free_corner'])==int(nearest[i]);boundary_checks+=4
++            for item in d[mkey]:
++                count=int((dist<float(item['threshold_model'])).sum())
++                expected=dict(boundary_vertex_count=len(bid),matched_count=count,VMR=count/len(bid),perfect=int(count==len(bid)))
++                for key,value in expected.items():eq(item[key],value);eq(mm[method,rid,phase,item['setting']][key],value);boundary_checks+=2
++            # Rebuild actual or exact-coordinate graph using saved original pair classifications only.
++            if phase=='POST':vertices,faces=post['vertices'],post['faces'];graph_pairs=pairs
++            else:
++                flat=np.ascontiguousarray(tri,dtype=np.float32).reshape(-1,3)
++                _,first,inverse=np.unique(flat.view(np.uint32).reshape(-1,3),axis=0,return_index=True,return_inverse=True)
++                vertices,faces=flat[first],inverse.reshape(-1,3);graph_pairs=read(Path(r['diagnostic_path']).parent/'PRE_edge_local_pairs.json')
++            ep=Path(r['diagnostic_path']).parent/(('valid_edges_' if method=='BLEND' else 'valid_edge_details_')+('POST' if phase=='POST' else 'PRE')+'.csv')
++            top=d['topology' if phase=='POST' else 'pre_GEO_topology'];edge_checks+=graph_audit(tri,vertices,faces,k,rows(ep),top,graph_pairs)
++            for key,value in top.items():
++                if isinstance(value,(int,float)) or value is None:eq(topology_table[method,rid,phase].get(key),value)
++        q=d['quality']['metrics'];strict=next(v for v in d['metrics'] if v['setting']=='raw_tau_1e-6');loose=next(v for v in d['metrics'] if v['setting']=='L_tau_0.02')
++        expected=dict(CF=q['CF_proper_affected_free_fraction'],CF_illegal=q['CF_illegal_affected_free_fraction'],FF=q['FF_illegal_affected_free_fraction'],I=q['ConflictCov_C'],
++            small_angle_lt5=q['free_minimum_angle_lt5_fraction'],strict_AVMR=strict['VMR'],strict_PMR=strict['perfect'],AVMR_02L=loose['VMR'],
++            distance_mean_model=float(np.mean([v['distance_model'] for v in d['vertices']])),pre_distance_mean_model=float(np.mean([v['distance_model'] for v in d['pre_GEO_vertices']])),
++            valid_edges=d['topology']['C_F_valid_edge_count'],opposed_before=d['topology']['C_F_valid_opposite_winding_edge_count'],opposed_after=proof['after']['C_F_valid_opposite_winding_edge_count'],
++            reachable_area=d['topology']['reached_free_area_fraction'],opposed_reach_before=d['topology']['opposite_winding_reached_free_area_fraction'],opposed_reach_after=proof['after']['opposite_winding_reached_free_area_fraction'],
++            free_faces=len(post['output'])-k,deleted_free_faces=int(r['N'])-len(post['output']))
++        for key,value in expected.items():eq(dm[method,rid][key],value);decision_checks+=1
++        audits.append(dict(method=method,request_id=rid,status='PASS',**checked_orientation))
++    pairs_checked=0
++    for p in rows(OUT/'paired_per_parent_noise.csv'):
++        a=dm[p['method'],p['request_id']];b=dm[p['reference'],p['request_id']]
++        for key,value in p.items():
++            if key.endswith('_delta'):eq(value,num(a[key[:-6]])-num(b[key[:-6]]));pairs_checked+=1
++    summary_checks=0;meta_keys={'method','request_id','label','parent_id','condition_id','region_type','tier','candidate','N','K'}
++    for s in rows(OUT/'decision_summary.csv'):
++        field={'REGION':'region_type','PARENT':'parent_id','NOISE':'candidate'}.get(s['group'])
++        subset=[r for r in decisions if r['method']==s['method'] and (field is None or r[field]==s['value'])]
++        eq(s['n'],len(subset))
++        for key in decisions[0]:
++            if key not in meta_keys:eq(s[key],float(np.mean([float(r[key]) for r in subset])));summary_checks+=1
++        for key,f in [('outputs_with_valid_edges','valid_edges'),('outputs_with_opposed_edges_before','opposed_before'),('outputs_with_opposed_edges_after','opposed_after')]:
++            eq(s[key],sum(float(r[f])>0 for r in subset));summary_checks+=1
++    summary_checks+=reduction(metrics_rows,rows(OUT/'AVMR_PMR_summary.csv'))
++    csvwrite(AUDIT/'blend_per_output.csv',blends);csvwrite(AUDIT/'orientation_per_output.csv',audits)
++    result=dict(status='PASS',BLEND_outputs=12,orientation_outputs=36,eligible_graph='Full indexed two-incidence nondegenerate C-C/C-F/F-F, regardless of intersection classification',
++        independent_parity_algorithm='Union-by-size XOR disjoint sets; execution solver uses BFS',actual_legal_graph_edges_checked=edge_checks,
++        boundary_and_threshold_checks=boundary_checks,AVMR_rows=len(mm),decision_value_checks=decision_checks,paired_delta_checks=pairs_checked,summary_stat_checks=summary_checks,
++        protected_nonweight_files_rehashed=len(small),protected_weights_from_execution_receipt=weight_receipts,
++        weight_verification_basis=dict(path=str(OUT/'execution_completion.json'),sha256=sha(OUT/'execution_completion.json'),full_execution_protected_count=done['original_files_unchanged']),
++        blend_controls=8,orientation_controls=7,all_C_coordinates_and_winding_preserved=True,source_corner_and_face_identity_verified=True,
++        scalar_quality_reuse='Unordered per-face geometry equivalence, frozen original scorer evidence; no assertion of rerun FP64 bitwise identity',
++        full_PRE_quality='NA_NOT_BUDGETED',audit_source_sha256=sha(__file__),registration_sha256=sha(OUT/'registration.json'),
++        pure_graph_helper_path=str(ROOT/'r2/tools/c_restore_coupling_v1/independent_audit.py'),
++        pure_graph_helper_sha256=sha(ROOT/'r2/tools/c_restore_coupling_v1/independent_audit.py'),
++        seconds=time.monotonic()-started,model_forwards=0,training_updates=0,new_GEO_runs=0,new_quality_scans=0)
++    write(AUDIT/'completion.json',result);return result
++
++def main():
++    parser=argparse.ArgumentParser();parser.add_argument('--check-only',action='store_true');args=parser.parse_args()
++    for p in [ROOT/'WORKSPACE.md',OUT/'registration.json',ROOT/'experiments/r2_c_restore_coupling_v1/REPORT.md']:
++        try:checked(p)
++        except AssertionError:pass
++        else:raise AssertionError('Negative output guard failed')
++    if args.check_only:
++        print(json.dumps(dict(status='PASS',negative_output_guards=3,model_calls=0)));return
++    result=audit();print(json.dumps(result,ensure_ascii=False))
++if __name__=='__main__':main()
+--- /dev/null
++++ b/r2/tools/c_restore_bounded_v1/orientation.py
+@@ -0,0 +1,164 @@
++"""Fixed-C indexed triangle orientation audit and deterministic free-only repair.
++
++Pure NumPy/CPU. No vertex movement, merging, deletion, duplication, model, or
++quality scorer. Satisfiability concerns the stated two-incidence edge system;
++it never certifies collision freedom, semantic attachment, or outward normals.
++"""
++from __future__ import annotations
++import collections
++import numpy as np
++
++VERSION='fixed_C_two_incidence_XOR_orientation_v1'
++
++def definition():
++    return dict(version=VERSION,
++        variables='One binary face reversal; every C face is fixed to zero',
++        constraints='All indexed C-C/C-F/F-F edges with exactly two distinct nondegenerate incident faces: same original edge direction requires XOR1, opposite requires XOR0',
++        degenerate='Repeated vertex IDs or exactly zero FP64 triangle area; no near-zero threshold introduced',
++        components='Connected components of the eligible two-incidence constraint graph, including isolated faces',
++        repair='If parity-consistent and all fixed C anchors compatible, apply the unique anchored solution or an unanchored solution with minimum face ID unflipped; conflicted components remain entirely unchanged',
++        reversal='Per-face vertex order [0,2,1]; C face rows preserved byte-for-byte',
++        exclusions='Nonmanifold incidence, boundary edges, self-incidence, or a degenerate incident face produce no XOR constraint and are explicitly listed',
++        unanchored='Gauge only, no outward-orientation certification',
++        limitations='No vertex-link manifold, collision, overlap, watertightness, or semantic-attachment certificate. Duplicate faces are not repaired or removed.')
++
++def orient_fixed_C(vertices,faces,K):
++    """Return faces, flips, component_rows, edge_rows, face provenance, summary.
++
++    vertices:(V,3) finite floating array; faces:(N,3) integer indexed faces;
++    first K face rows are immutable C. Caller inputs are never modified.
++    """
++    vertices=np.asarray(vertices);faces=np.asarray(faces)
++    if vertices.ndim!=2 or vertices.shape[1]!=3 or not np.issubdtype(vertices.dtype,np.floating):raise ValueError('Finite floating vertices(V,3) required')
++    if not np.isfinite(vertices).all():raise ValueError('Nonfinite input vertices')
++    if faces.ndim!=2 or faces.shape[1]!=3 or not np.issubdtype(faces.dtype,np.integer):raise ValueError('Integer indexed faces(N,3) required')
++    if not isinstance(K,(int,np.integer)) or not 0<=K<=len(faces):raise ValueError('K outside face array')
++    if faces.size and (faces.min()<0 or faces.max()>=len(vertices)):raise ValueError('Face index outside vertex array')
++    K=int(K);N=len(faces);tri=vertices[faces].astype(np.float64)
++    areas=.5*np.linalg.norm(np.cross(tri[:,1]-tri[:,0],tri[:,2]-tri[:,0]),axis=1)
++    repeated=np.asarray([len(set(map(int,f)))<3 for f in faces],dtype=bool)
++    degenerate=repeated|(areas==0)
++    incidence=collections.defaultdict(list)
++    duplicate_groups=collections.defaultdict(list)
++    for i,face in enumerate(faces):
++        duplicate_groups[tuple(sorted(map(int,face)))].append(i)
++        for corner,(u,v) in enumerate(((face[0],face[1]),(face[1],face[2]),(face[2],face[0]))):
++            u,v=int(u),int(v);incidence[tuple(sorted((u,v)))].append((i,corner,u,v))
++    duplicate_faces={i for group in duplicate_groups.values() if len(group)>1 for i in group}
++    edges=[];adjacency=[[] for _ in range(N)]
++    for edge_id,((u,v),entries) in enumerate(sorted(incidence.items())):
++        ff=[x[0] for x in entries];distinct=set(ff);reasons=[]
++        has_C=any(i<K for i in ff);has_F=any(i>=K for i in ff)
++        if u==v:reasons.append('SELF_LOOP_EDGE')
++        if len(entries)==1:reasons.append('BOUNDARY_SINGLE_INCIDENCE')
++        elif len(entries)>2:reasons.append('NONMANIFOLD_MORE_THAN_TWO_INCIDENCES')
++        elif len(entries)!=2:reasons.append('NOT_TWO_INCIDENCES')
++        if len(entries)==2 and len(distinct)!=2:reasons.append('TWO_INCIDENCES_SAME_FACE')
++        if any(degenerate[i] for i in distinct):reasons.append('DEGENERATE_INCIDENT_FACE')
++        eligible=not reasons
++        opposed=entries[0][2:]==entries[1][2:][::-1] if len(entries)==2 and len(distinct)==2 and u!=v else None
++        required=int(not opposed) if eligible else None
++        row=dict(edge_id=edge_id,vertex_u=u,vertex_v=v,incidence=len(entries),distinct_incident_faces=len(distinct),
++            incident_face_ids=ff,incident_local_edges=[x[1] for x in entries],
++            incident_directions=[[x[2],x[3]] for x in entries],
++            domain='C_F' if has_C and has_F else 'C_C' if has_C else 'F_F',
++            original_opposite_direction=opposed,eligible_constraint=eligible,required_flip_XOR=required,
++            exclusion_reasons=reasons,length=float(np.linalg.norm(vertices[u].astype(float)-vertices[v])))
++        edges.append(row)
++        if eligible:
++            i,j=ff;adjacency[i].append((j,edge_id,required));adjacency[j].append((i,edge_id,required))
++    relative=np.full(N,-1,np.int8);component_ids=np.full(N,-1,np.int64);components=[]
++    for root in range(N):
++        if relative[root]>=0:continue
++        cid=len(components);relative[root]=0;component_ids[root]=cid;queue=collections.deque([root]);members=[]
++        while queue:
++            i=queue.popleft();members.append(i)
++            for j,edge_id,wanted in sorted(adjacency[i]):
++                if relative[j]<0:
++                    relative[j]=int(relative[i])^wanted;component_ids[j]=cid;queue.append(j)
++        members.sort();components.append(dict(component_id=cid,root_face=min(members),face_ids=members))
++    constraints_by_component=collections.defaultdict(list)
++    excluded_by_component=collections.defaultdict(set)
++    for e in edges:
++        ids=sorted({int(component_ids[i]) for i in e['incident_face_ids']})
++        e['constraint_component_ids']=ids
++        if e['eligible_constraint']:
++            assert len(ids)==1;constraints_by_component[ids[0]].append(e)
++        else:
++            for cid in ids:excluded_by_component[cid].add(e['edge_id'])
++    flips=np.zeros(N,dtype=bool)
++    for comp in components:
++        cid=comp['component_id'];members=comp['face_ids'];cc=[i for i in members if i<K];ee=constraints_by_component[cid]
++        conflict=[e['edge_id'] for e in ee if int(relative[e['incident_face_ids'][0]])^int(relative[e['incident_face_ids'][1]])!=e['required_flip_XOR']]
++        parity_conflict=bool(conflict)
++        # Anchor compatibility is meaningful only once the graph parity is
++        # internally consistent. Do not mislabel an arbitrary inconsistent
++        # spanning assignment as a separate anchor-only contradiction.
++        anchor_gauges=sorted({int(relative[i]) for i in cc})
++        anchored_conflict=(len(anchor_gauges)>1) if not parity_conflict else None
++        excluded_faces=[i for i in members if degenerate[i]]
++        satisfiable=not parity_conflict and not anchored_conflict and not excluded_faces
++        gauge=anchor_gauges[0] if cc and satisfiable else 0 if satisfiable else None
++        if satisfiable:
++            flips[members]=(relative[members]^gauge).astype(bool)
++            assert not flips[cc].any()
++            repair_status='SATISFIABLE_ANCHORED' if cc else 'SATISFIABLE_UNANCHORED_GAUGE_ONLY'
++        else:
++            repair_status='UNCHANGED_PARITY_CONFLICT' if parity_conflict else 'UNCHANGED_FIXED_C_CONFLICT' if anchored_conflict else 'UNCHANGED_DEGENERATE_FACE'
++        exclusions=[edges[i] for i in sorted(excluded_by_component[cid])]
++        comp.update(face_count=len(members),C_face_ids=cc,C_face_count=len(cc),free_face_count=sum(i>=K for i in members),
++            eligible_constraint_edges=len(ee),parity_conflict=parity_conflict,
++            parity_conflict_edge_ids_under_deterministic_propagation=conflict,
++            fixed_C_anchor_conflict=anchored_conflict,
++            fixed_C_anchor_status='NA_PARITY_CONFLICT' if parity_conflict else 'NO_C_ANCHOR' if not cc else 'CONTRADICTION' if anchored_conflict else 'COMPATIBLE',
++            C_anchor_required_gauges=anchor_gauges,
++            degenerate_face_ids=excluded_faces,excluded_incident_edge_ids=sorted(excluded_by_component[cid]),
++            duplicate_indexed_face_ids=[i for i in members if i in duplicate_faces],
++            touches_duplicate_indexed_face=any(i in duplicate_faces for i in members),
++            touches_nonmanifold_edge=any('NONMANIFOLD_MORE_THAN_TWO_INCIDENCES' in e['exclusion_reasons'] for e in exclusions),
++            touches_degenerate_incident_edge=any('DEGENERATE_INCIDENT_FACE' in e['exclusion_reasons'] for e in exclusions),
++            satisfiable=satisfiable,repair_status=repair_status,gauge=gauge,
++            flipped_free_face_ids=[i for i in members if flips[i]],flipped_free_face_count=int(flips[members].sum()),
++            outward_orientation_certified=False)
++    repaired=faces.copy();repaired[flips]=faces[flips][:,[0,2,1]]
++    assert repaired[:K].tobytes()==faces[:K].tobytes() and not flips[:K].any()
++    assert np.array_equal(np.sort(repaired,axis=1),np.sort(faces,axis=1))
++    permutations=np.tile(np.array([0,1,2],np.int8),(N,1));permutations[flips]=[0,2,1]
++    for e in edges:
++        e['incident_faces_flipped']=[bool(flips[i]) for i in e['incident_face_ids']]
++        if e['original_opposite_direction'] is not None:
++            i,j=e['incident_face_ids'];e['repaired_opposite_direction']=bool(e['original_opposite_direction'])^(bool(flips[i])^bool(flips[j]))
++        else:e['repaired_opposite_direction']=None
++        if e['eligible_constraint']:
++            i,j=e['incident_face_ids'];cid=int(component_ids[i])
++            e['relative_parity_conflict']=(int(relative[i])^int(relative[j]))!=e['required_flip_XOR']
++            e['repaired_constraint_satisfied']=(int(flips[i])^int(flips[j]))==e['required_flip_XOR']
++            if components[cid]['satisfiable']:assert e['repaired_constraint_satisfied'] and e['repaired_opposite_direction']
++        else:e['relative_parity_conflict']=None;e['repaired_constraint_satisfied']=None
++    eligible=[e for e in edges if e['eligible_constraint']];cf=[e for e in eligible if e['domain']=='C_F']
++    parity_count=sum(c['parity_conflict'] for c in components);anchor_count=sum(c['fixed_C_anchor_conflict'] is True for c in components)
++    nonmanifold=sum(e['incidence']>2 for e in edges);deg_count=int(degenerate.sum())
++    summary=dict(status='PASS',scope='Executed orientation audit/repair, not a manifold/geometry-quality certificate',definition=definition(),
++        vertices=len(vertices),faces=N,C_faces=K,free_faces=N-K,constraint_components=len(components),
++        anchored_components=sum(c['C_face_count']>0 for c in components),
++        unanchored_nondegenerate_components=sum(c['C_face_count']==0 and not c['degenerate_face_ids'] for c in components),
++        satisfiable_components=sum(c['satisfiable'] for c in components),parity_conflict_components=parity_count,
++        fixed_C_anchor_conflict_components=anchor_count,
++        fixed_C_anchor_status_not_evaluated_due_to_parity_components=parity_count,
++        degenerate_faces=deg_count,nonmanifold_edges=nonmanifold,boundary_edges=sum(e['incidence']==1 for e in edges),
++        duplicate_indexed_face_groups=sum(len(v)>1 for v in duplicate_groups.values()),
++        duplicate_indexed_faces=len(duplicate_faces),
++        eligible_two_incidence_edges=len(eligible),eligible_C_F_edges=len(cf),
++        opposite_two_incidence_edges_before=sum(bool(e['original_opposite_direction']) for e in eligible),
++        opposite_two_incidence_edges_after=sum(bool(e['repaired_opposite_direction']) for e in eligible),
++        opposite_C_F_edges_before=sum(bool(e['original_opposite_direction']) for e in cf),
++        opposite_C_F_edges_after=sum(bool(e['repaired_opposite_direction']) for e in cf),
++        unsatisfied_eligible_edges_after=sum(not e['repaired_constraint_satisfied'] for e in eligible),
++        flipped_free_faces=int(flips.sum()),flipped_free_surface_area=float(areas[flips].sum()),
++        fixed_C_constraints_satisfiable_on_eligible_graph=not parity_count and not anchor_count,
++        whole_indexed_edge_orientation_status='NA_NONMANIFOLD_OR_DEGENERATE' if nonmanifold or deg_count else 'INCOMPATIBLE_FIXED_C_OR_PARITY' if parity_count or anchor_count else 'TWO_INCIDENCE_CONSTRAINTS_SATISFIABLE',
++        C_face_rows_bytewise_preserved=True,C_triangle_coordinate_order_bytewise_preserved=vertices[repaired[:K]].tobytes()==vertices[faces[:K]].tobytes(),
++        coordinates_unchanged=True,face_vertex_sets_unchanged=True,face_count_unchanged=True,
++        outward_orientation_certified=False,model_calls=0)
++    return dict(faces=repaired,flips=flips,face_component_ids=component_ids,
++        face_corner_permutation=permutations,component_rows=components,edge_rows=edges,summary=summary)
+--- /dev/null
++++ b/r2/tools/c_restore_bounded_v1/orientation_checks.py
+@@ -0,0 +1,117 @@
++"""Pure-CPU fixed-C XOR tests; no real meshes, models, or quality scoring."""
++from __future__ import annotations
++import os
++for k in ('OMP_NUM_THREADS','OPENBLAS_NUM_THREADS','MKL_NUM_THREADS','NUMEXPR_NUM_THREADS'):os.environ[k]='2'
++os.environ['CUDA_VISIBLE_DEVICES']=''
++import hashlib,json,resource,subprocess,sys,time
++from pathlib import Path
++import numpy as np
++sys.path.insert(0,str(Path(__file__).resolve().parents[3]))
++from r2.tools.c_restore_bounded_v1 import orientation as O
++ROOT=Path(__file__).resolve().parents[3]
++OUT=ROOT/'experiments/r2_c_restore_bounded_v1/orientation_checks'
++
++def sha(p):return hashlib.sha256(Path(p).read_bytes()).hexdigest()
++def checked(p):
++    p=Path(p).absolute()
++    if any(q.is_symlink() for q in (p,*p.parents)):raise ValueError('Symlink output')
++    p=p.resolve()
++    if p==OUT.resolve() or not p.is_relative_to(OUT.resolve()):raise ValueError('Outside owned checks')
++    return p
++def atomic(p,fn,binary=False):
++    p=checked(p);p.parent.mkdir(parents=True,exist_ok=True);tmp=p.with_name(p.name+'.tmp')
++    with tmp.open('wb' if binary else 'w',**({} if binary else {'encoding':'utf-8'})) as f:
++        fn(f);f.flush();os.fsync(f.fileno())
++    tmp.replace(p)
++def write(p,o):atomic(p,lambda f:json.dump(o,f,indent=2,allow_nan=False))
++def save(p,**a):atomic(p,lambda f:np.savez_compressed(f,**a),True)
++def resources():
++    def run(args):
++        r=subprocess.run(args,text=True,capture_output=True,timeout=20);return dict(code=r.returncode,stdout=r.stdout,stderr=r.stderr)
++    return dict(cpu_cores=os.cpu_count(),RAM=Path('/proc/meminfo').read_text(),loadavg=list(os.getloadavg()),
++        gpu=run(['nvidia-smi','--query-gpu=name,memory.total,memory.used,memory.free,utilization.gpu','--format=csv,noheader,nounits']),
++        gpu_processes=run(['nvidia-smi','--query-compute-apps=pid,process_name,used_memory','--format=csv']),
++        cpu_processes=run(['ps','-eo','pid,pcpu,pmem,comm','--sort=-pcpu']))
++
++def fixtures():
++    v=np.array([[0,0,0],[1,0,0],[0,1,0],[1,1,0],[0,2,0],[0,0,1]],np.float32)
++    rows=[dict(name='same_directed_CF_interface',vertices=v,faces=np.array([[0,1,2],[1,2,3]],np.int64),K=1),
++          dict(name='two_C_anchors_conflict_through_free',vertices=v,faces=np.array([[0,1,2],[3,2,4],[1,2,3]],np.int64),K=2)]
++    # A three-quad triangulated Mobius strip. The cycle, not fixed C, is
++    # contradictory. These synthetic positions only avoid zero-area faces.
++    mv=[]
++    for i in range(3):
++        theta=2*np.pi*i/3
++        for w in (-.25,.25):
++            r=1+w*np.cos(theta/2);mv.append([r*np.cos(theta),r*np.sin(theta),w*np.sin(theta/2)])
++    mf=[]
++    for i in range(3):
++        a,b=2*i,2*i+1;an,bn=(2*(i+1),2*(i+1)+1) if i<2 else (1,0)
++        mf.extend([[a,b,an],[b,bn,an]])
++    rows.append(dict(name='nonorientable_cycle_conflict',vertices=np.array(mv,np.float32),faces=np.array(mf,np.int64),K=0))
++    rows.append(dict(name='nonmanifold_three_incident_faces',vertices=v,faces=np.array([[0,1,2],[1,0,3],[0,1,5]],np.int64),K=1))
++    uv=np.concatenate((v[:4],v[:4]+np.array([3,0,0],np.float32)))
++    rows.append(dict(name='disconnected_unanchored_component',vertices=uv,faces=np.array([[0,1,2],[1,2,3],[4,5,6],[5,6,7]],np.int64),K=1))
++    rows.append(dict(name='degenerate_face_exclusion',vertices=v,faces=np.array([[0,1,2],[0,0,1]],np.int64),K=1))
++    sv=v.copy();sv[0,0]=np.float32(-0.0)
++    rows.append(dict(name='C_byte_order_and_signed_zero_preservation',vertices=sv,faces=np.array([[2,0,1],[1,2,3]],np.int32),K=1))
++    return rows
++
++def check(name,r,faces,K):
++    s=r['summary'];fl=r['flips']
++    if name in ('same_directed_CF_interface','C_byte_order_and_signed_zero_preservation'):
++        assert fl.tolist()==[False,True] and s['opposite_C_F_edges_before']==0 and s['opposite_C_F_edges_after']==1
++    elif name=='two_C_anchors_conflict_through_free':
++        assert s['parity_conflict_components']==0 and s['fixed_C_anchor_conflict_components']==1
++        assert not fl.any() and np.array_equal(r['faces'],faces)
++    elif name=='nonorientable_cycle_conflict':
++        assert s['parity_conflict_components']==1 and s['fixed_C_anchor_conflict_components']==0
++        assert s['fixed_C_anchor_status_not_evaluated_due_to_parity_components']==1
++        assert not fl.any() and np.array_equal(r['faces'],faces)
++    elif name=='nonmanifold_three_incident_faces':
++        assert s['nonmanifold_edges']==1 and s['eligible_two_incidence_edges']==0
++        assert s['whole_indexed_edge_orientation_status']=='NA_NONMANIFOLD_OR_DEGENERATE'
++        assert all(c['touches_nonmanifold_edge'] for c in r['component_rows'])
++    elif name=='disconnected_unanchored_component':
++        assert fl.tolist()==[False,True,False,True] and s['unanchored_nondegenerate_components']==1
++        c=next(c for c in r['component_rows'] if c['C_face_count']==0)
++        assert c['root_face']==2 and c['gauge']==0 and not c['outward_orientation_certified']
++    elif name=='degenerate_face_exclusion':
++        assert s['degenerate_faces']==1 and not fl.any()
++        assert any('DEGENERATE_INCIDENT_FACE' in e['exclusion_reasons'] for e in r['edge_rows'])
++    assert r['faces'][:K].tobytes()==faces[:K].tobytes() and not fl[:K].any()
++
++def main():
++    completion=OUT/'completion.json';sources={str(Path(O.__file__)):sha(O.__file__),str(Path(__file__)):sha(__file__)}
++    if completion.exists():
++        old=json.loads(completion.read_text());assert old['status']=='PASS' and old['source_hashes']==sources
++        for p,h in old['files'].items():assert sha(p)==h
++        print(json.dumps(dict(status='VERIFIED_REUSE',cases=7,model_calls=0)));return
++    if (OUT/'registration.json').exists():raise RuntimeError('Incomplete prior checks; no automatic replay')
++    before=resources();start=time.perf_counter();data=fixtures()
++    protected={str(p):sha(p) for p in (ROOT/'AGENTS.md',ROOT/'WORKSPACE.md',ROOT/'native_t1/docs/control_metrics.md')}
++    write(OUT/'registration.json',dict(status='REGISTERED',source_hashes=sources,definition=O.definition(),
++        protected=protected,cases=[r['name'] for r in data],CPU_workers=1,threads=2,
++        rationale='Small deterministic analytic orientation fixtures, no GPU/model/real-mesh work'))
++    write(OUT/'resources_before.json',before)
++    results=[]
++    for case in data:
++        name=case['name'];v,f,K=case['vertices'],case['faces'],case['K'];vbits,fbits=v.tobytes(),f.tobytes()
++        write(OUT/name/'started.json',dict(status='STARTED'))
++        r=O.orient_fixed_C(v,f,K);check(name,r,f,K)
++        assert v.tobytes()==vbits and f.tobytes()==fbits
++        assert v[r['faces'][:K]].tobytes()==v[f[:K]].tobytes()
++        assert np.array_equal(np.sort(r['faces'],axis=1),np.sort(f,axis=1))
++        # Determinism and idempotence on these seven small authorized fixtures
++        # are arithmetic checks, not extra model or real-mesh evaluation.
++        repeat=O.orient_fixed_C(v,f,K);assert np.array_equal(repeat['faces'],r['faces']) and repeat['component_rows']==r['component_rows']
++        again=O.orient_fixed_C(v,r['faces'],K);assert np.array_equal(again['faces'],r['faces'])
++        save(OUT/name/'arrays.npz',vertices=v,original_faces=f,repaired_faces=r['faces'],flips=r['flips'],face_component_ids=r['face_component_ids'],face_corner_permutation=r['face_corner_permutation'])
++        write(OUT/name/'result.json',dict(summary=r['summary'],component_rows=r['component_rows'],edge_rows=r['edge_rows']))
++        results.append(dict(case=name,status='PASS',flipped_free_faces=r['summary']['flipped_free_faces'],parity_conflict_components=r['summary']['parity_conflict_components'],fixed_C_anchor_conflict_components=r['summary']['fixed_C_anchor_conflict_components'],nonmanifold_edges=r['summary']['nonmanifold_edges'],C_bytes_preserved=True,deterministic=True,idempotent=True))
++    for p,h in protected.items():assert sha(p)==h
++    files={str(p):sha(p) for p in OUT.rglob('*') if p.is_file()}
++    done=dict(status='PASS',cases=results,source_hashes=sources,files=files,protected_unchanged=True,
++        model_calls=0,real_mesh_operations=0,new_queries=0,seconds=time.perf_counter()-start,peak_CPU_RSS_KiB=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
++    write(completion,done);print(json.dumps({k:v for k,v in done.items() if k not in ('files','source_hashes')}))
++if __name__=='__main__':main()
+--- /dev/null
++++ b/r2/tools/c_restore_bounded_v1/pack.py
+@@ -0,0 +1,207 @@
++"""CPU-only complete evidence archive. No imports of model or scientific runners."""
++from __future__ import annotations
++import argparse,csv,difflib,hashlib,html,json,os,posixpath,re,time,zipfile
++from pathlib import Path
++
++ROOT=Path(__file__).resolve().parents[3]
++CODE=Path(__file__).resolve().parent
++OUT=ROOT/'experiments/r2_c_restore_bounded_v1'
++ZIP=OUT/'R2_C_RESTORE_BOUNDED_REVIEW.zip'
++FINAL=OUT/'packaging'
++
++def sha(p):
++ h=hashlib.sha256()
++ with Path(p).open('rb') as f:
++  for b in iter(lambda:f.read(1<<20),b''):h.update(b)
++ return h.hexdigest()
++def read(p):return json.loads(Path(p).read_text(encoding='utf-8-sig'))
++def rows(p):
++ with Path(p).open(encoding='utf-8-sig',newline='') as f:return list(csv.DictReader(f))
++def checked(p):
++ p=Path(p).absolute()
++ if any(q.is_symlink() for q in (p,*p.parents)):raise ValueError('Symlink output')
++ p=p.resolve()
++ if p==OUT.resolve() or not p.is_relative_to(OUT.resolve()):raise ValueError('Write outside new output')
++ return p
++def atomic(p,fn,binary=False):
++ p=checked(p);p.parent.mkdir(parents=True,exist_ok=True);tmp=checked(p.with_name(p.name+'.tmp'))
++ with tmp.open('wb' if binary else 'w',**({} if binary else {'encoding':'utf-8','newline':''})) as f:
++  fn(f);f.flush();os.fsync(f.fileno())
++ tmp.replace(p)
++def write(p,obj):atomic(p,lambda f:json.dump(obj,f,ensure_ascii=False,indent=2,allow_nan=False))
++def textfile(p,s):atomic(p,lambda f:f.write(s))
++def immutable_copy(src,dst):
++ src=Path(src);dst=checked(dst)
++ if dst.exists():
++  if sha(src)!=sha(dst):raise RuntimeError('Existing snapshot differs: '+str(dst))
++ else:atomic(dst,lambda f:f.write(src.read_bytes()),True)
++def assert_hash(p,h):
++ if sha(p)!=h:raise ValueError('Hash mismatch: '+str(p))
++
++
++def prerequisite_check():
++ required=['REPORT.md','README_RESUME.md','completion.json','registration.json','execution_completion.json',
++  'geometry_completion.json','score_completion.json','post_completion.json','aggregate_completion.json',
++  'blend_checks/completion.json','orientation_checks/completion.json','independent_audit/completion.json',
++  'gallery/manifest.json','gallery/index.html','gallery/visual_review.csv','gallery/visual_review_completion.json',
++  'decision_per_output.csv','decision_summary.csv','paired_per_parent_noise.csv','AVMR_PMR_per_output.csv']
++ for name in required:
++  if not (OUT/name).is_file():raise RuntimeError('BLOCKED_MISSING '+name)
++ done=read(OUT/'execution_completion.json')
++ assert done['status']=='PASS' and done['new_blend_outputs']==done['new_GEO_C']==done['new_POST_quality']==12
++ assert done['orientation_outputs']==36 and done['new_model_forwards']==done['training_updates']==done['new_noise']==done['new_generator_outputs']==0
++ for name in ['independent_audit/completion.json','blend_checks/completion.json','orientation_checks/completion.json','gallery/visual_review_completion.json']:
++  assert read(OUT/name)['status'] in ('PASS','COMPLETE')
++ assert read(OUT/'independent_audit/completion.json')['audit_source_sha256']==sha(CODE/'independent_audit.py')
++ assert read(OUT/'blend_checks/completion.json')['checks']==8 and len(read(OUT/'orientation_checks/completion.json')['cases'])==7
++ g=read(OUT/'gallery/manifest.json');assert g['status']=='PASS' and g['images']==24 and g['requests']==12
++ lookup={}
++ for q in g['receipts']:
++  for typ in ['png','jpg']:
++   assert_hash(q[typ],q[typ+'_sha256']);lookup[q[typ]]=q[typ+'_sha256']
++  for p,h in q['identity']['source_hashes'].items():assert_hash(p,h)
++ records=[]
++ for p in sorted((OUT/'gallery').glob('*images.json')):
++  q=read(p)
++  for item in q.get('images',q.get('records',[])):
++   if not item.get('actually_viewed'):raise ValueError('Review image not actually viewed')
++   path=item.get('viewed_path',item.get('path'))
++   if path is None:path=str(OUT/'gallery'/item['file'])
++   h=item.get('viewed_sha256',item.get('sha256'))
++   assert lookup[path]==h;assert_hash(path,h)
++   records.append(dict(path=path,sha256=h,actually_viewed=True,format=Path(path).suffix,receipt=str(p.relative_to(OUT))))
++ assert len(records)==24 and len({r['path'] for r in records})==24
++ # A source view may be observed in PNG or JPEG but never counted twice.
++ image_ids={str(Path(r['path']).with_suffix('')) for r in records}
++ assert len(image_ids)==24 and image_ids=={str(Path(q['png']).with_suffix('')) for q in g['receipts']}
++ review=rows(OUT/'gallery/visual_review.csv');expected={(r['request_id'],m) for r in read(OUT/'registration.json')['records'] for m in ['D0_BASE','RBF','BLEND']}
++ assert len(review)==36 and {(r['request_id'],r['method']) for r in review}==expected
++ assert all(r['review_kind']=='AI_PROXY' and r['review_status'] in ('COMPLETE','REVIEWED') for r in review)
++ assert len(read(OUT/'post_index.json'))==36 and len(rows(OUT/'AVMR_PMR_per_output.csv'))==576
++ return {str(OUT/n):sha(OUT/n) for n in required},records
++
++def source_snapshot():
++ reg=read(OUT/'registration.json');protected=dict(reg['protected']);selected={}
++ review=OUT/'review/source_C_orientation_receipt.json'
++ if review.exists():
++  rd=read(review);assert rd['status']=='PASS';protected.update(rd['protected_before'])
++ for p,h in {**protected,**reg['runner_hashes']}.items():
++  if p.endswith('.py') and not any(s in p for s in ['/source_snapshot/','/scoring_code/']):
++   assert_hash(p,h);selected[p]=h
++ new={str(p):sha(p) for p in CODE.glob('*.py')};selected.update(new)
++ for rel in ['LICENSE','r2/LICENSE','r2/THIRD_PARTY_NOTICES.md','requirements.txt']:
++  p=ROOT/rel
++  if p.exists():selected[str(p)]=sha(p)
++ for p in [Path('/mnt/e/MeshFlow-Control/LICENSE'),Path('/mnt/e/MeshFlow-Control/requirements.txt')]:
++  if p.exists():selected[str(p)]=sha(p)
++ records=[]
++ for name,h in sorted(selected.items()):
++  p=Path(name);rel=('repository/'+p.relative_to(ROOT).as_posix()) if p.is_relative_to(ROOT) else ('external/'+p.relative_to('/mnt/e').as_posix())
++  target=OUT/'source_snapshot'/rel;immutable_copy(p,target);assert_hash(target,h)
++  records.append(dict(source_path=name,snapshot_path=target.relative_to(OUT).as_posix(),sha256=h,bytes=p.stat().st_size,new_this_experiment=name in new,registered_before_execution=name in protected or name in reg['runner_hashes']))
++ textfile(OUT/'code.diff',''.join(line for name in sorted(new) for line in difflib.unified_diff([],Path(name).read_text().splitlines(keepends=True),fromfile='/dev/null',tofile='b/'+Path(name).relative_to(ROOT).as_posix())))
++ textfile(OUT/'old_source.diff','')
++ write(OUT/'source_hashes.json',dict(schema='actual_sources_v1',sources=records,
++  old_source_diff='empty; all copied old sources match frozen protected hashes',new_diff='All new .py files including audit and assembler are additions from /dev/null.'))
++ return records
++
++def baseline_copies():
++ reg=read(OUT/'registration.json');copied=[]
++ for r in reg['baselines']:
++  folder=OUT/'baseline_diagnostics'/r['method']/r['request_id'];d=read(r['diagnostic_path'])
++  files={Path(r['diagnostic_path'])}
++  for p in d.get('files',{}):
++   if Path(p).suffix=='.csv':files.add(Path(p))
++  files.add(Path(d['quality']['shape_details_path']))
++  for p in sorted(files):
++   target=folder/p.name;immutable_copy(p,target)
++   copied.append(dict(source_path=str(p),archive_path=target.relative_to(OUT).as_posix(),sha256=sha(p),bytes=p.stat().st_size))
++ write(OUT/'baseline_diagnostics/source_index.json',dict(status='PASS',methods=['D0_BASE','RBF'],outputs=24,files=copied,
++  policy='Unchanged original diagnostic/cache bytes; absolute references remain original provenance paths. Full36 aggregate and per-output CSVs are in the package root. Large pair JSON and geometry remain local.'))
++ return copied
++
++def omit_reason(p):
++ if p.suffix.lower() in {'.npz','.npy','.pt','.pth','.ckpt','.ply','.png'}:return 'Retained original arrays, mesh, weight or PNG; portable review uses unchanged JPEG and complete CSVs.'
++ if p.name=='pairs.json':return 'Large complete pair detector JSON retained locally; all scalar metrics, edge constraints, original scorer code and source identities are included.'
++ if p.name.endswith('.tmp'):return 'Retained temporary engineering artifact, not a completed result.'
++ return None
++
++def select_files():
++ selected=[];omitted=[]
++ for p in sorted(OUT.rglob('*')):
++  if not p.is_file() or p.is_relative_to(FINAL) or p.name in {ZIP.name} or p.name.endswith('.zip.tmp'):continue
++  reason=omit_reason(p)
++  if reason:omitted.append(dict(path=str(p),relative_path=p.relative_to(OUT).as_posix(),bytes=p.stat().st_size,sha256=sha(p),hash_basis='Current archive CPU hash',reason=reason))
++  else:selected.append(p)
++ protected=dict(read(OUT/'registration.json')['protected'])
++ review=OUT/'review/source_C_orientation_receipt.json'
++ if review.exists():protected.update(read(review)['protected_before'])
++ for name,h in protected.items():
++  p=Path(name)
++  if not p.is_relative_to(OUT):
++   omitted.append(dict(path=name,bytes=p.stat().st_size,sha256=h,hash_basis='Frozen registration; root complete before/after protection verification and independent nonweight audit',reason='External retained read-only evidence. Relevant actual source and diagnostic copies are separately indexed.'))
++ write(FINAL/'omitted_local_assets.json',dict(files=omitted,deleted_files=0,policy='Omission is only from portable ZIP. Local evidence remains at original paths.'))
++ return selected
++
++def verify():
++ complete=read(FINAL/'archive_completion.json');assert complete['status']=='COMPLETE';assert_hash(ZIP,complete['zip_sha256'])
++ manifest=read(FINAL/'package_manifest.json');names={r['path'] for r in manifest['files']}
++ with zipfile.ZipFile(ZIP) as z:
++  assert z.testzip() is None and len(z.namelist())==len(set(z.namelist()))
++  assert set(z.namelist())==names|{'packaging/package_manifest.json'}
++  for row in manifest['files']:
++   assert hashlib.sha256(z.read(row['path'])).hexdigest()==row['sha256'];assert_hash(OUT/row['path'],row['sha256'])
++  assert hashlib.sha256(z.read('packaging/package_manifest.json')).hexdigest()==sha(FINAL/'package_manifest.json')
++  source=read(OUT/'source_hashes.json')
++  for row in source['sources']:assert row['snapshot_path'] in names and sha(row['source_path'])==row['sha256']
++  assert sum(n.endswith('.jpg') for n in names)==24
++  assert not any(Path(n).suffix in {'.pt','.pth','.npz','.npy','.ply','.png'} for n in names)
++  csvs={p.relative_to(OUT).as_posix() for p in OUT.rglob('*.csv') if not p.is_relative_to(FINAL)}
++  assert csvs<=names
++  checked_links=0
++  for name in names:
++   if Path(name).suffix.lower() not in {'.html','.md'}:continue
++   body=z.read(name).decode('utf-8-sig')
++   links=re.findall(r'(?:href|src)=["\']([^"\']+)',body) if name.endswith('.html') else re.findall(r'\[[^\]]*\]\(([^)]+)\)',body)
++   for link in links:
++    link=html.unescape(link).strip().split(' "')[0].strip('<>');link=link.split('#')[0]
++    if not link or re.match(r'^[A-Za-z][A-Za-z0-9+.-]*:',link) or link.startswith('/'):continue
++    target=posixpath.normpath(posixpath.join(posixpath.dirname(name),link))
++    assert target in names or any(n.startswith(target.rstrip('/')+'/') for n in names),(name,target,'missing relative document link')
++    checked_links+=1
++  methods=sorted({i.compress_type for i in z.infolist()});assert methods==[zipfile.ZIP_DEFLATED]
++  return dict(status='PASS',zip_path=str(ZIP),bytes=ZIP.stat().st_size,sha256=sha(ZIP),members=len(z.namelist()),CSV_count=len(csvs),JPEG_count=24,
++   source_files=len(source['sources']),CRC='PASS',all_member_hashes='PASS',all_CSV_present=True,checked_relative_links=checked_links,
++   compression='DEFLATE',under_10MB=ZIP.stat().st_size<10000000,model_forwards=0,training_updates=0,new_scoring=0)
++
++def main():
++ ap=argparse.ArgumentParser();ap.add_argument('--check-only',action='store_true');ap.add_argument('--verify',action='store_true');a=ap.parse_args()
++ for path in [ROOT/'REPORT.md',ROOT/'experiments/r2_c_restore_coupling_v1/REPORT.md',OUT.parent/'outside']:
++  try:checked(path)
++  except ValueError:pass
++  else:raise AssertionError('Negative output guard failed')
++ if a.verify or (FINAL/'archive_completion.json').exists():print(json.dumps(verify(),ensure_ascii=False));return
++ prereqs,viewed=prerequisite_check()
++ if a.check_only:print(json.dumps(dict(status='PASS',prerequisites=len(prereqs),actually_viewed_images=len(viewed),scientific_calls=0)));return
++ before={str(p):sha(p) for p in OUT.rglob('*') if p.is_file() and not p.is_relative_to(FINAL) and 'source_snapshot' not in p.parts and 'baseline_diagnostics' not in p.parts and p.name not in {'code.diff','old_source.diff','source_hashes.json',ZIP.name}}
++ sources=source_snapshot();baselines=baseline_copies();selected=select_files()
++ write(FINAL/'prerequisites.json',dict(status='PASS',hashes=prereqs,preexisting_evidence_hashes=before))
++ write(FINAL/'visual_review_coverage.json',dict(status='PASS',images=viewed,actually_viewed_images=24,review_kind='AI_PROXY',blind=False,
++  viewed_format_counts={ext:sum(r['format']==ext for r in viewed) for ext in sorted({r['format'] for r in viewed})},not_topology_certificate=True))
++ textfile(FINAL/'README_PACKAGE.md','# Portable review package\n\nOpen ../REPORT.md and ../gallery/index.html. All new per-output/per-corner/edge-constraint/pairing/full-threshold CSVs, all24 original JPEGs, registrations, ledgers, independent audit, actual scoring/code snapshots and diffs are included. No adverse result is removed. Unchanged D0/RBF diagnostic and small shape/edge cache copies are under baseline_diagnostics, with source paths and hashes. NPZ/PLY/PNG/weights and large full pair JSON remain local and are indexed in omitted_local_assets.json. Source face/corner mappings and geometry-equivalence certificates document flip-only reuse without claiming a new quality scorer call.\n\nStandard ZIP DEFLATE compression. Old source diff is empty after hash verification; new code.diff represents this experiment as additions from /dev/null. Archive completion/hash verification receipts are local packaging outputs created after ZIP assembly to avoid self-hash circularity.\n')
++ selected.extend([FINAL/'omitted_local_assets.json',FINAL/'prerequisites.json',FINAL/'visual_review_coverage.json',FINAL/'README_PACKAGE.md'])
++ members=[dict(path=p.relative_to(OUT).as_posix(),bytes=p.stat().st_size,sha256=sha(p)) for p in sorted(set(selected))]
++ write(FINAL/'package_manifest.json',dict(schema='bounded_C_restore_review_v1',files=members,source_files=len(sources),baseline_cache_files=len(baselines),scientific_calls=0))
++ temp=checked(ZIP.with_name(ZIP.name+'.tmp'))
++ with zipfile.ZipFile(temp,'w',compression=zipfile.ZIP_DEFLATED,compresslevel=9) as z:
++  for r in members:z.write(OUT/r['path'],r['path'])
++  z.write(FINAL/'package_manifest.json','packaging/package_manifest.json');assert z.testzip() is None
++ temp.replace(checked(ZIP))
++ assert before=={p:sha(p) for p in before},'Preexisting scientific/documentation evidence changed during archive'
++ write(FINAL/'archive_completion.json',dict(status='COMPLETE',task='R2_C_RESTORE_BOUNDED_AND_ORIENTATION_V1',
++  zip_path=str(ZIP),zip_bytes=ZIP.stat().st_size,zip_sha256=sha(ZIP),new_blend_outputs=12,new_GEO=12,new_POST_quality=12,
++  orientation_outputs=36,comparison_images=24,actually_viewed_images=24,no_default_change=True,no_git=True,
++  packaging_model_forwards=0,packaging_training_updates=0,packaging_new_scores=0))
++ result=verify();write(FINAL/'verification.json',dict(**result,all_preexisting_evidence_hashes_unchanged=True,compared_files=len(before)))
++ print(json.dumps(result,ensure_ascii=False))
++if __name__=='__main__':main()
+--- /dev/null
++++ b/r2/tools/c_restore_bounded_v1/report.py
+@@ -0,0 +1,119 @@
++"""Read completed evidence only; write the experiment report without new scores."""
++from . import common as C
++import numpy as np
++
++def table(headers,rows):
++ return '\n'.join(['| '+' | '.join(headers)+' |','|'+'|'.join(['---']*len(headers))+'|']+['| '+' | '.join(map(str,r))+' |' for r in rows])
++def main():
++ reg=C.registration();execution=C.read(C.OUT/'execution_completion.json');audit=C.read(C.OUT/'independent_audit/completion.json')
++ assert execution['status']==audit['status']=='PASS'
++ d=C.rows(C.OUT/'decision_per_output.csv');s=C.rows(C.OUT/'decision_summary.csv');paired=C.rows(C.OUT/'paired_per_parent_noise.csv')
++ methods=['D0_BASE','RBF','BLEND'];allrows={r['method']:r for r in s if r['group']=='ALL'}
++ metrics=[('CF proper受影响free ↓','CF',100),('FF illegal受影响free ↓','FF',100),('I / ConflictCov_C ↓','I',100),
++  ('free小角<5° ↓','small_angle_lt5',100),('严格模型单位1e-6 A-VMR ↑','strict_AVMR',100),('严格PMR ↑','strict_PMR',100),
++  ('A-VMR@2%L ↑','AVMR_02L',100),('C边界顶点→free顶点平均距离 ↓','distance_mean_model',1),('PRE同定义平均距离 ↓','pre_distance_mean_model',1),
++  ('无方向合法图可达free面积%','reachable_area',100),('反向绕序路径可达free面积%','opposed_reach_after',100),('保留free面数','free_faces',1)]
++ mt=table(['指标（除距离/面数外为%）',*methods],[[name,*[f'{float(allrows[m][key])*scale:.6f}' for m in methods]] for name,key,scale in metrics])
++ counts=table(['连接观察',*methods],[[name,*[allrows[m][key]+'/12' for m in methods]] for name,key in [('有效C/F共边输出','outputs_with_valid_edges'),('反向共边输出，修复前后相同','outputs_with_opposed_edges_after')]])
++ case=[]
++ for r in [x for x in paired if x['method']=='BLEND' and x['reference']=='D0_BASE']:
++  orig=next(x for x in d if x['request_id']==r['request_id'] and x['method']=='BLEND')
++  case.append([r['parent_id'][:4]+' n'+r['candidate'],r['region_type'],f"{float(r['distance_mean_model_delta']):+.6f}",f"{float(r['I_delta'])*100:+.3f}",f"{float(r['FF_delta'])*100:+.3f}",orig['valid_edges']])
++ ct=table(['父/噪声','区域','Δ平均距离','ΔI(pp)','ΔFF(pp)','BLEND有效共边数'],case)
++ orientation=[]
++ for m in methods:
++  rs=[C.read(p) for p in (C.OUT/'oriented'/m).glob('*/receipt.json')]
++  orientation.append([m,sum(q['summary']['fixed_C_anchor_conflict_components']>0 for q in rs),sum(q['summary']['parity_conflict_components']>0 for q in rs),sum(q['summary']['flipped_free_faces'] for q in rs),sum(q['summary']['nonmanifold_edges'] for q in rs)])
++ ot=table(['方法','含固定C矛盾的输出/12','含奇偶环矛盾的输出/12','翻转free面总数','非流形边总数'],orientation)
++ logs=[C.read(p) for p in (C.OUT/'pre_geo/BLEND').glob('*/diagnostics.json')]
++ maxdisp=max(q['free_applied_FP32_displacement_norm']['max'] for q in logs)
++ scored=C.read(C.OUT/'score_completion.json');gallery=C.read(C.OUT/'gallery/manifest.json');dispatch=C.read(C.OUT/'CPU_dispatch.json')
++ document=f'''# R2 C 恢复：固定C方向审计与有界融合对照
++
++状态：COMPLETE。固定开发面板6父×2噪声，36份POST比较；2026-10-11。实验标识：{reg['version']}。
++
++**保留RBF作为局部接近/匹配候选，有界BLEND暂不替代。** BLEND把RBF两例大的I尾部压低，但距离收益全面减弱、有效共边减少，FF还更高。此次没有找到同时保留RBF长处又消除主要代价的版本。
++
++**方向低分需要重新解释：规范化C自身的绕序已不一致。** 原始来源面在本6条条件内方向一致，逐面角点规范化以后出现同向共享边。在固定C角点顺序的严格合同下，free-only全图方向一致约束无解。这是输入表示与方向合同的矛盾，不能称为RBF制造了物理缝隙，也不能把原始来源网格说成有方向缺陷。实际无方向共边、相交、重叠及可见错层的证据不受这个解释修正影响。
++
++## 1. 实际执行与固定定义
++
++- 复用上一轮同12 USER_MIX RAW、官方D0无约束proposal、原RBF PRE/POST及24份POST完整质量缓存；新训练/模型加载/前向/生成器采样/抽噪均为0。
++- 按顺序完成D0/RBF共24份方向处理，12份BLEND、12次相同GEO_C、12份原定义完整质量评分，再对12份BLEND作相同方向处理。36份都保留C坐标、面顺序及绕序。旧结果不覆写。
++- 新融合唯一配方：同Wendland C2核，半径0.1L；b=C−C_hat；s_i=k_i/同源顶点副本数；alpha_i=s_i/max(1,sum(s))；u=sum(alpha_i b_i)。权重非负、总和≤1，作用边缘平滑趋零。无矩阵求解、正则/半径/解算器扫描。
++- 同旧RBF保留0.02L安全限幅，并核验实际FP32位移≤min(0.02L,参与锚点最大修正)。本12例所有限幅与舍入修正均未触发；最大实际位移{maxdisp:.9f}，上限0.02L={.02*reg['fixed_L']:.9f}。因此结果不是由更频繁裁剪产生。
++- 固定L={reg['fixed_L']:.15f}，不是按每个输出bbox重定尺度。模型单位严格1e-6不宣称与论文原坐标尺度相同。全部C源拓扑开放边界为描述性域，没有登记用户必接接口。
++- PRE保留全部8档AVMR/PMR、逐边界距离和共边图；完整PRE CF/FF/I为NA_NOT_BUDGETED。POST使用原质量定义、冻结C查询点及实际free面数分母，无唯一GT排名。
++- 方向修复使用完整实际索引图中两面非退化邻接（C-C、C-F、F-F），与几何pair是否合法分开。相同边方向要求flip XOR=1，相反要求0；每个C固定flip=0。可满足分量按确定性解翻free；矛盾分量整体保留。非流形/退化边单列，不声称整体流形或法向朝外。
++- 翻面后的CF/FF/I/AVMR/距离继承无方向几何等价的原评分证据，不冒充重新执行原评分器；每面无序顶点集合、顶点数组、source_face_ids和源角点排列映射都核验。原pair witness仍属于原绕序缓存。合法图的绕序与可达性另算。
++
++冻结协议：[registration.json](registration.json)。可恢复入口：[README_RESUME.md](README_RESUME.md)。
++
++## 2. 全12例结果
++
++均先逐输出再宏平均；每父两噪声等权，不把12份当12个独立父。方向整理前后的下表几何质量不变。
++
++{mt}
++
++{counts}
++
++三组有效C/F共边总数分别1、9、3。BLEND新增有效连接仅86ec n0；其2条共边包含1条反向边，86ec n1保留1条。bdd29 n0的RBF共边在BLEND中消失。四份seat在三组均无有效共边，不能宣称座面接合已解决。全部8档PMR均为0。
++
++RBF相对D0的距离11/12改善；BLEND10/12改善，但BLEND相对RBF距离12/12更大。BLEND严格AVMR相对D0增加5.688pp，RBF增加12.103pp。三组PRE严格AVMR均0，精确顶点/边收益仍是在GEO之后出现，应归因于协调恢复与同一GEO组合。
++
++BLEND的I相对D0为+0.301pp，比RBF的+0.704pp小；但只1例降低、6例持平、5例增加。BLEND的FF为8例增加、3例持平、1例下降。其小角率略低于D0和RBF，不足以抵消以上权衡。
++
++## 3. 逐父噪声与尾部
++
++下表为BLEND−D0；I和FF为百分点，负值表示该项降低，原始逐例与BLEND−RBF配对均保存。
++
++{ct}
++
++866e n0原RBF的I增量+7.959pp，在BLEND中为0；bdd29 n0从+6.055pp降到+0.879pp。这支持较温和传播可以减小这两个尾部。但86ec n0原RBF的I/FF同时下降，在BLEND却分别+0.195/+3.571pp；86ec n1的I/FF为+2.441/+6.306pp。不能把两例尾部改善说成对所有输出更安全。
++
++BLEND保留free面总量与D0相同；RBF总量少8面。相同总量不代表逐例删面身份相同，本轮保留全部source_face_ids和GEO删除记录。原始PRE融合不删面，方向修复也不删面。
++
++数据：[decision_per_output.csv](decision_per_output.csv)、[paired_per_parent_noise.csv](paired_per_parent_noise.csv)、[quality_per_output.csv](quality_per_output.csv)、[AVMR_PMR_per_output.csv](AVMR_PMR_per_output.csv)、[boundary_vertices.csv](boundary_vertices.csv)、[blend_per_free_corner.csv](blend_per_free_corner.csv)。
++
++## 4. 为什么翻free面没有增加接合方向可达性
++
++{ot}
++
++三组的有效共边反向数量、反向路径可达面积均未增加。确实有free面被翻转，但主要发生在不受矛盾C分量阻断的区域，不能把“执行了翻面”当成“接合修好了”。
++
++来源审计核对原C的源顶点ID边，而非只看GEO按坐标构造的索引：六条条件依次33ec、534b、866e、86ec、bdd29、f596，同向两面共享边分别0、1、1、10、11、5。共28条独立边在original_source_faces绕序下全部相反，按保存的C_source_corner_permutations重排后变同向。5/6条件、两噪声共10/12输出已包含直接C-C矛盾；不是RBF独有，也不是坐标焊接才制造。
++
++MeshFlow的面角点规范化可改变绕序，不能默认模型输入已经保持一致表面法向。这个发现局限于本6条DEV条件及其已核验来源，不扩大成整套训练数据结论。
++
++RBF的86ec n0无方向合法图可达85.333%，当前反向路径仅3.047%；本轮两者仍保持原值。差值不代表82%的表面隔着缝；也不能由无方向可达就认证所有连接用途合理。当前策略是矛盾分量整体不改，未求最大可满足子图，不能证明任何局部free翻面都无益。未执行允许重排C角点的另一种合同。
++
++完整分量、约束和前后图：[orientation_per_output.csv](orientation_per_output.csv)、[orientation_components.csv](orientation_components.csv)、[orientation_constraints.csv](orientation_constraints.csv)、[topology_per_output.csv](topology_per_output.csv)。[六条件来源归因](review/source_C_orientation_conditions.csv)、[逐输出来源归因](review/source_C_orientation_audit.csv)、[边级与源码证据](review/source_C_orientation_edge_evidence.json)显示：原C所选面的45条双面共享边全相反，规范化后28条变同向；24份D0/RBF中的109条直接C-C矛盾全部对应同一原source-ID边，coordinate-only或source/indexed mismatch均0。额外96份来源文件只读前后hash一致。
++
++## 5. 图片与审计
++
++24张同相机/同尺度三组图均已实际查看，形成36条非盲AI_PROXY记录。BLEND多数轮廓接近D0，没有观察到新增整组腿消失，也没有清楚的广泛接续修复。33ec n0蓝C仍位于灰座面下方，866e n1座位前沿叠层仍在，86ec n1蓝拱背与更高灰背部并存。其余背板/框与额外灰背部共存的现象也未明显解决。遮挡与图像分辨率限制下，共边和相交以数值证据为准；这不是人类盲评或完整质量认证。
++
++[全部24图](gallery/index.html)、[36条图审](gallery/visual_review.csv)、[实际查看回执](gallery/visual_review_completion.json)。
++
++8项BLEND与7项方向CPU正负控通过。BLEND首轮一项测试把FP64的6×(1/6)和1作逐位等号比较而失败；保留原件后只把测试数学等式容差改为2e-16，算法未修改。正式12例没有科学失败或重放。
++
++独立审计采用与执行BFS不同的XOR并查集：12份融合公式及FP32端点、36份完整约束图/角点身份、{audit['actual_legal_graph_edges_checked']}条合法图边、{audit['boundary_and_threshold_checks']}项边界/阈值检查、576阈值行、648决策值、648配对差和18357汇总统计全部通过。1408份原文件/源码/权重执行前后hash不变；独立二次检查1407份非权重文件，权重引用全量执行校验回执。没有修改原评分器、旧报告、默认模型或Git。
++
++初始RTX5080约16GiB，Windows资源快照2487MiB占用/13493MiB空闲、2%利用率；本轮GPU worker=0。CPU24逻辑核，首份正式评分峰值RSS {dispatch['first_authorized_job']['peak_RSS_KiB']/1024:.2f}MiB，WSL可用内存约{dispatch['available_RAM_bytes']/2**30:.2f}GiB；据实启用{dispatch['workers']}个CPU评分worker，每个2线程。评分及BLEND方向阶段{scored['seconds']:.2f}秒，渲染{gallery['seconds']:.2f}秒，总执行入口{execution['phase_seconds']:.2f}秒（含保护hash，准备/编码/人工检查另计），独立审计{audit['seconds']:.2f}秒。并发墙钟不是独占性能基准。
++
++证据：[execution_completion.json](execution_completion.json)、[independent_audit/completion.json](independent_audit/completion.json)、[CPU_dispatch.json](CPU_dispatch.json)、[ledger.jsonl](ledger.jsonl)。完整源码、原实际评分代码、diff/hash随小审阅包保留；NPZ/PLY/原PNG留本地，不夹带大权重。
++
++## 6. 决策与一个优先下一步
++
++RBF仍是三个方案里“边界更近/顶点匹配更多”的候选；D0的平均FF/I更低；BLEND的小角与RBF两例I尾部较好，但没有形成更值得替代的总体折中。本轮不自动晋级任何方案，也不按父ID挑优拼接结果。
++
++**优先下一步是校正方向合同，而非继续调位移幅度。** 在明确“保持C几何与连接”是否允许仅重排角点后，单独核验全网格方向整理，把表示造成的绕序矛盾与真正缝隙/非法连接分开。检验假说：规范化角点排列是当前方向可达性低的一项表示性障碍；解除这一障碍应能改善方向一致性，同时CF/FF/I、无方向共边和C几何保持不变。它不会自动解决座面错层或RBF相交代价。
++
++这项新合同没有在本轮执行。固定任务已完成停止；未追加训练、模型前向、参数扫描、默认切换、commit或push。
++'''
++ # BOM keeps Chinese Markdown readable in the local Windows editors.
++ C.atomic(C.OUT/'REPORT.md',lambda f:f.write(('\ufeff'+document).encode('utf-8')),True)
++ C.write(C.OUT/'report_validation.json',dict(status='PASS',report_sha256=C.sha(C.OUT/'REPORT.md'),UTF8_BOM=True,paired_outputs=36,execution_and_independent_audit_PASS=True))
++ print('REPORT_COMPLETE')
++
++if __name__=='__main__':main()
+--- /dev/null
++++ b/r2/tools/c_restore_bounded_v1/run.py
+@@ -0,0 +1,68 @@
++"""Resumable fixed-panel CPU entry. No training or model-forward path exists."""
++import os
++for _k in ('OMP_NUM_THREADS','OPENBLAS_NUM_THREADS','MKL_NUM_THREADS','NUMEXPR_NUM_THREADS'):os.environ[_k]='2'
++os.environ['CUDA_VISIBLE_DEVICES']=''
++import argparse, sys, time
++import numpy as np
++from . import common as C
++
++def geometry(reg):
++ from .blend import coordinate_restore
++ free_rows=[];anchor_rows=[];receipts=[]
++ for r in reg['records']:
++  dest=C.OUT/'pre_geo/BLEND'/r['request_id'];out=dest/'denoised.npz';rp=dest/'receipt.json'
++  ident=dict(request_id=r['request_id'],method='BLEND',raw_sha256=r['raw_sha256'],registration_sha256=C.sha(C.OUT/'registration.json'))
++  if rp.exists():
++   q=C.read(rp);assert q['identity']==ident and q['status']=='PASS';C.verify(q['files'])
++  else:
++   if dest.exists():raise RuntimeError('Partial BLEND output; no automatic replay')
++   raw=C.payload(r['raw_path']);source=C.payload(r['condition_source']);d0=C.payload(r['D0_denoised_path'])
++   c=source['C'];proposal=d0['official_unconstrained_proposal'];assert C.same(raw['C'],c)
++   tick=time.perf_counter();C.event('BLEND_STARTED',**ident)
++   output,diag,details=coordinate_restore(c,proposal,source['C_source_vertex_ids'],L=reg['fixed_L'])
++   C.save_npz(out,output=output,C=c,official_unconstrained_proposal=proposal)
++   C.save_npz(dest/'details.npz',**details);C.write(dest/'diagnostics.json',diag)
++   q=dict(status='PASS',identity=ident,seconds=time.perf_counter()-tick,output_sha256=C.sha(out),
++    files={str(p):C.sha(p) for p in (out,dest/'details.npz',dest/'diagnostics.json')})
++   C.write(rp,q);C.event('BLEND_COMPLETE',**ident,seconds=q['seconds'])
++  receipts.append(q);d=C.payload(dest/'details.npz');m={k:r[k] for k in ('request_id','parent_id','region_type','candidate')}
++  for i,x in enumerate(d['free_actual_displacement_FP32']):
++   free_rows.append(dict(**m,free_face=i//3,corner=i%3,support_count=int(d['free_support_count'][i]),
++    support_sum=d['free_support_sum'][i],alpha_sum=d['free_alpha_sum'][i],participating_b_max=d['free_participating_b_max_norm'][i],
++    bound=d['free_actual_bound'][i],unclipped_norm=np.linalg.norm(d['free_displacement_unclipped'][i]),
++    actual_norm=np.linalg.norm(x),dx=x[0],dy=x[1],dz=x[2],safety_cap_active=bool(d['free_safety_cap_active'][i]),
++    rounding_adjusted=bool(d['free_FP32_cap_rounding_adjusted'][i])))
++  for i,vid in enumerate(d['anchor_source_vertex_ids']):
++   b=d['anchor_displacement_target'][i]
++   anchor_rows.append(dict(**m,C_face=i//3,corner=i%3,source_vertex_id=int(vid),weight=d['anchor_weight'][i],
++    bx=b[0],by=b[1],bz=b[2],b_norm=np.linalg.norm(b)))
++ C.csvwrite(C.OUT/'blend_per_free_corner.csv',free_rows);C.csvwrite(C.OUT/'blend_per_anchor_corner.csv',anchor_rows)
++ C.write(C.OUT/'geometry_completion.json',dict(status='PASS',outputs=12,receipts=receipts,model_calls=0))
++
++def main():
++ p=argparse.ArgumentParser(description=__doc__);p.add_argument('--stage',choices=['prepare','orientation','blend','score','gallery','all'],default='all');a=p.parse_args()
++ for name in ('orientation_checks','blend_checks'):
++  receipt=C.OUT/name/'completion.json'
++  if not receipt.exists() or C.read(receipt)['status']!='PASS':raise RuntimeError('Required CPU checks missing: '+name)
++ reg=C.prepare()
++ from . import evaluation as E
++ tick=time.perf_counter()
++ if a.stage in ('all','orientation'):E.orient_baselines(reg)
++ if a.stage in ('all','blend'):geometry(reg)
++ if a.stage in ('all','score'):
++  rows=E.postprocess(reg);E.score(reg,rows);E.aggregate(rows)
++ if a.stage in ('all','gallery'):E.render(C.read(C.OUT/'post_index.json'))
++ if a.stage=='all':
++  C.verify(reg['protected']);C.verify(reg['runner_hashes'])
++  assert 'torch' not in sys.modules
++  for kind,expected in (('ORIENTATION',36),('GEO',12),('QUALITY',12)):
++   for suffix in ('started','complete'):
++    assert len(list((C.OUT/'events').glob('*/*/'+kind+'_'+suffix+'.json')))==expected
++  C.write(C.OUT/'execution_completion.json',dict(status='PASS',phase_seconds=time.perf_counter()-tick,
++   new_model_forwards=0,training_updates=0,new_generator_outputs=0,new_noise=0,
++   new_blend_outputs=12,new_GEO_C=12,new_POST_quality=12,orientation_outputs=36,
++   original_files_unchanged=len(reg['protected']),frozen_sources_unchanged=True,torch_imported=False))
++ C.event('STAGE_COMPLETE',stage=a.stage,seconds=time.perf_counter()-tick)
++ print('STAGE_COMPLETE',a.stage,flush=True)
++
++if __name__=='__main__':main()

@@ -1,0 +1,120 @@
+完全接受你指出的这两处致命的梯度与数学修正，并撤回此前对 Idea A（局部随机化等价性與远端保护）、Idea B（作为策略梯度直接推论）以及 Idea C（B 2% 无损及 `608/n0` 移动 $0.26\%L$ 即可绑定）的不严谨表述。
+
+特别是你抓出的这两个核心实现陷阱——**“确定性区段如果仍挂着可训练 LoRA，就会漏掉确定性状态转移对 $\phi$ 的雅可比传导”**以及**“更新时必须固定 buffer 中的动作 $(F_k^{\text{buf}}, F_{k+1}^{\text{buf}})$ 重新前向计算 $\mu_\phi$，绝不能直接对旧噪声残差或重参数化新动作求导”**——这直接决定了写出来的代码到底是不是真正的 ReinFlow 策略梯度。
+
+我们将第一版实验彻底收敛为你批准的这份纯净合同，把所有实现细节、超参数与预标定流程锁死如下：
+
+---
+
+### 一、第一版“二值连接专项轨迹 RL”冻结实现规格
+
+#### 1. 严格分段策略与 LoRA 物理开关（消除未计入的参数依赖）
+
+设总 Euler 步数为 50 步（$k \in \{0, \dots, 49\}$，$\Delta t = 0.02$），预设固定随机窗口为 $\mathcal{W} \subset \{0, \dots, 49\}$：
+
+* **当 $k \notin \mathcal{W}$（确定性区段）**：
+* **物理关闭 LoRA 分支**（例如将 LoRA 缩放系数置 0 或直接走原冻结 `FULL_S6000` 权重 $v_0$，而不仅是外包 `torch.no_grad()`），执行确定性积分：
+
+$$F_{k+1} = F_k + \Delta t_k \, v_0(F_k, C, t_k)$$
+
+
+* 此时前缀与后缀完完全全是与可训练参数 $\phi$ 无关的确定性环境映射（前缀相当于准备固定初始分布，后缀与 `D0 + GEO_C` 共同构成确定性环境终态评估器）。
+
+
+* **当 $k \in \mathcal{W}$（随机探索窗口）**：
+* **物理启用可训练 LoRA 参数 $\phi$**，对全部有效 free 坐标（维度 $d = 9(N-K)$）注入独立同分布正方差高斯转移噪声：
+
+$$F_{k+1} = F_k + \Delta t_k \, v_\phi(F_k, C, t_k) + \sigma_k \epsilon_k, \quad \epsilon_k \sim \mathcal{N}(0, I_d)$$
+
+
+* 已知条件 $C$ 在全部 51 个状态逐位硬保持，不参与噪声注入，也不计入概率维度 $d$。
+
+
+
+#### 2. 轨迹 Buffer 存储与当前策略 Log-Prob 重算（杜绝假梯度）
+
+* **Rollout 收集阶段（使用当前冻结的 $\phi_{\text{old}}$）**：
+对每条轨迹 $g$，在窗口 $k \in \mathcal{W}$ 内逐步落盘实际状态对 $(F_k^{\text{buf}}, F_{k+1}^{\text{buf}})$、噪声标准差 $\sigma_k$ 以及采样当时的旧对数概率 $\log p_{\phi_{\text{old}}}(F_{k+1}^{\text{buf}} \mid F_k^{\text{buf}}, C)$。
+* **梯度更新阶段（对 $\phi$ 开启梯度）**：
+将 buffer 中的 $F_k^{\text{buf}}$ 和 $F_{k+1}^{\text{buf}}$ 作为完全固定的常数张量（detached）读入，用当前带梯度的策略重新前向计算均值：
+
+$$\mu_\phi(F_k^{\text{buf}}, C, t_k) = F_k^{\text{buf}} + \Delta t_k \, v_\phi(F_k^{\text{buf}}, C, t_k)$$
+
+
+
+严格计算完整 $d = 9(N-K)$ 维联合高斯对数密度（**绝不除以 $d$ 取维度平均，也绝不用旧 $\epsilon_{\text{old}}$ 冒充**）：
+
+$$\log p_\phi(F_{k+1}^{\text{buf}} \mid F_k^{\text{buf}}, C) = -\frac{\Vert{}F_{k+1}^{\text{buf}} - \mu_\phi\Vert{}^2}{2\sigma_k^2} - d\log\sigma_k - \frac{d}{2}\log(2\pi)$$
+
+
+
+#### 3. 奖励、RLOO 优势与单次 On-Policy 更新（最简且零比率爆炸风险）
+
+* **唯一任务奖励**：
+
+$$R_g = R_{\text{connect}}(C, F_{50}^{(g)}) = \mathbf{1}\Big[ E_{\text{CF}}^{\text{valid}}\big(\mathcal{D}(C, F_{50}^{(g)})\big) \neq \varnothing \Big] \in \{0, 1\}$$
+
+
+
+其中 $\mathcal{D}$ 严格为原单次官方 `D0 + GEO_C + 来源定向`，读取 `C_F_valid_edge_count > 0`。
+* **无偏组内 Leave-One-Out 优势（RLOO）**：
+对同一条件 $C$ 独立采样的 $G$ 条轨迹（$g = 1, \dots, G$），计算：
+
+$$A_g = R_g - \frac{1}{G - 1}\sum_{h \neq g} R_h$$
+
+
+* **不做组内标准差归一化**；
+* **如实记录全 0 组与全 1 组**：当某条 $C$ 的 $G$ 次采样全为 0 或全为 1 时，$A_g \equiv 0$，该组对梯度贡献为 0，**严禁为了凑混合组而静默重抽丢弃全零组**，但在训练日志中明确记录每个 batch 的有效混合组比例（Active Group Fraction）与单步解析 KL：
+
+$$D_{\text{KL}}(p_{\text{old}} \Vert p_\phi) = \frac{\Vert{}\mu_{\phi_{\text{old}}} - \mu_\phi\Vert{}^2}{2\sigma_k^2}$$
+
+
+
+
+* **更新方式选择（建议第一版锁死：每批 Rollout 严格只做 1 次 On-Policy 梯度更新）**：
+* 为什么第一版优先选 **1-step On-Policy REINFORCE with RLOO** 而不是多轮 PPO？
+* 因为在 $d \approx 1800$ 维、且跨 $\vert{}\mathcal{W}\vert{}$ 个时间步累加的情况下，多轮更新时的轨迹级重要性采样比 $\rho_g(\phi) = \exp\big(\sum_{k \in \mathcal{W}}(\log p_\phi - \log p_{\text{old}})\big)$ 指数项极其庞大，哪怕 $\mu_\phi$ 只动了一点点，$\rho_g$ 也会瞬间溢出到 `inf` 或 `0` 触发全员 clip 锁死。
+* 如果每批采样数据**严格只执行 1 次梯度步**（此时在求导点处 $\phi = \phi_{\text{old}}$，$\rho_g \equiv 1$），目标函数直接简化为最干净、无截断偏差的解析形式：
+
+$$\mathcal{L}_{\text{RL}}(\phi) = -\frac{1}{B \cdot G} \sum_{c=1}^B \sum_{g=1}^G A_{c,g} \sum_{k \in \mathcal{W}} \log p_\phi\big(F_{k+1}^{(c,g)} \mid F_k^{(c,g)}, C_c\big)$$
+
+
+
+既完全规避了高维指数比率爆炸，又无需调参 clip 阈值 $\epsilon_{\text{ppo}}$。
+
+
+
+---
+
+### 二、开训前的唯一前置微实验：冻结 `FULL_S6000` 噪声窗口标定（Calibration）
+
+在正式跑 RL 更新之前，只需用冻结的 `FULL_S6000`（不開 LoRA 训练）在训练条件池（如原 8 条代表性训练 $C$，每条 $G=8$ 次采样）上做一次极小规模的窗口与 $\sigma$ 标定，检查以下四个硬指标：
+
+1. **推荐测试的极简网格**（例如固定一个中段窗口 $\mathcal{W} = [10, 30)$ 即 $t \in [0.2, 0.6)$，对比两到三档状态噪声标准差 $\sigma_k = \sigma_0 \sqrt{\Delta t}$ 或常数 $\sigma \in \{0.005, 0.01, 0.02\}$ 模型单位）：
+* **指标 1（混合组覆盖率）**：8 条训练 $C$ 中，有多少条 $C$ 出现了 $0 < \sum_{g=1}^8 R_g < 8$（即既有接上又有没接上的混合组，能产生非零 RLOO 优势）？
+* **指标 2（基线连接保留率）**：相比原确定性 `FULL_S6000`，注入该 $\sigma$ 后，总体平均连接率 $\bar{R}_{\text{connect}}$ 是维持在合理水平，还是直接跌到了 0？
+* **指标 3（几何退化底线）**：加噪后的 `POST` 网格，其 `CF / FF / I` 和主体完整性是否依然处于正常范围（没有因为 $\sigma$ 太大而炸成刺球）？
+* **指标 4（数值稳定性）**：$\log p_{\text{old}}$ 的数值范围是否健康（无 `NaN/Inf`）？
+
+
+
+---
+
+### 三、最终验收的三组硬对照与双层判据
+
+标定冻结 $(\mathcal{W}, \sigma)$ 后，正式实验在**未用于训练选择的预定新初始噪声 + 新转移噪声**上，严格输出以下三组单次采样结果（涵盖训练 $C$ 与 DEV $C$）：
+
+| 对照组名称 | 权重状态 | 采样器配置 | 回答的核心科学问题 |
+| --- | --- | --- | --- |
+| **1. `FULL_DET**` | 冻结 `FULL_S6000` | 原确定性 Euler50 ($\sigma = 0$) | 原始确定性基准表现 |
+| **2. `FULL_STOCH**` | 冻结 `FULL_S6000` | 窗口 $\mathcal{W}$ 内注入随机转移 $\sigma$ | **隔离随机探索本身的影响**（加噪是帮了忙还是帮了倒忙？） |
+| **3. `RL_STOCH**` | RL 训练后 ($\phi_{\text{final}}$) | 窗口 $\mathcal{W}$ 内启用 LoRA + 相同随机转移 $\sigma$ | **验证真实 RL 学习增量**（必须正面击败 `FULL_STOCH`） |
+
+* *(注：可顺带免费测一组 `RL_DET` 即训练后关掉窗口噪声 $\sigma=0$ 仅开 LoRA，作为额外观察，但不顶替 `RL_STOCH` 的主合同地位。)*
+
+**双层判据严格分开**：
+
+* **第一层（RL 机制是否生效）**：`RL_STOCH` 的单次合法连接率 $\mathbb{E}[R_{\text{connect}}]$ 是否在新噪声上实质性高于同采样器的 `FULL_STOCH`？
+* **第二层（是否构成可用升级）**：连接率的提升，是转化成了同一输出上的“明确采用 + 合法接口 + 合理共边长度”，还是仅仅学会了“挂一片畸形小三角面刷分”或付出了 `CF/FF/I` 恶化的代价？且最终能否超越原确定性基准 `FULL_DET`？
+
+这套方案把你指出的所有数学漏洞都堵上了，而且做到了真正的“单一变量、无代理重加噪、梯度严谨”。你看先做那个小规模的冻结 $(\mathcal{W}, \sigma)$ 标定测试可以吗？

@@ -1,0 +1,104 @@
+--- gallery.initial.py
++++ gallery.py
+@@ -5,8 +5,10 @@
+ import json
+ import os
+ import time
++import ast
++import inspect
+ import numpy as np
+-from .common import OUT,LABELS,read_json,digest,atomic_json,resolve,arrays
++from .common import OUT,LABELS,read_json,digest,atomic_json,resolve,arrays,json_hash
+ from experiments.mf_h1_local0.chair_control_usability_quick_v1.gallery import _render,_frame,_display
+ 
+ VERSION='chair_bounded_attachment_gallery_v1'
+@@ -117,20 +119,64 @@
+     atomic_json(gallery/'frames.json',dict(frames=frames,
+         policy='One union frame per parent across two noises, every available label and GT; no clipping, normalization or repairs',
+         includes_every_raw_corner=True))
++    previous=read_json(gallery/'summary.json') if (gallery/'summary.json').exists() else {}
++    cache_path=gallery/'render_manifest.json'
++    cache=read_json(cache_path) if cache_path.exists() else {}
++    from experiments.mf_h1_local0.chair_control_usability_quick_v1 import gallery as renderer
++    render_source=dict(overlay_AST=ast.dump(ast.parse(inspect.getsource(_overlay)),include_attributes=False),
++        historical_renderer_sha256=digest(renderer.__file__))
++    render_signature=json_hash(render_source)
++    imported_first_render=False
++    initial=out/'engineering/gallery_cache001'
++    if not cache and (initial/'gallery.py').exists() and previous.get('source_sha256')==digest(initial/'gallery.py'):
++        old_ast=ast.parse((initial/'gallery.py').read_text())
++        old_overlay=next(x for x in old_ast.body if isinstance(x,ast.FunctionDef) and x.name=='_overlay')
++        now_overlay=ast.parse(inspect.getsource(_overlay)).body[0]
++        assert ast.dump(old_overlay,include_attributes=False)==ast.dump(now_overlay,include_attributes=False)
++        assert read_json(initial/'frames.json')['frames']==frames
++        imported_first_render=True
++    previous_rows={r['request_id']:r for r in previous.get('records',[])}
++    rendered_now=0;cache_hits=0
++    def cached(path,identity,draw,previous_sha=None,observation=None):
++        nonlocal rendered_now,cache_hits
++        key=path.name;identity=dict(identity,renderer=render_signature)
++        if imported_first_render and key not in cache and path.exists():
++            if previous_sha is not None:assert digest(path)==previous_sha
++            cache[key]=dict(identity=identity,sha256=digest(path),observation=observation,
++                provenance='Original renderer AST and frames verified; first-render source/summary preserved')
++        saved=cache.get(key)
++        if saved and saved['identity']==identity and path.exists() and digest(path)==saved['sha256']:
++            cache_hits+=1
++            return saved.get('observation')
++        observation=draw();rendered_now+=1
++        cache[key]=dict(identity=identity,sha256=digest(path),observation=observation)
++        return observation
+     records=[];by_id={};references={}
+     for base in bases:
+         cid=base['condition_id'];c=conditions[cid]
+         if cid not in references:
+-            p=assets/('REFERENCE__'+cid+'.png');_render(p,c['C'],c['GT_free'],frames[base['uid']]);references[cid]=p
++            p=assets/('REFERENCE__'+cid+'.png')
++            identity=dict(kind='reference',condition_sha256=base['condition_sha256'],frame=frames[base['uid']])
++            cached(p,identity,lambda:_render(p,c['C'],c['GT_free'],frames[base['uid']]))
++            references[cid]=p
+     for row in requests:
+         rid=row['request_id'];result=results[rid]
+         rec=dict(request_id=rid,base_id=row['base_id'],label=row['label'],uid=row['uid'],candidate=row['candidate'],status=result['status'])
+         if rid in meshes:
+             C=conditions[row['condition_id']]['C'];F=meshes[rid]
+             geometry=assets/(rid+'__geometry.png');overlay=assets/(rid+'__intervention.png')
+-            _render(geometry,C,F,frames[row['uid']])
+-            raw=meshes['RAW__'+row['base_id']]
+-            observation=_overlay(overlay,C,raw,F,frames[row['uid']],_load_logs(result),row['label'])
++            identity=dict(raw_sha256=result['raw_sha256'],condition_sha256=row['condition_sha256'],frame=frames[row['uid']])
++            old_rec=previous_rows.get(rid,{})
++            if imported_first_render:assert old_rec.get('raw_sha256')==result['raw_sha256']
++            cached(geometry,dict(identity,kind='geometry'),lambda:_render(geometry,C,F,frames[row['uid']]),old_rec.get('geometry_sha256'))
++            raw=meshes['RAW__'+row['base_id']];logs=_load_logs(result)
++            base_sha=results['RAW__'+row['base_id']]['raw_sha256']
++            old_observation={k:old_rec.get(k) for k in ('moved_corner_count','total_free_corners','accepted_edges_drawn','actual_displacement_not_amplified')}
++            if imported_first_render:
++                assert old_observation['moved_corner_count']==int(np.any(F!=raw,axis=2).sum())
++                assert old_observation['accepted_edges_drawn']==sum(len(x['log'].get('accepted_constraints',[])) for x in logs)
++            observation=cached(overlay,dict(identity,kind='intervention',RAW_sha256=base_sha,logs_sha256=json_hash(logs),label=row['label']),
++                lambda:_overlay(overlay,C,raw,F,frames[row['uid']],logs,row['label']),old_rec.get('overlay_sha256'),old_observation)
+             rec.update(geometry_image=str(geometry),geometry_sha256=digest(geometry),overlay_image=str(overlay),
+                 overlay_sha256=digest(overlay),raw_path=result['raw_path'],raw_sha256=result['raw_sha256'],
+                 correction_status=result.get('correction_status'),C_bitwise=True,four_fixed_views=True,wireframe=True,**observation)
+@@ -161,6 +207,7 @@
+     images=[Path(r[k]) for r in records for k in ('geometry_image','overlay_image') if k in r]+list(references.values())
+     for p in images:
+         with Image.open(p) as im:im.verify()
++    atomic_json(cache_path,cache)
+     summary=dict(status='COMPLETE' if not pending else 'INCOMPLETE',expected_rows=16,actual_rows=len(bases),
+         expected_columns=list(LABELS),registered_cells=48,rendered_cells=len(meshes),
+         explicit_not_run_cells=sum(r['status'].startswith('NOT_RUN_NO_PHASE1_SIGNAL') for r in records),
+@@ -169,7 +216,11 @@
+         frame_adjusted_parents=[uid for uid,f in frames.items() if f['adjusted_for_outlier']],
+         frames_include_all_available_corners=True,geometry_repairs=0,model_calls=0,projection_calls=0,scoring_calls=0,
+         human_ratings='NOT_RUN',AI_PROXY='NOT_PERFORMED_BY_GALLERY',records=records,
+-        seconds=time.perf_counter()-tick,source_sha256=digest(__file__),page=str(gallery/'index.html'))
++        seconds=previous.get('seconds',time.perf_counter()-tick) if rendered_now==0 else time.perf_counter()-tick,
++        initial_render_seconds=previous.get('initial_render_seconds',previous.get('seconds')),
++        latest_run_seconds=time.perf_counter()-tick,rendered_images_this_run=rendered_now,verified_cached_images=cache_hits,
++        first_render_cache_bound_without_repainting=imported_first_render,render_signature=render_signature,
++        source_sha256=digest(__file__),page=str(gallery/'index.html'))
+     atomic_json(gallery/'summary.json',summary)
+     return {k:v for k,v in summary.items() if k!='records'}
+ 

@@ -1,0 +1,1889 @@
+--- /dev/null
++++ b/experiments/r2_bench_flow_integrity_diagnostic_v1/audits/final_check.py
+@@ -0,0 +1,182 @@
++"""Independent final artifact audit. NumPy/stdlib only; no model/scorer/OT calls."""
++import os
++for name in ('OMP_NUM_THREADS','MKL_NUM_THREADS','OPENBLAS_NUM_THREADS','NUMEXPR_NUM_THREADS'):
++    os.environ[name]='1'
++os.environ['CUDA_VISIBLE_DEVICES']=''
++import csv
++from collections import Counter, defaultdict
++from datetime import datetime, timezone
++import hashlib
++import json
++from pathlib import Path
++import statistics
++import time
++import numpy as np
++
++OUT=Path(__file__).resolve().parents[1]
++ROOT=OUT.parents[1]
++CACHE={}
++def read(p):return json.loads(Path(p).read_text(encoding='utf-8-sig'))
++def sha(p):
++    p=Path(p)
++    if p.suffix=='.pt':raise RuntimeError('No repeated large checkpoint hashing')
++    if p not in CACHE:CACHE[p]=hashlib.sha256(p.read_bytes()).hexdigest()
++    return CACHE[p]
++def hashed(p,h):
++    assert sha(p)==h,('HASH_MISMATCH',str(p))
++def rows(p):
++    with Path(p).open(encoding='utf-8-sig',newline='') as f:return list(csv.DictReader(f))
++def close(a,b):assert np.isclose(a,b,atol=1e-12,rtol=1e-10),(a,b)
++def load(p):
++    with np.load(p,allow_pickle=False) as z:return {k:z[k].copy() for k in z.files}
++def jlines(p):return [json.loads(x) for x in Path(p).read_text().splitlines() if x.strip()]
++def aggregate(rs,keys,metrics):
++    groups=defaultdict(list)
++    for r in rs:groups[tuple(r[k] for k in keys)].append(r)
++    out=[]
++    for key,group in sorted(groups.items()):
++        r=dict(zip(keys,key))
++        for m in metrics:
++            values=[float(g[m]) for g in group if g.get(m) not in ('',None)]
++            r[m]=statistics.fmean(values) if values else None
++        out.append(r)
++    return out
++def run():
++    started=time.perf_counter();reg=read(OUT/'registration.json')
++    package_path=OUT/'audits/source_contract/probe_manifest.json';pkg=read(package_path)
++    contract=read(OUT/'audits/source_contract/manifest.json')
++    analysis=read(OUT/'probe_analysis_v1/COMPLETE.json')
++    trajectory=read(OUT/'trajectory/completion.json')
++    for p,h in reg['protected'].items():hashed(p,h)
++    for x in contract['source_inventory']:hashed(x['path'],x['sha256'])
++    hashed(pkg['registration_path'],pkg['registration_sha256'])
++    hashed(pkg['pair_preparation_module'],pkg['pair_preparation_module_sha256'])
++    assert Counter(r['representation'] for r in pkg['rows'])=={'NATIVE':12,'SEAM':4}
++    for r in pkg['rows']:
++        for key,hkey in [('trace_path','trace_sha256'),('case_path','case_sha256'),('noise_npz','noise_npz_sha256'),('pair_path','pair_sha256')]:hashed(r[key],r[hkey])
++        a=read(r['audit_json']);assert a['status']=='PASS' and all(a['checks'].values())
++        assert a['production_OT_calls']==1 and a['model_forwards']==a['backwards']==0
++    ot=jlines(OUT/'audits/source_contract/ledger.jsonl')
++    assert sum(x['event']=='OT_STARTED' for x in ot)==sum(x['event']=='OT_COMPLETED' for x in ot)==16
++    assert not any('FAIL' in x['event'] for x in ot)
++    assert contract['new_noise_draws']==0 and contract['new_epsilon_arrays']==12
++    source=ROOT/'r2/pilots/bench_flow_integrity_v1/probe.py';source_text=source.read_text()
++    assert 'assert torch.equal(cpu_rng,torch.get_rng_state()) and torch.equal(gpu_rng,torch.cuda.get_rng_state())' in source_text
++    assert 'assert state_hash(model.state_dict())==frozen_hash' in source_text
++    assert 'with torch.no_grad()' in source_text
++    summaries=[];total=0;prediction_files=0
++    for label,spec in reg['models'].items():
++        directory=OUT/'probes'/label;attempt=read(directory/'attempt.json');done=read(directory/'completion.json')
++        assert not (directory/'failure.json').exists()
++        assert attempt['weights']==spec and done['status']=='COMPLETE'
++        hashed(source,attempt['probe_code_sha256']);hashed(package_path,done['manifest_sha256'])
++        assert attempt['manifest_sha256']==done['manifest_sha256']
++        side=Path(spec['path']).with_suffix('.json');hashed(side,spec['sidecar_sha256'])
++        metadata=read(side);assert metadata['sha256']==spec['sha256']
++        assert Path(spec['path']).stat().st_size==spec['bytes']
++        if 'generator_state_sha256' in metadata:assert metadata['generator_state_sha256']==done['frozen_tensor_sha256']
++        selected=[r for r in pkg['rows'] if r['representation']==('SEAM' if label=='SEAM_S3000' else 'NATIVE')]
++        calls=jlines(directory/'calls.jsonl')
++        assert len(calls)==spec['probe_forwards']*2
++        for index,entry in enumerate((r,ti,t) for r in selected for ti,t in enumerate(pkg['times'])):
++            r,ti,t=entry;start,finish=calls[2*index:2*index+2]
++            assert start['type']=='FORWARD_STARTED' and finish['type']=='FORWARD_COMPLETE'
++            for event in (start,finish):
++                assert event['request_id']==r['request_id'] and event['time_index']==ti and event['representation']==r['representation']
++                close(event['t'],t)
++            assert start['utc']<=finish['utc']
++        assert done['forwards']==spec['probe_forwards'] and done['backwards']==done['updates']==done['head_forwards']==0
++        assert len(done['files'])==len(selected)
++        assert {str(p) for p in directory.glob('*.npz')}==set(done['files'])
++        for p,h in done['files'].items():
++            hashed(p,h);pred=load(p);assert len(pred['pred'])==5 and np.isfinite(pred['pred']).all()
++            np.testing.assert_allclose(pred['times'],pkg['times'],rtol=0,atol=1e-7)
++        prediction_files+=len(done['files']);total+=done['forwards']
++        summaries.append(dict(label=label,forwards=done['forwards'],prediction_files=len(done['files']),
++            frozen_tensor_sha256=done['frozen_tensor_sha256'],weights_sha256=spec['sha256'],
++            seconds=done['seconds'],peak_allocated=done['peak_allocated'],peak_reserved=done['peak_reserved']))
++    assert total==200 and prediction_files==40
++    dispatch=read(OUT/'dispatch/completion.json')
++    assert dispatch['status']=='COMPLETE' and dispatch['forwards']==200 and dispatch['backwards']==dispatch['updates']==0
++    assert set(dispatch['jobs'])==set(reg['models'])
++    assert sum(x['event']=='DISPATCH' for x in dispatch['history'])==4
++    assert all(x['code']==0 for x in dispatch['history'] if x['event']=='EXIT')
++    assert trajectory['trajectories']==108 and len(trajectory['source_trajectories'])==108
++    for p,h in trajectory['source_trajectories'].items():hashed(p,h)
++    for key in ('model_calls','scoring_calls','new_noise','new_OT'):assert trajectory[key]==0
++    gate=read(OUT/'trajectory/risk_gate.json')
++    assert gate['status']=='NOT_TRIGGERED' and len(gate['rows'])==4 and gate['threshold']==.005
++    assert all(r['B_velocity_variation_proxy']<=.005 for r in gate['rows'])
++    identities=read(OUT/'audits/trajectory_inventory/checkpoint_identities.json')
++    aliased=next(x for x in identities if x['label']=='COVERAGE_FINAL')
++    assert aliased['path']==reg['models']['COVERAGE_S1500']['path']
++    assert aliased['registered_sha256']==reg['models']['COVERAGE_S1500']['sha256']
++    assert analysis['registered_forward_artifacts']==analysis['identity_rows']==200 and analysis['model_calls_here']==0
++    for key in ('source_hashes','protected_input_hashes','output_hashes'):
++        for p,h in analysis[key].items():hashed(p,h)
++    scalars=rows(OUT/'probe_analysis_v1/per_time_stratum.csv')
++    metrics=('velocity_mse','velocity_mse_L2','E_shared_pair_mean','endpoint_mse','endpoint_rms_L','endpoint_gap_L_mean','endpoint_gap_L_p95')
++    keys=('model','representation','kind','stratum')
++    req=aggregate(scalars,keys+('parent_id','condition_id','request_id'),metrics)
++    cond=aggregate(req,keys+('parent_id','condition_id'),metrics)
++    parents=aggregate(cond,keys+('parent_id',),metrics)
++    means=aggregate(parents,keys,metrics)
++    saved=rows(OUT/'probe_analysis_v1/parent_equal_summary.csv')
++    ix={tuple(r[k] for k in keys):r for r in saved};checks=0
++    for r in means:
++        other=ix[tuple(r[k] for k in keys)]
++        for m in metrics:
++            if r[m] is None:assert other[m]==''
++            else:close(r[m],float(other[m]));checks+=1
++    paircsv=rows(OUT/'probe_analysis_v1/native_paired_per_parent.csv')
++    pi={(r['model'],r['kind'],r['stratum'],r['parent_id']):r for r in parents}
++    for r in paircsv:
++        first=pi[(r['first_model'],r['kind'],r['stratum'],r['parent_id'])]
++        second=pi[(r['second_model'],r['kind'],r['stratum'],r['parent_id'])]
++        for m in metrics:
++            a,b=first[m],second[m]
++            if a is None or b is None:assert r[m+'_delta']==''
++            else:close(float(r[m+'_delta']),b-a);checks+=1
++    scalarix={(r['model'],r['request_id'],int(r['time_index']),r['kind'],r['stratum']):r for r in scalars}
++    spot=[]
++    for label in reg['models']:
++        rep='SEAM' if label=='SEAM_S3000' else 'NATIVE';prefix='6b894c' if rep=='SEAM' else 'a8e987'
++        row=next(r for r in pkg['rows'] if r['representation']==rep and r['parent_id'].startswith(prefix) and r['noise_index']==0)
++        sample=load(row['trace_path']);prediction=load(OUT/'probes'/label/(row['request_id']+'.npz'))
++        pairmap=read(row['pair_path'])['pairs'];n=int(sample['N'])
++        fixed=sample['anchor_ids']>=0;free=sample['valid_mask'][:,None]&~fixed
++        for ti in (0,2,4):
++            v=prediction['pred'][ti].reshape(n,3,3).astype(np.float64);v[fixed]=0
++            residual=v-sample['u'].reshape(n,3,3).astype(np.float64)
++            calc=float(np.square(residual[free]).mean())
++            close(calc,float(scalarix[(label,row['request_id'],ti,'corner','all_free')]['velocity_mse']))
++            for name,pairs in [('all_both_free',[p for p in pairmap if p['both_free']]),('all_one_fixed',[p for p in pairmap if not p['both_free'] and not p['both_fixed']])]:
++                differences=[residual[p['slot_a'],p['corner_a']]-residual[p['slot_b'],p['corner_b']] for p in pairs]
++                expected=scalarix[(label,row['request_id'],ti,'shared_source_pair',name)]
++                if differences:close(float(np.square(np.asarray(differences)).mean()),float(expected['velocity_mse']))
++                else:assert expected['velocity_mse']==''
++            spot.append(dict(label=label,request_id=row['request_id'],time_index=ti,all_free_velocity_mse=calc))
++    groupmap={r['parent_id']:r['eval_group'] for r in pkg['rows']}
++    core=[]
++    for r in means:
++        if (r['kind'],r['stratum']) in (('corner','all_free'),('shared_source_pair','all_both_free'),('shared_source_pair','all_one_fixed')):
++            core.append(r)
++    result=dict(status='PASS',audit_utc=datetime.now(timezone.utc).isoformat(),audit_scope='Independent CPU artifact/accounting and reduction audit; no new scoring/model/OT',
++        actual_budget=dict(frozen_forwards=total,backwards=0,optimizer_updates=0,head_forwards=0,new_rollouts=0,D0=0,CPU_OT=16,cached_trajectories=108,new_generation_noise_arrays=0,new_diagnostic_epsilon_arrays=12),
++        probe_models=summaries,dispatch_max_workers=dispatch['actual_max_workers'],prediction_file_hashes_verified=prediction_files,
++        RNG_and_frozen_state_check='Executed loader/post-forward assertions precede COMPLETE in exact attempt-hashed probe.py; RNG tensors were not persisted for independent replay',
++        checkpoint_hash_policy='Use registered and loader-verified SHA/state hashes plus fresh small sidecar hashes and file size; no repeated checkpoint read/load',
++        coverage_alias=dict(trajectory='COVERAGE_FINAL',probe='COVERAGE_S1500',same_path=aliased['path'],same_sha256=aliased['registered_sha256']),
++        source_and_artifact_hashes_verified=len(CACHE),source_hash_status='All registered protected sources, inputs, predictions and analyzed output hashes match at audit time',
++        risk_gate=gate,summary_numeric_checks=checks,spot_prediction_reductions=spot,parent_equal_core=core,
++        metadata_note='probe scalar split=UNSPECIFIED; frozen eval_group resolved by exact parent_id in probe manifest, not inferred from scores',
++        eval_group_by_parent=groupmap,
++        interpretation_limits=['No Euler100 was triggered; integration error was not excluded.',
++          'Lower source-bridge MSE does not establish autonomous generation improvement.',
++          'SEAM probe has two parents and target-derived source-owner layout; not same-input comparison with six-parent Native.',
++          'Reported both-free differential MSE averages source-legal adjacent-edge endpoint pairs, not arbitrary same-vertex copies or all generated edges.'],
++        seconds=time.perf_counter()-started,audit_code_sha256=sha(__file__))
++    target=OUT/'audits/final_check.json'
++    with target.open('x',encoding='utf-8') as f:json.dump(result,f,indent=2,ensure_ascii=False)
++    print(json.dumps(dict(status=result['status'],forwards=total,hashes=len(CACHE),checks=checks,spot=len(spot),seconds=result['seconds'])))
++if __name__=='__main__':run()
+--- /dev/null
++++ b/experiments/r2_bench_flow_integrity_diagnostic_v1/audits/trajectory_inventory/inventory.py
+@@ -0,0 +1,135 @@
++"""CPU read-only trajectory inventory. No project/model/scorer imports."""
++import collections,csv,hashlib,json,os,sys
++from pathlib import Path
++os.environ['CUDA_VISIBLE_DEVICES']=''
++import numpy as np
++ROOT=Path('/mnt/e/MeshFlow')
++OUT=ROOT/'experiments/r2_bench_flow_integrity_diagnostic_v1/audits/trajectory_inventory'
++CUR=ROOT/'experiments/r2_bench_seat_coverage_v1'
++FULL=ROOT/'experiments/r2_bench_full_seat_curriculum_v1'
++OLD=ROOT/'experiments/r2_bench_trajectory_diagnostic_v1'
++CROSS=ROOT/'experiments/r2_bench_trajectory_crossover_v1'
++def read(p):return json.loads(Path(p).read_text('utf-8-sig'))
++def sha(p):return hashlib.sha256(Path(p).read_bytes()).hexdigest()
++def arrays(p):
++    with np.load(p,allow_pickle=False) as z:return {k:z[k].copy() for k in z.files}
++def save(p,data):
++    raw=(json.dumps(data,ensure_ascii=False,indent=2)+'\n').encode()
++    if p.exists():assert p.read_bytes()==raw,str(p)
++    else:p.write_bytes(raw)
++def csvwrite(p,rows):
++    import io
++    text=io.StringIO(newline='');keys=list(dict.fromkeys(k for r in rows for k in r))
++    w=csv.DictWriter(text,fieldnames=keys);w.writeheader();w.writerows({k:(json.dumps(v,ensure_ascii=False) if isinstance(v,(dict,list)) else v) for k,v in r.items()} for r in rows)
++    raw=('\ufeff'+text.getvalue()).encode()
++    if p.exists():assert p.read_bytes()==raw,str(p)
++    else:p.write_bytes(raw)
++
++def inspect(q,label,root,layout,manifest,ckpt=None,L=None,kind='CURRENT'):
++    rid=q['request_id'];d=root/'evaluation'/label/rid/'raw';p=d/'trajectory.npz'
++    tr=arrays(p);state=tr.get('state',tr.get('states'));lay=arrays(layout);raw=arrays(d/'raw.npz')
++    N,K=int(q['N']),int(q['K']);fixed=lay['anchor_ids']>=0
++    assert state.shape==(51,N,3,3) and state.dtype==np.float32 and np.isfinite(state).all(),str(p)
++    noise=arrays(q['noise_npz'])['z'];initial=np.zeros((N,3,3),np.float32);initial[K:]=noise
++    initial[fixed]=lay['C_vertices'][lay['anchor_ids'][fixed]]
++    assert np.array_equal(initial,state[0]) and np.array_equal(state[-1],raw['raw'])
++    assert all(np.array_equal(x[fixed],initial[fixed]) for x in state)
++    assert np.array_equal(lay['free_corner_mask'],~fixed)
++    assert np.array_equal(lay['known_mask'],np.arange(N)<K)
++    assert np.array_equal(raw['raw_anchor_ids'],lay['anchor_ids'])
++    if 'times' in tr:assert np.array_equal(tr['times'],np.arange(51)/50)
++    hasv='velocities' in tr
++    if hasv:
++        assert tr['velocities'].shape==(50,N,3,3)
++        for j,v in enumerate(tr['velocities']):
++            nx=state[j]+np.float32(.02)*v;nx[fixed]=initial[fixed]
++            assert np.array_equal(nx,state[j+1])
++    receipt=read(d/'receipt.json');h=sha(p)
++    registered=[v for k,v in receipt.get('files',{}).items() if Path(k).name=='trajectory.npz']
++    if registered:assert registered==[h]
++    return dict(cohort=kind,label=label,parent_id=q['parent_id'],condition_id=q['condition_id'],request_id=rid,
++        eval_group=q.get('eval_group',q.get('split')),noise_index=q['noise_index'],N=N,K=K,
++        trajectory_path=str(p),trajectory_sha256=h,trajectory_array_key='state' if 'state'in tr else 'states',
++        trajectory_shape=list(state.shape),nodes=51,t0=0,t1=1,dt=.02,stored_velocity=hasv,
++        stored_times='times'in tr,all51_finite=True,all51_fixed_corners_exact=True,initial_noise_writeback_exact=True,
++        final_equals_raw_canonical=True,stored_Euler_velocity_recurrence_exact=True if hasv else 'NA_NO_STORED_VELOCITY',
++        identity_transport='fixed slot and corner addresses across all51 states; no per-time OT',
++        free_corner_count=int((~fixed).sum()),free_coordinate_count=int((~fixed).sum()*3),
++        seam_slots=len(lay['seam_slots']),bulk_slots=len(lay['bulk_slots']),fixed_free_corners=int(fixed[K:].sum()),
++        layout_path=str(layout),layout_sha256=sha(layout),layout_keys=list(lay),
++        free_mask_field='free_corner_mask (equals anchor_ids<0)',role_fields='known_mask, seam_slots, bulk_slots, anchor_ids, edge_records, occupied',
++        noise_path=q['noise_npz'],noise_sha256=sha(q['noise_npz']),input_path=q['inference_npz'],input_sha256=sha(q['inference_npz']),
++        source_condition_path=q.get('source_npz'),metadata_path=q.get('metadata_npz'),case_path=q.get('case_path'),
++        raw_path=str(d/'raw.npz'),raw_sha256=sha(d/'raw.npz'),receipt_path=str(d/'receipt.json'),receipt_sha256=sha(d/'receipt.json'),
++        manifest_path=str(manifest),manifest_sha256=sha(manifest),checkpoint=ckpt,L=L,L_policy='frozen prior score reference, not parent bbox',
++        geometry_frame='original model/world coordinates, canonical C in state; raw.output restores source C corner order',
++        scientific_execution_this_inventory='0 model,0 scorer,0 new noise,0 OT')
++
++def run():
++    OUT.mkdir(parents=True,exist_ok=True);rows=[];weights=[]
++    curman=read(CUR/'eval_manifest.json');fullman=read(FULL/'eval_manifest.json')
++    for root,labels,qs,kind,manifest in [
++        (FULL,('COMMON_S12000','NATIVE_S6000','SEAM_S3000'),fullman['requests'],'FULL_SEAT_CURRICULUM',FULL/'eval_manifest.json'),
++        (CUR,('NATIVE_S6000','COVERAGE_FINAL'),curman['requests'],'CURRENT_COVERAGE',CUR/'eval_manifest.json')]:
++        for label in labels:
++            reg=read(root/'evaluation/inference_registrations'/(label+'__RAW.json'))
++            spec=reg['spec'];cp=Path(spec['generator_path'])
++            weights.append(dict(cohort=kind,label=label,path=str(cp),exists=cp.is_file(),bytes=cp.stat().st_size if cp.exists() else None,
++                registered_sha256=reg['protected'].get(str(cp)),hash_policy='copied from immutable inference registration; no expensive weight reread or load',spec=spec,
++                registration_path=str(root/'evaluation/inference_registrations'/(label+'__RAW.json')),registration_sha256=sha(root/'evaluation/inference_registrations'/(label+'__RAW.json'))))
++            for q in qs:
++                if root==CUR and label=='NATIVE_S6000' and q['panel_origin']=='INHERITED24':continue
++                lp=root/'evaluation'/label/'layouts'/q['condition_id']/'layout.npz'
++                rows.append(inspect(q,label,root,lp,manifest,weights[-1],curman['L'] if root==CUR else fullman['L'],kind))
++    oldreg=read(OLD/'registration.json');oldman=read(OLD/'evaluation_inputs/manifest.json')
++    oldscore=read(OLD/'evaluation/score_registrations/COMMON.json')
++    oldL=oldscore.get('L',float(np.sqrt(3)*5.31488037109375))
++    for label in ('COMMON','USER'):
++        cp=Path(oldreg['checkpoints'][label]);weight=dict(cohort='OLD_COMMON_USER',label=label,path=str(cp),exists=cp.exists(),bytes=cp.stat().st_size if cp.exists() else None,
++            registered_sha256=oldreg['files'].get(str(cp)),hash_policy='copied from frozen registration; no weight loading or rehash',registration_path=str(OLD/'registration.json'),registration_sha256=sha(OLD/'registration.json'))
++        weights.append(weight)
++        for q in oldman['requests']:
++            rows.append(inspect(q,label,OLD,OLD/'layouts'/q['condition_id']/'layout.npz',OLD/'evaluation_inputs/manifest.json',weight,oldL,'OLD_COMMON_USER'))
++    crosses=[];creg=read(CROSS/'registration.json')
++    for combo in ('CU','UC'):
++        for q in creg['requests']:
++            p=CROSS/'evaluation'/combo/q['request_id']/'raw/trajectory.npz';tr=arrays(p)
++            assert tr['states'].shape==(26,q['N'],3,3) and tr['velocities'].shape==(25,q['N'],3,3)
++            assert np.array_equal(tr['times'],np.arange(25,51)/50)
++            crosses.append(dict(combo=combo,request_id=q['request_id'],path=str(p),sha256=sha(p),nodes=26,t0=.5,t1=1,stored_velocity=True,eligible_pure_model_smoothness=False,
++                exclusion='intentional model switch at .5; not a pure single-model flow; first half is read-only baseline reference'))
++    # Exact identity pairing within current Native/Candidate; older model pairs use a different panel/representation.
++    pairs=[]
++    for q in curman['requests']:
++        a=next(r for r in rows if r['label']=='NATIVE_S6000' and r['request_id']==q['request_id'])
++        b=next(r for r in rows if r['label']=='COVERAGE_FINAL' and r['request_id']==q['request_id'])
++        for key in ('noise_sha256','input_sha256','layout_sha256','N','K','free_corner_count'):assert a[key]==b[key],(q['request_id'],key)
++        pairs.append(dict(request_id=q['request_id'],parent_id=q['parent_id'],eval_group=q['eval_group'],native_trajectory=a['trajectory_path'],candidate_trajectory=b['trajectory_path'],noise_sha256=a['noise_sha256'],layout_sha256=a['layout_sha256'],exact_same_current_condition_noise_layout=True))
++    recommendations=[]
++    reason={'a8e987':'new trained regular slat seat; large POST loss', '27eb79':'new trained curved seat; RAW organized but thin supports lost after processing','838c48':'old trained reasonable slab/dual support control','6b894c':'old trained candidate FF/I tail and visibly torn infill','f495bd':'old DEV C underneath/replaced by gray deck','df6fd3':'current-lineage-unseen holdout; only one parent, two noises'}
++    for q in curman['requests']:
++        prefix=q['parent_id'][:6]
++        if prefix not in reason:continue
++        rec={k:q[k] for k in ('request_id','condition_id','parent_id','noise_index','N','K','eval_group','case_path','inference_npz','metadata_npz','source_npz','noise_npz','query_descriptor')}
++        rec.update(reason=reason[prefix],selection_scope='post-observation mechanism panel, not a new unbiased success-rate test',new_model_calls_needed_for_trajectory=0,
++            trajectories=[r for r in rows if r['request_id']==q['request_id'] and r['label']in ('NATIVE_S6000','COVERAGE_FINAL','SEAM_S3000')])
++        recommendations.append(rec)
++    extras=[]
++    for p in sorted((OLD/'execution').glob('*/*/*/*trajectory.npz')):
++        with np.load(p,allow_pickle=False) as z:
++            extras.append(dict(path=str(p),keys=z.files,shapes={k:list(z[k].shape) for k in z.files},scope='source-owner oracle, not production layout; excluded from pure C-only primary panel'))
++    csvwrite(OUT/'per_trajectory.csv',rows);save(OUT/'per_trajectory.json',rows)
++    csvwrite(OUT/'cross_suffixes.csv',crosses);save(OUT/'checkpoint_identities.json',weights);save(OUT/'current_identity_pairs.json',pairs)
++    save(OUT/'recommended_panel.json',dict(status='PROPOSED_NOT_NEW_DISPATCH',parents=6,requests=len(recommendations),requests_data=recommendations,selection_after_known_results=True))
++    save(OUT/'extra_source_oracle_assets.json',extras)
++    summary=dict(status='PASS',model_calls=0,scoring_calls=0,training_updates=0,new_noise=0,new_OT=0,full51_trajectories=len(rows),
++        counts=dict(collections.Counter(r['cohort']+'/'+r['label'] for r in rows)),stored50_velocity_trajectories=sum(r['stored_velocity'] for r in rows),
++        suffix26_mixed_model_trajectories=len(crosses),current_native_candidate_exact_pairs=len(pairs),all_requested_assets_full51=True,
++        sparse_snapshots_found_in_requested_raw_trajectories=0,raw_endpoint_fixed_mask_noise_checks='PASS',
++        reference_scales={'CURRENT':curman['L'],'OLD':oldL,'scale_rounding_difference':abs(curman['L']-oldL)},
++        source_code_paths=['r2/pilots/bench_control_transfer_v1/sample.py','r2/pilots/bench_trajectory_diagnostic_v1/gpu.py','r2/pilots/bench_trajectory_crossover_v1/prepare.py','r2/pilots/bench_full_seat_curriculum_v1/audit_all_raw_cache.py'],
++        script_sha256=sha(__file__),notes=['No current trajectory velocities saved: diff(state)/.02 is realized discrete velocity, not bitwise recovery of BF16 network output.', 'Use existing role masks and per-model free coordinate denominator. Current SEAM changes fixed corners; do not compare whole arrays without role/free masking.', 'Historical CC/UU refer directly to OLD COMMON/USER full trajectories. CU/UC cannot estimate a single-model smoothness.', 'Source-informed continuation_t*.npz and prediction_t*.npz are not full noise-to-output production trajectories.'])
++    save(OUT/'receipt.json',summary);print(json.dumps(summary,ensure_ascii=False,indent=2))
++    assert 'torch' not in sys.modules
++
++if __name__=='__main__':run()
+--- /dev/null
++++ b/r2/pilots/bench_flow_integrity_v1/__init__.py
+@@ -0,0 +1 @@
++"""Frozen-weight diagnostic; no training or default changes."""
+--- /dev/null
++++ b/r2/pilots/bench_flow_integrity_v1/analyse_probes.py
+@@ -0,0 +1,241 @@
++"""Reduce the frozen 200-forward probe artifacts on CPU; no model calls."""
++from __future__ import annotations
++import argparse
++from collections import defaultdict
++import csv
++import io
++import json
++from pathlib import Path
++import time
++import numpy as np
++from .common import OUT, ROOT, read, resolve, sha, write_new
++from . import probe_metrics as M
++
++DEST = OUT / 'probe_analysis_v1'
++NATIVE = ('COMMON_S12000', 'NATIVE_S6000', 'COVERAGE_S1500')
++MODELS = NATIVE + ('SEAM_S3000',)
++METRICS = ('velocity_mse', 'velocity_mse_L2', 'E_shared_pair_mean',
++           'endpoint_mse', 'endpoint_rms_L', 'endpoint_gap_L_mean', 'endpoint_gap_L_p95')
++
++
++def arrays(path):
++    with np.load(resolve(path), allow_pickle=False) as z:
++        return {key:z[key].copy() for key in z.files}
++
++
++def csv_write(path, rows):
++    path=Path(path); path.parent.mkdir(parents=True,exist_ok=True)
++    columns=list(dict.fromkeys(k for r in rows for k in r))
++    stream=io.StringIO(newline='')
++    writer=csv.DictWriter(stream,fieldnames=columns); writer.writeheader(); writer.writerows(rows)
++    value=stream.getvalue()
++    if path.exists():
++        with path.open('r',encoding='utf-8-sig',newline='') as f: existing=f.read()
++        if existing != value:
++            raise RuntimeError('Existing diagnostic CSV differs: '+str(path))
++        return
++    with path.open('x',encoding='utf-8-sig',newline='') as f:f.write(value)
++
++
++def balanced(rows,keys,stage):
++    groups=defaultdict(list)
++    for r in rows: groups[tuple(r[k] for k in keys)].append(r)
++    result=[]
++    for key, group in sorted(groups.items()):
++        row=dict(zip(keys,key)); row['aggregation']=stage; row['input_rows']=len(group)
++        row['available_rows']=sum(g['status']=='AVAILABLE' for g in group)
++        row['status']='AVAILABLE' if row['available_rows'] else 'NA_NO_APPLICABLE_SOURCE_ELEMENTS'
++        for metric in METRICS:
++            values=[float(g[metric]) for g in group if g.get(metric) is not None]
++            row[metric]=float(np.mean(values)) if values else None
++        for name in ('count','scalar_count'):
++            values=[g[name] for g in group if name in g]
++            if values: row[name+'_min'],row[name+'_max']=min(values),max(values)
++        result.append(row)
++    return result
++
++
++def _normalize_manifest(package):
++    source=package.get('rows', package.get('traces'))
++    if not isinstance(source,list): raise ValueError('No trace rows')
++    result=[]
++    for raw in source:
++        row=dict(raw)
++        row['representation']=row.get('representation',row.get('arm'))
++        if row['representation'] in ('PLAIN','NATIVE'): row['representation']='NATIVE'
++        if row['representation'] not in ('NATIVE','SEAM'): raise ValueError('Unknown representation')
++        row['trace_path']=row.get('trace_path',row.get('sample_path'))
++        row['trace_sha256']=row.get('trace_sha256',row.get('sample_sha256'))
++        if not row['trace_sha256'] and row.get('audit_json'):
++            audit=read(row['audit_json']);row['trace_sha256']=audit['sample_sha256']
++        if not all(row.get(k) for k in ('trace_path','trace_sha256','case_path','request_id','parent_id','condition_id')):
++            raise ValueError('Missing trace metadata')
++        result.append(row)
++    return result
++
++
++def analyze(manifest_path):
++    manifest_path=resolve(manifest_path)
++    if (DEST/'COMPLETE.json').exists():
++        result=read(DEST/'COMPLETE.json')
++        if sha(manifest_path)!=result['manifest_sha256']:raise ValueError('Manifest changed')
++        for path,digest in result['output_hashes'].items():
++            if sha(path)!=digest:raise ValueError('Diagnostic output changed')
++        return result
++    package=read(manifest_path);traces=_normalize_manifest(package)
++    missing=[]
++    for model in MODELS:
++        completion=OUT/'probes'/model/'completion.json'
++        if not completion.exists():missing.append(str(completion))
++    if missing:return dict(status='PENDING',missing=missing,model_calls=0)
++    start=time.perf_counter();protected={str(manifest_path):sha(manifest_path)}
++    cases={};sources={};scalar=[];pair_rows=[];identities=[];forward_count=0
++    for model in MODELS:
++        completion_path=OUT/'probes'/model/'completion.json';complete=read(completion_path)
++        protected[str(completion_path)]=sha(completion_path);forward_count+=complete['forwards']
++        if complete['backwards'] or complete['updates']:raise ValueError('Probe unexpectedly updated model')
++        representation='SEAM' if model=='SEAM_S3000' else 'NATIVE'
++        for row in (r for r in traces if r['representation']==representation):
++            trace_path=resolve(row['trace_path']);case_path=resolve(row['case_path'])
++            if sha(trace_path)!=row['trace_sha256']:raise ValueError('Trace changed')
++            if row.get('case_sha256') and sha(case_path)!=row['case_sha256']:raise ValueError('Source case changed')
++            protected[str(trace_path)]=row['trace_sha256'];protected[str(case_path)]=sha(case_path)
++            sample=arrays(trace_path)
++            if str(case_path) not in cases:cases[str(case_path)]=arrays(case_path)
++            case=cases[str(case_path)]
++            if row.get('pair_path'):
++                pair_path=resolve(row['pair_path'])
++                if row.get('pair_sha256') and sha(pair_path)!=row['pair_sha256']:raise ValueError('Pair map changed')
++                pairs=read(pair_path);protected[str(pair_path)]=sha(pair_path)
++            else:
++                if str(case_path) not in sources:sources[str(case_path)]=M.source_pairs(case)
++                pairs=M.prepare_pairs(sample,case,source=sources[str(case_path)])
++            prediction_path=OUT/'probes'/model/(row['request_id']+'.npz')
++            expected=complete['files'].get(str(prediction_path))
++            if expected is None:
++                expected=next((h for p,h in complete['files'].items() if resolve(p)==prediction_path),None)
++            if not expected or sha(prediction_path)!=expected:raise ValueError('Unregistered/changed probe prediction')
++            protected[str(prediction_path)]=expected;prediction=arrays(prediction_path)
++            times=np.asarray(sample['times']);values=prediction['pred']
++            if len(times)!=5 or len(values)!=5 or not np.array_equal(times,prediction['times']):raise ValueError('Probe time mismatch')
++            for ti,t in enumerate(times):
++                current=dict(sample,t=np.asarray(t,np.float32),xt=sample['x_by_time'][ti].reshape(int(sample['N']),3,3))
++                scores,details=M.compute_metrics(current,values[ti],pairs=pairs)
++                meta=dict(model=model,representation=representation,request_id=row['request_id'],
++                    parent_id=row['parent_id'],condition_id=row['condition_id'],noise_index=row.get('noise_index'),
++                    split=row.get('split',row.get('panel','UNSPECIFIED')),time_index=ti,t=float(t),
++                    L=M.L_DEFAULT,metric_version=M.VERSION,interpretation='SOURCE_BRIDGE_DIAGNOSTIC')
++                scalar.extend(dict(meta,**s) for s in scores)
++                pair_rows.extend(dict(meta,**p) for p in details['pairs'])
++                identities.append(dict(meta,pair_count=details['pair_count'],
++                    bridge_identity_max_abs=details['bridge_identity_max_abs'],
++                    shared_identity_max_abs=details['shared_identity_max_abs'],
++                    identity_status=details['identity_status'],
++                    raw_fixed_prediction_squared_sum=details['raw_fixed_prediction_squared_sum']))
++    if forward_count!=200 or len(identities)!=200:raise ValueError('Frozen 200-forward scope differs')
++    common=('model','representation','kind','stratum')
++    request=balanced(scalar,common+('parent_id','condition_id','request_id'),'equal_five_fixed_times')
++    condition=balanced(request,common+('parent_id','condition_id'),'equal_existing_noises')
++    parent=balanced(condition,common+('parent_id',),'equal_conditions_within_parent')
++    summary=balanced(parent,common,'equal_parents')
++    native=[r for r in scalar if r['representation']=='NATIVE']
++    index={(r['model'],r['request_id'],r['time_index'],r['kind'],r['stratum']):r for r in native}
++    paired=[]
++    for first,second in ((NATIVE[0],NATIVE[1]),(NATIVE[1],NATIVE[2]),(NATIVE[0],NATIVE[2])):
++        for r in (r for r in native if r['model']==first):
++            key=(second,r['request_id'],r['time_index'],r['kind'],r['stratum']);other=index[key]
++            if r['count']!=other['count']:raise ValueError('Same-state Native denominator differs')
++            out={k:r[k] for k in ('request_id','parent_id','condition_id','noise_index','time_index','t','kind','stratum','count','status')}
++            out.update(first_model=first,second_model=second)
++            for metric in METRICS:
++                a,b=r.get(metric),other.get(metric)
++                out[metric+'_before']=a;out[metric+'_after']=b
++                out[metric+'_delta']=b-a if a is not None and b is not None else None
++                out[metric+'_ratio']=b/a if a is not None and b is not None and a>0 else None
++            paired.append(out)
++    DEST.mkdir(parents=True,exist_ok=True)
++    tables={'per_time_stratum':scalar,'per_source_pair':pair_rows,'identity_checks':identities,
++            'per_request_time_mean':request,'per_condition_noise_mean':condition,
++            'per_parent_summary':parent,'parent_equal_summary':summary,'native_paired_per_time':paired}
++    for name,rows in tables.items():csv_write(DEST/(name+'.csv'),rows)
++    # Requested explicit request/parent paired tables use the same balanced means.
++    for table_name,base,ids in [('native_paired_per_request',request,('parent_id','condition_id','request_id')),
++                              ('native_paired_per_parent',parent,('parent_id',))]:
++        lookup={(r['model'],r['kind'],r['stratum'])+tuple(r[k] for k in ids):r for r in base}
++        output=[]
++        for first,second in ((NATIVE[0],NATIVE[1]),(NATIVE[1],NATIVE[2]),(NATIVE[0],NATIVE[2])):
++            for r in (x for x in base if x['model']==first):
++                other=lookup[(second,r['kind'],r['stratum'])+tuple(r[k] for k in ids)]
++                out={k:r[k] for k in ids+('kind','stratum','status')};out.update(first_model=first,second_model=second)
++                for metric in METRICS:
++                    a,b=r.get(metric),other.get(metric)
++                    out[metric+'_before']=a;out[metric+'_after']=b
++                    out[metric+'_delta']=b-a if a is not None and b is not None else None
++                output.append(out)
++        csv_write(DEST/(table_name+'.csv'),output)
++    plot(scalar)
++    lines=['# Frozen source-bridge probe readout','',
++        '200 frozen forwards; zero updates/backward. These measurements use source-target interpolation states. They do not measure autonomous completion, certify generated topology, or require a unique source style.',
++        '', 'Native models share exactly the same 60 input states. SEAM has a distinct source-owner layout and is descriptive only; its errors are not a same-input architecture comparison.', '',
++        '| Model | Free velocity MSE | Both-free shared-pair difference MSE | One-fixed shared-pair difference MSE |',
++        '|---|---:|---:|---:|']
++    def val(model,kind,stratum):
++        rs=[r for r in summary if r['model']==model and r['kind']==kind and r['stratum']==stratum]
++        x=rs[0]['velocity_mse'] if rs else None
++        return 'NA' if x is None else f'{x:.8g}'
++    for model in MODELS:
++        lines.append('| '+model+' | '+val(model,'corner','all_free')+' | '+val(model,'shared_source_pair','all_both_free')+' | '+val(model,'shared_source_pair','all_one_fixed')+' |')
++    lines.extend(['','Means: equal five fixed times, equal noises, equal conditions within parent, then equal parents. MSE divides by three scalar coordinates per corner/pair. No valence-squared pooling. Nonapplicable strata stay NA.',
++        '', 'The primary pair mask excludes duplicate/degenerate source faces, incidence other than two, nonmanifold endpoint links, and unverified/non-legal adjacent contacts. Legality is pair-local, not a whole-source clean certificate. Slender-triangle proxy means minimum altitude / longest edge <0.1 on either incident triangle; it is not a semantic support label.',
++        '', 'Fixed network predictions are projected to zero for the exact production-motion identity and separately logged. Source face and corner metadata reconstruct x1 exactly. The endpoint-gap identity is checked per pair, with FP32 bridge rounding explicitly tolerated.',
++        '', 'Do not infer a broken coupling, numerical integration error, or improved free-generation quality from a change in these MSEs alone. Use the separately frozen rollout and step-sensitivity results for those questions.'])
++    readout='\n'.join(lines)+'\n'
++    target=DEST/'READOUT.md'
++    if target.exists() and target.read_text(encoding='utf-8')!=readout:raise ValueError('Existing readout differs')
++    if not target.exists():target.write_text(readout,encoding='utf-8')
++    for path,digest in protected.items():
++        if sha(path)!=digest:raise ValueError('Protected input mutated: '+path)
++    result=dict(status='COMPLETE',model_calls_here=0,registered_forward_artifacts=200,
++        scalar_rows=len(scalar),source_pair_rows=len(pair_rows),identity_rows=len(identities),
++        max_bridge_residual=max(r['bridge_identity_max_abs'] for r in identities),
++        max_shared_identity_residual=max(r['shared_identity_max_abs'] for r in identities),
++        seconds=time.perf_counter()-start,manifest_sha256=sha(manifest_path),
++        source_hashes={str(Path(__file__)):sha(__file__),str(Path(M.__file__)):sha(M.__file__)},
++        protected_input_hashes=protected,
++        output_hashes={str(p):sha(p) for p in sorted(DEST.iterdir()) if p.is_file() and p.name!='COMPLETE.json'})
++    write_new(DEST/'COMPLETE.json',result)
++    return result
++
++
++def plot(rows):
++    import matplotlib
++    matplotlib.use('Agg')
++    import matplotlib.pyplot as plt
++    fig,axes=plt.subplots(2,2,figsize=(11,8),constrained_layout=True)
++    wanted=(('corner','all_free','Native all-free FM error'),
++            ('shared_source_pair','all_both_free','Native adjacent free-corner difference'),
++            ('shared_source_pair','all_one_fixed','Native source C/free difference'),
++            ('shared_source_pair','bulk--seam_tip','SEAM source tip/bulk difference (descriptive)'))
++    for ax,(kind,stratum,title) in zip(axes.ravel(),wanted):
++        models=('SEAM_S3000',) if stratum=='bulk--seam_tip' else NATIVE
++        any_data=False
++        for model in models:
++            selected=[r for r in rows if r['model']==model and r['kind']==kind and r['stratum']==stratum]
++            bycondition=balanced(selected,('time_index','t','parent_id','condition_id'),'equal_noise')
++            byparent=balanced(bycondition,('time_index','t','parent_id'),'equal_condition')
++            means=balanced(byparent,('time_index','t'),'equal_parent')
++            points=[r for r in means if r.get('velocity_mse') is not None]
++            if points:
++                ax.plot([r['t'] for r in points],[r['velocity_mse'] for r in points],marker='o',label=model)
++                any_data=True
++        ax.set_title(title);ax.set_xlabel('Supervised bridge time t');ax.set_ylabel('MSE per scalar coordinate');ax.grid(alpha=.2)
++        if any_data:ax.legend(fontsize=7)
++        else:ax.text(.5,.5,'NA: no applicable legal source pairs',ha='center',transform=ax.transAxes)
++    path=DEST/'source_bridge_probe_curves.png'
++    if path.exists():raise RuntimeError('Refuse overwrite existing diagnostic chart')
++    fig.savefig(path,dpi=150);plt.close(fig)
++
++
++if __name__=='__main__':
++    parser=argparse.ArgumentParser();parser.add_argument('--manifest',required=True)
++    args=parser.parse_args();print(json.dumps(analyze(args.manifest),ensure_ascii=False))
+--- /dev/null
++++ b/r2/pilots/bench_flow_integrity_v1/common.py
+@@ -0,0 +1,10 @@
++from pathlib import Path
++from r2.pilots.bench_adaptation_strength_v1.common import read, resolve, sha, write_new, atomic_write, resources
++ROOT = Path(__file__).resolve().parents[3]
++OUT = ROOT/'experiments/r2_bench_flow_integrity_diagnostic_v1'
++MODELS = {
++ 'COMMON_S12000': ROOT/'experiments/r2_bench_full_seat_curriculum_v1/training/NATIVE/generator_step0.pt',
++ 'NATIVE_S6000': ROOT/'experiments/r2_bench_full_seat_curriculum_v1/training/NATIVE/generator_step6000.pt',
++ 'COVERAGE_S1500': ROOT/'experiments/r2_bench_seat_coverage_v1/training/NATIVE/generator_step1500.pt',
++ 'SEAM_S3000': ROOT/'experiments/r2_bench_full_seat_curriculum_v1/training/SEAM/generator_step3000.pt',
++}
+--- /dev/null
++++ b/r2/pilots/bench_flow_integrity_v1/contract_audit.py
+@@ -0,0 +1,418 @@
++"""Finite CPU trace of the unmodified production conditional FM packing path.
++
++No model, torch, forward, backward, sampling, or geometry scoring is performed.
++One actual production OT per registered arm/request is retained. Five times are
++algebraic views of that same coupling, not five newly matched couplings.
++"""
++from __future__ import annotations
++
++import os
++for _name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
++    os.environ[_name] = "1"
++os.environ["CUDA_VISIBLE_DEVICES"] = ""
++
++import argparse
++import csv
++import datetime as dt
++import hashlib
++import json
++from pathlib import Path
++import subprocess
++import sys
++import time
++import traceback
++
++ROOT = Path(__file__).resolve().parents[3]
++sys.path.insert(0, str(ROOT))
++sys.path.insert(0, str(ROOT / "r2/src"))
++import numpy as np
++from r2.pilots.bench_parts_convergence_v1 import data as D
++from meshflow_control.training.coupling import to_noise_slots
++
++OUT = ROOT / "experiments/r2_bench_flow_integrity_diagnostic_v1/audits/source_contract"
++PANEL = ROOT / "experiments/r2_bench_seat_coverage_v1/eval_manifest.json"
++PREFIXES = ("27eb79", "6b894", "91e169", "a8e987", "df6fd3", "fd355")
++SEAM_PREFIXES = ("6b894", "91e169")
++TIMES = [0.1, 0.3, 0.5, 0.7, 0.9]
++SOURCE_FILES = [
++    "r2/pilots/bench_parts_convergence_v1/data.py",
++    "r2/pilots/seam_abc_v1/slot_data_extension.py",
++    "r2/src/meshflow_control/seam/slot_data.py",
++    "r2/src/meshflow_control/training/coupling.py",
++    "r2/src/meshflow_control/seam/model_adapter.py",
++    "r2/src/meshflow_control/seam/corner_contract.py",
++    "r2/pilots/bench_full_seat_curriculum_v1/train.py",
++    "r2/pilots/bench_full_seat_curriculum_v1/training_state.py",
++    "r2/pilots/bench_seat_coverage_v1/train.py",
++    "r2/pilots/bench_control_transfer_v1/sample.py",
++    "r2/pilots/bench_full_seat_curriculum_v1/sample.py",
++    "r2/pilots/bench_flow_integrity_v1/contract_audit.py",
++]
++
++
++def stamp():
++    return dt.datetime.now(dt.timezone.utc).isoformat()
++
++
++def sha(path):
++    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
++
++
++def arrsha(value):
++    value = np.ascontiguousarray(value)
++    return hashlib.sha256(value.tobytes()).hexdigest()
++
++
++def read(path):
++    return json.loads(Path(path).read_text(encoding="utf-8-sig"))
++
++
++def write_new(path, value):
++    path = Path(path)
++    path.parent.mkdir(parents=True, exist_ok=True)
++    if path.exists():
++        if read(path) != value:
++            raise RuntimeError("Immutable output differs: " + str(path))
++        return
++    with path.open("x", encoding="utf-8", newline="\n") as f:
++        json.dump(value, f, ensure_ascii=False, indent=2, allow_nan=False)
++        f.write("\n")
++
++
++def append_ledger(event, **kwargs):
++    OUT.mkdir(parents=True, exist_ok=True)
++    row = {"timestamp": stamp(), "event": event, **kwargs}
++    with (OUT / "ledger.jsonl").open("a", encoding="utf-8", newline="\n") as f:
++        f.write(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n")
++
++
++def source_inventory():
++    return [{"path": str(ROOT / p), "sha256": sha(ROOT / p)} for p in SOURCE_FILES]
++
++
++def prepare():
++    """Freeze exactly twelve pre-existing request/noise identities, zero OT."""
++    existing = OUT / "manifest.json"
++    if existing.exists():
++        return read(existing)
++    panel = read(PANEL)
++    selected = [q for q in panel["requests"] if q["parent_id"].startswith(PREFIXES)]
++    assert len(selected) == 12
++    assert all(sum(q["parent_id"].startswith(p) for q in selected) == 2 for p in PREFIXES)
++    assert len({q["condition_id"] for q in selected}) == 6
++    # The inherited panel names this existing seed simply "seed".
++    selected.sort(key=lambda q: (q["condition_id"], int(q["seed"])))
++    requests, traces = [], []
++    for index, q in enumerate(selected):
++        case_path, noise_path = D.resolve(q["case_path"]), D.resolve(q["noise_npz"])
++        case_hash, noise_hash = sha(case_path), sha(noise_path)
++        assert case_hash == q["case_sha256"]
++        assert noise_hash == q["noise_npz_sha256"]
++        case, noise = D.load_case(case_path), D.arrays(noise_path)
++        z = np.asarray(noise["z"])
++        n, k = int(q["N"]), int(q["K"])
++        assert z.shape == (n-k, 3, 3) and z.dtype == np.float32
++        assert np.isfinite(z).all()
++        assert len(case["full_target"]) == n
++        request = {key: q[key] for key in ("request_id", "condition_id", "parent_id", "noise_index", "eval_group", "N", "K")}
++        request.update(request_index=index, noise_seed=int(q["seed"]),
++                       epsilon_seed=2026102300+index, permutation_seed=2026102400+index,
++                       case_path=str(case_path), case_sha256=case_hash,
++                       noise_npz=str(noise_path), noise_npz_sha256=noise_hash,
++                       noise_array_sha256=arrsha(z),
++                       inference_npz=q["inference_npz"],
++                       L=float(panel["L"]), augmentation_alpha=1.0,
++                       source_occupancy_count=int(case["occupied_labels"].sum()))
++        requests.append(request)
++        arms = ["NATIVE"]
++        if q["parent_id"].startswith(SEAM_PREFIXES):
++            arms.append("SEAM_SOURCE_OWNER_DIAGNOSTIC")
++        for arm in arms:
++            rel = Path("traces") / arm / q["request_id"]
++            traces.append({**request, "arm": arm,
++                           "production_arm": "PLAIN" if arm == "NATIVE" else "SEAM",
++                           "deployable_layout_claim": arm == "NATIVE",
++                           "layout_scope": "C-only all-free Native" if arm == "NATIVE" else "Source-owner oracle supervision diagnosis; not deployment inference",
++                           "sample_npz": str(OUT / rel / "sample.npz"),
++                           "audit_json": str(OUT / rel / "audit.json")})
++    assert len(traces) == 16
++    manifest = {
++        "schema": "BENCH_PRODUCTION_FM_COUPLING_TRACE_V1", "status": "FROZEN",
++        "created_utc": stamp(), "panel_path": str(PANEL), "panel_sha256": sha(PANEL),
++        "request_sort": "condition_id lexical, then numeric existing panel seed",
++        "epsilon_policy": "RandomState(2026102300 + request_index).randn(z.shape).astype(float32)",
++        "permutation_policy": "2026102400 + request_index",
++        "actual_production_call_time": 0.5, "times": TIMES,
++        "t_scope": "Same fixed coupling for all five t; no rematching across t",
++        "requests": requests, "traces": traces,
++        "authorized_production_OT_calls": 16, "new_noise_draws": 0,
++        "new_epsilon_arrays": 12, "model_forwards": 0, "backwards": 0,
++        "augmentation": "Identity alpha=1; unaugmented frozen source targets and C",
++        "source_inventory": source_inventory(),
++        "sample_schema": {
++            "x_by_time": "float32 (5,N,9); fixed C/anchor coordinates restored",
++            "target": "float32 (N,9), production velocity U",
++            "Y": "float32 (N,3,3), production matched endpoint x1",
++            "known": "bool (N,), original C faces only",
++            "fixed_mask": "bool (N,3), all fixed corners including seam anchors",
++            "source_face_ids": "int64 (N,), after production final face permutation",
++            "source_corner_permutations": "int64 (N,3), exact target source-corner identity",
++            "production_keys": "All keys returned by D.supervised_sample retained unchanged",
++        },
++        "limitations": [
++            "Fixed interpolation probes expose source Y to X_t as ordinary supervision; not autonomous generation",
++            "SEAM source-owner layout is a labelled diagnostic; not a C-only deployable result",
++            "Native and SEAM layout contracts differ; compare SEAM descriptively, not as same-input causal arm",
++            "Finite sample moments are descriptive; Gaussian marginal statement follows independent affine Gaussian algebra",
++        ],
++    }
++    write_new(existing, manifest)
++    append_ledger("PREPARED", production_OT_calls=0, requests=12, traces=16, model_forwards=0)
++    return manifest
++
++
++def maxabs(value):
++    value = np.asarray(value)
++    return float(np.max(np.abs(value))) if value.size else 0.0
++
++
++def check_trace(case, z, eps, sample, entry):
++    """Independent identity reconstruction; never calls nested OT again."""
++    n, k = entry["N"], entry["K"]
++    full = np.asarray(case["full_target"], np.float32).reshape(n, 3, 3)
++    pre = np.asarray(case["pre_ot_full"], np.float32)
++    order = sample["face_permutation"]
++    invorder = np.argsort(order)
++    anchor = sample["anchor_ids"]
++    fixed = anchor >= 0
++    free = sample["valid_mask"][:, None] & ~fixed
++    sf, sc = sample["source_face_ids"], sample["source_corner_permutations"]
++    ids_pre, corner_pre = sf[invorder], sc[invorder]
++    anchors_pre = anchor[invorder]
++    fixed_pre = anchors_pre >= 0
++    active = np.asarray(case["occupied_labels"], bool) if entry["production_arm"] == "SEAM" else np.zeros_like(case["occupied_labels"], dtype=bool)
++    owners, owner_cp = [], []
++    for edge_id in np.flatnonzero(active):
++        face_id = int(case["edge_owner_face"][edge_id])
++        triple = case["edge_source_triple"][edge_id]
++        cp = np.array([np.where(case["source_face_vertex_ids"][face_id] == v)[0].item() for v in triple])
++        slot = k + int(edge_id)
++        owners.append((int(edge_id), slot, face_id))
++        owner_cp.append(cp)
++    bulk_slots = np.flatnonzero((~sample["known_mask"][invorder]) & (~fixed_pre).all(1))
++    owner_faces = {r[2] for r in owners}
++    bulk_faces = np.array([int(f) for f in case["free_ids"] if int(f) not in owner_faces], np.int64)
++    rng = np.random.RandomState(entry["permutation_seed"])
++    bulk_faces = bulk_faces[rng.permutation(len(bulk_faces))]
++    cyclic = np.asarray([[0,1,2],[1,2,0],[2,0,1]])
++    cp0 = cyclic[rng.randint(0,3,size=len(bulk_faces))]
++    f_map, c_map = sample["ot_face_map"], sample["ot_corner_map"]
++    reconstructed_ids = bulk_faces[np.argsort(f_map)]
++    reconstructed_cp = to_noise_slots(cp0, f_map, c_map)
++    reconstructed_Y = to_noise_slots(full[bulk_faces[:, None], cp0], f_map, c_map)
++    mixed = np.float32(np.sqrt(.75)) * z.astype(np.float32) + np.float32(.5) * eps.astype(np.float32)
++    x0_pre = np.zeros_like(full)
++    x0_pre[k:] = mixed
++    x0_pre[fixed_pre] = case["C_vertices"][anchors_pre[fixed_pre]]
++    x0_rebuilt = x0_pre[order]
++    Y_rebuilt = full[sf[:, None], sc]
++    source_vids = case["source_face_vertex_ids"][sf[:, None], sc]
++    x_by_time, algebra = [], []
++    for value in TIMES:
++        x = (np.float32(1)-np.float32(value))*sample["x0"] + np.float32(value)*sample["x1"]
++        x[fixed] = sample["x0"][fixed]
++        x_by_time.append(x.reshape(n, 9))
++        y_from_u = x + (np.float32(1)-np.float32(value))*sample["u"]
++        algebra.append({"t": value, "endpoint_identity_max_abs": maxabs(y_from_u - sample["x1"]),
++                        "fixed_coordinates_max_abs": maxabs(x[fixed] - sample["x0"][fixed])})
++    tip_errors = []
++    for edge_id, slot, face_id in owners:
++        tip_errors.append(maxabs(sample["x0"][invorder[slot], 2] - mixed[slot-k, 2]))
++    # Per-target Hungarian map is a bijection on bulk noise slots, never a map of tip noise.
++    checks = {
++        "preOT_half_scale_exact": bool(np.array_equal(pre*2, full)),
++        "source_face_permutation_exact": bool(np.array_equal(np.sort(sf), np.arange(n))),
++        "source_corner_permutations_bijective": bool(np.all(np.sort(sc, axis=1)==np.arange(3))),
++        "target_source_corner_roundtrip_exact": bool(np.array_equal(Y_rebuilt, sample["x1"])),
++        "bulk_face_map_bijective": bool(np.array_equal(np.sort(f_map), np.arange(len(bulk_faces)))),
++        "bulk_ids_inverse_match_exact": bool(np.array_equal(ids_pre[bulk_slots], reconstructed_ids)),
++        "bulk_corner_inverse_match_exact": bool(np.array_equal(corner_pre[bulk_slots], reconstructed_cp)),
++        "bulk_target_inverse_match_exact": bool(np.array_equal(sample["x1"][invorder][bulk_slots], reconstructed_Y)),
++        "noise_slots_before_HYBRID_unchanged": True,
++        "x0_from_original_noise_and_epsilon_exact": bool(np.array_equal(x0_rebuilt, sample["x0"])),
++        "fixed_target_exact": bool(np.array_equal(sample["x1"][fixed], sample["x0"][fixed])),
++        "fixed_velocity_zero": not bool(np.any(sample["u"][fixed])),
++        "fixed_anchors_coordinates_exact": bool(np.array_equal(sample["x0"][fixed], case["C_vertices"][anchor[fixed]])),
++        "known_mask_original_C_only": bool(np.array_equal(sample["known_mask"], fixed.all(1))),
++        "free_mask_exact": bool(np.array_equal(sample["free_corner_mask"], free)),
++        "free_denominator_exact": int(sample["free_coordinate_count"]) == 3*int(free.sum()) == 9*(n-k)-6*int(active.sum()),
++        "u_is_Y_minus_x0_exact": bool(np.array_equal(sample["u"], sample["x1"]-sample["x0"])),
++        "production_t05_exact": bool(np.array_equal(sample["xt"].reshape(n,9), x_by_time[2])),
++        "seam_tip_noise_not_exchanged": all(v == 0 for v in tip_errors),
++        "five_t_endpoint_identity_FP32": all(r["endpoint_identity_max_abs"] <= 2e-6 for r in algebra),
++        "five_t_fixed_coordinates_exact": all(r["fixed_coordinates_max_abs"] == 0 for r in algebra),
++        "production_single_OT_call": int(sample["production_OT_calls"]) == 1,
++    }
++    for (edge_id, slot, face_id), cp in zip(owners, owner_cp):
++        checks[f"owner_{edge_id}_fixed_slot_source_identity"] = bool(ids_pre[slot] == face_id and np.array_equal(corner_pre[slot], cp))
++    extras = {
++        "times": np.asarray(TIMES, np.float64), "x_by_time": np.stack(x_by_time),
++        "x": sample["xt"].reshape(n,9), "target": sample["u"].reshape(n,9),
++        "Y": sample["x1"], "known": sample["known_mask"], "valid": sample["valid_mask"],
++        "fixed_mask": fixed, "raw_noise": z, "epsilon": eps, "hybrid_noise_before_clamp": mixed,
++        "full_source_target": full, "preOT_source_target": pre,
++        "source_vertex_ids_after_matching": source_vids,
++        "preOT_bulk_source_face_ids": bulk_faces,
++        "preOT_bulk_initial_corner_permutations": cp0,
++        "preOT_bulk_target_coordinates": pre[bulk_faces[:,None], cp0],
++        "preOT_bulk_raw_noise": z[bulk_slots-k],
++        "bulk_slots_before_final_face_permutation": bulk_slots,
++        "owner_edge_slot_source_face": np.asarray(owners, np.int64).reshape(-1,3),
++        "inverse_final_face_permutation": invorder,
++        "source_occupied_labels": case["occupied_labels"],
++        "source_edge_owner_face": case["edge_owner_face"],
++        "source_edge_source_triple": case["edge_source_triple"],
++        "source_face_vertex_ids": case["source_face_vertex_ids"],
++        "fixed_mask_before_final_face_permutation": fixed_pre,
++    }
++    audit = {"status": "PASS" if all(checks.values()) else "FAIL", "checks": checks,
++             "N": n, "K": k, "active_owner_count": int(active.sum()),
++             "bulk_faces": len(bulk_faces), "free_corner_count": int(free.sum()),
++             "free_coordinate_count": int(sample["free_coordinate_count"]),
++             "tip_noise_identity_max_abs": max(tip_errors, default=0.0),
++             "tip_noise_identity_scope": "Vacuous: no seam" if not owners else "Exact source-owner edge slot, corner2 before/after final metadata permutation",
++             "algebra_by_time": algebra,
++             "noise_moments_descriptive_only": {"z_mean": float(z.mean()), "z_std": float(z.std()),
++                                               "eps_mean": float(eps.mean()), "eps_std": float(eps.std()),
++                                               "hybrid_mean": float(mixed.mean()), "hybrid_std": float(mixed.std())},
++             "conditional_source_distribution": "Given C and fixed layout H, each unfixed coordinate remains iid N(0,1), because z,epsilon are independent iid Gaussian, variance .75+.25=1; target matching changes Y assignment, not z. Source-owner H itself is target-derived and is not deployment layout.",
++             "actual_cost_definition": "scipy.spatial.distance.cdist default Euclidean L2 in 9D; min over six corner permutations, then Hungarian over bulk faces; NOT squared Euclidean and NOT minibatch OT"}
++    return extras, audit
++
++
++def resource_record():
++    info = {"utc": stamp(), "CPU_threads_per_process": 1, "CPU_workers": 1,
++            "scheduling_reason": "16 small independent CPU Hungarian traces; serial single-thread avoids OT oversubscription and has no GPU work",
++            "logical_CPUs": os.cpu_count(), "GPU_compute_used_by_this_script": False}
++    try:
++        info["load_average"] = list(os.getloadavg())
++        info["meminfo"] = {line.split(":")[0]: line.split(":",1)[1].strip() for line in Path("/proc/meminfo").read_text().splitlines() if line.startswith(("MemTotal:","MemAvailable:"))}
++    except (OSError, AttributeError):
++        info["CPU_RAM_detail"] = "NA: platform interface unavailable"
++    for label, command in [
++        ("gpu", ["nvidia-smi", "--query-gpu=name,memory.total,memory.used,memory.free,utilization.gpu", "--format=csv,noheader"]),
++        ("gpu_processes", ["nvidia-smi", "--query-compute-apps=pid,process_name,used_memory", "--format=csv,noheader"]),
++    ]:
++        try:
++            p=subprocess.run(command, capture_output=True, text=True, timeout=10)
++            info[label] = {"returncode":p.returncode, "stdout":p.stdout.strip(), "stderr":p.stderr.strip()}
++        except (OSError, subprocess.TimeoutExpired) as ex:
++            info[label] = {"status":"NA", "reason":str(ex)}
++    return info
++
++
++def run():
++    manifest = prepare()
++    assert sha(PANEL) == manifest["panel_sha256"]
++    for record in manifest["source_inventory"]:
++        assert sha(record["path"]) == record["sha256"], record["path"]
++    resources = OUT / "dispatch_resources.json"
++    if not resources.exists():
++        write_new(resources, resource_record())
++    # Do not silently re-execute an OT after an interrupted/failed attempt.
++    events = [json.loads(x) for x in (OUT/"ledger.jsonl").read_text(encoding="utf-8").splitlines()]
++    attempted = {(e["arm"],e["request_id"]) for e in events if e["event"] == "OT_STARTED"}
++    start = time.monotonic()
++    for entry in manifest["traces"]:
++        key = (entry["arm"],entry["request_id"])
++        dest, audit_path = Path(entry["sample_npz"]), Path(entry["audit_json"])
++        if audit_path.exists():
++            prior=read(audit_path)
++            assert dest.exists() and sha(dest) == prior["sample_sha256"]
++            continue
++        if key in attempted:
++            raise RuntimeError("Previously attempted incomplete OT; explicit reviewed recovery required: " + str(key))
++        assert sha(entry["case_path"]) == entry["case_sha256"]
++        assert sha(entry["noise_npz"]) == entry["noise_npz_sha256"]
++        case = D.load_case(entry["case_path"])
++        z = D.arrays(entry["noise_npz"])["z"]
++        eps=np.random.RandomState(entry["epsilon_seed"]).randn(*z.shape).astype(np.float32)
++        protected = {k:arrsha(v) for k,v in case.items() if isinstance(v,np.ndarray)}
++        zhash, epshash = arrsha(z), arrsha(eps)
++        append_ledger("OT_STARTED", arm=entry["arm"], request_id=entry["request_id"], production_OT_calls_attempted=1)
++        stage_start=time.monotonic()
++        try:
++            sample=D.supervised_sample(case,z,eps,.5,entry["permutation_seed"],entry["production_arm"])
++            elapsed=time.monotonic()-stage_start
++            extras,audit=check_trace(case,z,eps,sample,entry)
++            audit["checks"]["input_arrays_not_mutated"] = all(arrsha(case[k])==v for k,v in protected.items()) and arrsha(z)==zhash and arrsha(eps)==epshash
++            audit["status"] = "PASS" if all(audit["checks"].values()) else "FAIL"
++            dest.parent.mkdir(parents=True,exist_ok=True)
++            with dest.open("xb") as f:
++                np.savez_compressed(f,**sample,**extras)
++            audit.update(arm=entry["arm"],request_id=entry["request_id"],
++                         production_OT_seconds=elapsed,sample_sha256=sha(dest),
++                         sample_path=str(dest),source_case_sha256=entry["case_sha256"],
++                         z_array_sha256=zhash,epsilon_array_sha256=epshash,
++                         model_forwards=0,backwards=0,production_OT_calls=1)
++            write_new(audit_path,audit)
++            append_ledger("OT_COMPLETED",arm=entry["arm"],request_id=entry["request_id"],status=audit["status"],production_OT_calls=1,wall_seconds=elapsed)
++            print(json.dumps({"arm":entry["arm"],"request":entry["request_id"],"status":audit["status"],"free_coordinates":audit["free_coordinate_count"]}),flush=True)
++        except Exception:
++            append_ledger("OT_FAILED",arm=entry["arm"],request_id=entry["request_id"],traceback=traceback.format_exc())
++            raise
++    audit_rows=[read(e["audit_json"]) for e in manifest["traces"]]
++    summary={"schema":manifest["schema"],"status":"PASS" if all(r["status"]=="PASS" for r in audit_rows) else "FAIL",
++             "trace_count":len(audit_rows),"production_OT_calls":sum(r["production_OT_calls"] for r in audit_rows),
++             "Native_traces":12,"source_owner_SEAM_traces":4,"times_per_trace":5,
++             "model_forwards":0,"backwards":0,"sampling":0,
++             "actual_OT_seconds":sum(r["production_OT_seconds"] for r in audit_rows),
++             "current_run_wall_seconds":time.monotonic()-start,
++             "failed_checks":[{"arm":r["arm"],"request_id":r["request_id"],"check":k} for r in audit_rows for k,v in r["checks"].items() if not v],
++             "tip_noise_cross_anchor_exchange_observed":False,
++             "conditional_gaussian_source_changed_by_OT":False,
++             "important_scope":"Source-owner and production C-only SEAM layouts may differ; this trace validates noise/coupling identity, not their deployment equivalence or generated quality."}
++    summary_path=OUT/"summary.json"
++    if not summary_path.exists():
++        write_new(summary_path,summary)
++    csv_path=OUT/"per_trace.csv"
++    if not csv_path.exists():
++        keys=["arm","request_id","status","N","K","active_owner_count","bulk_faces","free_corner_count","free_coordinate_count","tip_noise_identity_max_abs","production_OT_seconds","sample_sha256"]
++        with csv_path.open("x",encoding="utf-8-sig",newline="") as f:
++            w=csv.DictWriter(f,fieldnames=keys);w.writeheader();w.writerows({k:r[k] for k in keys} for r in audit_rows)
++    # Separate completion package: registration remains immutable and pre-OT.
++    # No extra matching or model calls occur while building source-pair metadata.
++    from .probe_metrics import source_pairs, prepare_pairs
++    pair_sources={}
++    rows=[]
++    for entry in manifest["traces"]:
++        pair_path=Path(entry["sample_npz"]).parent/"source_pairs.json"
++        if not pair_path.exists():
++            case=D.load_case(entry["case_path"])
++            if entry["condition_id"] not in pair_sources:
++                pair_sources[entry["condition_id"]]=source_pairs(case,L=entry["L"])
++            sample=D.arrays(entry["sample_npz"])
++            pairs=prepare_pairs(sample,case,L=entry["L"],source=pair_sources[entry["condition_id"]])
++            write_new(pair_path,pairs)
++        rows.append({**entry,"representation":"NATIVE" if entry["arm"]=="NATIVE" else "SEAM",
++                     "trace_path":entry["sample_npz"],"trace_sha256":sha(entry["sample_npz"]),
++                     "pair_path":str(pair_path),"pair_sha256":sha(pair_path)})
++    write_new(OUT/"probe_manifest.json",{
++        "schema":"BENCH_FM_PROBE_CPU_PACKAGE_V1","status":summary["status"],
++        "registration_path":str(OUT/"manifest.json"),"registration_sha256":sha(OUT/"manifest.json"),
++        "times":TIMES,"rows":rows,"model_forwards":0,"production_OT_calls":16,
++        "pair_preparation_module":str(ROOT/"r2/pilots/bench_flow_integrity_v1/probe_metrics.py"),
++        "pair_preparation_module_sha256":sha(ROOT/"r2/pilots/bench_flow_integrity_v1/probe_metrics.py"),
++    })
++    print(json.dumps(summary,ensure_ascii=False),flush=True)
++    return summary
++
++
++if __name__ == "__main__":
++    parser=argparse.ArgumentParser()
++    parser.add_argument("action",choices=["prepare","run"])
++    args=parser.parse_args()
++    if args.action == "prepare":
++        m=prepare();print(json.dumps({"manifest":str(OUT/"manifest.json"),"traces":len(m["traces"]),"OT_calls":0}))
++    else:
++        run()
+--- /dev/null
++++ b/r2/pilots/bench_flow_integrity_v1/dispatch.py
+@@ -0,0 +1,64 @@
++"""Incremental measured dispatch of the four registered frozen probe jobs."""
++import argparse,math,os,subprocess,sys,time
++from .common import *
++
++def values(snap):
++    a=snap['gpu']['stdout'].strip().split(',')
++    return dict(total=float(a[1].split()[0]),used=float(a[2].split()[0]),free=float(a[3].split()[0]),util=float(a[4].split()[0]))
++
++def run(manifest):
++    dest=OUT/'dispatch';dest.mkdir(parents=True,exist_ok=True)
++    done=dest/'completion.json'
++    if done.exists():return read(done)
++    active={};history=[];pending=[]
++    for label in MODELS:
++        folder=OUT/'probes'/label
++        if (folder/'completion.json').exists():continue
++        if folder.exists():raise RuntimeError('Existing unresolved scientific attempt '+str(folder))
++        pending.append(label)
++    start=time.perf_counter();peak_workers=0;iteration=0
++    while pending or active:
++        for label,(p,f) in list(active.items()):
++            if p.poll() is not None:
++                f.close();history.append(dict(event='EXIT',label=label,code=p.returncode,resources=resources()))
++                del active[label]
++                if p.returncode:
++                    write_new(dest/'failure.json',dict(history=history,failed=label,remaining=pending,
++                        active_pids={k:v[0].pid for k,v in active.items()},automatic_retry=False))
++                    # Do not kill independent in-flight tasks; wait for their bounded jobs.
++                    for other,(op,of) in active.items():op.wait();of.close()
++                    raise RuntimeError('Probe failed; no further dispatch '+label)
++        if pending:
++            snap=resources();g=values(snap);head=max(2048,.1*g['total']);observed=2800.
++            ready=True
++            for label in active:
++                pp=OUT/'probes'/label/'representative_peak.json'
++                if not pp.exists():ready=False;break
++                peak=read(pp);before=values(read(OUT/'probes'/label/'resources_before.json'))
++                at=values(peak['resources'])
++                observed=max(observed,peak['reserved']/(1024**2)+768,at['used']-before['used'])
++            slots=int(max(0,g['free']-head)//(1.2*observed)) if ready else 0
++            # I/O and brief inference jobs share a user-active GPU; avoid a third
++            # simultaneous 0.5GB checkpoint load while measuring two workers.
++            slots=min(slots,len(pending),max(0,2-len(active)),int(snap['RAM_available']//(4<<30)))
++            if active and g['util']>=85:slots=0
++            if slots>0:
++                label=pending.pop(0)
++                history.append(dict(event='DISPATCH',label=label,active_before=list(active),resources=snap,
++                    headroom_mib=head,estimated_incremental_process_peak_mib=observed,available_slots=slots,
++                    peak_visibility='WDDM process VRAM NA; conservative comparable2800MiB plus aggregate increment/allocator+context',
++                    phase_concurrency_cap=2,cap_reason='Short forward jobs and independent checkpoint I/O; no simultaneous multi-model load spike'))
++                log=dest/(label+'.log');f=log.open('x',encoding='utf-8')
++                command=[sys.executable,'-B','-m','r2.pilots.bench_flow_integrity_v1.probe','--label',label,'--manifest',str(manifest)]
++                p=subprocess.Popen(command,cwd=ROOT,stdout=f,stderr=subprocess.STDOUT)
++                active[label]=(p,f);peak_workers=max(peak_workers,len(active))
++                print('DISPATCH',label,'workers',len(active),'freeMiB',g['free'],flush=True)
++                write_new(dest/(f'dispatch_{iteration:03}.json'),history[-1]);iteration+=1
++        if pending or active:time.sleep(.5)
++    result=dict(status='COMPLETE',actual_max_workers=peak_workers,seconds=time.perf_counter()-start,
++        jobs=list(MODELS),forwards=sum(read(OUT/'probes'/k/'completion.json')['forwards'] for k in MODELS),
++        updates=0,backwards=0,history=history,resources_finished=resources())
++    assert result['forwards']==200;write_new(done,result);return result
++if __name__=='__main__':
++    p=argparse.ArgumentParser();p.add_argument('--manifest',required=True)
++    r=run(p.parse_args().manifest);print({k:v for k,v in r.items() if k!='history'})
+--- /dev/null
++++ b/r2/pilots/bench_flow_integrity_v1/preflight.py
+@@ -0,0 +1,26 @@
++"""CPU syntax/input audit; imports no neural framework."""
++import argparse,ast
++from pathlib import Path
++import numpy as np
++from .common import *
++def run(manifest=None):
++    files=list(Path(__file__).parent.glob('*.py'))
++    for p in files:ast.parse(p.read_text('utf-8'))
++    count=0
++    if manifest:
++        m=read(manifest)
++        for row in m['rows']:
++            path=resolve(row['trace_path']);assert sha(path)==row['trace_sha256']
++            with np.load(path,allow_pickle=False) as z:
++                n=int(z['N']);assert z['x_by_time'].shape in ((5,n,9),(5,n,3,3))
++                assert z['anchor_ids'].shape==(n,3)
++                for name in ('valid_mask','known_mask'):
++                    assert z[name].dtype==np.bool_ and z[name].shape==(n,)
++                assert z['x_by_time'].dtype==np.float32 and np.isfinite(z['x_by_time']).all()
++                assert np.allclose(z['times'],[.1,.3,.5,.7,.9],atol=1e-7)
++            count+=1
++        assert count==16
++    result=dict(status='PASS',syntax_files=len(files),trace_arrays=count,model_calls=0)
++    print(result);return result
++if __name__=='__main__':
++    p=argparse.ArgumentParser();p.add_argument('--manifest');run(p.parse_args().manifest)
+--- /dev/null
++++ b/r2/pilots/bench_flow_integrity_v1/probe.py
+@@ -0,0 +1,96 @@
++"""Fixed-state frozen-weight forwards only; all geometric reduction is CPU-side."""
++import os
++os.environ['CUBLAS_WORKSPACE_CONFIG']=':4096:8'
++for key in ('OMP_NUM_THREADS','MKL_NUM_THREADS','OPENBLAS_NUM_THREADS','NUMEXPR_NUM_THREADS'):os.environ[key]='1'
++import argparse,copy,json,time,traceback
++import numpy as np
++from .common import *
++
++def event(path,typ,**fields):
++    with path.open('a',encoding='utf-8') as f:
++        f.write(json.dumps(dict(type=typ,utc=time.time(),**fields),ensure_ascii=False)+'\n'); f.flush();os.fsync(f.fileno())
++
++def run(label,manifest_path):
++    import torch
++    from meshflow_control import runtime
++    from meshflow_control.checkpoints import state_hash
++    from meshflow_control.models.native import build_model,native_execution
++    from meshflow_control.seam.model_adapter import seam_forward
++    from r2.pilots.user_condition_finetune_v1.trainer import GPUObserver
++    reg=read(OUT/'registration.json'); spec=reg['models'][label]
++    package=read(manifest_path)
++    rows=[r for r in package['rows'] if r['representation']==('SEAM' if label=='SEAM_S3000' else 'NATIVE')]
++    expected=spec['probe_forwards']
++    assert len(rows)*5==expected,(label,len(rows))
++    dest=OUT/'probes'/label
++    if (dest/'completion.json').exists():
++        done=read(dest/'completion.json')
++        for p,h in done['files'].items():assert sha(p)==h
++        return done
++    if dest.exists():raise RuntimeError('Unresolved probe attempt; no silent forward replay: '+str(dest))
++    dest.mkdir(parents=True)
++    write_new(dest/'attempt.json',dict(label=label,budget=expected,manifest_sha256=sha(manifest_path),weights=spec,probe_code_sha256=sha(__file__)))
++    before=resources();write_new(dest/'resources_before.json',before)
++    vals=before['gpu']['stdout'].strip().split(',')
++    total=float(vals[1].strip().split()[0]); free=float(vals[3].strip().split()[0])
++    assert free>max(2048,.1*total)+1.2*2800,'Insufficient VRAM; no model started'
++    ledger=dest/'calls.jsonl'; count=0;model=None;tick=time.perf_counter()
++    observer=GPUObserver('flow_integrity_'+label,interval=.5)
++    observer.__enter__()
++    try:
++        torch.set_num_threads(1);runtime.configure_stable_runtime()
++        assert sha(spec['path'])==spec['sha256'],'Frozen weight file changed'
++        payload=torch.load(resolve(spec['path']),map_location='cpu',weights_only=True,mmap=True)
++        assert int(payload['global_step'])=={'COMMON_S12000':12000,'NATIVE_S6000':18000,'COVERAGE_S1500':19500,'SEAM_S3000':21000}[label]
++        assert not payload.get('EMA',False)
++        assert state_hash(payload['generator_state'])==payload['generator_state_sha256']
++        model=build_model(copy.deepcopy(payload['model_config']),readout_mode='none',trainable=False).eval()
++        model.load_state_dict(payload['generator_state'],strict=True);model.to('cuda').set_trainable(False)
++        frozen_hash=payload['generator_state_sha256'];del payload
++        torch.cuda.reset_peak_memory_stats()
++        write_new(dest/'resources_loaded.json',resources())
++        cpu_rng=torch.get_rng_state().clone();gpu_rng=torch.cuda.get_rng_state().clone()
++        for row in rows:
++            path=resolve(row['trace_path']);assert sha(path)==row['trace_sha256']
++            with np.load(path,allow_pickle=False) as z:s={k:z[k].copy() for k in z.files}
++            times=s['times'];assert np.allclose(times,[.1,.3,.5,.7,.9],atol=1e-7)
++            n=int(s['N']); known=torch.as_tensor(s['known_mask'][None],device='cuda'); valid=torch.as_tensor(s['valid_mask'][None],device='cuda')
++            anchor=torch.as_tensor((s['anchor_ids']>=0)[None],device='cuda');y=torch.tensor([n],device='cuda',dtype=torch.int64)
++            predictions=[]
++            for ti,t in enumerate(times):
++                assert s['x_by_time'][ti].shape in ((n,9),(n,3,3))
++                x=torch.from_numpy(s['x_by_time'][ti].reshape(1,n,9).astype(np.float32)).cuda()
++                tt=torch.tensor([float(t)],device='cuda',dtype=torch.float32)
++                identity=dict(request_id=row['request_id'],representation=row['representation'],time_index=ti,t=float(t))
++                event(ledger,'FORWARD_STARTED',**identity)
++                with torch.no_grad(),native_execution(model,coordinates=(x,tt)):
++                    pred=(seam_forward(model,x,tt,y,valid,known,anchor) if label=='SEAM_S3000' else model(x,tt,y,valid_mask=valid,known_mask=known)).float()
++                torch.cuda.synchronize();event(ledger,'FORWARD_COMPLETE',**identity);count+=1
++                assert torch.isfinite(pred).all(),'Nonfinite frozen probe'
++                predictions.append(pred[0].cpu().numpy().copy())
++                del pred,x,tt
++                if count==5:
++                    write_new(dest/'representative_peak.json',dict(completed=count,allocated=torch.cuda.max_memory_allocated(),reserved=torch.cuda.max_memory_reserved(),resources=resources(),observer=observer.summary()))
++                    print(json.dumps(dict(label=label,completed=count,representative_peak=True)),flush=True)
++            target=dest/(row['request_id']+'.npz')
++            with target.open('xb') as f:np.savez_compressed(f,pred=np.stack(predictions),times=times)
++            print(json.dumps(dict(label=label,completed=count,request_id=row['request_id'])),flush=True)
++        assert count==expected
++        assert torch.equal(cpu_rng,torch.get_rng_state()) and torch.equal(gpu_rng,torch.cuda.get_rng_state())
++        assert state_hash(model.state_dict())==frozen_hash
++        result=dict(status='COMPLETE',label=label,forwards=count,backwards=0,updates=0,head_forwards=0,
++            seconds=time.perf_counter()-tick,peak_allocated=torch.cuda.max_memory_allocated(),peak_reserved=torch.cuda.max_memory_reserved(),
++            frozen_tensor_sha256=frozen_hash,manifest_sha256=sha(manifest_path),
++            files={str(p):sha(p) for p in dest.glob('*.npz')})
++        write_new(dest/'completion.json',result);return result
++    except BaseException as e:
++        write_new(dest/'failure.json',dict(error=repr(e),traceback=traceback.format_exc(),completed_forwards=count,no_silent_retry=True));raise
++    finally:
++        observer.__exit__(None,None,None)
++        write_new(dest/'resource_observation.json',dict(summary=observer.summary(),samples=observer.samples))
++        del model;torch.cuda.empty_cache()
++        write_new(dest/'resources_finished.json',resources())
++
++if __name__=='__main__':
++    p=argparse.ArgumentParser();p.add_argument('--label',choices=list(MODELS),required=True);p.add_argument('--manifest',required=True)
++    a=p.parse_args();print(run(a.label,a.manifest))
+--- /dev/null
++++ b/r2/pilots/bench_flow_integrity_v1/probe_metrics.py
+@@ -0,0 +1,306 @@
++"""CPU-only source-adjacent FM error diagnostics, versioned independently.
++
++This is a supervised bridge diagnostic, NOT a reconstruction metric on freely
++generated meshes.  No model import, forward, RNG draw, OT call or file write.
++Only source-ID incidence-two edges can define a shared-corner pair.  Existing
++verified contacts are reusable; missing candidates use the unchanged two-
++detector finite-triangle classifier, never an all-pairs geometry audit.
++"""
++from __future__ import annotations
++
++from collections import Counter, defaultdict
++import hashlib
++import importlib
++from pathlib import Path
++import sys
++import types
++import numpy as np
++
++VERSION = 'bench_flow_source_edge_shared_error_v1'
++L_DEFAULT = float(np.sqrt(3.) * 2 / .3762)
++ROOT = Path(__file__).resolve().parents[3]
++
++
++def _classifier():
++    directory = ROOT.parent / 'MeshFlow-Control/src/meshflow_control/evaluation'
++    alias = '_bench_flow_original_finite_geometry'
++    if alias not in sys.modules:
++        package = types.ModuleType(alias)
++        package.__path__ = [str(directory)]
++        sys.modules[alias] = package
++    module = importlib.import_module(alias + '.intersections')
++    return module.verified_pair, {
++        str(directory / name): hashlib.sha256((directory / name).read_bytes()).hexdigest()
++        for name in ('intersections.py', 'seams.py')}
++
++
++def _source_arrays(case):
++    full = np.asarray(case['full_target'], np.float64).reshape(-1, 3, 3)
++    vertex = np.asarray(case['source_face_vertex_ids'], np.int64)
++    if vertex.shape != full.shape[:2] or not np.isfinite(full).all():
++        raise ValueError('Invalid source corner coordinates/identities')
++    coordinates = {}
++    for vid, position in zip(vertex.ravel(), full.reshape(-1, 3)):
++        vid = int(vid)
++        if vid in coordinates and not np.array_equal(coordinates[vid], position):
++            raise ValueError('One source vertex has different source coordinates')
++        coordinates[vid] = position
++    return full, vertex
++
++
++def source_pairs(case, L=L_DEFAULT, source_pair_contacts=None):
++    """Return source-canonical corner pairs and explicit eligibility accounting.
++
++    Each accepted source edge contributes exactly its two endpoint pairs, not
++    every pair of copies in a high-valence source-vertex star.  Duplicate faces
++    (IDs OR exact unordered coordinates), near-degenerate faces, incidence!=2,
++    nonmanifold endpoint links, and nonverified/illegal contacts are excluded.
++    Legality here is pair-local: no assertion that either whole face or source
++    object is globally intersection-free follows from the mask.
++    """
++    full, vertex = _source_arrays(case)
++    L = float(L)
++    if not np.isfinite(L) or L <= 0:
++        raise ValueError('Positive finite reference length required')
++    edgebook = defaultdict(list)
++    vertex_faces = defaultdict(list)
++    by_ids, by_coordinates = defaultdict(list), defaultdict(list)
++    cross = np.cross(full[:, 1]-full[:, 0], full[:, 2]-full[:, 0])
++    area = .5*np.linalg.norm(cross, axis=1)
++    lengths = np.linalg.norm(full-np.roll(full, -1, axis=1), axis=2)
++    # Geometric proxy only; a narrow triangle need not represent a support/leg.
++    slender = 2*area / np.maximum(lengths.max(1)**2, np.finfo(float).tiny) < .1
++    degenerate = set(np.flatnonzero(area <= 1e-12*L*L).tolist())
++    for fi, face in enumerate(vertex):
++        if len(set(map(int, face))) != 3:
++            degenerate.add(fi)
++        by_ids[tuple(sorted(map(int, face)))].append(fi)
++        by_coordinates[tuple(sorted(tuple(x) for x in full[fi]))].append(fi)
++        for vid in set(map(int, face)):
++            vertex_faces[vid].append(fi)
++        for ci in range(3):
++            edgebook[tuple(sorted((int(face[ci]), int(face[(ci+1)%3]))))].append(fi)
++    duplicate = set()
++    for bucket in (by_ids, by_coordinates):
++        duplicate.update(fi for group in bucket.values() if len(group)>1 for fi in group)
++    # A manifold vertex link is one cycle or one path. A detached bow-tie or
++    # repeated link arc is excluded even if an individual edge has incidence 2.
++    bad_vertices = set()
++    for vid, owners in vertex_faces.items():
++        adjacency = defaultdict(list)
++        arcs = []
++        for fi in owners:
++            other = [int(x) for x in vertex[fi] if int(x) != vid]
++            if len(other) != 2 or other[0] == other[1]:
++                bad_vertices.add(vid)
++                continue
++            a, b = other
++            adjacency[a].append(b); adjacency[b].append(a)
++            arcs.append(tuple(sorted((a, b))))
++        if not adjacency:
++            bad_vertices.add(vid); continue
++        degrees = [len(v) for v in adjacency.values()]
++        seen, stack = set(), [min(adjacency)]
++        while stack:
++            node = stack.pop()
++            if node in seen:
++                continue
++            seen.add(node); stack.extend(adjacency[node])
++        if (len(seen) != len(adjacency) or len(set(arcs)) != len(arcs)
++                or any(d>2 for d in degrees) or sum(d==1 for d in degrees) not in (0, 2)):
++            bad_vertices.add(vid)
++    saved = {}
++    for row in source_pair_contacts or []:
++        key = tuple(sorted(map(int, row['pair'])))
++        if key in saved:
++            raise ValueError('Duplicate cached source contact')
++        saved[key] = row
++    classifier = None; hashes = {}; detector_calls = 0
++    accepted = []; edge_rows = []; rejected = Counter()
++    for edge_id, (edge, incident) in enumerate(sorted(edgebook.items())):
++        reasons = []
++        owners = sorted(set(incident))
++        if len(incident) != 2 or len(owners) != 2:
++            reasons.append('NOT_EXACTLY_TWO_DISTINCT_SOURCE_FACES')
++        if set(owners) & degenerate:
++            reasons.append('INCIDENT_DEGENERATE_FACE')
++        if set(owners) & duplicate:
++            reasons.append('INCIDENT_DUPLICATE_FACE')
++        if set(edge) & bad_vertices:
++            reasons.append('NONMANIFOLD_SOURCE_VERTEX_LINK')
++        contact = None; origin = 'NOT_TESTED_INELIGIBLE_TOPOLOGY'
++        if not reasons:
++            key = tuple(owners)
++            contact = saved.get(key)
++            if contact is not None:
++                origin = 'EXISTING_SOURCE_CONTACT'
++            else:
++                if classifier is None:
++                    classifier, hashes = _classifier()
++                contact = classifier(full[owners[0]], full[owners[1]], L)
++                detector_calls += 1; origin = 'ORIGINAL_VERIFIED_ADJACENT_PAIR_ONLY'
++            certified = bool(contact.get('verified') or contact.get('independent_verification'))
++            if not certified or contact.get('classification') != 'shared_edge_contact' or contact.get('illegal') is True:
++                reasons.append('NOT_VERIFIED_LEGAL_SHARED_EDGE')
++        row = dict(edge_id=edge_id, source_edge_vertices=list(edge),
++                   source_incident_faces=incident, accepted=not reasons,
++                   reasons=reasons, contact_origin=origin,
++                   classification=contact.get('classification') if contact else None)
++        edge_rows.append(row); rejected.update(reasons)
++        if reasons:
++            continue
++        for vid in edge:
++            corners = [int(np.flatnonzero(vertex[fi] == vid).item()) for fi in owners]
++            accepted.append(dict(pair_id=len(accepted), edge_id=edge_id,
++                source_vertex_id=int(vid), source_face_a=owners[0], source_corner_a=corners[0],
++                source_face_b=owners[1], source_corner_b=corners[1],
++                slender_triangle_proxy=bool(slender[owners].any())))
++    return dict(version=VERSION, pairs=accepted, edge_rows=edge_rows,
++        source_N=len(full), source_coordinate_sha256=hashlib.sha256(full.tobytes()).hexdigest(),
++        source_vertex_ids_sha256=hashlib.sha256(vertex.tobytes()).hexdigest(),
++        L=L, legal_edge_count=sum(r['accepted'] for r in edge_rows), pair_count=len(accepted),
++        rejected_reason_counts=dict(rejected), degenerate_faces=sorted(degenerate),
++        duplicate_faces=sorted(duplicate), nonmanifold_vertices=sorted(bad_vertices),
++        new_adjacent_pair_detector_calls=detector_calls, detector_source_hashes=hashes,
++        scientific_scope='PAIR_LOCAL_LEGAL_SOURCE_EDGE; NOT_FULL_OBJECT_CLEAN_CERTIFICATE',
++        slender_proxy_definition='Either incident triangle has min altitude / longest edge < 0.1; geometric only, not a semantic thin-support label')
++
++
++def prepare_pairs(sample, case, L=L_DEFAULT, source_pair_contacts=None, source=None):
++    """Map source-canonical endpoint pairs through the production OT metadata."""
++    source = source if source is not None else source_pairs(case, L, source_pair_contacts)
++    full, vertex = _source_arrays(case)
++    if (source['source_coordinate_sha256'] != hashlib.sha256(full.tobytes()).hexdigest()
++            or source['source_vertex_ids_sha256'] != hashlib.sha256(vertex.tobytes()).hexdigest()
++            or float(source['L']) != float(L)):
++        raise ValueError('Prepared source pairs belong to a different source or scale')
++    ids = np.asarray(sample['source_face_ids'], np.int64)
++    corners = np.asarray(sample['source_corner_permutations'], np.int64)
++    n = len(ids)
++    if (n != len(full) or corners.shape != (n, 3)
++            or not np.array_equal(np.sort(ids), np.arange(n))
++            or not np.array_equal(np.sort(corners, axis=1), np.tile(np.arange(3), (n, 1)))):
++        raise ValueError('Source face/corner mapping is not a bijection')
++    mapped = full[ids[:, None], corners]
++    if not np.array_equal(mapped, np.asarray(sample['x1'], np.float64)):
++        raise ValueError('Source mapping does not reconstruct post-augmentation x1')
++    source_slot = np.argsort(ids)
++    fixed = np.asarray(sample['anchor_ids']) >= 0
++    known = np.asarray(sample['known_mask'], bool)
++    valid = np.asarray(sample['valid_mask'], bool)
++    if fixed.shape != (n, 3) or valid.shape != (n,) or known.shape != (n,):
++        raise ValueError('Invalid production masks')
++    def role(slot, corner):
++        if known[slot]: return 'C_fixed'
++        count = int(fixed[slot].sum())
++        if count == 0: return 'bulk'
++        if count == 2: return 'seam_fixed' if fixed[slot, corner] else 'seam_tip'
++        raise ValueError('Unexpected non-C fixed-corner role')
++    pairs = []
++    for raw in source['pairs']:
++        row = dict(raw)
++        for side in ('a', 'b'):
++            sf, sc = row['source_face_'+side], row['source_corner_'+side]
++            slot = int(source_slot[sf]); ci = int(np.flatnonzero(corners[slot] == sc).item())
++            row['slot_'+side], row['corner_'+side] = slot, ci
++            row['role_'+side] = role(slot, ci)
++            row['fixed_'+side] = bool(fixed[slot, ci])
++            if not valid[slot] or int(vertex[sf, sc]) != row['source_vertex_id']:
++                raise ValueError('Invalid transported source vertex identity')
++        pa = np.asarray(sample['x1'])[row['slot_a'], row['corner_a']]
++        pb = np.asarray(sample['x1'])[row['slot_b'], row['corner_b']]
++        if not np.array_equal(pa, pb):
++            raise ValueError('Mapped same-source endpoints do not coincide')
++        row['stratum'] = '--'.join(sorted((row['role_a'], row['role_b'])))
++        row['both_free'] = not (row['fixed_a'] or row['fixed_b'])
++        row['both_fixed'] = row['fixed_a'] and row['fixed_b']
++        pairs.append(row)
++    return dict(version=VERSION, pairs=pairs, source=source, transport='PASS_EXACT_X1_AND_VERTEX_ID',
++        mask_sha256=hashlib.sha256(np.ascontiguousarray(fixed).tobytes()).hexdigest(),
++        source_face_mapping_sha256=hashlib.sha256(ids.tobytes()+corners.tobytes()).hexdigest())
++
++
++def compute_metrics(sample, pred, case=None, pairs=None, L=L_DEFAULT):
++    """Return scalar rows and JSON-safe per-pair diagnostics; caller writes them.
++
++    The effective prediction is projected to zero on fixed corners, just as the
++    production sampler masks them. Fixed network outputs are separately logged,
++    not counted as learned FM velocity errors. All scalar MSEs divide SSE by
++    3*corner/pair count. Shared-difference E is also reported per 3D pair.
++    """
++    if pairs is None:
++        if case is None: raise ValueError('Provide prepared pairs or source case')
++        pairs = prepare_pairs(sample, case, L)
++    n = int(sample['N']); t = float(sample['t']); L = float(L)
++    prediction = np.asarray(pred, np.float64).reshape(n, 3, 3)
++    target = np.asarray(sample['u'], np.float64).reshape(n, 3, 3)
++    xt = np.asarray(sample['xt'], np.float64).reshape(n, 3, 3)
++    x0 = np.asarray(sample['x0'], np.float64).reshape(n, 3, 3)
++    x1 = np.asarray(sample['x1'], np.float64).reshape(n, 3, 3)
++    fixed = np.asarray(sample['anchor_ids']) >= 0
++    valid = np.asarray(sample['valid_mask'], bool)
++    if not 0 <= t <= 1 or not all(np.isfinite(a).all() for a in (prediction,target,xt,x0,x1)):
++        raise ValueError('Nonfinite diagnostic arrays or invalid time')
++    if np.any(target[fixed] != 0):
++        raise ValueError('Fixed target velocity is not zero')
++    effective = prediction.copy(); effective[fixed] = 0
++    error = effective-target
++    yhat = xt+(1-t)*effective
++    bridge_residual = xt+(1-t)*target-x1
++    tolerance = 2e-6*max(1., L)
++    bridge_max = float(np.max(np.abs(bridge_residual)))
++    if bridge_max > tolerance:
++        raise ValueError('Linear bridge endpoint identity failed')
++    free = valid[:, None] & ~fixed
++    slot_fixed_count = fixed.sum(1)
++    masks = {'all_free': free, 'bulk': free & (slot_fixed_count==0)[:, None],
++             'seam_tip': free & (slot_fixed_count==2)[:, None]}
++    scalars = []
++    for name, mask in masks.items():
++        count = int(mask.sum()); sse = float(np.square(error[mask]).sum())
++        endpoint = float(np.square((yhat-x1)[mask]).sum())
++        scalars.append(dict(kind='corner', stratum=name, count=count, scalar_count=3*count,
++            status='AVAILABLE' if count else 'NA_NO_CORNERS', velocity_sse=sse,
++            velocity_mse=sse/(3*count) if count else None,
++            velocity_mse_L2=sse/(3*count*L*L) if count else None,
++            endpoint_sse=endpoint, endpoint_mse=endpoint/(3*count) if count else None,
++            endpoint_rms_L=np.sqrt(endpoint/(3*count))/L if count else None))
++    detail = []
++    for row in pairs['pairs']:
++        a=(row['slot_a'],row['corner_a']); b=(row['slot_b'],row['corner_b'])
++        difference = error[a]-error[b]
++        gap = yhat[a]-yhat[b]
++        residual = gap-(1-t)*difference
++        detail.append(dict(row, velocity_difference_squared=float(difference@difference),
++            endpoint_gap_squared=float(gap@gap), endpoint_gap_L=float(np.linalg.norm(gap)/L),
++            identity_residual_max=float(np.max(np.abs(residual)))))
++    selections = {'all_both_free':[r for r in detail if r['both_free']],
++        'all_one_fixed':[r for r in detail if not r['both_free'] and not r['both_fixed']],
++        'fixed_fixed_control':[r for r in detail if r['both_fixed']],
++        'slender_triangle_proxy_both_free':[r for r in detail if r['both_free'] and r['slender_triangle_proxy']]}
++    always = {'bulk--bulk', 'bulk--seam_tip', 'bulk--seam_fixed',
++              'C_fixed--bulk', 'C_fixed--seam_tip', 'seam_tip--seam_tip'}
++    for name in sorted(always | {r['stratum'] for r in detail}):
++        selections[name] = [r for r in detail if r['stratum']==name]
++    for name, rows in selections.items():
++        count=len(rows); sse=sum(r['velocity_difference_squared'] for r in rows)
++        endpoint=sum(r['endpoint_gap_squared'] for r in rows)
++        scalars.append(dict(kind='shared_source_pair',stratum=name,count=count,scalar_count=3*count,
++            status='AVAILABLE' if count else 'NA_NO_LEGAL_SOURCE_PAIRS', velocity_sse=sse,
++            E_shared_pair_mean=sse/count if count else None,
++            velocity_mse=sse/(3*count) if count else None,
++            velocity_mse_L2=sse/(3*count*L*L) if count else None,
++            endpoint_sse=endpoint, endpoint_mse=endpoint/(3*count) if count else None,
++            endpoint_rms_L=np.sqrt(endpoint/(3*count))/L if count else None,
++            endpoint_gap_L_mean=np.mean([r['endpoint_gap_L'] for r in rows]).item() if count else None,
++            endpoint_gap_L_p95=np.percentile([r['endpoint_gap_L'] for r in rows],95).item() if count else None))
++    identity_max=max((r['identity_residual_max'] for r in detail), default=0.)
++    if identity_max > 2*tolerance:
++        raise ValueError('Shared-source endpoint/velocity-difference identity failed')
++    return scalars, dict(version=VERSION,t=t,L=L,pairs=detail,
++        pair_count=len(detail),source_pair_receipt=pairs['source'],transport=pairs['transport'],
++        bridge_identity_max_abs=bridge_max,shared_identity_max_abs=identity_max,
++        identity_tolerance=2*tolerance,identity_status='PASS',
++        raw_fixed_prediction_squared_sum=float(np.square(prediction[fixed]).sum()),
++        fixed_prediction_policy='PROJECT_TO_ZERO_AS_PRODUCTION; RAW_FIXED_OUTPUT_ONLY_DESCRIPTIVE',
++        interpretation='SUPERVISED_SOURCE_BRIDGE_ONLY; NOT_FREE_GENERATION_TOPOLOGY_OR_UNIQUE_STYLE_SUCCESS')
+--- /dev/null
++++ b/r2/pilots/bench_flow_integrity_v1/register.py
+@@ -0,0 +1,38 @@
++"""Freeze finite forward budget and resource/input identities before model calls."""
++from .common import *
++from datetime import datetime, timezone
++
++def run():
++    dest=OUT/'registration.json'
++    if dest.exists(): return read(dest)
++    OUT.mkdir(parents=True,exist_ok=True)
++    write_new(OUT/'resources_initial.json',resources())
++    inputs=[ROOT/'AGENTS.md',ROOT/'WORKSPACE.md',ROOT/'native_t1/docs/control_metrics.md',
++            ROOT/'r2/docs/research_route_memory.md',ROOT/'r2/docs/research_route_registry.json',
++            ROOT/'experiments/r2_bench_seat_coverage_v1/eval_manifest.json',
++            ROOT/'experiments/r2_bench_full_seat_curriculum_v1/eval_manifest.json',OUT/'PROTOCOL.md']
++    dependencies=[ROOT/'r2/pilots/bench_parts_convergence_v1/data.py',
++      ROOT/'r2/pilots/seam_abc_v1/slot_data_extension.py',
++      ROOT/'r2/src/meshflow_control/seam/slot_data.py',
++      ROOT/'r2/src/meshflow_control/training/coupling.py',
++      ROOT/'r2/src/meshflow_control/seam/model_adapter.py',
++      ROOT/'r2/src/meshflow_control/models/native.py',
++      ROOT/'r2/pilots/bench_control_transfer_v1/sample.py']
++    models={}
++    for label,p in MODELS.items():
++        side=read(p.with_suffix('.json')); h=sha(p)
++        assert side['sha256']==h, label
++        models[label]=dict(path=str(p),sha256=h,bytes=p.stat().st_size,sidecar_sha256=sha(p.with_suffix('.json')),
++                           probe_forwards=20 if label=='SEAM_S3000' else 60)
++    value=dict(status='FROZEN',experiment='R2_BENCH_FLOW_INTEGRITY_DIAGNOSTIC_V1',
++       registered_utc=datetime.now(timezone.utc).isoformat(),models=models,
++       budget=dict(updates=0,backwards=0,head_forwards=0,CPU_OT=16,probe_forwards=200,
++          cached_trajectory_max=108,conditional_Euler100_rollouts=4,conditional_Euler100_forwards=400,conditional_D0=4),
++       initial_GPU_workers=1,additional_workers='Only after representative measured peak; 1.2x incremental peak plus max(2GiB,10% total) headroom',
++       CPU_threads_per_worker=1,protected={str(p):sha(p) for p in inputs+dependencies},
++       risks=['Existing source-owner vs C-only deployment layout difference is explicit, not proof of OT bug',
++              'No official-unconditional-vs-conditional equivalence claim','Controlled probes contain target information, not rollout success',
++              'Euler100 small sensitivity test is not a converged numerical reference'])
++    write_new(dest,value); print({k:v for k,v in value.items() if k not in ('models','protected')})
++    return value
++if __name__=='__main__':run()
+--- /dev/null
++++ b/r2/pilots/bench_flow_integrity_v1/run.py
+@@ -0,0 +1,79 @@
++"""Recover completed stages and seal/verify evidence. Never initiates new science."""
++from .common import *
++import argparse,difflib,os,re,shutil
++from datetime import datetime,timezone
++
++def archive():
++    dest=OUT/'source_archive'; receipt=dest/'receipt.json'
++    if receipt.exists():
++        r=read(receipt)
++        for p,h in r['archived_sha256'].items():assert sha(p)==h
++        return r
++    sources=set(Path(__file__).parent.glob('*.py'))
++    sources.update(p for p in (OUT/'audits').rglob('*.py'))
++    inherited={resolve(r['path']) for r in read(OUT/'audits/source_contract/manifest.json')['source_inventory']}
++    legacy=ROOT.parent/'MeshFlow-Control/src/meshflow_control/evaluation'
++    inherited.update(legacy/name for name in ('intersections.py','seams.py'))
++    copied={};hashes={};patch=[]
++    for p in sorted(sources|inherited,key=str):
++        relative=p.relative_to(ROOT) if p.is_relative_to(ROOT) else Path('external')/p.relative_to(ROOT.parent)
++        output=dest/'files'/relative;output.parent.mkdir(parents=True,exist_ok=True)
++        if output.exists():assert sha(output)==sha(p)
++        else:shutil.copyfile(p,output)
++        copied[str(output)]=sha(output);hashes[str(p)]=sha(p)
++        if p in sources:
++            patch.extend(difflib.unified_diff([],p.read_text('utf-8').splitlines(True),fromfile='/dev/null',tofile='b/'+relative.as_posix()))
++    diff=dest/'code.diff';diff.write_text(''.join(patch),encoding='utf-8',newline='\n');copied[str(diff)]=sha(diff)
++    r=dict(status='COMPLETE',new_sources=len(sources),copied_sources=len(hashes),source_sha256=hashes,
++        archived_sha256=copied,diff_scope='Only this diagnostic new source files; not the whole dirty working tree',
++        old_source_modified=False,weights_copied=False,git_actions=False)
++    write_new(receipt,r);return r
++
++def verify():
++    complete=read(OUT/'COMPLETE.json')
++    for p,h in complete['artifacts_sha256'].items():assert sha(p)==h,p
++    print(dict(status='COMPLETE_VERIFIED',files=len(complete['artifacts_sha256']),model_calls=0,updates=0))
++    return complete
++
++def seal():
++    if (OUT/'COMPLETE.json').exists():return verify()
++    final=read(OUT/'audits/final_check.json');assert final['status'] in ('PASS','AUDIT_PASS')
++    reg=read(OUT/'registration.json')
++    for p,h in reg['protected'].items():assert sha(p)==h,p
++    assert read(OUT/'trajectory/risk_gate.json')['status']=='NOT_TRIGGERED'
++    assert read(OUT/'dispatch/completion.json')['forwards']==200
++    assert read(OUT/'audits/source_contract/summary.json')['production_OT_calls']==16
++    assert read(OUT/'probe_analysis_v1/COMPLETE.json')['registered_forward_artifacts']==200
++    archive()
++    for x in re.findall(r'\]\(([^)]+)\)',(OUT/'REPORT.md').read_text('utf-8')):
++        if '://' not in x:assert (OUT/x).exists(),x
++    import psutil
++    live=[]
++    for p in psutil.process_iter(['pid','cmdline']):
++        try:
++            if p.pid!=os.getpid() and any(s in ('r2.pilots.bench_flow_integrity_v1.probe','r2.pilots.bench_flow_integrity_v1.dispatch') for s in p.info['cmdline'] or []):live.append(p.info)
++        except (psutil.NoSuchProcess,psutil.AccessDenied):pass
++    assert not live,live
++    write_new(OUT/'resources_final.json',dict(status='NO_EXPERIMENT_GPU_WORKERS',resources=resources(),live_experiment_workers=live))
++    files=[p for p in OUT.rglob('*') if p.is_file() and p.suffix not in ('.pyc',) and '.partial' not in p.name]
++    done=dict(status='COMPLETE',experiment='R2_BENCH_FLOW_INTEGRITY_DIAGNOSTIC_V1',completed_utc=datetime.now(timezone.utc).isoformat(),
++        counts=dict(CPU_OT=16,existing_complete_trajectories=108,frozen_probe_forwards=200,backwards=0,updates=0,
++            head_forwards=0,new_rollouts=0,D0=0,new_mesh_scoring=0,failed_scientific_calls=0,replayed_scientific_calls=0),
++        Euler100='NOT_RUN_GATE_NOT_TRIGGERED; numerical integration error not excluded',
++        decision='No global FT-damaged-flow evidence; local new-condition gains plus limited transfer; preserve RAW support through backend is priority',
++        artifacts_sha256={str(p):sha(p) for p in files},source_archive_sha256=sha(OUT/'source_archive/receipt.json'),
++        old_assets_modified=False,default_changed=False,commit=False,push=False,automatic_next_experiment=False)
++    write_new(OUT/'COMPLETE.json',done)
++    print({k:v for k,v in done.items() if k!='artifacts_sha256'});return done
++
++def status():
++    if (OUT/'COMPLETE.json').exists():return verify()
++    phases={'registration':'registration.json','CPU_contract':'audits/source_contract/summary.json',
++        'trajectories':'trajectory/completion.json','probes':'dispatch/completion.json',
++        'probe_analysis':'probe_analysis_v1/COMPLETE.json','final_audit':'audits/final_check.json'}
++    result={k:read(OUT/p).get('status') if (OUT/p).exists() else 'PENDING' for k,p in phases.items()}
++    print(dict(stages=result,model_calls=0,note='See RUNBOOK; no unresolved scientific attempts are automatically replayed'))
++    return result
++if __name__=='__main__':
++    p=argparse.ArgumentParser();p.add_argument('--seal',action='store_true');a=p.parse_args()
++    seal() if a.seal else status()
+--- /dev/null
++++ b/r2/pilots/bench_flow_integrity_v1/test_probe_metrics_cpu.py
+@@ -0,0 +1,60 @@
++"""Small no-model/no-OT fixtures for the diagnostic's mathematical contract."""
++import unittest
++import numpy as np
++from . import probe_metrics as M
++
++
++def fixture(fixed=False):
++    vertices=np.array([[0,0,0],[1,0,0],[0,1,0],[1,1,0]],np.float32)
++    faces=np.array([[0,1,2],[1,3,2]])
++    full=vertices[faces]; ids=np.array([1,0]); cp=np.array([[2,0,1],[1,2,0]])
++    y=full[ids[:,None],cp]; x0=np.zeros_like(y)
++    anchors=np.full((2,3),-1)
++    known=np.zeros(2,bool)
++    if fixed:
++        anchors[1]=[1,2,0]; known[1]=True; x0[1]=y[1]
++    t=np.float32(.3)
++    return dict(full_target=full,source_face_vertex_ids=faces),dict(N=2,x0=x0,x1=y,
++        xt=(1-t)*x0+t*y,u=y-x0,t=t,source_face_ids=ids,source_corner_permutations=cp,
++        anchor_ids=anchors,known_mask=known,valid_mask=np.ones(2,bool))
++
++
++class Contract(unittest.TestCase):
++    def test_permutation_and_identity(self):
++        case,sample=fixture(); pairs=M.prepare_pairs(sample,case)
++        pred=sample['u']+np.arange(18,dtype=np.float32).reshape(2,3,3)/100
++        rows,detail=M.compute_metrics(sample,pred,pairs=pairs)
++        self.assertEqual(pairs['source']['legal_edge_count'],1)
++        self.assertEqual(detail['pair_count'],2)
++        self.assertLess(detail['shared_identity_max_abs'],1e-7)
++        self.assertEqual(next(r for r in rows if r['stratum']=='bulk--seam_tip')['status'],'NA_NO_LEGAL_SOURCE_PAIRS')
++
++    def test_fixed_projection_is_explicit(self):
++        case,sample=fixture(True); pairs=M.prepare_pairs(sample,case)
++        pred=sample['u']+1
++        rows,detail=M.compute_metrics(sample,pred,pairs=pairs)
++        self.assertEqual(next(r for r in rows if r['stratum']=='all_one_fixed')['count'],2)
++        self.assertEqual(detail['raw_fixed_prediction_squared_sum'],9)
++        self.assertLess(detail['shared_identity_max_abs'],1e-7)
++
++    def test_corrupt_corner_map_rejected(self):
++        case,sample=fixture(); sample['source_corner_permutations'][0]=[0,0,1]
++        with self.assertRaises(ValueError): M.prepare_pairs(sample,case)
++
++    def test_wrong_source_cache_rejected(self):
++        case,sample=fixture(); source=M.source_pairs(case); source['source_coordinate_sha256']='bad'
++        with self.assertRaises(ValueError): M.prepare_pairs(sample,case,source=source)
++
++    def test_opposite_duplicate_not_a_legal_shared_pair(self):
++        case,_=fixture(); case['full_target']=np.r_[case['full_target'],case['full_target'][:1,::-1]]
++        case['source_face_vertex_ids']=np.r_[case['source_face_vertex_ids'],case['source_face_vertex_ids'][:1,::-1]]
++        source=M.source_pairs(case)
++        self.assertEqual(source['duplicate_faces'],[0,2])
++        self.assertEqual(source['pair_count'],0)
++
++    def test_altered_bridge_rejected(self):
++        case,sample=fixture(); pairs=M.prepare_pairs(sample,case); sample['xt'][0,0,0]+=1
++        with self.assertRaises(ValueError): M.compute_metrics(sample,sample['u'],pairs=pairs)
++
++
++if __name__=='__main__': unittest.main()
+--- /dev/null
++++ b/r2/pilots/bench_flow_integrity_v1/trajectory.py
+@@ -0,0 +1,191 @@
++"""Frozen CPU diagnostics of stored Euler trajectories; never loads a model."""
++from __future__ import annotations
++import os
++os.environ['CUDA_VISIBLE_DEVICES']=''
++for key in ('OMP_NUM_THREADS','MKL_NUM_THREADS','OPENBLAS_NUM_THREADS','NUMEXPR_NUM_THREADS'):
++    os.environ[key]='1'
++import argparse,collections,datetime,hashlib,io,json,math,statistics,subprocess,sys,time
++from pathlib import Path
++import numpy as np
++ROOT=Path(__file__).resolve().parents[3]
++OUT=ROOT/'experiments/r2_bench_flow_integrity_diagnostic_v1'
++INV=OUT/'audits/trajectory_inventory'
++DEST=OUT/'trajectory'
++PHASES={'FULL':(0,50),'EARLY':(0,15),'MID':(15,35),'LATE':(35,50)}
++ROLES=('ALL_FREE','BULK_FREE','SEAM_TIP')
++METRICS=('S','orthogonal_energy','parallel_speed_variance','parallel_global_offset_energy','path_chord_ratio','path_length_normalized','chord_length_normalized','B_velocity_variation_proxy')
++def read(p):return json.loads(Path(p).read_text('utf-8-sig'))
++def sha(p):return hashlib.sha256(Path(p).read_bytes()).hexdigest()
++def immutable(p,data):
++    p=Path(p);p.parent.mkdir(parents=True,exist_ok=True)
++    raw=data if isinstance(data,bytes) else (json.dumps(data,ensure_ascii=False,indent=2)+'\n').encode()
++    if p.exists():assert p.read_bytes()==raw,str(p)
++    else:p.write_bytes(raw)
++def arrays(p):
++    with np.load(p,allow_pickle=False) as z:return {k:z[k].copy() for k in z.files}
++def csvwrite(p,rows):
++    import csv
++    text=io.StringIO(newline='');keys=list(dict.fromkeys(k for row in rows for k in row));w=csv.DictWriter(text,fieldnames=keys,lineterminator='\n');w.writeheader()
++    w.writerows({k:('NA' if v is None else json.dumps(v,ensure_ascii=False) if isinstance(v,(dict,list)) else v) for k,v in r.items()} for r in rows)
++    immutable(p,('\ufeff'+text.getvalue()).encode())
++def num(x):
++    if isinstance(x,bool):return None
++    try:v=float(x)
++    except (TypeError,ValueError):return None
++    return v if math.isfinite(v) else None
++def avg(v):
++    v=[x for x in v if x is not None];return statistics.fmean(v) if v else None
++def grouped(rows,keys):
++    d=collections.defaultdict(list)
++    for r in rows:d[tuple(r[k] for k in keys)].append(r)
++    return d
++def resources():
++    def cmd(args):
++        try:return subprocess.run(args,text=True,capture_output=True,timeout=10).stdout.strip()
++        except Exception as e:return repr(e)
++    return dict(utc=datetime.datetime.now(datetime.timezone.utc).isoformat(),cpu_logical=os.cpu_count(),cpu_threads=1,
++        meminfo=Path('/proc/meminfo').read_text() if Path('/proc/meminfo').exists() else 'NA',
++        loadavg=Path('/proc/loadavg').read_text() if Path('/proc/loadavg').exists() else 'NA',
++        gpu=cmd(['nvidia-smi','--query-gpu=name,memory.total,memory.used,memory.free,utilization.gpu','--format=csv,noheader']),
++        gpu_processes=cmd(['nvidia-smi','--query-compute-apps=pid,process_name,used_gpu_memory','--format=csv,noheader']),
++        CUDA_VISIBLE_DEVICES=os.environ['CUDA_VISIBLE_DEVICES'],model_calls=0,scoring_calls=0)
++
++def freeze():
++    protocol=dict(schema='STORED_EULER_FREE_TRAJECTORY_V1',status='FROZEN_BEFORE_COMPUTATION',trajectories=108,
++        scope='all current84 plus same-panel curriculum COMMON24; no historical COMMON/USER mixed into current comparison',
++        input_inventory_sha256=sha(INV/'per_trajectory.json'),source_code_sha256=sha(__file__),
++        dt=.02,nodes=51,L='per-trajectory prior frozen L (9.208138264587333), not parent bounding box',
++        roles=ROLES,phases=PHASES,phase_interpretation='15/20/15 Euler increments; phase S contributions sum FULL and use the same global net displacement',
++        coordinates='Canonical model/world frame. Fixed slot/corner identities. No temporal OT alignment.',
++        velocity='v_k=(X[k+1]-X[k])/.02 in float64 from stored FP32 states. Realized discrete velocity, not recovered BF16 forward.',
++        S='sum_k dt ||v_k-(X50-X0)||^2 / (free_coordinate_count * L^2)',
++        orthogonal='Unit direction d=(X50-X0)/||X50-X0|| in the full selected state space; sum dt ||v-(v.dot(d))*d||^2/(count*L^2)',
++        parallel_speed_variance='Within phase alpha=v.dot(d); sum dt (alpha-mean_phase(alpha))^2/(count*L^2)',
++        parallel_global_offset_energy='duration*(mean_phase(alpha)-||X50-X0||)^2/(count*L^2); FULL nearly zero. S=orthogonal+parallel_variance+offset.',
++        path_chord_ratio='sum ||X[k+1]-X[k]|| / ||X[end]-X[start]|| in full selected coordinate state; monotone speed change along one line leaves ratio1. Phase ratio uses phase chord.',
++        normalization='S/energy divide count*L^2; path and chord divide sqrt(count)*L. Zero-mask or zero-chord is explicit NA.',
++        B_velocity_variation_proxy='.5*dt*sum_k RMS(v[k+1]-v[k])/L over all free scalar coordinates; descriptive screening proxy, not a rigorous error upper bound.',
++        risk_gate=dict(parent_prefixes=['a8e987','6b894c'],noise_index=0,labels=['NATIVE_S6000','COVERAGE_FINAL'],rows=4,threshold=.005,rule='Any one B>.005 triggers exactly the registered four Euler100 comparisons; no dispatch by this CPU script.',registered_by_root='OUT/PROTOCOL.md before current readings'),
++        pairs=[dict(reference='NATIVE_S6000',candidate='COVERAGE_FINAL',requests=30,mask='identical'),dict(reference='COMMON_S12000',candidate='NATIVE_S6000',requests=24,mask='identical'),dict(reference='NATIVE_S6000',candidate='SEAM_S3000',requests=24,mask='different; compare per-model normalized scalars descriptively, no tensor distance')],
++        conclusion_boundary='Curvature/speed variation alone does not prove fragmentation, OT failure or numerical error.',
++        aggregate='average noises within condition then conditions within parent, then equal parent means',
++        resources=resources(),model_calls=0,new_noise=0,new_OT=0)
++    immutable(DEST/'definition.json',protocol);return protocol
++
++def measures(state,mask,L,start=0,end=50):
++    m=int(mask.sum())*3
++    if not m:return dict(status='NA_EMPTY_ROLE',free_corner_count=0,free_coordinate_count=0,**dict.fromkeys(METRICS))
++    x=state[:,mask,:].astype(np.float64).reshape(51,m);dv=np.diff(x,axis=0);v=dv/.02;delta=x[-1]-x[0];v=v[start:end];dv=dv[start:end]
++    den=m*L*L;duration=(end-start)*.02;net=np.linalg.norm(delta);localnet=np.linalg.norm(x[end]-x[start]);path=np.linalg.norm(dv,axis=1).sum()
++    result=dict(status='PASS',free_corner_count=int(mask.sum()),free_coordinate_count=m,S=float(.02*np.sum((v-delta)**2)/den),
++        path_length_normalized=float(path/math.sqrt(m)/L),chord_length_normalized=float(localnet/math.sqrt(m)/L),
++        path_chord_ratio=float(path/localnet) if localnet>1e-15 else None,
++        B_velocity_variation_proxy=float(.5*.02*np.sqrt(np.mean(np.diff(v,axis=0)**2,axis=1)).sum()/L))
++    if net<=1e-15:
++        result.update(status='NA_ZERO_GLOBAL_CHORD_DIRECTION',orthogonal_energy=None,parallel_speed_variance=None,parallel_global_offset_energy=None)
++    else:
++        d=delta/net;alpha=v@d;perp=v-alpha[:,None]*d
++        result.update(orthogonal_energy=float(.02*np.sum(perp**2)/den),parallel_speed_variance=float(.02*np.sum((alpha-alpha.mean())**2)/den),parallel_global_offset_energy=float(duration*(alpha.mean()-net)**2/den))
++        assert math.isclose(result['S'],sum(result[k] for k in ('orthogonal_energy','parallel_speed_variance','parallel_global_offset_energy')),rel_tol=1e-9,abs_tol=1e-13)
++    return result
++
++def analytic_checks():
++    t=np.arange(51,dtype=np.float64)/50;mask=np.ones((1,1),bool)
++    straight=np.zeros((51,1,1,3));straight[:,0,0,0]=t
++    a=measures(straight,mask,1);assert a['S']<1e-28 and abs(a['path_chord_ratio']-1)<1e-14
++    speed=straight.copy();speed[:,0,0,0]=t*t;b=measures(speed,mask,1)
++    assert b['S']>0 and b['orthogonal_energy']<1e-28 and abs(b['path_chord_ratio']-1)<1e-14
++    bent=straight.copy();bent[:,0,0,1]=.2*np.sin(np.pi*t);c=measures(bent,mask,1)
++    assert c['orthogonal_energy']>0 and c['path_chord_ratio']>1
++    zero=measures(straight,np.zeros((1,1),bool),1);assert zero['status']=='NA_EMPTY_ROLE'
++    return dict(status='PASS',uniform_straight=a,monotone_nonuniform_speed=b,bent=c,empty_role=zero)
++
++def aggregate(rows,keys,metrics):
++    out=[]
++    for identity,gr in sorted(grouped(rows,keys).items()):
++        r=dict(zip(keys,identity));r['rows']=len(gr)
++        for m in metrics:
++            vals=[num(x.get(m)) for x in gr];r[m]=avg(vals);r[m+'__valid_n']=sum(x is not None for x in vals)
++        out.append(r)
++    return out
++
++def run():
++    tick=time.perf_counter();definition=read(DEST/'definition.json')
++    assert definition['source_code_sha256']==sha(__file__)
++    assert definition['input_inventory_sha256']==sha(INV/'per_trajectory.json')
++    entries=[r for r in read(INV/'per_trajectory.json') if r['cohort']!='OLD_COMMON_USER'];assert len(entries)==108
++    checks=analytic_checks();rows=[]
++    for e in entries:
++        assert sha(e['trajectory_path'])==e['trajectory_sha256'] and sha(e['layout_path'])==e['layout_sha256']
++        state=arrays(e['trajectory_path'])[e['trajectory_array_key']];lay=arrays(e['layout_path']);free=lay['anchor_ids']<0
++        assert state.shape==(51,e['N'],3,3) and state.dtype==np.float32 and np.isfinite(state).all()
++        masks={'ALL_FREE':free,'BULK_FREE':free&np.isin(np.arange(e['N']),lay['bulk_slots'])[:,None],
++               'SEAM_TIP':free&np.isin(np.arange(e['N']),lay['seam_slots'])[:,None]}
++        for role,mask in masks.items():
++            part=[]
++            for phase,(start,end) in PHASES.items():
++                r={k:e[k] for k in ('label','parent_id','condition_id','request_id','eval_group','noise_index','N','K','L','trajectory_path','trajectory_sha256','layout_path','layout_sha256','noise_sha256')}
++                r.update(role=role,phase=phase,start_step=start,end_step=end,**measures(state,mask,e['L'],start,end));rows.append(r);part.append(r)
++            if mask.any():assert math.isclose(part[0]['S'],sum(r['S'] for r in part[1:]),rel_tol=1e-12,abs_tol=1e-13)
++    allfull=[r for r in rows if r['role']=='ALL_FREE' and r['phase']=='FULL'];assert len(allfull)==108
++    pairs=[]
++    for p in definition['pairs']:
++        by={(r['label'],r['request_id'],r['role'],r['phase']):r for r in rows}
++        ref=[r for r in rows if r['label']==p['reference']]
++        for a in ref:
++            b=by.get((p['candidate'],a['request_id'],a['role'],a['phase']))
++            if not b:continue
++            same=a['layout_sha256']==b['layout_sha256']
++            assert a['noise_sha256']==b['noise_sha256'] and a['N']==b['N'] and a['K']==b['K']
++            if p['mask']=='identical':assert same
++            row=dict(reference=p['reference'],candidate=p['candidate'],**{k:a[k] for k in ('request_id','condition_id','parent_id','eval_group','noise_index','role','phase')},identical_layout=same,comparison_scope=p['mask'],reference_free_coordinate_count=a['free_coordinate_count'],candidate_free_coordinate_count=b['free_coordinate_count'])
++            for m in METRICS:
++                av,bv=a[m],b[m];row[m+'__reference']=av;row[m+'__candidate']=bv;row[m+'__delta']=None if av is None or bv is None else bv-av
++            pairs.append(row)
++    keys=('label','eval_group','role','phase')
++    conditions=aggregate(rows,keys+('parent_id','condition_id'),METRICS)
++    parents=aggregate(conditions,keys+('parent_id',),METRICS);macro=aggregate(parents,keys,METRICS)
++    pkeys=('reference','candidate','eval_group','role','phase');delta_metrics=tuple(m+'__delta' for m in METRICS)
++    pc=aggregate(pairs,pkeys+('parent_id','condition_id'),delta_metrics);pp=aggregate(pc,pkeys+('parent_id',),delta_metrics);pm=aggregate(pp,pkeys,delta_metrics)
++    gate_rows=[r for r in allfull if r['parent_id'][:6] in ('a8e987','6b894c') and int(r['noise_index'])==0 and r['label']in ('NATIVE_S6000','COVERAGE_FINAL')]
++    assert len(gate_rows)==4
++    gate=dict(status='TRIGGERED' if any(r['B_velocity_variation_proxy']>.005 for r in gate_rows) else 'NOT_TRIGGERED',threshold=.005,
++        rule=definition['risk_gate'],rows=[{k:r[k] for k in ('label','request_id','B_velocity_variation_proxy','S','path_chord_ratio','free_coordinate_count')} for r in gate_rows],
++        interpretation='Screening heuristic only; not a proven integration error bound and not an OT diagnosis.',new_model_dispatch_by_this_script=False)
++    tables={'per_output_all_roles_phases.csv':rows,'per_output_allfree_full.csv':allfull,'per_condition.csv':conditions,'per_parent.csv':parents,'parent_macro.csv':macro,
++        'paired_per_output.csv':pairs,'paired_per_condition.csv':pc,'paired_per_parent.csv':pp,'paired_parent_macro.csv':pm}
++    for name,data in tables.items():csvwrite(DEST/name,data)
++    immutable(DEST/'analytic_checks.json',checks);immutable(DEST/'risk_gate.json',gate)
++    plots(rows,pairs,macro)
++    receipt=dict(status='COMPLETE',trajectories=108,role_phase_rows=len(rows),per_output_pairs=len(pairs),model_calls=0,scoring_calls=0,new_noise=0,new_OT=0,
++        source_code_sha256=sha(__file__),definition_sha256=sha(DEST/'definition.json'),risk_gate=gate['status'],seconds=time.perf_counter()-tick,
++        source_trajectories={r['trajectory_path']:r['trajectory_sha256'] for r in entries},source_layouts={r['layout_path']:r['layout_sha256'] for r in entries},
++        files={p.name:sha(p) for p in DEST.iterdir() if p.suffix in ('.csv','.png','.svg','.json')},resources_finished=resources())
++    assert 'torch' not in sys.modules;immutable(DEST/'completion.json',receipt)
++    print(json.dumps({k:v for k,v in receipt.items() if k not in ('source_trajectories','source_layouts','files','resources_finished')},indent=2));print(json.dumps(gate,indent=2))
++
++def plots(rows,pairs,macro):
++    import matplotlib
++    matplotlib.use('Agg')
++    import matplotlib.pyplot as plt
++    colors={'CURRENT_TRAIN':'#3579a6','DEV':'#ce6c47','NEW_TRAIN':'#568c35','NEW_PARENT_HOLDOUT':'#9867ad'}
++    selected=[p for p in pairs if p['reference']=='NATIVE_S6000' and p['candidate']=='COVERAGE_FINAL' and p['role']=='ALL_FREE' and p['phase']=='FULL']
++    fig,axs=plt.subplots(2,2,figsize=(10,9),constrained_layout=True)
++    for ax,m in zip(axs.flat,('S','path_chord_ratio','orthogonal_energy','parallel_speed_variance')):
++        for group,color in colors.items():
++            rr=[p for p in selected if p['eval_group']==group];ax.scatter([p[m+'__reference'] for p in rr],[p[m+'__candidate'] for p in rr],label=group,color=color,s=30,alpha=.8)
++        lo=min(ax.get_xlim()[0],ax.get_ylim()[0]);hi=max(ax.get_xlim()[1],ax.get_ylim()[1]);ax.plot([lo,hi],[lo,hi],color='#999999',lw=1,ls='--');ax.set_xlabel('Native6000');ax.set_ylabel('Coverage1500');ax.set_title(m);ax.grid(alpha=.2)
++    axs[0,0].legend(fontsize=8);fig.suptitle('Same C / N / Gaussian / free mask, 30 fixed requests; stored Euler50')
++    fig.savefig(DEST/'native_coverage_paired.png',dpi=160);fig.savefig(DEST/'native_coverage_paired.svg');plt.close(fig)
++    labels=('COMMON_S12000','NATIVE_S6000','COVERAGE_FINAL','SEAM_S3000');fig,axs=plt.subplots(2,3,figsize=(12,7),constrained_layout=True)
++    for ax,(group,metric) in zip(axs.flat,[(g,m) for g in ('CURRENT_TRAIN','DEV') for m in ('S','path_chord_ratio','orthogonal_energy')]):
++        rr=[next(r for r in macro if r['label']==l and r['eval_group']==group and r['role']=='ALL_FREE' and r['phase']=='FULL') for l in labels]
++        ax.bar(range(4),[r[metric] for r in rr],color=['#888888','#3579a6','#568c35','#9867ad']);ax.set_xticks(range(4),['COMMON','NATIVE','COVERAGE','SEAM'],rotation=25);ax.set_title(group+' / '+metric);ax.grid(axis='y',alpha=.2)
++    fig.suptitle('Parent-equal, own-free-mask normalized; SEAM mask differs (descriptive)')
++    fig.savefig(DEST/'same_old_panel_models.png',dpi=160);fig.savefig(DEST/'same_old_panel_models.svg');plt.close(fig)
++
++if __name__=='__main__':
++    ap=argparse.ArgumentParser();ap.add_argument('--freeze',action='store_true');ap.add_argument('--run',action='store_true');a=ap.parse_args()
++    if a.freeze:print(json.dumps(freeze(),ensure_ascii=False,indent=2))
++    elif a.run:run()
++    else:ap.error('--freeze or --run required')

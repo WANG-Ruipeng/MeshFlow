@@ -1,0 +1,148 @@
+"""Read-only scientific review and UTF-8 presentation; no model import or call."""
+from pathlib import Path
+import csv
+import hashlib
+import json
+import shutil
+
+OUT=Path(__file__).resolve().parents[1]
+ROOT=OUT.parents[2]
+
+def read(name):return json.loads((OUT/name).read_text(encoding='utf8'))
+def sha(path):
+    h=hashlib.sha256()
+    with Path(path).open('rb') as f:
+        for b in iter(lambda:f.read(8*1024*1024),b''):h.update(b)
+    return h.hexdigest()
+def write(name,value):
+    path=OUT/name;path.parent.mkdir(parents=True,exist_ok=True)
+    path.write_text(json.dumps(value,ensure_ascii=False,indent=2,sort_keys=True)+'\n',encoding='utf8')
+def table(headers,rows):
+    return '\n'.join(['|'+'|'.join(headers)+'|','|'+'|'.join(['---']*len(headers))+'|']+
+        ['|'+'|'.join(str(v) for v in row)+'|' for row in rows])
+
+def main():
+    assert read('RUN_STOPPED.json')['status']=='IMPLEMENTATION_BLOCKED'
+    account=read('accounting.json');s=account['summary'];pre=read('precheck/result.json')
+    numeric=read('tests/relations/relations_gate_summary.json');analysis=read('numerical_failure_analysis.json')
+    baseline=read('registration/start_actual_score_readonly_audit.json')['primary_equal_parent_means']
+    own=read('registration/implementation_hashes.json')
+    source={**read('registration/source_hashes_before.json'),**read('registration/additional_historical_scorer_hashes.json')}
+    assert all(sha(ROOT/p)==h for p,h in {**source,**own}.items())
+    assert (s['optimizer_updates'],s['precheck_forwards'],s['precheck_zero_update_backwards'],s['actual_full_sampling_attempts'])==(0,10,1,0)
+    assert pre['cost']['status']=='INCOMPLETE' and pre['arms']['H_CONT']['all_state_restored']
+    assert set(pre['arms'])=={'H_CONT'}
+    assert all(r['passed'] and r['max_abs']==0 for r in pre['comparisons'])
+    p=OUT/'CHAIR_FINITE_SURFACE_ATTENTION_REPORT.md';original=OUT/'postrun_review/originals/AUTOMATIC_GATE_REPORT.md'
+    original.parent.mkdir(parents=True,exist_ok=True)
+    if not original.exists():shutil.copyfile(p,original)
+    source_checkpoint=read('registration/start_identity.json')['checkpoint_sha256']
+    stage_rows=[['资产、协议及真实输入登记','DONE','共同起点、四个真实任务、576评价请求已冻结'],
+        ['CPU关系与注意力测试','DONE','小模块通过；真实求积门禁失败，完整保留结果'],
+        ['真实模型预检与成本','INCOMPLETE','10/88前向、1/24反向后因日志代码错误停止'],
+        ['H_CONT / MOMENT_XY / SURFACE_XY训练','NOT_RUN','各0/1000步，无新权重'],
+        ['共同起点只读评分','DONE','138缓存、6原始不适用'],
+        ['三个新终点评价和SURFACE轨迹诊断','NOT_RUN','没有新终点或新生成']]
+    numerical_rows=[]
+    for f in numeric['fixtures']:
+        e=f['ordinary'];numerical_rows.append([f['fixture_id'],str(f['identity']['N'])+'/'+str(f['K']),
+            f"{e['mu_L2']:.8f}",f"{e['covariance_Frobenius']:.8f}",f"{e['compressed_mass_abs']:.8f}",
+            'PASS' if f['reference_convergence_pass'] else 'FAIL'])
+    comparison_rows=[[name,'NA','0/8','NOT_RUN'] for name in ['SURFACE_XY − H_CONT','SURFACE_XY − MOMENT_XY',
+        'MOMENT_XY − H_CONT','H_CONT − START','MOMENT_XY − START','SURFACE_XY − START']]
+    report=f'''# Chair Finite Surface Attention V1
+
+实际正式 optimizer 更新 **0**；H_CONT、MOMENT_XY、SURFACE_XY均为 **0/1000，NOT_RUN**。已登记576个唯一请求，其中552适用、24原始不适用；实际新采样0，已核验并复用START的138个完整raw，实际处理原始不适用6个。真实模型预检 **10次前向、1次零更新反向**，模型调用失败0、未决调用0；**另有1个显存日志缺陷导致预检提前停止**。CPU隔离小模块1次测试更新另列，不计Chair训练。
+
+结论是 **IMPLEMENTATION_BLOCKED**，方法质量为 **NA_NOT_EVALUATED**。192点求积的真实任务准确度门禁失败，且GPU工程预检未完成。两类阻塞独立记录；不能把它们解释成有限表面或质心矩的质量优劣。
+
+{table(['阶段','状态','实际结果'],stage_rows)}
+
+## 两个实际阻塞
+
+第一，192点候选与12288点参考的普通查询差异，在四个真实任务均未达到三项各小于0.01的冻结要求。
+
+{table(['真实任务','N/K','均值L2最大差异','协方差Frobenius最大差异','压缩质量最大差异','参考子集收敛'],numerical_rows)}
+
+普通query/known对共7504个，其中1459个至少一项不达标。t=0和0.5各1876对均通过；t=0.9有556对失败，t=1有903对失败。极端探针另有1072对，仅披露，不混入普通门禁。
+
+12288与49152点的96个预登记参考对子集中，有1个均值差异为0.0011148665，超过0.001。因而上述数值应称求积规则差异，不能冒称严格真积分误差界。其他三个任务的参考子集通过，也不代表全空间收敛。节点数量、对称性、公式、源面/角映射和模型坐标单位已只读复核，未发现把n、尺度或pre-OT坐标用错的证据。
+
+![保留的求积差异随t变化](figures/quadrature_gate.png)
+
+第二，我新增的真实预检显存记录器，将已含`time_unix`和`pid`的字典传给同样自动补充字段的`append_event`，触发重复关键字`TypeError`。后台监控与主线程均遇到同一缺陷。第一次测量的forward/backward已经返回，但成本记录尚未落盘便停止。该错误属于本轮审计代码，不是模型数值失败，也不是成本超3倍的证据。
+
+冻结的失败规则已执行：没有修代码后重跑，没有补足余下调用，没有训练任何一个臂。原失败源码、输出与traceback保留。控制器/worker中的DONE仅表示进程返回并保存结果；科学预检状态明确为INCOMPLETE，不能把计划的88/24当成已执行。
+
+## 哪些实现事实已经验证
+
+CPU FP64小模块的字面pair-value实现与代数重排，输出最大差异约2.78e-17，参数梯度最大差异约8.88e-16；原消息与完整重排最大差异约6.66e-16。K=1/2/4、六角置换、known/free面置换、padding、无known、梯度可达性及关系有限性均通过。隔离小模块更新1次后内部层梯度由0变为非零。生产关系计算保持FP32。
+
+真实模型只完成H_CONT的20%/40%普通任务FP32和正式BF16重复检查，两次输出均逐位相同；另有一次预热前向及一次已返回的前向/反向。**MOMENT_XY/SURFACE_XY的真实零初始化、非零置换和padding检查均未执行**，不能用CPU测试替代其结论。H_CONT加载后的完整参数、AdamW和RNG在预检结束时均与初始哈希一致。
+
+两关系臂各新增104496个参数，层号3/6/9/12，初值一致；完整实现保留旧QKV、QK归一化、AdaLN、投影、gate和全有效源softmax。接口源码已登记，训练入口在加载前检查总门禁。关系共享及四层事件的真实GPU验证仍未完成。
+
+## 质量比较与真实共同起点
+
+{table(['比较','主MSE配对差/改善父数','有效父/登记父','状态'],comparison_rows)}
+
+所有比较保留8父分母；未训练臂没有可供比较的原始输出。当前无法回答新增算子是否胜过等预算续训，或有限表面是否胜过同容量质心矩。条件控制、反向误差、尾部、接口、相交和小角面的新增收益/代价均为NA。
+
+共同起点严格是`chair_hybrid_coupling_v1 / OT_HYBRID / pilot1000 / conditional_total5000 / lambda=.25`，SHA256：`{source_checkpoint}`。它的138项原评分逐例与旧结果一致；138组冻结512点距离和69份GT角度参照已独立核算。
+
+验证A20按两噪声先父内平均、再8父等权的实际基线：
+
+{table(['指标','START实际数值'],[
+    ['fixed_query_MSE',f"{baseline['fixed_query_MSE']:.12f}"],
+    ['GT→F 原表面RMS/L',f"{baseline['GT_to_F_original_RMS_L']:.9f}"],
+    ['F→GT 原表面RMS/L',f"{baseline['F_to_GT_original_RMS_L']:.9f}"],
+    ['原双向表面RMS/L',f"{baseline['bidirectional_original_RMS_L']:.9f}"],
+    ['预测free小角面比例',f"{100*baseline['free_minimum_angle_lt5_fraction']:.4f}%"],
+    ['同GT free小角面比例',f"{100*baseline['GT_minimum_angle_lt5_fraction']:.4f}%"]])}
+
+单向固定查询MSE、原面积采样双向RMS、求积数值差异分开命名。GT角度只作参照；预测小角比例低于GT本身不能证明网格质量优良。A各划分/上下文、C及两噪声明细保留在逐例、逐父CSV和[原始自动汇总](postrun_review/originals/AUTOMATIC_GATE_REPORT.md)。
+
+START的完整3×3矩阵有432个实际单元（16曲线×MODEL/No-response/Post-scale×9）；全四标签1728个登记单元保留，其中三个未训练标签为BLOCKED/NA。固定beta列评分及解析正控已经CPU检查，未增加生成或I/P交叉模型调用。
+
+## 成本、恢复与协议边界
+
+真实预检启动时RTX5080共16303 MiB，空闲12614 MiB，登记余量2445.45 MiB；CPU可用24核，分析进程限制2线程。GPU始终一个worker，先获共享锁再初始化CUDA。
+
+**完整forward与F+B的三臂成本倍率均为NA/INCOMPLETE，尚不能判断192点成本是否合格。**调用账本中的10次前向和1次反向墙钟，不能代替每任务两次同步成本测量。WDDM/WSL的进程显存显示N/A；保存的通用全局采样也不能代替未测的SURFACE峰值。每更新耗时、新采样延迟、正式训练峰值均NA。
+
+没有修改点数、带宽、loss、学习率、数据、N/K、采样器、默认模型或总预算，没有静默重试。协议设计未变；原定真实预检因代码缺陷未完成，已明确披露。正式训练和评价按失败门禁停止，不写DONE。不复制旧大权重，不制作额外交接ZIP。
+
+1328项既有保护文件及8项历史评分源码校验通过；冻结新实验源码保持不变。完整真实评分源码和新增代码位于`source_code/`，代码差异见`code.diff`。这份收尾脚本只读已存证据并改进报告呈现，原自动报告另存，未重新计算模型或关系。
+
+## 唯一优先后续及检验假说
+
+**本轮尚不支持新增关系注意力，也没有证据选择更便宜的MOMENT_XY。优先对同一冻结失败输入建立误差受控的独立积分参考，再判断有限表面算子的数值实现是否值得进入训练。**
+
+检验假说：t接近1时，固定s=0.1的窄核相对较长三角边上的n8子网格欠分辨，误差因此集中在晚期、边缘和角附近。本轮最坏协方差对应三角形最长边约5.3153，边长/8/s约6.64；t≤0.5全部普通对通过，支持把这个假说作为下一项数值检验，而非据此认定机制有效。日志接口缺陷应作为下一次审计的工程前置修正；本轮保留失败原件，不重启实验。
+
+后续判据应先要求独立参考收敛，并在这些固定失败对上核验三项精度，再检查同任务真实模型成本。此后续尚未执行；没有扫描点数、求解器或训练预算。水密与严格拓扑审计为NOT_RUN。固定任务已停止。
+
+详细索引见[DELIVERY_INDEX.md](DELIVERY_INDEX.md)，运行/恢复边界见[RUN_AND_RESUME.md](RUN_AND_RESUME.md)，逐点失败定位见[NUMERICAL_FAILURE_ANALYSIS.md](NUMERICAL_FAILURE_ANALYSIS.md)。
+'''
+    p.write_text(report,encoding='utf8')
+    status=dict(status='PASS',scope='Scientific calls unchanged; presentation-only review',
+        formal_optimizer_updates=0,real_model_forwards=10,real_model_backwards=1,
+        model_call_failures=0,instrumentation_root_causes=1,real_precheck_completion='INCOMPLETE',
+        model_and_optimizer_and_rng_restored=True,cost_gate='INCOMPLETE',formal_training='NOT_RUN',
+        protected_files=len(source),frozen_implementation_files=len(own),new_model_calls=0,new_relation_calculations=0,
+        automatic_report_sha256=sha(original),final_report_sha256=sha(p),review_script_sha256=sha(__file__))
+    write('postrun_review/review_status.json',status)
+    write('accounting_review.json',dict(original_accounting_sha256=sha(OUT/'accounting.json'),
+        summary=s,instrumentation_failures=dict(root_causes=1,kind='Duplicate time_unix/pid in append_event',
+        distinct_from_failed_model_calls=True),actual_scientific_precheck_status='INCOMPLETE',
+        repeated_GPU_calls_after_failure=0,unused_budget_does_not_authorize_replay=True))
+    # A stopped frozen run is recovered by verification/reporting only.
+    docs=OUT/'RUN_AND_RESUME.md';base=OUT/'postrun_review/originals/RUN_AND_RESUME.initial.md'
+    if not base.exists():shutil.copyfile(docs,base)
+    note='''\n## Final read-only recovery entry\n\nThe frozen run has stopped. To verify all protected/frozen hashes and regenerate the final reviewed report without executing any scientific call:\n\n```bash\ncd /mnt/e/MeshFlow\n/home/warpwang/miniforge3/envs/meshflow/bin/python -B native_t1/runs/chair_surface_attention_v1/postrun_review/finalize_delivery.py\n```\n\nThe original run_all entry and its executed code are retained unchanged for provenance. It will not retry the failed precheck or train; it may regenerate the original automatic presentation, so apply this final review entry afterward. The initial report is preserved in postrun_review/originals/. Real-model precheck is INCOMPLETE (10/88 forwards, 1/24 backwards), even though its process/controller returned successfully after recording the failure.\n'''
+    docs.write_text(base.read_text(encoding='utf8')+note,encoding='utf8')
+    write('delivery_hashes.json',{p.relative_to(OUT).as_posix():sha(p) for p in sorted(OUT.rglob('*'))
+        if p.is_file() and p.name!='delivery_hashes.json' and not p.name.endswith('.lock')})
+    print('FINAL_REVIEW_PASS: 0 formal updates; 10 forward, 1 backward; no replay; gate stopped.')
+
+if __name__=='__main__':main()

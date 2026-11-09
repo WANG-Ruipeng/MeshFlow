@@ -1,0 +1,292 @@
+"""Write the final report from completed measurements and actual visual records.
+
+No model/scorer calls. Original evidence is read-only. A pending report skeleton
+is retained before the first final write; completed reports are never replaced.
+"""
+from pathlib import Path
+from collections import Counter
+import csv, json, hashlib, statistics, sys
+
+ROOT = Path(__file__).resolve().parents[3]
+OUT = ROOT / 'experiments/r2_bench_three_mechanisms_v1'
+LABELS = ('EXPOSURE','PLAIN200','PLAIN267','PATCH200','LOOP200','RL_ZERO','RL16')
+STAGES = ('RAW','BASE_POST','CLEAN_FINAL_POST')
+
+def read(p):
+    return json.loads(Path(p).read_text('utf-8'))
+
+def sha(p):
+    h=hashlib.sha256()
+    with Path(p).open('rb') as f:
+        for b in iter(lambda:f.read(8*1024*1024),b''): h.update(b)
+    return h.hexdigest()
+
+def csvrows(p):
+    with Path(p).open(encoding='utf-8-sig',newline='') as f:return list(csv.DictReader(f))
+
+def table(headers, rows):
+    return '\n'.join(['| '+' | '.join(headers)+' |','|'+'|'.join(['---']*len(headers))+'|',
+        *['| '+' | '.join(map(str,r))+' |' for r in rows]])
+
+def macro(rows, metric):
+    parents={r['parent_id'] for r in rows}
+    means=[]
+    for p in parents:
+        vals=[r[metric] for r in rows if r['parent_id']==p and isinstance(r.get(metric),(int,float))]
+        if vals:means.append(statistics.fmean(vals))
+    return statistics.fmean(means) if means else None
+
+def metric_table(rows, stage):
+    keys=('CF_illegal_affected_free_fraction','FF_illegal_affected_free_fraction','ConflictCov_C',
+          'free_minimum_angle_lt5_fraction','hinge_diag_isolated_1face_edge_components',
+          'C_F_valid_edge_count','opposite_winding_reached_free_area_fraction','actual_free_faces','deleted_free_faces','free_area')
+    data=[]
+    for label in LABELS:
+        rs=[r for r in rows if r['label']==label and r['stage']==stage]
+        v=[macro(rs,k) for k in keys]
+        data.append([label,*[f'{x*(100 if i in (0,1,2,3,6) else 1):.2f}' for i,x in enumerate(v)]])
+    return table(('方法','CF % ↓','FF % ↓','I(C) % ↓','小角 % ↓','单面分量','合法 C/F 边','方向可达面积 %','有效 F','删除 F','F 面积'),data)
+
+def visual_table(rows, stage):
+    data=[]
+    for label in LABELS:
+        rs=[r for r in rows if r['label']==label and r['stage']==stage]
+        data.append([label,*[sum(r[k]==v for r in rs) for k,v in (
+            ('overall_shape','REASONABLE'),('C_use','PLAUSIBLE'),('support_retention','PRESENT'),
+            ('three_axis_joint','YES'),('visible_fragment_or_gap','YES'),('layering_or_fold','YES'))],
+            sum(r['three_axis_joint']=='UNCERTAIN' for r in rs)])
+    return table(('方法','主体合理','C 用途合理','支撑保留','三轴交集','可见碎片/缝隙','可见重层/折叠','交集不确定'),data)
+
+def transitions(rows):
+    idx={(r['label'],r['stage'],r['request_id']):r for r in rows}
+    requests=sorted({r['request_id'] for r in rows});out=[]
+    for a,b in (('PLAIN200','PATCH200'),('PLAIN200','LOOP200'),('PLAIN267','LOOP200'),('RL_ZERO','RL16')):
+        for stage in ('RAW','CLEAN_FINAL_POST'):
+            gained=[];lost=[]
+            for q in requests:
+                av=idx[a,stage,q]['three_axis_joint'];bv=idx[b,stage,q]['three_axis_joint']
+                short=q.split('__')[0][:6]+'/'+q.rsplit('__',1)[-1]
+                if av!='YES' and bv=='YES':gained.append(short+'('+av+'→YES)')
+                if av=='YES' and bv!='YES':lost.append(short+'(YES→'+bv+')')
+            out.append([a+' → '+b,stage,'；'.join(gained) or '无','；'.join(lost) or '无'])
+    return table(('比较','阶段','新增严格三轴正例','失去严格三轴正例'),out)
+
+def main():
+    completion=read(OUT/'COMPLETION.json')
+    assert completion['status']=='COMPLETE'
+    vc=read(OUT/'visual_review/summary_v2/completion.json')
+    assert vc['status']=='COMPLETE' and vc['cells']==252
+    rows=read(OUT/'results/metric_rows.json')
+    visual=csvrows(OUT/'visual_review/summary_v2/actual_observations.csv')
+    snapshots=[]
+    for p in (OUT/'report_snapshots').glob('*/snapshot.json'):
+        if read(p)['status']=='COMPLETE':snapshots.append(p)
+    snap=sorted(snapshots)[-1].parent
+    sr=snap.relative_to(OUT).as_posix()
+    training=csvrows(snap/'training_summary.csv')
+    train_table=table(('臂','更新','前20步目标','末20步目标','前向/反向','更新累计秒','该完成尝试墙钟秒','峰值 reserved GiB'),[
+        [r['arm'],r['updates'],f"{float(r['first20_objective']):.5f}",f"{float(r['last20_objective']):.5f}",
+         r['successful_forwards']+'/'+r['successful_backwards'],f"{float(r['logged_update_seconds']):.1f}",
+         f"{float(r['latest_attempt_wall_seconds']):.1f}",f"{float(r['peak_reserved_bytes'])/2**30:.2f}"] for r in training])
+    obs_changes=csvrows(OUT/'visual_review/summary_v1/baseline_review_differences.csv')
+    changed=sum(r['changed'].lower()=='true' for r in obs_changes)
+    q=read(OUT/'data/eval_manifest.json')['requests']
+    panel=table(('父前缀','本轮身份','N','K','固定噪声'),[
+        [r['parent_id'][:6],r.get('report_group',r.get('eval_group',r.get('split',''))),r['N'],r['K'],'n0 / n1']
+        for r in q[::2]])
+    weights=[]
+    for arm in ('PLAIN','PATCH','LOOP'):
+        s=read(OUT/'training'/arm/'status.json')
+        for step,e in s['exports'].items():
+            rel=Path(e['path']).relative_to(Path('/mnt/e/MeshFlow/experiments/r2_bench_three_mechanisms_v1')).as_posix()
+            cp=OUT/'training'/arm/f'checkpoint_step{step}.pt'
+            assert cp.exists()
+            weights.append(dict(label=arm+step,generator=rel,generator_sha256=e['sha256'],
+                recovery=cp.relative_to(OUT).as_posix(),recovery_sha256=sha(cp)))
+    rl=read(OUT/'rl/verification.json')
+    weights.append(dict(label='RL16',adapter='rl/training/opportunity_015/checkpoint.pt',
+        adapter_sha256=rl['final_checkpoint_sha256'],base='EXPOSURE generator_step3000.pt',
+        base_file_sha256='70e51d7913f99ad017d023e47965387b28692075ed9964b61d9d55dd1f0ff6b3'))
+    (OUT/'WEIGHTS.json').write_text(json.dumps(dict(status='COMPLETE',models=weights,
+        no_default_change=True),ensure_ascii=False,indent=2)+'\n','utf-8')
+
+    text='''# Bench 三方向有限训练实测：共享 PATCH、训练式 LOOP、局部 RL
+
+实验：`R2_BENCH_THREE_MECHANISMS_V1`；执行：2026-10-29—30。固定预算已完成并停止。
+
+## 1. 先回答是否改善
+
+**本轮没有得到可以替换 EXPOSURE 的全面升级。三条路线的证据不同，不能统一记成“都没有变化”。**
+
+- **PATCH200：本版不晋级。** 两三角共享表示确实保证了内部共边，但没有兑现为整体表面质量和 C 接续的提高。FINAL FF 为 21.01%，同更新普通续训为 9.79%；方向可达 free 面积从对照的 12.03% 降到 4.28%。
+- **LOOP200：保留局部信号，不替换基线。** 熟悉父 a8 的两份输出出现新的合法 C/F 接口；f495/n0 后处理后的部分替代灰座面消失，RAW仍有替代问题，不能写成生成器RAW采用进步。全组 FINAL CF/I 下降，但 FF 比 PLAIN200 高 3.62 个百分点，比近似等 block 计算的 PLAIN267 高 2.75 个百分点。表面积也明显改变，不能把低 I 单独当质量胜出。
+- **RL16：本配置未获得稳定升级。** 16 次机会实际完成 14 次更新、2 次跳过；相对相同随机过程的 RL_ZERO，FINAL FF/CF/I 分别增加 0.43/0.28/0.21 个百分点，合法 C/F 接口身份与条数没有变化。不能把与确定性基线的差异全部归于奖励学习。
+
+三者均保留完整终点、逐输出指标、RAW/POST、截面和实际评阅。没有自动延长、合并机制、更换默认模型、清理旧资产、commit 或 push。
+
+## 2. 固定对照与可解释边界
+
+起点是保留的 **EXPOSURE global25500 / Native13500** live 生成器，监督臂继承匹配的 AdamW 和 RNG，未从上一轮 MULTILOD 终点续训。使用现成 30 个 NATURAL TRAIN 父，复用父曝光/缩放alpha流；noise、epsilon、time、permutation使用本轮新冻结、各臂配对的seed，不能把继承checkpoint RNG说成历史随机数据流原样延续。batch8 / micro1、原精度、原学习率与组 FM 系数；OT 后 HYBRID0.25。实际训练 N128..776，合同上限799。不加入新父、LOW 版本或新的条件池。
+
+| 臂 | 新增预算 | 主要对照 | 实际改变 |
+|---|---:|---|---|
+| PLAIN | 267 更新，保存200/267 | 普通续训 | 原结构和目标 |
+| PATCH | 200 更新 | PLAIN200 | 固定双面共享状态、受限匹配、独立坐标分母及共享解码 |
+| LOOP | 200 更新 | PLAIN200 与 PLAIN267 | 原12层之后重用末4层，双轮 FM 监督 |
+| RL | 16机会×4轨迹 | RL_ZERO | 冻结基座上的局部随机动作 LoRA / RLOO |
+
+PLAIN267 的 267×12=3204 与 LOOP200 的 200×16=3200 只近似匹配 block 计算，不是精确 FLOPs/墙钟等预算；LOOP 还包含两个读出和不同反向图。RL 与监督臂的计算预算并不相等。三方向按各自对照判断，不能当严格资源排名。
+
+固定面板如下，每父一个既有 C、两份原噪声。没有重抽噪声，没有看结果后换父或挑 checkpoint。
+
+'''+panel+'''
+
+这是已观察过的小开发面板。df6 是本轮训练留出父；DEV 也不是新建立的独立测试集。不能把12请求的结果解释成广泛类别泛化。
+
+### PATCH 的实际实现
+
+对 F=N−K 个 free 面，固定 M=floor(F/8) 个双三角 patch，角点形式为 `[a,b,c] / [b,a,d]`，其余为单面槽。M 仅依赖 C 的 K 与请求 N；未知 Y 只在训练中用于合法面配对及受限 OT，来源面恰好各出现一次。30父全部通过数据门，60个真实 CPU OT 往返检查通过，没有缩池。
+
+共享 Gaussian 来自两个原角点噪声之和除以 √2，共享 HYBRID 噪声与平均预测速度贯穿积分。实际独立坐标分母为 9F−6M，共享副本各计半权。RAW 使用共享索引。
+
+**这不是一个已经学会全局面关系的预测头。** 它测试固定小拓扑能否帮助 bulk 组织，同时改变了表示、噪声相关性和匹配。内部强制共边不能计作学到的 C 接续。
+
+官方 D0 后，PATCH 还执行共享副本平均恢复，再进入同一 GEO_C。这是候选解码合同的一部分，其坐标操作与普通臂不同，不能冒称后端完全相同；D0 原始提议和投影账本均保存。
+
+### LOOP 的实际实现
+
+原12层执行一轮后，末4层再执行一次完整残差更新；第二轮 known hidden 恢复到当前前向的 core 入口参考，不 detach。两轮读取同一 Xt/t/N/C，使用同一速度目标：`loss=0.5 FM(v1)+0.5 FM(v2)`；推理使用第二轮。参数和 AdamW 身份不变，无新增条件头、motif guidance 或几何 loss。
+
+这与此前失败的“冻结层、两次半残差”不同，是经过训练的计算路径；也不是完整 LiFT 论文复现。重复层本身不保证新增条件信息或保留原函数。
+
+### RL 的实际实现
+
+冻结 EXPOSURE，仅训练 rank4 LoRA（48模块、589824参数）。4条 TRAIN C 按固定顺序各4次机会；每次4条预登记噪声。先取同噪声冻结参考 RAW，从非法 FF 面对选择最多8张 free 面作为固定编辑集合。
+
+仅 Euler k30..39 在选中坐标上执行可训练随机动作（状态标准差0.005）；其他坐标当步采用冻结基座均值。其后 attention 仍可传播影响，因此这不是“所有非编辑面终态锁死”。联合 log probability 只包含真正随机且受策略控制的坐标，10步 FP64 求和；一次 RLOO 更新，不重复 PPO epoch，不按终态坏面裁剪整条策略概率。
+
+奖励是局部非法 FF 减少，附 C 保持、新退化、CF数量增加、区域外FF数量增加、free面积变化≤5%、受保护参考表面≥98%在1%L内的门。CF/FF 门控制**面对计数**，不是“逐面对身份零新增”。参考是冻结生成 RAW，不是唯一来源GT；奖励训练无 D0，也无删面奖励。RL_ZERO 与 RL16 使用同 mask、相同动作噪声和同一随机过程。
+
+## 3. 完整生成流程和指标口径
+
+72份新增 RAW 全部完成后，才执行72次单次官方 Bench D0；之后同 GEO_C/来源角序与free定向 → HINGE_OPP015 → ALPHA → HOLE。保留 RAW、BASE_POST、CLEAN_FINAL_POST 三阶段。EXPOSURE 的12请求缓存只读复用。
+
+完整表共 **252行 ×177个原指标字段**。CF/FF 是各自非法面对涉及的 free 面比例；I 是原 `ConflictCov_C` 的 **C查询域冲突覆盖**，不等于整物体自交面积。252行 C 保持检查均通过，I 支持域均 PASS；本轮 Native/PATCH/LOOP 没有 SEAM 槽，seam→bulk 专属指标明确为 `NA_NOT_SEAM_REPRESENTATION`。
+
+以下均为父等权宏均值；每父两噪声，所以与本面板输出均值一致。面积单位为模型单位²，面数和边数为每输出均值。有效F/删除F用于揭示代价；后处理桥面另有独立字段。面积比不是原表面覆盖保留率。
+
+### FINAL
+
+'''+metric_table(rows,'CLEAN_FINAL_POST')+'''
+
+### RAW
+
+'''+metric_table(rows,'RAW')+'''
+
+普通臂 RAW 是独立角点 triangle soup，其原始索引单面分量多是表示性质，不能直接当肉眼碎片计数。PATCH RAW 已使用共享索引，单面分量少60，恰好对应平均30个强制双面 patch，不能据此声称减少了60个视觉碎片。
+
+### BASE_POST
+
+'''+metric_table(rows,'BASE_POST')+'''
+
+完整对照见 [逐输出177字段](results/per_output.csv)、[逐条件](results/per_condition.csv)、[逐父](results/per_parent.csv)、[逐输出配对](results/paired_per_output.csv)、[全部177字段父宏均值]('''+sr+'''/all177_parent_macro.csv)。原评分代码和源文件hash在 `source_snapshot/`、`source_hashes.json`，新增源码差分见 `code.diff`。
+
+## 4. 实际图审：不能用低冲突代替完整采用
+
+36张同尺度对照页，每页7方法、两个视角和原固定 front/side 截面；实际逐页查看108个原分辨率裁切，252单元五轴记录完成。同一请求的所有方法由同一评阅者检查。评阅为**非盲 AI_PROXY**，不是独立人类认证；三位评阅者按父分工，未读数值分数来填写标签。
+
+三轴交集定义为“主体合理 ∩ C用途合理 ∩ 支撑保留”；它不认证无碎片、无重层或无交。下表分母均12，不确定保留，不从分母剔除。
+
+收口时root对LOOP f495/n1细杆是否完整提出图像分歧，原评阅者实际复看BASE/FINAL两张既有裁切后，将支撑PRESENT修订为UNCERTAIN：可见杆与框间隔，远侧被遮挡，中截面不能补证。原v1图审和计数未改；独立修订与保守summary_v2完整保留。所以下表LOOP的FINAL严格交集为1/12、另1份不确定，而不是原初审的2/12。此修订未读取数值指标来选标签。
+
+### RAW 实际图审
+
+'''+visual_table(visual,'RAW')+'''
+
+### FINAL 实际图审
+
+'''+visual_table(visual,'CLEAN_FINAL_POST')+'''
+
+### 同一请求的三轴转移
+
+'''+transitions(visual)+f'''
+
+本轮复核旧 EXPOSURE 图像时，216个“阶段×请求×轴（含交集）”历史标签比较中有 **{changed}** 项不同；旧标签没有覆盖。这属于 AI_PROXY 重复评阅差异，不能当成模型变化。只在本轮同一口径内作配对比较。
+
+详细证据见 [有效逐图记录](visual_review/summary_v2/actual_observations.csv)、[完整五轴计数](visual_review/summary_v2/five_axis_and_joint_counts.csv)、[逐请求转移](visual_review/summary_v2/paired_request_transitions.csv)、[旧标签差异](visual_review/summary_v1/baseline_review_differences.csv)、[争议复看修订](visual_review/amendments/f495_n1_loop_support_v2.json)。原 [v1图审](visual_review/summary_v1/actual_observations.csv)不覆盖。[图集入口](gallery/index.html)保留全部样本及位置截面，不只展示好例。
+
+## 5. 三个机制各自学到了什么
+
+### PATCH：保证小片内部连接，没有解决小片之间的组织
+
+每份 RAW 平均30条强制内部合法共边；到 BASE/FINAL 平均只保留12.33条共享边，其中11.92条合法，平均17.67条因关联面被清理而丢失。FINAL 平均只有2.58条跨 patch 合法边、4.00条 patch—单面合法边，方向 C 可达面积仅4.28%。
+
+D0后共享投影的“每输出最大角点移动”均值为3.59%L，RMS均值0.419%L；平均13.83张面法向变化超过60°，没有新增面积≤1e−12 L²的退化面，C不动。这说明投影并非完全无代价；它不能单独证明全部FF增加都由D0或投影导致。
+
+结论限于本200步固定双面原型：内部共享能建立，但整体冲突和 C 接续没有同步改善。不能把它当成功的碎面修复，也不能由此否定所有可学习连接表示。见 [共享边账本](analysis/patch_diagnostics_v1/per_output.csv)、[D0投影账本](analysis/patch_diagnostics_v1/d0_projection.csv)。
+
+### LOOP：有局部变化，但不是整体质量提升
+
+FINAL 在 a8/n0、新增2条合法C/F边，在a8/n1新增5条；相应方向可达面积为13.19%与18.40%。相对EXPOSURE，27和bcb的原有5条接口仍在，全组由4/12个有接口输出、5条总边，变为6/12个输出、12条总边；另两对照PLAIN200为3个输出/3条边、PLAIN267为4个输出/4条边。新增都在熟悉父，两个DEV父与留出df6仍没有合法C/F共边。
+
+f495/n0的实际视图显示，LOOP在后处理后去掉了大量覆盖蓝C上方的灰色替代座面，但仍有残片；RAW仍是灰座替代，不能当作生成器RAW采用改善。f495/n1则还能看到端部板式支撑大量消失、仅剩细条的代价。f495父FINAL的I从PLAIN267的32.25%降到0.56%，同时free面积30.22→8.59，FF16.91%→19.24%。减少的面积既包含多余重层，也有结构损失风险，不能用面积数值单独裁决；采用与支撑的判定保留在图审记录中。
+
+459中蓝C与灰色座体的明显高度差仍在。全组LOOP FINAL小角率61.57%，FF13.41%，均没有达到全面升级；平均free面积相对PLAIN267减少26.65%，最终删面更多。应保留a8的连接及f495的局部用途信号，同时保留对应代价，不自动加长训练或改层段。
+
+### RL：有可区分奖励，但未兑现为固定面板终态收益
+
+64条策略训练轨迹中，25条通过全部保护门，4条奖励为正、6条为零，平均奖励−0.61886；16机会中2次无有效组内奖励差异而跳过，未补抽。实际14更新，560次反向，8160次生成器前向（含参考、策略及更新重算），训练D0为0。CPU核验确认基座未改、调度与log概率重放合同通过。
+
+固定评价相对RL_ZERO，RAW FF仅下降0.28个百分点；FINAL反而上升0.43个百分点，合法C/F接口身份与条数完全相同。终态可达面积比例略增不能抵消绝对面积与冲突代价，也不是新增采用证据。本版局部窗口/奖励/预算到此停止，不否定所有RL。
+
+## 6. 训练曲线、实际计算和工程事件
+
+'''+train_table+f'''
+
+![实际学习曲线]({sr}/learning_curves.png)
+
+PATCH 的独立坐标分母和匹配组织不同，LOOP是双轮平均目标，不能把跨臂绝对loss直接排名。LOOP最后一轮FM前20步均值0.23091、末20步0.09665；它证明适应了循环路径，不证明条件质量已收敛。
+
+监督合计667更新、5337次成功前向、5336次反向（额外1次工程前向单列）。RL另有14更新和2跳过。冻结评价新增3720生成器前向、72D0、72GEO，72份RAW；没有重复采样或额外checkpoint筛选。评分252行中EXPOSURE36行只读复用，新增216行；图审252单元均为本轮实际查看。
+
+每次派发前记录RTX5080 16GiB、计算利用率、设备显存、GPU进程、24 CPU核和可用RAM；保留至少max(2GiB,总显存10%)余量并按实测峰值逐个启动。PLAIN/PATCH并行，LOOP大部分串行；采样和D0另行测峰、最多两worker，CPU评分两worker，每进程限制线程。没有停止用户进程。
+
+PLAIN/PATCH并行期间设备总显存峰12867MiB，LOOP阶段8870MiB，包含用户程序；WSL未提供可信单PID显存，记NA，不能把设备差值冒充模型独占峰。训练reserved峰见表；这些墙钟含并发争用，不能作为隔离吞吐比较。RAW CPU评分约141秒，POST/FINAL CPU约280秒，图集渲染约25秒；资源、每阶段收据和实际调用均保存。
+
+工程事件全部保留，没有隐藏失败：
+
+1. CPU准备日志参数重复，模型调用0，修复后继续。
+2. 首次PLAIN调用方没有拆开CallLedger的(result, seconds)，在1次成功前向后报错，反向/更新均0；另完成8次CPU OT。修复后重用原起点与样本，增加的1次前向纳入PLAIN_v2账本；17项CPU检查通过，原失败记录保留。
+3. 评测资源字典的嵌套结构不匹配，在模型调用前被拦截；修复本地适配，6项CPU检查通过，保存score_registration_v2与旧注册。
+4. RL初次把state hash当成file hash，在加载前门禁失败，0前向/0反向/0CUDA；逐张量核验完整权重与导出194个张量一致，CPU真实load通过、19项检查通过，独立v2注册保存。没有改变奖励、输入、预算或随机流。
+5. 一次提前派发评价被“所有训练端点完成”门禁正确拦截，0模型调用，没有创建采样尝试。正式采样随后只执行一次。
+
+没有OOM、数值故障、丢失更新回放、科学失败后重抽或降精度。详见 `engineering_events/`、`audits/`、`dispatch/` 和 `rl/amendments/identity_v2/`。
+
+## 7. 权重、恢复与归档
+
+- [模型与恢复文件清单](WEIGHTS.json)：PLAIN200/267、PATCH200、LOOP200生成器及匹配完整优化器/RNG；RL16最终adapter、AdamW与机会账本。
+- [原固定合同](registration.json)、[方法实现说明](METHODS.md)、[恢复入口](RUNBOOK.md)。完整实验已结束；恢复入口用于核验或明确授权的故障恢复，不授权增加更新。
+- [最终完成/调用核验](COMPLETION.json)、[RL只读核验](rl/verification.json)、[本轮结果快照]({sr}/snapshot.json)。
+- [完整逐输出结果](results/per_output.csv)、[逐父配对](results/paired_per_parent.csv)、[图集与截面](gallery/index.html)、[有效实际图审](visual_review/summary_v2/actual_observations.csv)。
+- `source_snapshot/`包含实际试验代码和所用原评分小文件，`code.diff`只描述新增独立模块，`source_hashes.json`记录哈希。没有改写原评分定义或历史结果。
+
+原EXPOSURE完整检查点file SHA256为 `3c1e9e1db0f9a462632bd70a91b5acaa4bef1dd40ad20ad90a194ab17bbd49fd`；导出生成器file SHA为 `70e51d7913f99ad017d023e47965387b28692075ed9964b61d9d55dd1f0ff6b3`，state SHA为 `76c42158b9016e58cc235b859f6cd5bc68ff1f4e19f3c70e4f94f676447170f4`。文件hash与状态hash是不同身份，已分开保存。
+
+## 8. 决定
+
+固定快筛完成后停止。PATCH200与RL16本版不晋级；LOOP200保留熟悉父连接和局部后处理用途变化的证据，但尚不能认定生成器采用能力提高，几何代价和跨父接续未解决，不替换EXPOSURE或当前正式流程。
+
+如果以后专门跟进LOOP，应先要求局部收益在新噪声/条件上保住主体和支撑，同时控制FF，并区分RAW进步与后处理删掉替代面的现象；本轮不支持仅因I较低就延长训练。没有自动启动后续，也不把短期失败解释为所有RL、循环或共享表示均无效。
+'''
+    path=OUT/'REPORT.md'
+    if path.exists():
+        old=path.read_text('utf-8')
+        if old==text:return
+        if 'DRAFT / PENDING EVALUATION' not in old:raise RuntimeError('Refuse completed report overwrite')
+        archive=OUT/'report_snapshots/initial_pending_REPORT.md'
+        if not archive.exists():archive.write_bytes(path.read_bytes())
+    path.write_text(text,encoding='utf-8',newline='\n')
+    print(json.dumps(dict(status='COMPLETE',report_sha256=sha(path),visual_cells=len(visual),metric_rows=len(rows),snapshot=str(snap))))
+
+if __name__=='__main__':main()

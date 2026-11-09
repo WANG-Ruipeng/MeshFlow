@@ -1,0 +1,2647 @@
+--- /dev/null
++++ b/experiments/mf_h1_local0/control_mvp48_budget_single/__init__.py
+@@ -0,0 +1 @@
++"""Isolated, fixed-budget continuation of the verified Control MVP48 experiment."""
+--- /dev/null
++++ b/experiments/mf_h1_local0/control_mvp48_budget_single/checkpoint.py
+@@ -0,0 +1,150 @@
++"""Strict, isolated continuation checkpoints; the old loader remains read-only."""
++from native_t1 import runtime as _runtime
++import gc
++import hashlib
++import os
++from pathlib import Path
++import time
++import torch
++from models.equidit import DiT
++from models.utils import get_embedder
++from native_t1.artifacts import state_sha256
++from native_t1.checkpoint import DEFAULT_CONFIG
++from native_t1.context_geometry import ContextGeometryEncoder
++from native_t1.portable_checkpoint import (_read_config, config_sha256,
++    OFFICIAL_FILE_SHA256, OFFICIAL_BACKBONE_SHA256)
++from experiments.mf_h1_local0.control_mvp48.model_mvp import MVPModel
++from experiments.mf_h1_local0.control_mvp48.train_io import tree_cpu, tree_hash, capture_rng
++from .common import atomic_json, read_json, digest, json_hash
++
++SCHEMA = 'control_mvp48_budget_checkpoint_v1'
++ARMS = ('T1','Geo','Full','T1_fit2_probe')
++
++
++def tensor_state_hash(state):
++    h = hashlib.sha256()
++    for key, value in sorted(state.items()):
++        value = value.detach().cpu().contiguous()
++        h.update(key.encode()); h.update(str((tuple(value.shape), value.dtype)).encode())
++        h.update(value.view(torch.uint8).numpy().tobytes())
++    return h.hexdigest()
++
++
++def validate_payload(payload):
++    if payload.get('schema') != SCHEMA or payload.get('update_in_progress') is not False:
++        raise ValueError('Not a completed budget checkpoint')
++    m = payload['metadata']; arm = m['variant']; step = m['logical_step']
++    if arm not in ARMS or type(step) is not int:
++        raise ValueError('Unknown continuation arm/step')
++    low, high = (0,1000) if arm == 'T1_fit2_probe' else (1000,5000)
++    if not low <= step <= high:
++        raise ValueError('Checkpoint outside fixed budget')
++    if m['context_encoder'] != ('geo' if arm in ('Geo','Full') else None):
++        raise ValueError('Arm/network mismatch')
++    if m['loss_recipe'] != ('edge5' if arm == 'Full' else 'fm'):
++        raise ValueError('Arm/loss mismatch')
++    if m['protocol_sha256'] != json_hash(payload['protocol']):
++        raise ValueError('Frozen protocol identity mismatch')
++    if m['official_file_sha256'] != OFFICIAL_FILE_SHA256 or m['official_backbone_sha256'] != OFFICIAL_BACKBONE_SHA256:
++        raise ValueError('Official lineage mismatch')
++    if m['config_sha256'] != config_sha256(DEFAULT_CONFIG):
++        raise ValueError('Architecture changed')
++    if m['stream_state_sha256'] != json_hash(payload['stream_state']) or payload['stream_state']['batch_index'] != step:
++        raise ValueError('Stream cursor/hash mismatch')
++    if m['rng_sha256'] != tree_hash(payload['rng']):
++        raise ValueError('RNG hash mismatch')
++    if m['actual_new_updates'] != step-low:
++        raise ValueError('New update accounting mismatch')
++    if 'optimizer' in payload:
++        opt = payload['optimizer']
++        if tree_hash(opt) != m['optimizer_state_sha256']:
++            raise ValueError('AdamW content changed')
++        expected_step = step if arm != 'T1_fit2_probe' else step
++        if not opt['state'] or any(int(s['step']) != expected_step for s in opt['state'].values()):
++            raise ValueError('AdamW step mismatch')
++        for g in opt['param_groups']:
++            if (g['lr'],tuple(g['betas']),g['weight_decay']) != (1e-5,(.9,.95),0.):
++                raise ValueError('AdamW settings changed')
++    return m
++
++
++def load_checkpoint(path, device='cpu', trainable=False):
++    path = Path(path)
++    payload = torch.load(path, map_location='cpu', weights_only=True, mmap=True)
++    m = validate_payload(payload)
++    config = _read_config(Path(DEFAULT_CONFIG))
++    _runtime.configure_stable_runtime()
++    with torch.device('meta'):
++        model = MVPModel(DiT(**config), trainable=False)
++    model.backbone.x_embedder.embed_fn, _ = get_embedder(config['pe_freq'], input_dims=3)
++    if m['context_encoder'] == 'geo':
++        model.context_encoder = ContextGeometryEncoder('geo', seed=1010)
++    state = payload['model']
++    if any(x.dtype != torch.float32 or x.device.type != 'cpu' or not bool(torch.isfinite(x).all()) for x in state.values()):
++        raise ValueError('Model must contain finite CPU FP32 tensors')
++    model.load_state_dict(state, strict=True, assign=True)
++    if state_sha256(model) != m['model_state_sha256']:
++        raise ValueError('Model hash changed')
++    sha = digest(path)
++    sidecar = path.with_suffix('.json')
++    if sidecar.exists():
++        record = read_json(sidecar)
++        if record['checkpoint_sha256'] != sha or record['metadata'] != m:
++            raise ValueError('Checkpoint sidecar differs')
++    model.set_trainable(trainable).eval().to(device)
++    return model, dict(m, checkpoint=str(path.resolve()), strict_load=True), dict(
++        checkpoint_sha256=sha,model_state_sha256=m['model_state_sha256'],protocol_sha256=m['protocol_sha256'])
++
++
++def component_changes(state, source_path):
++    old = torch.load(source_path,map_location='cpu',weights_only=True,mmap=True)['model']
++    result = {g:dict(squared_delta=0.,max_abs_delta=0.,numel=0) for g in ('role','Geo','backbone')}
++    for key, value in state.items():
++        group = 'role' if key == 'role_embedding' else ('Geo' if key.startswith('context_encoder.') else 'backbone')
++        delta = value-old[key]
++        r=result[group]; r['squared_delta'] += float(delta.double().square().sum())
++        r['max_abs_delta'] = max(r['max_abs_delta'],float(delta.abs().max()))
++        r['numel'] += value.numel()
++    for r in result.values():
++        r['l2_delta'] = r.pop('squared_delta')**.5
++        r['changed'] = bool(r['max_abs_delta'] > 0)
++    return result
++
++
++def save_checkpoint(path, model, optimizer, stream, protocol, *, arm, step, source_path,
++                    source_hash, full_state=True, changes=False, counts=None, replace=False):
++    path = Path(path); path.parent.mkdir(parents=True,exist_ok=True)
++    if path.exists() and not replace:
++        raise FileExistsError('Refusing checkpoint overwrite: '+str(path))
++    started = time.perf_counter()
++    state = tree_cpu(model.state_dict()); rng = capture_rng(); ss = stream.state_dict()
++    opt = tree_cpu(optimizer.state_dict()) if full_state else None
++    m = dict(variant=arm,logical_step=step,context_encoder='geo' if arm in ('Geo','Full') else None,
++        model_state_sha256=tensor_state_hash(state),protocol_sha256=json_hash(protocol),
++        source_checkpoint_sha256=source_hash,source_checkpoint=str(source_path),
++        official_file_sha256=OFFICIAL_FILE_SHA256,official_backbone_sha256=OFFICIAL_BACKBONE_SHA256,
++        config_sha256=config_sha256(DEFAULT_CONFIG),rng_sha256=tree_hash(rng),
++        stream_state_sha256=json_hash(ss),loss_recipe='edge5' if arm=='Full' else 'fm',
++        optimizer_state_sha256=tree_hash(opt) if opt is not None else None,
++        actual_new_updates=step-(0 if arm=='T1_fit2_probe' else 1000),
++        recovery_mode='FRESH_PROBE' if arm=='T1_fit2_probe' else 'RESTORE_ALL',
++        full_recovery_state=full_state,optimizer_reset_at_1000=arm=='T1_fit2_probe',
++        counts=dict(counts or {}))
++    if changes: m['component_changes_from_source1000'] = component_changes(state,source_path)
++    payload=dict(schema=SCHEMA,metadata=m,protocol=protocol,model=state,rng=rng,
++                 stream_state=ss,update_in_progress=False)
++    if opt is not None: payload['optimizer']=opt
++    temporary = path.with_name(path.name+'.tmp')
++    torch.save(payload,temporary)
++    with temporary.open('rb') as f: os.fsync(f.fileno())
++    os.replace(temporary,path)
++    record=dict(path=str(path.resolve()),checkpoint_sha256=digest(path),metadata=m)
++    atomic_json(path.with_suffix('.json'),record)
++    # Verify persisted tensors and recovery identity, with no model forward.
++    loaded=torch.load(path,map_location='cpu',weights_only=True,mmap=True)
++    validate_payload(loaded)
++    if tensor_state_hash(loaded['model'])!=m['model_state_sha256']:
++        raise ValueError('Persisted checkpoint model differs')
++    record.update(save_and_verify_seconds=time.perf_counter()-started,strict_reload='PASS')
++    del loaded,payload,opt,state;gc.collect()
++    return record
+--- /dev/null
++++ b/experiments/mf_h1_local0/control_mvp48_budget_single/common.py
+@@ -0,0 +1,68 @@
++"""Small CPU-only durable state helpers for the single managed experiment."""
++from __future__ import annotations
++import contextlib
++import hashlib
++import json
++import os
++from pathlib import Path
++import time
++
++REPO = Path(__file__).resolve().parents[3]
++GPU_LOCK = '/tmp/wrp_meshflow_jedge5_diag_gpu0.lock'
++LIMITS = dict(main_updates=12000, probe_updates=1000, optimizer_updates=13000,
++              generations=1192, repeat_generations=4, all_generations=1196,
++              teacher_forwards=738, wiring_forwards=80,
++              training_microbatch_forwards=104000, model_forwards=164618)
++
++def read_json(path):
++    return json.loads(Path(path).read_text(encoding='utf-8'))
++
++def digest(path):
++    h = hashlib.sha256()
++    with Path(path).open('rb') as f:
++        for block in iter(lambda: f.read(8*1024*1024), b''):
++            h.update(block)
++    return h.hexdigest()
++
++def json_hash(obj):
++    return hashlib.sha256(json.dumps(obj, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()).hexdigest()
++
++def atomic_json(path, obj):
++    path = Path(path)
++    path.parent.mkdir(parents=True, exist_ok=True)
++    tmp = path.with_name(path.name + '.tmp.' + str(os.getpid()))
++    with tmp.open('w', encoding='utf-8') as f:
++        json.dump(obj, f, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False)
++        f.write('\n'); f.flush(); os.fsync(f.fileno())
++    os.replace(tmp, path)
++
++def append_event(path, obj):
++    path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)
++    record = dict(time_unix=time.time(), pid=os.getpid(), **obj)
++    with path.open('a', encoding='utf-8') as f:
++        f.write(json.dumps(record, sort_keys=True, ensure_ascii=False, allow_nan=False)+'\n')
++        f.flush(); os.fsync(f.fileno())
++
++def freeze_json(path, obj):
++    path = Path(path)
++    if path.exists():
++        if read_json(path) != obj:
++            raise ValueError('Frozen artifact identity changed: '+str(path))
++    else:
++        atomic_json(path, obj)
++    return digest(path)
++
++@contextlib.contextmanager
++def controller_lock(out):
++    import fcntl
++    path = Path(out)/'controller.lock'
++    path.parent.mkdir(parents=True, exist_ok=True)
++    with path.open('a+') as f:
++        try:
++            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
++        except BlockingIOError:
++            raise RuntimeError('An identical experiment controller is already running')
++        try:
++            yield
++        finally:
++            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+--- /dev/null
++++ b/experiments/mf_h1_local0/control_mvp48_budget_single/controller_tests.py
+@@ -0,0 +1,157 @@
++"""CPU-only controller contract tests; no model, CUDA or optimizer calls."""
++import json
++from pathlib import Path
++import signal
++import subprocess
++import tempfile
++import unittest
++from unittest import mock
++
++from .common import atomic_json, digest, freeze_json, json_hash, LIMITS
++from .run_all import (MODULE, stages, worker_status, orphan_budget_workers,
++                      wait_managed_child, execution_budget_audit)
++
++
++class ControllerTests(unittest.TestCase):
++    def setUp(self):
++        self.temp=tempfile.TemporaryDirectory()
++        self.out=Path(self.temp.name)
++        self.protocol={'fixed':'identity','main_updates':12000,'probe_updates':1000}
++        atomic_json(self.out/'protocol.json',self.protocol)
++
++    def tearDown(self):
++        self.temp.cleanup()
++
++    def training(self,arm='T1',target=5000,status='SEGMENT_COMPLETE'):
++        updates=target-(0 if arm=='T1_fit2_probe' else 1000)
++        count=dict(optimizer_updates=updates,optimizer_step_attempts=updates,
++                   forward_attempts=8*updates,forward_returns=8*updates,
++                   backward_attempts=8*updates,backward_returns=8*updates)
++        path=self.out/'checkpoints'/f'{arm}_step{target}.pt'
++        path.parent.mkdir(parents=True,exist_ok=True)
++        path.write_bytes((arm+str(target)).encode())
++        metadata=dict(variant=arm,logical_step=target,protocol_sha256=json_hash(self.protocol),
++                      counts=count,actual_new_updates=updates)
++        atomic_json(path.with_suffix('.json'),dict(path=str(path),checkpoint_sha256=digest(path),metadata=metadata))
++        state=dict(status=status,arm=arm,logical_step=target,counts=count,protocol_sha256=json_hash(self.protocol))
++        atomic_json(self.out/'training'/f'{arm}_to{target}_summary.json',state)
++        return dict(key=f'train_{arm}_{target}',module='training',args=['--arm',arm,'--target',str(target)])
++
++    def complete_fixture(self):
++        for arm in ('T1','Geo','Full'):self.training(arm)
++        self.training('T1_fit2_probe',1000)
++        registered=stages()
++        atomic_json(self.out/'run_state.json',dict(stages={r['key']:dict(status='PASS') for r in registered}))
++        atomic_json(self.out/'registration/wiring_precheck.json',dict(status='PASS',optimizer_updates=0,
++                    forwards_attempted=27,forwards_returned=27))
++        sizes=dict(curve=(64,48),swap=(16,0),fit=(8,6),holdout=(32,0))
++        for stage in registered:
++            if stage['module']!='evaluation':continue
++            args=stage['args'];phase=args[args.index('--phase')+1];model=args[args.index('--model-id')+1]
++            gs,ts=sizes[phase]
++            sampling=dict(complete_rollouts=gs,rollout_attempts=gs)
++            teacher=dict(teacher_returns=ts,teacher_attempts=ts)
++            for key in ('model_forward_attempts','model_forward_returns','backbone_forward_attempts','backbone_forward_returns'):
++                sampling[key]=gs*50;teacher[key]=ts
++            rows=[dict(case_id=f'case{i}',status='PASS',score_path=f'scores/{i}.json') for i in range(gs)]
++            teachers=[dict(case_id=f'teacher{i}',status='PASS') for i in range(ts)]
++            atomic_json(self.out/f'evaluation/{phase}/{model}/ledger.json',dict(status='PASS',sampling_counts=sampling,
++                        teacher_counts=teacher,rows=rows,teacher_rows=teachers))
++
++    def test_stage_dag_and_fixed_matrix(self):
++        graph=stages();by_key={s['key']:s for s in graph}
++        self.assertEqual(len(graph),len(by_key))
++        seen=set()
++        for stage in graph:
++            self.assertTrue(set(stage['dependencies'])<=seen,stage['key'])
++            seen.add(stage['key'])
++        self.assertEqual(sum(s['key'].startswith('curve_') for s in graph),15)
++        self.assertEqual(sum(s['key'].startswith('swap_') for s in graph),7)
++        self.assertEqual(sum(s['key'].startswith('fit_') for s in graph),3)
++        self.assertEqual(sum(s['key'].startswith('holdout_') for s in graph),3)
++        for arm in ('T1','Geo','Full'):
++            self.assertIn(f'train_{arm}_2000',by_key[f'train_{arm}_3500']['dependencies'])
++            self.assertIn(f'train_{arm}_3500',by_key[f'train_{arm}_5000']['dependencies'])
++            self.assertEqual(set(by_key[f'holdout_{arm}_5000']['dependencies']),
++                             {f'train_{a}_5000' for a in ('T1','Geo','Full')})
++        generations=15*64+7*16+3*8+3*32
++        teachers=15*48+3*6
++        self.assertEqual(generations,1192)
++        self.assertEqual(teachers,738)
++        self.assertEqual(13000*8+(generations+4)*50+teachers+80,164618)
++        self.assertEqual(13000*8+generations*50+teachers+80,164418)
++        self.assertEqual(LIMITS['model_forwards'],164618)
++
++    def test_safe_interrupt_cannot_be_completed(self):
++        stage=self.training(status='INTERRUPTED_SAFE')
++        self.assertEqual(worker_status(self.out,stage)['status'],'STOPPED')
++
++    def test_fixed_checkpoint_required_and_verified(self):
++        stage=self.training()
++        self.assertEqual(worker_status(self.out,stage)['status'],'PASS')
++        cp=self.out/'checkpoints/T1_step5000.pt'
++        cp.write_bytes(b'changed')
++        with self.assertRaisesRegex(ValueError,'SHA'):worker_status(self.out,stage)
++
++    def test_status_fallback_and_target_gate(self):
++        stage=self.training(target=3500)
++        summary=self.out/'training/T1_to3500_summary.json'
++        summary.rename(self.out/'training/T1_status.json')
++        self.assertEqual(worker_status(self.out,stage)['status'],'PASS')
++        sidecar=self.out/'checkpoints/T1_step3500.json'
++        sidecar.unlink()
++        self.assertEqual(worker_status(self.out,stage)['status'],'STOPPED')
++
++    def test_frozen_identity_refuses_change(self):
++        path=self.out/'frozen.json';freeze_json(path,{'seed':123,'revision':'repair_v2'})
++        freeze_json(path,{'seed':123,'revision':'repair_v2'})
++        with self.assertRaisesRegex(ValueError,'identity changed'):
++            freeze_json(path,{'seed':124,'revision':'repair_v2'})
++        stage=self.training()
++        atomic_json(self.out/'protocol.json',dict(self.protocol,main_updates=12001))
++        with self.assertRaisesRegex(ValueError,'protocol identity'):worker_status(self.out,stage)
++
++    def test_orphan_scan_scoped_to_budget_workers(self):
++        table='PID PPID COMMAND\n'
++        table+=f'210 1 python -B -m {MODULE}.training --out {self.out} --arm T1 --target 2000\n'
++        table+=f'211 1 python -B -m {MODULE}.evaluation --out /tmp/unrelated --phase curve\n'
++        table+='212 1 python -m unrelated.training --out '+str(self.out)+'\n'
++        found=orphan_budget_workers(self.out,table)
++        self.assertEqual([r['pid'] for r in found],[210])
++
++    def test_owned_child_receives_sigterm_and_is_reaped(self):
++        child=mock.Mock()
++        child.wait.side_effect=[KeyboardInterrupt('stop'),0]
++        child.poll.side_effect=[None,None,0]
++        with mock.patch('signal.signal'):
++            with self.assertRaises(KeyboardInterrupt):wait_managed_child(child)
++        child.send_signal.assert_called_once_with(signal.SIGTERM)
++        self.assertEqual(child.wait.call_count,2)
++
++    def test_actual_budget_audit_requires_exact_updates(self):
++        self.complete_fixture()
++        result=execution_budget_audit(self.out)
++        self.assertEqual(result['status'],'PASS',result['errors'])
++        self.assertEqual(result['optimizer_updates'],13000)
++        self.assertEqual(result['complete_rollouts'],1192)
++        self.assertEqual(result['teacher_returns'],738)
++        self.assertEqual(result['model_forward_attempts'],104000+59600+738+27)
++        path=self.out/'training/T1_to5000_summary.json'
++        data=json.loads(path.read_text());data['counts']['optimizer_updates']=3999
++        atomic_json(path,data)
++        self.assertEqual(execution_budget_audit(self.out)['status'],'FAIL')
++
++    def test_actual_budget_audit_rejects_counter_mismatch_and_partial_matrix(self):
++        self.complete_fixture()
++        path=self.out/'evaluation/curve/T1_5000/ledger.json'
++        data=json.loads(path.read_text());data['sampling_counts']['complete_rollouts']=65
++        atomic_json(path,data)
++        result=execution_budget_audit(self.out)
++        self.assertEqual(result['status'],'FAIL')
++        self.assertTrue(any('budget' in e or 'counter' in e for e in result['errors']))
++        path=self.out/'run_state.json';data=json.loads(path.read_text());data['stages'].pop('holdout_Full_5000')
++        atomic_json(path,data)
++        self.assertTrue(any('stage set' in e for e in execution_budget_audit(self.out)['errors']))
++
++
++if __name__=='__main__':unittest.main(verbosity=2)--- /dev/null
++++ b/experiments/mf_h1_local0/control_mvp48_budget_single/evaluation.py
+@@ -0,0 +1,281 @@
++"""Bounded evaluation workers; immutable inputs, original Euler50 and scorer."""
++from __future__ import annotations
++import os
++os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
++os.environ['OMP_NUM_THREADS'] = '1'
++os.environ['MKL_NUM_THREADS'] = '1'
++os.environ['OPENBLAS_NUM_THREADS'] = '1'
++import argparse
++import gc
++from pathlib import Path
++import time
++import traceback
++import numpy as np
++from .common import atomic_json, read_json, digest, json_hash, GPU_LOCK, LIMITS
++
++CURVE_MODELS = ['Native0', 'T1_500', 'Geo_shared_500'] + [f'{a}_{s}' for s in (1000,2000,3500,5000) for a in ('T1','Geo','Full')]
++SWAP_MODELS = ['Native0'] + [f'{a}_{s}' for s in (1000,5000) for a in ('T1','Geo','Full')]
++FIT_MODELS = ['T1_1000','T1_fit2_probe_500','T1_fit2_probe_1000']
++PHASE_KEYS = dict(curve=('generation','teacher'), swap=('swap',None), fit=('fit_generation','fit_teacher'), holdout=('holdout',None))
++
++def resolve(out, value):
++    path = Path(value)
++    return path if path.is_absolute() else Path(out)/path
++
++def arrays(path):
++    with np.load(path, allow_pickle=False) as f:
++        return {k:f[k].copy() for k in f.files}
++
++def save_npz(path, data):
++    path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)
++    with path.open('xb') as f:
++        np.savez_compressed(f, **data); f.flush(); os.fsync(f.fileno())
++    return digest(path)
++
++def _verified(out, record, key='input_path', hash_key='input_sha256'):
++    path = resolve(out, record[key])
++    if hash_key in record and digest(path) != record[hash_key]:
++        raise ValueError('Frozen file changed: '+str(path))
++    return arrays(path)
++
++def checkpoint_path(source, out, model_id):
++    if model_id == 'Native0':
++        return Path(source)/'checkpoints/official_chair_last.pt'
++    arm, step = model_id.rsplit('_',1)
++    base = source if int(step) <= 1000 and arm != 'T1_fit2_probe' else out
++    return Path(base)/'checkpoints'/f'{arm}_step{step}.pt'
++
++def load_model(source, out, model_id, device='cuda:0'):
++    from experiments.mf_h1_local0.control_mvp48.model_mvp import initialize_mvp, load_mvp_checkpoint, state_sha256
++    path = checkpoint_path(source,out,model_id)
++    if model_id == 'Native0':
++        result = initialize_mvp(path, geo=False, device=device)
++        model = result[0] if isinstance(result, tuple) else result
++        model.set_trainable(False).eval()
++        return model, dict(variant='Native0',logical_step=0), dict(checkpoint_sha256=digest(path),model_state_sha256=state_sha256(model))
++    if path.parent.parent.resolve() == Path(source).resolve():
++        return load_mvp_checkpoint(path, device)
++    from .checkpoint import load_checkpoint
++    return load_checkpoint(path, device=device, trainable=False)
++
++def _request_id(record, teacher=False):
++    return str(record.get('teacher_id' if teacher else 'case_id',record.get('id')))
++
++def _bank_reference(out, record):
++    ref = _verified(out,record,'ref_npz','ref_npz_sha256')
++    prefix=record.get('reference_key_prefix')
++    if prefix: ref={k[len(prefix):]:v for k,v in ref.items() if k.startswith(prefix)}
++    meta_path = resolve(out,record['ref_json'])
++    if record.get('ref_json_sha256') and digest(meta_path) != record['ref_json_sha256']:
++        raise ValueError('Frozen reference metadata changed')
++    return dict(arrays=ref,audit=read_json(meta_path))
++
++def score_record(out, record, raw, *, phase):
++    from experiments.mf_h1_local0.control_mvp48.eval_scoring import score_free
++    bank = _verified(out,record)
++    reference = _bank_reference(out,record)
++    # Holdout input banks are the actual source arrays. Their scoring-only bank
++    # is separate, so no GT or bbox is ever passed into model forward.
++    if 'gt_free' not in bank:
++        extra = arrays(resolve(out,record.get('target_path',record['ref_npz'])))
++        bank.update(extra)
++    K, N = len(bank['C']), int(bank['N'])
++    C = bank.get('recipient_C',bank['C']) if phase == 'swap' else bank['C']
++    target = bank['gt_free']; L = float(bank['L'])
++    if phase == 'swap' and 'recipient_input_path' in record:
++        receiver = arrays(resolve(out,record['recipient_input_path']))
++        C = receiver['C']
++    preserved = raw[:K].reshape(K,3,3).tobytes() == bank['C'].reshape(K,3,3).tobytes()
++    scored = score_free(raw[K:], C, target, L, reference=reference, include_pair_audit=True)
++    scored['metrics']['C_preserved'] = preserved
++    scored['detail'].update(actual_condition_preserved=preserved,swap_request=phase=='swap',
++        CF_interpretation='recipient C versus free output; wrong donor is not a valid completion target' if phase=='swap' else 'actual C versus free output')
++    if raw.shape != (N,9) or not preserved:
++        scored.update(status='INVALID_OUTPUT',failure_reason='N_OR_C_MISMATCH')
++    return scored
++
++def teacher_once(model, bank, record, counts):
++    import torch
++    from native_t1.model import native_execution, assert_native_runtime
++    from native_t1.artifacts import array_hash
++    from experiments.mf_h1_local0.control_mvp48.eval_teacher import offline_teacher_diagnostics
++    keys = ('xt','t','y','valid_mask','known_mask')
++    identity = dict(record.get('identity',{}))
++    N = int(bank['y']); K = int(np.asarray(bank['known_mask']).sum())
++    identity.update(N=N,K=K,bbox_L=float(identity.get('bbox_L',bank.get('L',1))))
++    if float(bank['t']) not in [float(np.float32(t)) for t in (.2,.5,.8)]:
++        raise ValueError('Unregistered teacher time')
++    for key,expected in identity.get('array_sha256',{}).items():
++        if key in bank and array_hash(bank[key]) != expected:
++            raise ValueError('Teacher array identity changed: '+key)
++    args = {k:torch.from_numpy(np.array(bank[k],copy=True)).unsqueeze(0).to('cuda:0') for k in keys}
++    before = dict(counts); start = time.perf_counter(); handles=[]
++    def inc(k):
++        def hook(*unused): counts[k] += 1
++        return hook
++    handles += [model.register_forward_pre_hook(inc('model_forward_attempts')),model.register_forward_hook(inc('model_forward_returns')),
++        model.backbone.x_embedder.register_forward_pre_hook(inc('backbone_forward_attempts')),
++        model.backbone.final_layer.linear.register_forward_hook(inc('backbone_forward_returns'))]
++    counts['teacher_attempts'] += 1
++    partial={}
++    try:
++        torch.cuda.reset_peak_memory_stats()
++        with torch.no_grad(), native_execution(model,coordinates=(args['xt'],args['t'])) as facts:
++            v = model(*(args[k] for k in keys)).float()[0].cpu().numpy().copy()
++            after = assert_native_runtime(model,coordinates=(args['xt'],args['t']))
++        partial['velocity']=v
++        for key in keys:
++            if array_hash(args[key][0].cpu().numpy())!=array_hash(bank[key]): raise ValueError('Teacher model mutated input '+key)
++        if not np.isfinite(v).all(): raise FloatingPointError('Nonfinite teacher velocity')
++        result, endpoint = offline_teacher_diagnostics(bank,identity,v)
++        counts['teacher_returns'] += 1
++        result.update(status='PASS',teacher_t=float(bank['t']),runtime_before=facts,runtime_after=after,
++            nfe=counts['backbone_forward_attempts']-before['backbone_forward_attempts'],
++            peak_cuda_allocated_bytes=torch.cuda.max_memory_allocated(),peak_cuda_reserved_bytes=torch.cuda.max_memory_reserved(),
++            peak_scope='one teacher forward after reset including resident model',seconds=time.perf_counter()-start)
++        if result['nfe'] != 1: raise RuntimeError('Teacher one-forward count mismatch')
++        # Original auxiliary formulas on CPU predictions; no model/geometry backward.
++        if all(k in bank for k in ('free_vertex_ids','known_vertex_ids')):
++            from native_t1.losses import prepare_targets, evaluate
++            target = prepare_targets(dict(free_gt=bank['x1'][~bank['known_mask']].reshape(-1,3,3),
++                known=bank['C'].reshape(-1,3,3),free_ids=bank['free_vertex_ids'],known_ids=bank['known_vertex_ids'],bbox_L=identity['bbox_L']))
++            pred=torch.from_numpy(endpoint[~bank['known_mask']].reshape(-1,3,3))
++            with torch.no_grad():
++                for key in ('D_edge','L5'):
++                    result[key]=float(evaluate(key,pred,target[key])['loss'])
++        else:
++            result.update(D_edge=None,L5=None,auxiliary_status='NOT_AVAILABLE_SOURCE_VERTEX_LABELS')
++        return result,dict(velocity=v,Yhat=endpoint)
++    except BaseException as exc:
++        exc.partial_teacher_arrays=partial
++        raise
++    finally:
++        for handle in handles: handle.remove()
++
++def _global_attempts(out):
++    gs=ts=0
++    for path in (Path(out)/'evaluation').glob('*/*/ledger.json'):
++        data=read_json(path)
++        gs+=sum(bool(x.get('attempt_reserved')) for x in data.get('rows',[]))
++        ts+=sum(bool(x.get('attempt_reserved')) for x in data.get('teacher_rows',[]))
++    return gs,ts
++
++def run(source,out,model_id,phase,score_only=False):
++    source,out=Path(source),Path(out)
++    allowed = CURVE_MODELS if phase=='curve' else SWAP_MODELS if phase=='swap' else FIT_MODELS if phase=='fit' else [f'{a}_5000' for a in ('T1','Geo','Full')]
++    if model_id not in allowed: raise ValueError('Unregistered model/phase')
++    manifest=read_json(out/'panels.json'); key,tkey=PHASE_KEYS[phase]
++    for frozen_path,expected_sha in manifest.get('frozen_files',{}).items():
++        if digest(resolve(out,frozen_path))!=expected_sha: raise ValueError('Frozen panel file changed: '+frozen_path)
++    records=manifest[key]; teachers=manifest[tkey] if tkey else []
++    expected = {'curve':(64,48),'swap':(16,0),'fit':(8,6),'holdout':(32,0)}[phase]
++    if len(records)>expected[0] or len(teachers)!=expected[1]: raise ValueError('Panel count exceeds fixed protocol')
++    folder=out/'evaluation'/phase/model_id; target=folder/'ledger.json'
++    signature=dict(model_id=model_id,phase=phase,panels_sha256=digest(out/'panels.json'),checkpoint=str(checkpoint_path(source,out,model_id)),
++        checkpoint_sha256=digest(checkpoint_path(source,out,model_id)) if checkpoint_path(source,out,model_id).exists() else None)
++    ledger=read_json(target) if target.exists() else dict(schema='mvp48_budget_evaluation_v1',identity=signature,status='PREPARED',rows=[],teacher_rows=[],sampling_counts={},teacher_counts={},actual_gpu_workers=1)
++    if ledger['identity']!=signature: raise ValueError('Existing evaluation identity differs')
++    if any(r.get('status') in ('RUNNING','FAIL','STOPPED') for r in ledger['rows']+ledger['teacher_rows']):
++        raise RuntimeError('An interrupted/failed attempt exists; automatic replay prohibited')
++    if signature['checkpoint_sha256'] is None:
++        if model_id not in ('Native0','T1_500','Geo_shared_500'): raise FileNotFoundError(signature['checkpoint'])
++        ledger.update(status='NOT_AVAILABLE',reason='Historical checkpoint absent; no historical retraining');atomic_json(target,ledger);return ledger
++    def persist(): atomic_json(target,ledger)
++    def score_pending():
++        for row in ledger['rows']:
++            if row.get('status')!='PASS' or row.get('score_path'): continue
++            record=next(r for r in records if _request_id(r)==row['case_id'])
++            raw_path=resolve(out,row['raw_path'])
++            if digest(raw_path)!=row['raw_sha256']: raise ValueError('Raw hash differs')
++            scoring_started=time.perf_counter()
++            scored=score_record(out,record,arrays(raw_path)['raw'],phase=phase)
++            row['scoring_seconds']=time.perf_counter()-scoring_started
++            loc=folder/'scores'/(row['case_id']+'.json');atomic_json(loc,scored)
++            row.update(score_path=str(loc.relative_to(out)),score_sha256=digest(loc),score_status=scored['status']);persist()
++    if score_only:
++        score_pending(); return ledger
++    if ledger['status']=='PASS':
++        score_pending();return ledger
++    if ledger['status']=='GPU_COMPLETE':
++        score_pending();ledger['status']='PASS';persist();return ledger
++    import fcntl
++    from experiments.mf_h1_local0.control_mvp48.eval_common import snapshot
++    from experiments.mf_h1_local0.control_mvp48.eval_gpu_worker import resources_ok
++    lock=open(GPU_LOCK,'a+');started=time.perf_counter()
++    ledger.update(status='WAITING_GPU_LOCK',pid=os.getpid());persist()
++    try:
++        while True:
++            try: fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
++            except BlockingIOError: time.sleep(5);continue
++            facts=snapshot();ok,admission=resources_ok(facts,initial=True)
++            ledger.update(resources_before=facts,admission=admission);persist()
++            if ok:break
++            fcntl.flock(lock,fcntl.LOCK_UN);time.sleep(5)
++        ledger['lock_wait_seconds']=time.perf_counter()-started
++        import torch
++        from experiments.mf_h1_local0.control_mvp48.eval_runtime import new_counts,sample_euler50,SamplingFailure
++        from native_t1.artifacts import array_hash
++        from experiments.mf_h1_local0.control_mvp48.model_mvp import state_sha256
++        torch.set_num_threads(1);torch.set_num_interop_threads(1)
++        ledger['sampling_counts']=ledger['sampling_counts'] or new_counts();ledger['teacher_counts']=ledger['teacher_counts'] or new_counts()
++        load_started=time.perf_counter()
++        model,metadata,hashes=load_model(source,out,model_id)
++        ledger['model_load_seconds']=time.perf_counter()-load_started
++        ledger.update(model_metadata=metadata,model_hashes=hashes,status='RUNNING');persist()
++        for teacher,requests,rows,counts in ((False,records,ledger['rows'],ledger['sampling_counts']),(True,teachers,ledger['teacher_rows'],ledger['teacher_counts'])):
++            existing={r['case_id']:r for r in rows}
++            for ordinal,record in enumerate(requests):
++                rid=_request_id(record,teacher)
++                if rid in existing:continue
++                if record.get('status')=='NOT_AVAILABLE':
++                    rows.append(dict(case_id=rid,status='NOT_AVAILABLE',reason=record.get('reason'),attempt_reserved=False));persist();continue
++                gs,ts=_global_attempts(out)
++                if gs+(not teacher)>LIMITS['generations'] or ts+teacher>LIMITS['teacher_forwards']: raise RuntimeError('Global evaluation budget exhausted')
++                facts=snapshot();ok,admission=resources_ok(facts,initial=False)
++                ledger.setdefault('phase_resource_snapshots',[]).append(dict(phase=('teacher' if teacher else 'generation'),request_id=rid,snapshot=facts,admission=admission))
++                if not ok: raise RuntimeError('GPU headroom lost')
++                bank=_verified(out,record)
++                row=dict(case_id=rid,model_id=model_id,phase=phase,uid=record.get('uid',record.get('parent_id')),patch_id=record.get('patch_id',record.get('condition_id')),
++                    split=record.get('split'),noise_index=record.get('noise_index',record.get('noise_id')),teacher_t=record.get('t'),status='RUNNING',attempt_reserved=True,input_sha256=digest(resolve(out,record['input_path'])))
++                rows.append(row);persist()
++                before=dict(counts);raws={}
++                try:
++                    if teacher:
++                        result,raws=teacher_once(model,bank,record,counts);row.update(result)
++                    else:
++                        z=torch.from_numpy(bank['z']).to('cuda:0');C=torch.from_numpy(bank['C']).to('cuda:0')
++                        raw,path,audit=sample_euler50(model,z,C,counts)
++                        raws=dict(raw=raw,noise=bank['z'],C=bank['C'],known_mask=bank['known_mask'])
++                        if ordinal==0:raws['states']=path
++                        row.update(status='PASS',audit=audit,output_array_sha256={k:array_hash(v) for k,v in raws.items()})
++                    loc=folder/('teacher_raw' if teacher else 'raw')/(rid+'.npz')
++                    sha=save_npz(loc,raws);row.update(raw_path=str(loc.relative_to(out)),raw_sha256=sha)
++                except SamplingFailure as exc:
++                    loc=folder/'failed_raw'/(rid+'.npz');sha=save_npz(loc,dict(states=exc.partial_states))
++                    row.update(status='FAIL',reason=str(exc),audit=exc.audit,raw_path=str(loc.relative_to(out)),raw_sha256=sha);raise
++                except BaseException as exc:
++                    if getattr(exc,'partial_teacher_arrays',None):
++                        loc=folder/'failed_teacher_raw'/(rid+'.npz');sha=save_npz(loc,exc.partial_teacher_arrays)
++                        row.update(raw_path=str(loc.relative_to(out)),raw_sha256=sha)
++                    row.update(status='FAIL',reason=repr(exc));raise
++                finally:
++                    row['counts_delta']={k:counts[k]-before[k] for k in counts};persist()
++        if state_sha256(model)!=hashes['model_state_sha256']: raise RuntimeError('Evaluation changed model parameters')
++        del model;gc.collect();torch.cuda.empty_cache()
++        ledger.update(status='GPU_COMPLETE',resources_after=snapshot(),worker_seconds=time.perf_counter()-started);persist()
++    except BaseException as exc:
++        ledger.update(status='STOPPED',reason=repr(exc),traceback=traceback.format_exc(),worker_seconds=time.perf_counter()-started);persist();raise
++    finally:
++        # Keep flock until process exit, including the remaining CUDA context.
++        global _PROCESS_LOCK
++        _PROCESS_LOCK=lock
++    score_pending()
++    ledger.update(status='PASS',completed_generations=ledger['sampling_counts']['complete_rollouts'],requested_generations=len(records),completed_teacher=ledger['teacher_counts']['teacher_returns'],requested_teacher=len(teachers),worker_seconds=time.perf_counter()-started);persist()
++    return ledger
++
++def main():
++    p=argparse.ArgumentParser();p.add_argument('--source',required=True);p.add_argument('--out',required=True)
++    p.add_argument('--model-id',required=True);p.add_argument('--phase',required=True,choices=list(PHASE_KEYS));p.add_argument('--score-only',action='store_true')
++    a=p.parse_args();run(a.source,a.out,a.model_id,a.phase,a.score_only)
++
++if __name__=='__main__':main()
+--- /dev/null
++++ b/experiments/mf_h1_local0/control_mvp48_budget_single/finalize.py
+@@ -0,0 +1,98 @@
++"""Inventory actual checkpoints and calls; never infer completion from filenames."""
++from pathlib import Path
++import csv
++from .common import read_json, atomic_json, digest, LIMITS, REPO
++
++def finalize(source,out):
++    source,out=Path(source),Path(out)
++    state=read_json(out/'run_state.json') if (out/'run_state.json').exists() else {}
++    checkpoints=[]
++    index=read_json(source/'checkpoints/checkpoints.json')
++    for row in index['checkpoints']:
++        path=Path(row['path'])
++        checkpoints.append(dict(origin='protected_source',path=str(path),exists=path.is_file(),
++            checkpoint_sha256=row['checkpoint_sha256'],metadata=row['metadata'],
++            hash_verified=path.is_file() and digest(path)==row['checkpoint_sha256']))
++    for sidecar in sorted((out/'checkpoints').glob('*.json')):
++        row=read_json(sidecar)
++        if 'checkpoint_sha256' not in row:continue
++        path=Path(row['path'])
++        checkpoints.append(dict(origin='current_run',path=str(path),exists=path.is_file(),
++            checkpoint_sha256=row['checkpoint_sha256'],metadata=row['metadata'],
++            hash_verified=path.is_file() and digest(path)==row['checkpoint_sha256'],
++            purpose='recoverable_latest' if path.stem.endswith('_latest') else 'fixed_registered_state'))
++    manifest=dict(schema='control_mvp48_budget_inventory_v1',restore_mode='RESTORE_ALL',
++        probe_restore_mode='FRESH_PROBE',checkpoints=checkpoints,
++        note='MVP48 conditional fine-tuning steps only; official pretraining excluded; weights are not repackaged')
++    atomic_json(out/'checkpoint_manifest.json',manifest)
++    training=[];micro_attempt=micro_return=back_attempt=back_return=step_attempt=steps=0
++    for arm in ('T1','Geo','Full','T1_fit2_probe'):
++        path=out/'training'/f'{arm}_status.json'
++        row=read_json(path) if path.exists() else dict(arm=arm,status='NOT_RUN',counts={})
++        training.append(row);c=row.get('counts',{})
++        micro_attempt+=c.get('forward_attempts',0);micro_return+=c.get('forward_returns',0)
++        back_attempt+=c.get('backward_attempts',0);back_return+=c.get('backward_returns',0)
++        step_attempt+=c.get('optimizer_step_attempts',0);steps+=c.get('optimizer_updates',0)
++    evaluation=[];gen_attempt=gen_return=gen_fwd_attempt=gen_fwd_return=teach_attempt=teach_return=0
++    resources=[]
++    for path in sorted((out/'evaluation').glob('*/*/ledger.json')):
++        row=read_json(path);identity=row.get('identity',{});a=row.get('sampling_counts',{});b=row.get('teacher_counts',{})
++        evaluation.append(dict(identity=identity,status=row['status'],sampling_counts=a,teacher_counts=b))
++        gen_attempt+=a.get('rollout_attempts',0);gen_return+=a.get('complete_rollouts',0)
++        gen_fwd_attempt+=a.get('model_forward_attempts',0);gen_fwd_return+=a.get('model_forward_returns',0)
++        teach_attempt+=b.get('model_forward_attempts',0);teach_return+=b.get('model_forward_returns',0)
++        cases=row.get('rows',[]);teachers=row.get('teacher_rows',[])
++        resources.append(dict(phase=identity.get('phase'),worker=identity.get('model_id'),status=row['status'],
++            gpu_workers=row.get('actual_gpu_workers'),worker_seconds=row.get('worker_seconds'),lock_wait_seconds=row.get('lock_wait_seconds'),
++            forward_seconds=sum(r.get('audit',{}).get('seconds',0) for r in cases)+sum(r.get('seconds',0) for r in teachers),
++            cuda_peak_allocated_bytes=max([r.get('audit',{}).get('peak_cuda_allocated_bytes',0) for r in cases]+[r.get('peak_cuda_allocated_bytes',0) for r in teachers]+[0]),
++            cuda_peak_reserved_bytes=max([r.get('audit',{}).get('peak_cuda_reserved_bytes',0) for r in cases]+[r.get('peak_cuda_reserved_bytes',0) for r in teachers]+[0]),
++            memory_scope='max of per-generation/teacher scopes; includes resident model; not summed',
++            process_gpu_used_peak_mib=row.get('process_gpu_used_peak_mib'),global_gpu_used_peak_mib=row.get('global_gpu_used_peak_mib')))
++    ot_attempt=ot_return=ot_hits=0
++    for path in sorted((out/'training').glob('*_to*_summary.json')):
++        r=read_json(path);c=r.get('OT_counts',{})
++        ot_attempt+=c.get('actual_OT_attempts',0);ot_return+=c.get('actual_OT_returns',0);ot_hits+=c.get('OT_cache_hits',0)
++        resources.append(dict(phase='training',worker=f"{r['arm']}_to{r['target']}",status=r['status'],gpu_workers=1,
++            worker_seconds=r.get('worker_wall_seconds'),lock_wait_seconds=r.get('lock_wait_seconds'),
++            forward_seconds=r.get('worker_train_seconds'),OT_seconds=r.get('worker_OT_seconds'),save_seconds=r.get('worker_save_seconds'),
++            load_seconds=r.get('load_seconds'),cuda_peak_allocated_bytes=r.get('cuda_peak_allocated_bytes'),
++            cuda_peak_reserved_bytes=r.get('cuda_peak_reserved_bytes'),memory_scope=r.get('memory_scope'),
++            process_gpu_used_peak_mib=r.get('process_gpu_used_peak_mib'),global_gpu_used_peak_mib=r.get('global_gpu_used_peak_mib'),
++            updates_per_train_second=r.get('throughput_updates_per_train_second')))
++    wiring=read_json(out/'registration/wiring_precheck.json') if (out/'registration/wiring_precheck.json').exists() else {}
++    prepare_path=out/'registration/prepare_events.jsonl'
++    import json
++    prep=[json.loads(line) for line in prepare_path.read_text().splitlines()] if prepare_path.exists() else []
++    wa=wiring.get('forwards_attempted',0);wr=wiring.get('forwards_returned',0)
++    total=micro_attempt+gen_fwd_attempt+teach_attempt+wa
++    record=dict(status=state.get('status','NOT_RUN'),limits=LIMITS,training=training,evaluation=evaluation,
++        optimizer_step_attempts=step_attempt,optimizer_updates_returned=steps,
++        training_microbatch_forward_attempts=micro_attempt,training_microbatch_forward_returns=micro_return,
++        training_backward_attempts=back_attempt,training_backward_returns=back_return,
++        generation_attempts=gen_attempt,complete_generations=gen_return,
++        generation_forward_attempts=gen_fwd_attempt,generation_forward_returns=gen_fwd_return,
++        teacher_forward_attempts=teach_attempt,teacher_forward_returns=teach_return,
++        wiring_forward_attempts=wa,wiring_forward_returns=wr,zero_update_backward_returns=wiring.get('zero_update_backwards',0),
++        zero_update_output_gradient_calls=wiring.get('zero_update_output_gradient_calls',0),
++        all_model_forward_attempts=total,
++        CPU_OT=dict(training_attempts=ot_attempt,training_returns=ot_return,cache_hits=ot_hits,
++            teacher_prepare_attempts=sum(r.get('action')=='teacher_OT_attempt' for r in prep),
++            teacher_prepare_returns=sum(r.get('action')=='teacher_OT_return' for r in prep),
++            wiring=wiring.get('cpu_OT',{})),
++        within_hard_limits=steps<=13000 and gen_return<=1196 and teach_attempt<=738 and wa<=80 and total<=164618,
++        timing_note='Worker wall times include their own waiting/loading/IO; overlapping observations and resource peaks are not additive. No isolated throughput equivalence claimed.',
++        process_VRAM_unavailable='null/NA denotes WSL unavailable; allocated and reserved are not added',
++        restart_command=state.get('restart_command'))
++    atomic_json(out/'execution_accounting.json',record)
++    fields=list(dict.fromkeys(k for r in resources for k in r))
++    with (out/'resource_summary.csv').open('w',newline='',encoding='utf-8') as f:
++        w=csv.DictWriter(f,fieldnames=fields);w.writeheader()
++        for r in resources:w.writerow({k:'NA' if v is None else v for k,v in r.items()})
++    protected=read_json(source/'TRAIN_READY.json')['source_hashes']
++    checks={name:digest(REPO/name)==sha for name,sha in protected.items()}
++    atomic_json(out/'protected_assets_after.json',dict(public_code_hashes=checks,
++        source_checkpoints_unchanged=all(r['hash_verified'] for r in checkpoints if r['origin']=='protected_source'),
++        no_default_model_change=all(checks.values()),commit_or_push=False))
++    (out/'restart.txt').write_text((state.get('restart_command') or 'Run the same run_all --source --out command')+'\n',encoding='utf-8')
++    return record
+--- /dev/null
++++ b/experiments/mf_h1_local0/control_mvp48_budget_single/precheck.py
+@@ -0,0 +1,146 @@
++"""Bounded disposable GPU wiring checks: no optimizer is created or stepped."""
++import os
++for _name in ('OMP_NUM_THREADS','MKL_NUM_THREADS','OPENBLAS_NUM_THREADS','NUMEXPR_NUM_THREADS'):
++    os.environ[_name] = '2'
++from native_t1 import runtime
++import argparse
++import gc
++from pathlib import Path
++import time
++import traceback
++import torch
++from native_t1.artifacts import state_sha256
++from native_t1.context_geometry import attach_context_encoder
++from native_t1.data import model_inputs
++from native_t1.losses import prepare_targets, evaluate
++from native_t1.model import native_execution
++from experiments.mf_h1_local0.control_mvp48.model_mvp import load_mvp_checkpoint, initialize_mvp, velocity_mvp
++from experiments.mf_h1_local0.control_mvp48.train_stream import FrozenStream, MVPObjective, collate
++from experiments.mf_h1_local0.control_mvp48.train_core import backward_batch
++from experiments.mf_h1_local0.control_mvp48.train_io import gpu_lock, resource_snapshot
++from experiments.mf_h1_local0.control_mvp48.train_run import dispatch_check
++from .common import atomic_json, read_json, digest, append_event
++
++def module_gradients(model):
++    groups = {'role': [], 'backbone': [], 'Geo': []}
++    for name, p in model.named_parameters():
++        group = 'role' if name == 'role_embedding' else ('Geo' if name.startswith('context_encoder.') else 'backbone')
++        if p.grad is not None:
++            if not bool(torch.isfinite(p.grad).all()):
++                raise FloatingPointError('Nonfinite gradient: '+name)
++            groups[group].append(float(p.grad.float().square().sum()))
++    values = {k:sum(v)**.5 for k,v in groups.items()}
++    if values['role'] <= 0 or values['backbone'] <= 0:
++        raise RuntimeError('Missing role/backbone gradient')
++    if model.context_encoder is not None and values['Geo'] <= 0:
++        raise RuntimeError('Missing Geo gradient')
++    return values
++
++def run(source, out):
++    out = Path(out); source = Path(source)
++    target = out/'registration/wiring_precheck.json'
++    if target.exists():
++        old = read_json(target)
++        if old['status'] != 'PASS':
++            raise RuntimeError('Previous wiring failure preserved; no automatic replay')
++        for name, expected in old['source_checkpoints'].items():
++            if digest(source/'checkpoints'/name) != expected:
++                raise ValueError('Precheck source changed')
++        return old
++    attempt = out/'registration/wiring_attempt.json'
++    if attempt.exists():
++        raise RuntimeError('Interrupted wiring attempt; refusing unaccounted replay')
++    torch.set_num_threads(2); torch.set_num_interop_threads(2)
++    runtime.configure_stable_runtime()
++    status = dict(status='RUNNING', optimizer_updates=0, forwards_attempted=0,
++                  forwards_returned=0, zero_update_backwards=0, arms={}, source_checkpoints={})
++    tick = time.perf_counter()
++    (out/'training').mkdir(parents=True, exist_ok=True)
++    before = resource_snapshot(); atomic_json(out/'registration/wiring_resources_before.json',before)
++    dispatch_check(before)
++    try:
++        with gpu_lock(out) as wait:
++            dispatch_check(resource_snapshot())
++            atomic_json(attempt,dict(time_unix=time.time(), maximum_forwards=28, optimizer_updates=0))
++            status['lock_wait_seconds']=wait
++            binding = read_json(source/'registration/train_data_binding.json')
++            stream = FrozenStream(binding,source/'data/train_plan.json',source/'data')
++            samples = stream.next_effective_batch()
++            torch.cuda.reset_peak_memory_stats()
++            for arm in ('T1','Geo','Full'):
++                path = source/'checkpoints'/f'{arm}_step1000.pt'
++                model,meta,hashes = load_mvp_checkpoint(path,'cuda')
++                status['source_checkpoints'][path.name] = hashes['checkpoint_sha256']
++                model.set_trainable(True).eval()
++                before_hash = state_sha256(model)
++                class Counting(dict):
++                    def __setitem__(self,key,value):
++                        old=self.get(key,0)
++                        super().__setitem__(key,value)
++                        mapped={'forward_attempts':'forwards_attempted','forward_returns':'forwards_returned',
++                                'backward_returns':'zero_update_backwards'}.get(key)
++                        if mapped:
++                            status[mapped]+=value-old
++                            atomic_json(target,status)
++                counts=Counting()
++                model.zero_grad(set_to_none=True)
++                atomic_json(target,status)
++                result=backward_batch(model,samples,objective=MVPObjective(stream) if arm=='Full' else None,
++                                      additional_step=501 if arm=='Full' else None,counts=counts)
++                gradients=module_gradients(model)
++                if state_sha256(model) != before_hash:
++                    raise RuntimeError('Disposable precheck unexpectedly changed model parameters')
++                status['arms'][arm] = dict(status='PASS', gradients=gradients, FM=result['FM'],
++                                           geometry=result['geometry'], counts=counts, parameters_unchanged=True)
++                model.zero_grad(set_to_none=True)
++                if arm=='Full':
++                    sample=next(s for s in samples if float(s['t']) >= .5)
++                    batch=collate([sample],'cuda'); targets=prepare_targets(stream.label(sample))
++                    status['forwards_attempted']+=1; atomic_json(target,status)
++                    with native_execution(model,coordinates=(batch['xt'],batch['t'])):
++                        velocity=model(*model_inputs(batch)).float()
++                        status['forwards_returned']+=1
++                        prediction=(batch['xt']+(1-batch['t'][:,None,None])*velocity)[batch['loss_mask']].reshape(-1,3,3)
++                        terms={name:evaluate(name,prediction,targets[name])['loss'] for name in ('D_edge','L5')}
++                        diagnostics={}
++                        for name,term in terms.items():
++                            g=torch.autograd.grad(term,velocity,retain_graph=True)[0]
++                            if not bool(torch.isfinite(g).all()) or float(g.norm()) <= 0:
++                                raise RuntimeError('Auxiliary has no finite real-prediction gradient: '+name)
++                            diagnostics[name]=dict(loss=float(term.detach()),output_gradient_norm=float(g.norm()))
++                        status['arms'][arm]['term_output_gradients']=diagnostics
++                        status['zero_update_output_gradient_calls']=2
++                    del velocity,prediction,terms,g,batch,targets
++                del model; gc.collect(); torch.cuda.empty_cache()
++                atomic_json(target,status)
++            official=source/'checkpoints/official_chair_last.pt'
++            model,identity=initialize_mvp(official,geo=False,device='cuda')
++            batch=collate([samples[0]],'cuda')
++            with torch.no_grad():
++                status['forwards_attempted']+=1; atomic_json(target,status)
++                native=velocity_mvp(model,*model_inputs(batch)); status['forwards_returned']+=1
++                attach_context_encoder(model,'geo',seed=1010)
++                status['forwards_attempted']+=1; atomic_json(target,status)
++                geo=velocity_mvp(model,*model_inputs(batch)); status['forwards_returned']+=1
++                if not torch.equal(native,geo):
++                    raise RuntimeError('Native and zero-exit Geo initialization differ')
++            status.update(status='PASS', zero_exit_geo_bitwise=True, official_identity=identity,
++                peak_allocated_bytes=torch.cuda.max_memory_allocated(),peak_reserved_bytes=torch.cuda.max_memory_reserved(),
++                peak_scope='entire disposable wiring stage after reset',cpu_OT=stream.counts,
++                elapsed_seconds=time.perf_counter()-tick,raw_known_velocity_zero_required=False,
++                historical_BF16_permutation='FAIL_UNCHANGED: 10/1008 coordinates; max_abs .064453125; atol .015625, rtol .03125')
++            atomic_json(target,status)
++            del model,batch; gc.collect(); torch.cuda.empty_cache()
++    except Exception as exc:
++        status.update(status='STOPPED',error=repr(exc),traceback=traceback.format_exc(),elapsed_seconds=time.perf_counter()-tick)
++        atomic_json(target,status)
++        raise
++    finally:
++        atomic_json(out/'registration/wiring_resources_after.json',resource_snapshot())
++    return status
++
++def main():
++    p=argparse.ArgumentParser();p.add_argument('--source',type=Path,required=True);p.add_argument('--out',type=Path,required=True)
++    args=p.parse_args();print(run(args.source,args.out),flush=True)
++
++if __name__=='__main__': main()
+--- /dev/null
++++ b/experiments/mf_h1_local0/control_mvp48_budget_single/prepare.py
+@@ -0,0 +1,411 @@
++"""Frozen, CPU-only inputs for the bounded MVP48 continuation.
++
++Only the new output tree is writable. Existing source banks are hash checked and
++retained verbatim. Re-entry verifies the manifest before returning completed work.
++"""
++from __future__ import annotations
++
++import hashlib
++import importlib.util
++import json
++import os
++import time
++from collections import Counter, defaultdict, deque
++from pathlib import Path
++
++for _key in ('OMP_NUM_THREADS', 'MKL_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'NUMEXPR_NUM_THREADS'):
++    os.environ.setdefault(_key, '1')
++os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
++
++import numpy as np
++
++
++def read_json(path):
++    return json.loads(Path(path).read_text(encoding='utf-8-sig'))
++
++
++def sha256(path):
++    digest = hashlib.sha256()
++    with Path(path).open('rb') as stream:
++        for block in iter(lambda: stream.read(8 * 1024 * 1024), b''):
++            digest.update(block)
++    return digest.hexdigest()
++
++
++def _json(path, value, *, frozen=True):
++    path = Path(path)
++    text = json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False) + '\n'
++    if path.exists() and frozen:
++        if read_json(path) != json.loads(text):
++            raise ValueError('Frozen JSON identity changed: ' + str(path))
++        return
++    path.parent.mkdir(parents=True, exist_ok=True)
++    temporary = path.with_name(path.name + '.tmp')
++    temporary.write_text(text, encoding='utf-8')
++    os.replace(temporary, path)
++
++
++def _npz(path, arrays):
++    path = Path(path)
++    if path.exists():
++        with np.load(path, allow_pickle=False) as stored:
++            if set(stored.files) != set(arrays):
++                raise ValueError('Frozen NPZ keys changed: ' + str(path))
++            for key, value in arrays.items():
++                actual = stored[key]
++                expected = np.asarray(value)
++                if actual.dtype != expected.dtype or actual.shape != expected.shape or actual.tobytes() != expected.tobytes():
++                    raise ValueError('Frozen NPZ array changed: ' + str(path) + '/' + key)
++        return
++    path.parent.mkdir(parents=True, exist_ok=True)
++    temporary = path.with_name(path.name + '.tmp')
++    with temporary.open('wb') as stream:
++        np.savez_compressed(stream, **arrays)
++    os.replace(temporary, path)
++
++
++def _seed(domain, *identity):
++    message = json.dumps(['control_mvp48_budget_single_v1', domain, *identity], separators=(',', ':'))
++    return int.from_bytes(hashlib.sha256(message.encode()).digest()[:4], 'little')
++
++
++def _load_api(source):
++    spec = importlib.util.spec_from_file_location('budget_single_frozen_source', source / 'data/load_sample.py')
++    api = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(api)
++    return api
++
++
++def _source_audit(source):
++    ready = read_json(source / 'DATA_READY.json')
++    if ready.get('status') != 'READY' or ready.get('data_revision') != 'repair_v2':
++        raise ValueError('Require the authoritative repair_v2 DATA_READY')
++    root = Path(__file__).resolve().parents[3]
++    checked = {}
++    for name, spec in ready['files'].items():
++        path = source / name
++        if sha256(path) != spec['sha256'] or path.stat().st_size != spec['bytes']:
++            raise ValueError('Source data identity changed: ' + name)
++        checked[name] = spec['sha256']
++    for name, expected in ready['code'].items():
++        if sha256(root / name) != expected:
++            raise ValueError('Source data code identity changed: ' + name)
++    splits = read_json(source / 'data/splits.json')
++    objects = {row['uid']: row for row in read_json(source / 'data/manifest.json')['objects']}
++    if {key: len(splits[key]) for key in ('train', 'validation', 'test')} != dict(train=32, validation=8, test=8):
++        raise ValueError('MVP48 split count changed')
++    if len({u for key in ('train', 'validation', 'test') for u in splits[key]}) != 48:
++        raise ValueError('Overlapping MVP48 parent splits')
++    if any(not 128 <= item['N'] <= 256 or not 128 <= item['original_N'] <= 256 for item in objects.values()):
++        raise ValueError('Natural/retained face count outside registered range')
++    patches = read_json(source / 'data/patches.json')['records']
++    for split, count in (('train', 4), ('validation', 2), ('test', 2)):
++        for uid in splits[split]:
++            if {row['patch_id'] for row in patches if row['uid'] == uid} != {f'p{i}' for i in range(count)}:
++                raise ValueError('MVP48 condition identity/count changed')
++    return ready, splits, objects, checked
++
++
++def _make_plan(source_plan, objects, train_uids, *, probe=False):
++    steps = 1000 if probe else 4000
++    offset = 0 if probe else 1000
++    domain = 'probe_training' if probe else 'main_training_extension'
++    choices = [(uid, 'p0') for uid in train_uids[:2]] if probe else [(uid, f'p{p}') for uid in train_uids for p in range(4)]
++    schedule_rng = np.random.RandomState(_seed(domain, 'schedule'))
++    if probe:
++        assignments = [choices[int(i)] for _ in range(steps) for i in schedule_rng.permutation([0]*4 + [1]*4)]
++    else:
++        # Every 128-row block covers exactly all object/patch pairs; 32000/128=250.
++        assignments = [choices[int(i)] for _ in range(250) for i in schedule_rng.permutation(len(choices))]
++    records = []
++    for index, (uid, patch) in enumerate(assignments):
++        row = dict(source_plan['records'][0])
++        row.update(uid=uid, patch_id=patch, N=objects[uid]['N'], K=objects[uid]['K'],
++                   sample_index=8*offset+index, effective_batch_index=offset+index//8,
++                   slot_index=index%8, logical_step=offset+index//8+1,
++                   gaussian_seed=_seed(domain, 'gaussian', index), t_seed=_seed(domain, 'time', index),
++                   permutation_seed=_seed(domain, 'permutation', index))
++        records.append(row)
++    return dict(schema='control_mvp48_train_plan_v1', experiment_id='control_mvp48_budget_single_v1',
++                source_plan_sha256=None, effective_batch_count=steps, batch_size=8, sample_count=len(records),
++                effective_batch_index_base=0, first_effective_batch_index=offset, last_effective_batch_index=offset+steps-1,
++                seed=_seed(domain, 'schedule'), rng_namespace=domain,
++                RNG_mode='stateless_per_sample_frozen_seeds', model_arms_share_exact_plan=not probe,
++                object_counts=dict(Counter(row['uid'] for row in records)),
++                pair_counts=dict(Counter(row['uid']+'/'+row['patch_id'] for row in records)), records=records)
++
++
++def _area(triangles):
++    value = np.asarray(triangles, dtype=np.float64).reshape(-1, 3, 3)
++    return float((np.linalg.norm(np.cross(value[:, 1]-value[:, 0], value[:, 2]-value[:, 0]), axis=1)*.5).sum())
++
++
++def _donor_patch(sample, count):
++    """First source-face start that reaches K, sorted-neighbor FIFO shared-edge BFS."""
++    faces = sample['source_face_vertex_ids']
++    incident = defaultdict(list)
++    for face_id, face in enumerate(faces):
++        for a, b in ((0, 1), (1, 2), (2, 0)):
++            incident[tuple(sorted((int(face[a]), int(face[b]))))].append(face_id)
++    adjacency = [set() for _ in faces]
++    for connected in incident.values():
++        for i in connected:
++            adjacency[i].update(j for j in connected if i != j)
++    for start in range(len(faces)):
++        queue, visited, ordered = deque([start]), {start}, []
++        while queue and len(ordered) < count:
++            item = queue.popleft()
++            ordered.append(item)
++            for neighbor in sorted(adjacency[item]):
++                if neighbor not in visited:
++                    visited.add(neighbor)
++                    queue.append(neighbor)
++        if len(ordered) == count:
++            return np.asarray(ordered, np.int64)
++    return None
++
++
++def prepare(source, out):
++    source, out = Path(source).resolve(), Path(out).resolve()
++    if source == out or source in out.parents:
++        raise ValueError('New output must be separate from protected source')
++    out.mkdir(parents=True, exist_ok=True)
++    started = time.perf_counter()
++    ready, splits, objects, checked = _source_audit(source)
++    ready_hash = sha256(source / 'DATA_READY.json')
++    panel_path = out / 'panels.json'
++    if panel_path.exists():
++        panels = read_json(panel_path)
++        if panels['source_data_ready_sha256'] != ready_hash:
++            raise ValueError('Prepared banks belong to another source')
++        for path, digest in panels['frozen_files'].items():
++            actual = Path(path) if Path(path).is_absolute() else out / path
++            if sha256(actual) != digest:
++                raise ValueError('Prepared bank identity changed: ' + path)
++        if read_json(out / 'registration/data_audit.json')['status'] != 'PASS':
++            raise ValueError('Prior finite CPU audit did not pass')
++        return panels
++    api = _load_api(source)
++    source_plan = read_json(source / 'data/train_plan.json')
++    train_uids = sorted(splits['train'])
++    fit_uids = train_uids[:2]
++    ranked = sorted(train_uids, key=lambda uid: (objects[uid]['N'], uid))
++    panel_train = [min(ranked[4*i:4*i+4]) for i in range(8)]
++    panels = dict(schema='control_mvp48_budget_panels_v1', source=str(source), source_data_ready_sha256=ready_hash,
++                  data_revision='repair_v2', train_parents=panel_train, validation_parents=sorted(splits['validation']),
++                  fit_parents=fit_uids, train_selection='Sort all train parents by (N,UID); eight consecutive four-parent strata; lexicographically first UID in each stratum',
++                  fit_selection='First two training UIDs in ascending lexicographic order; p0',
++                  random_domains=['native_initialization', 'main_training_extension', 'probe_training', 'generation', 'teacher', 'fit_generation', 'fit_teacher', 'plotting'],
++                  generation=[], teacher=[], swap=[], fit_generation=[], fit_teacher=[], holdout=[], frozen_files={})
++
++    def frozen(path, arrays=None, value=None):
++        actual = out / path
++        if arrays is not None:
++            _npz(actual, arrays)
++        else:
++            _json(actual, value)
++        panels['frozen_files'][path] = sha256(actual)
++        return path
++
++    for filename, probe in (('train_plan.json', False), ('fit_plan.json', True)):
++        plan = _make_plan(source_plan, objects, train_uids, probe=probe)
++        plan['source_plan_sha256'] = sha256(source / 'data/train_plan.json')
++        frozen(filename, value=plan)
++
++    from experiments.mf_h1_local0.control_mvp48.eval_scoring import prepare_reference_from_sample, score_free
++    from native_t1.artifacts import array_hash
++    samples, references = {}, {}
++
++    def sample(uid, patch):
++        key = (uid, patch)
++        if key not in samples:
++            samples[key] = api.load_sample(uid, patch, source / 'data')
++        return samples[key]
++
++    # The scope and threshold are written before any real-data distance call.
++    controls = [(split, uid, 'p0') for split in ('train', 'validation') for uid in sorted(splits[split])[:2]]
++    precheck_spec = dict(schema='control_mvp48_budget_finite_cpu_spec_v1', selected=controls,
++                         selection='first two UIDs in each training/validation split, p0',
++                         RMS_max_over_L=1e-6, GPU_workers=0, model_forwards=0, optimizer_updates=0)
++    frozen('registration/cpu_positive_spec.json', value=precheck_spec)
++    audit_path = out / 'registration/data_audit.json'
++    if audit_path.exists():
++        audit = read_json(audit_path)
++        if audit.get('status') != 'PASS' or audit.get('source_data_ready_sha256') != ready_hash:
++            raise ValueError('Preserved finite CPU audit is not reusable')
++    else:
++        audit = dict(schema='control_mvp48_budget_data_audit_v1', status='RUNNING', source_data_ready_sha256=ready_hash,
++                     source_files_checked=checked, data_revision='repair_v2', split_counts={k:len(splits[k]) for k in ('train','validation','test')},
++                     repair=dict(repaired_objects=40, removed_exact_zero_faces=109, removed_duplicate_faces=571,
++                                 source_vertices_unchanged=True, full_object_transform_unchanged=True),
++                     positive_controls=[], model_forwards=0, optimizer_updates=0, CUDA_initialized=False,
++                     exploratory_read_only_self_scores_before_formal_entry=4,
++                     exploratory_note='All four returned passing geometry scores; terminal inspection then raised KeyError because torch was not imported.')
++        _json(audit_path, audit, frozen=False)
++        try:
++            for split, uid, patch in controls:
++                item = sample(uid, patch)
++                reference = prepare_reference_from_sample(item)
++                result = score_free(item['free_target'], item['constraints'], item['free_target'], item['bbox_diagonal'], reference=reference, include_pair_audit=False)
++                metrics = result['metrics']
++                measured = max(metrics[key]/100. for key in ('remainder_symmetric_RMS_bbox_pct','free_to_R12_RMS_bbox_pct','R12_to_free_RMS_bbox_pct','fixed_R12_coverage_RMS_bbox_pct'))
++                if measured > 1e-6 or not np.isfinite(measured):
++                    raise ValueError('GT self surface positive control failed: ' + uid)
++                audit['positive_controls'].append(dict(split=split, uid=uid, patch_id=patch, N=item['N'], K=item['K'],
++                    RMS_max_over_L=measured, partition_and_transform='PASS_BY_STRICT_SOURCE_LOADER',
++                    gamma_true_interface='PASS_BY_SOURCE_REFERENCE_BUILDER', metrics=metrics))
++            audit['status'] = 'PASS'
++        except BaseException as exc:
++            audit.update(status='FAIL', error=repr(exc))
++            _json(audit_path, audit, frozen=False)
++            raise
++        _json(audit_path, audit, frozen=False)
++    panels['frozen_files']['registration/data_audit.json'] = sha256(audit_path)
++
++    def reference(uid, patch):
++        key = (uid, patch)
++        if key not in references:
++            ref = prepare_reference_from_sample(sample(uid, patch))
++            stem = f'inputs/references/{uid}_{patch}'
++            references[key] = dict(ref_npz=frozen(stem+'.npz', arrays=ref['arrays']),
++                                   ref_json=frozen(stem+'.json', value=ref['audit']))
++        return references[key]
++
++    def generation(uid, patch, noise_index, split, domain, case_id):
++        item = sample(uid, patch)
++        n, k = item['N'], item['K']
++        seed = _seed(domain, uid, noise_index)
++        noise = api.gaussian(seed, n-k, fp32=True)
++        z = np.zeros((1,n,9), np.float32)
++        z[:, k:] = noise.reshape(1,n-k,9)
++        arrays = dict(C=item['constraints'], gaussian=noise, z=z, N=np.asarray(n), K=np.asarray(k), L=np.asarray(item['bbox_diagonal']),
++                      known_mask=np.arange(n)<k, valid_mask=np.ones(n, bool), full_target=item['full_target'], gt_free=item['free_target'])
++        location = frozen('inputs/generation/'+case_id+'.npz', arrays=arrays)
++        return dict(case_id=case_id, split=split, uid=uid, parent_id=uid, patch_id=patch, noise_index=noise_index,
++                    N=n, K=k, gaussian_seed=seed, input_path=location, input_sha256=sha256(out/location),
++                    C_area_fraction=_area(item['constraints'])/_area(item['full_target']), **reference(uid,patch))
++
++    for split, uids in (('train', panel_train), ('validation', sorted(splits['validation']))):
++        for uid in uids:
++            for patch in ('p0','p1'):
++                for noise_index in (0,1):
++                    panels['generation'].append(generation(uid,patch,noise_index,split,'generation',f'{split}_{uid}_{patch}_n{noise_index}'))
++    for uid in fit_uids:
++        for noise_index in range(4):
++            panels['fit_generation'].append(generation(uid,'p0',noise_index,'fit','fit_generation',f'fit_{uid}_p0_n{noise_index}'))
++
++    prep_events = out / 'registration/prepare_events.jsonl'
++    def event(value):
++        prep_events.parent.mkdir(parents=True, exist_ok=True)
++        with prep_events.open('a', encoding='utf-8') as stream:
++            stream.write(json.dumps(dict(utc=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), **value), sort_keys=True)+'\n')
++
++    def teacher(uid, split, domain):
++        from experiments.mf_h1_local0.control_mvp48.eval_teacher import prepare_teacher_sample
++        item = sample(uid,'p0')
++        pair_stem = f'inputs/teacher_pairs/{domain}_{uid}'
++        pair_npz, pair_json = out/(pair_stem+'.npz'), out/(pair_stem+'.json')
++        if pair_npz.exists() and pair_json.exists():
++            identity = read_json(pair_json)
++            with np.load(pair_npz, allow_pickle=False) as bank:
++                arrays = {key: bank[key] for key in bank.files}
++            if any(array_hash(arrays[key]) != digest for key,digest in identity['array_sha256'].items()):
++                raise ValueError('Cached teacher pairing identity changed')
++        else:
++            # Persist attempts before the original CPU OT; interrupted attempts remain visible.
++            event(dict(action='teacher_OT_attempt', uid=uid, domain=domain))
++            arrays, identity = prepare_teacher_sample(item, api.gaussian(_seed(domain,uid), item['N']-item['K']))
++            event(dict(action='teacher_OT_return', uid=uid, domain=domain))
++            _npz(pair_npz, arrays)
++            _json(pair_json, identity)
++        panels['frozen_files'][pair_stem+'.npz'] = sha256(pair_npz)
++        panels['frozen_files'][pair_stem+'.json'] = sha256(pair_json)
++        result=[]
++        for t_value in (.2,.5,.8):
++            current = {key: value.copy() for key,value in arrays.items()}
++            current['t'] = np.asarray(t_value,np.float32)
++            current['xt'] = (np.float32(1)-current['t'])*current['x0']+current['t']*current['x1']
++            current['xt'][current['known_mask']] = current['context'][current['known_mask']]
++            current['free_vertex_ids'] = item['source_face_vertex_ids'][item['free_source_ids']].copy()
++            current['known_vertex_ids'] = item['source_face_vertex_ids'][item['source_face_ids']].copy()
++            case_id=f'{domain}_{uid}_t{int(t_value*10)}'
++            location=frozen('inputs/teacher/'+case_id+'.npz', arrays=current)
++            info=dict(identity, teacher_t=t_value, array_sha256={key:array_hash(value) for key,value in current.items()})
++            info.update(model_input_sha256=hashlib.sha256(b''.join(current[key].tobytes() for key in ('xt','t','y','known_mask','valid_mask'))).hexdigest(), input_hash_definition='sha256 concatenated xt,t,y,known_mask,valid_mask bytes')
++            result.append(dict(case_id=case_id,teacher_id=case_id, split=split,uid=uid,parent_id=uid,patch_id='p0',t=t_value,
++                               N=item['N'],K=item['K'],input_path=location,input_sha256=sha256(out/location),identity=info,**reference(uid,'p0')))
++        return result
++
++    for split,uids in (('train',panel_train),('validation',sorted(splits['validation']))):
++        for uid in uids:
++            panels['teacher'].extend(teacher(uid,split,'teacher'))
++    for uid in fit_uids:
++        panels['fit_teacher'].extend(teacher(uid,'fit','fit_teacher'))
++
++    val_uids=sorted(splits['validation'])
++    for request in panels['generation']:
++        if request['split'] != 'validation' or request['patch_id'] != 'p0':
++            continue
++        own=sample(request['uid'],'p0')
++        donor_choice=None
++        start=val_uids.index(request['uid'])
++        for delta in range(1,len(val_uids)):
++            donor_uid=val_uids[(start+delta)%len(val_uids)]
++            other=sample(donor_uid,'p0')
++            ids=_donor_patch(other,own['K'])
++            if ids is None:
++                continue
++            donor_C=other['full_target'].reshape(-1,3,3)[ids].copy()
++            if donor_C.tobytes() == own['constraints'].tobytes():
++                continue
++            donor_choice=(donor_uid,other,ids,donor_C)
++            break
++        case_id='swap_'+request['case_id']
++        if donor_choice is None:
++            panels['swap'].append(dict(request,case_id=case_id,recipient_case_id=request['case_id'],status='NOT_AVAILABLE',reason='No distinct connected donor patch of exact recipient K'))
++            continue
++        donor_uid,other,ids,donor_C=donor_choice
++        with np.load(out/request['input_path'],allow_pickle=False) as bank:
++            arrays={key:bank[key] for key in bank.files}
++        arrays['recipient_C']=arrays['C'].copy()
++        arrays['C']=donor_C
++        location=frozen('inputs/swap/'+case_id+'.npz',arrays=arrays)
++        panels['swap'].append(dict(request,case_id=case_id,recipient_case_id=request['case_id'],status='READY',
++            donor_uid=donor_uid,donor_source_face_ids=ids.tolist(),donor_N=other['N'],input_path=location,input_sha256=sha256(out/location),
++            recipient_C_area=_area(own['constraints']),donor_C_area=_area(donor_C),
++            recipient_C_centroid=own['constraints'].mean(axis=(0,1)).tolist(),donor_C_centroid=donor_C.mean(axis=(0,1)).tolist(),
++            donor_rule='UID cycle; first source-face-start reaching exact K with sorted-neighbor shared-edge FIFO BFS; original donor coordinates',
++            scoring_scope='Recipient original free target and Gamma; wrong C is a one-way diagnostic, not donor completion ground truth'))
++
++    # Original held-out generation inputs are consumed from their actual arrays.
++    old=read_json(source/'registration/eval_preparation_ledger.json')
++    conditions={(r['parent_id'],r['condition_id']):r for r in old['conditions']}
++    for request in old['test_inputs']:
++        path=source/request['path']
++        if sha256(path)!=request['sha256']:
++            raise ValueError('Original holdout input bytes changed')
++        ref=conditions[(request['parent_id'],request['condition_id'])]
++        ref_path=source/ref['path']
++        if sha256(ref_path)!=ref['sha256']:
++            raise ValueError('Original holdout reference bytes changed')
++        panels['frozen_files'][str(path)]=request['sha256']
++        panels['frozen_files'][str(ref_path)]=ref['sha256']
++        meta_path=frozen('inputs/holdout_metadata/'+request['case_id']+'.json',value=ref['reference_metadata'])
++        panels['holdout'].append(dict(request,uid=request['parent_id'],patch_id=request['condition_id'],noise_index=request['noise_id'],split='holdout',
++            input_path=str(path),input_sha256=request['sha256'],ref_npz=str(ref_path),ref_json=meta_path,
++            reference_key_prefix='reference_',reference_contains_geometry=True,target_path=str(ref_path),source_case_id=request['case_id']))
++    if tuple(len(panels[key]) for key in ('generation','teacher','swap','fit_generation','fit_teacher','holdout')) != (64,48,16,8,6,32):
++        raise ValueError('Frozen panel counts differ from fixed budgets')
++    panels['preparation_seconds']=time.perf_counter()-started
++    _json(panel_path,panels)
++    return panels
++
++
++if __name__ == '__main__':
++    import argparse
++    parser=argparse.ArgumentParser()
++    parser.add_argument('--source',required=True)
++    parser.add_argument('--out',required=True)
++    args=parser.parse_args()
++    result=prepare(args.source,args.out)
++    print(json.dumps({key:len(result[key]) for key in ('generation','teacher','swap','fit_generation','fit_teacher','holdout')}))
+--- /dev/null
++++ b/experiments/mf_h1_local0/control_mvp48_budget_single/reporting.py
+@@ -0,0 +1,341 @@
++"""Deterministic tables and figures from actual completed work only."""
++from __future__ import annotations
++import argparse
++import csv
++import math
++from pathlib import Path
++import numpy as np
++from .common import atomic_json,read_json,digest
++from .evaluation import CURVE_MODELS,SWAP_MODELS,FIT_MODELS,PHASE_KEYS,resolve,arrays,score_record
++
++PRIMARY = ['remainder_symmetric_RMS_bbox_pct','fixed_R12_coverage_within_1pct_fraction','boundary_RMS_bbox_pct','Gamma_to_free_edges_RMS_bbox_pct','CF_proper_affected_free_fraction','FF_illegal_affected_free_fraction','free_area_over_GT_free_area']
++NA = 'NA'
++
++def write_csv(path,rows,fields=None):
++    path=Path(path);path.parent.mkdir(parents=True,exist_ok=True)
++    if fields is None:
++        fields=list(dict.fromkeys(k for row in rows for k in row))
++    with path.open('w',encoding='utf-8',newline='') as f:
++        w=csv.DictWriter(f,fieldnames=fields,extrasaction='ignore');w.writeheader()
++        for row in rows:
++            w.writerow({k:NA if v is None else v for k,v in row.items()})
++
++def finite(x):
++    return isinstance(x,(int,float,np.integer,np.floating)) and math.isfinite(x)
++
++def mean(values):
++    vals=[float(x) for x in values if finite(x)]
++    return float(np.mean(vals)) if vals else None
++
++def _step(model):
++    return 0 if model=='Native0' else int(model.rsplit('_',1)[1])
++
++def _arm(model):
++    return 'Native0' if model=='Native0' else model.rsplit('_',1)[0]
++
++def collect(out,panels):
++    from experiments.mf_h1_local0.control_mvp48.eval_scoring import METRIC_SPECS
++    rows=[];teacher=[];ledgers=[]
++    for phase,models in [('curve',CURVE_MODELS),('swap',SWAP_MODELS),('fit',FIT_MODELS),('holdout',[f'{a}_5000' for a in ('T1','Geo','Full')])]:
++        key,tkey=PHASE_KEYS[phase]
++        for model in models:
++            path=out/'evaluation'/phase/model/'ledger.json'
++            ledger=read_json(path) if path.exists() else {}
++            if ledger:ledgers.append(ledger)
++            indexed={x['case_id']:x for x in ledger.get('rows',[])}
++            for r in panels[key]:
++                found=indexed.get(r['case_id'],{})
++                row=dict(phase=phase,model_id=model,arm=_arm(model),step=_step(model),case_id=r['case_id'],
++                    split=r.get('split','holdout' if phase=='holdout' else None),uid=r.get('uid',r.get('parent_id')),
++                    patch_id=r.get('patch_id',r.get('condition_id')),noise_index=r.get('noise_index',r.get('noise_id')),
++                    C_area_fraction=r.get('C_area_fraction'),status=found.get('status',ledger.get('status','NOT_RUN')),
++                    raw_path=found.get('raw_path'),raw_sha256=found.get('raw_sha256'),score_path=found.get('score_path'),recipient_case_id=r.get('recipient_case_id'),
++                    donor_uid=r.get('donor_uid'))
++                row.update({metric:None for metric in METRIC_SPECS})
++                if found.get('score_path'):
++                    p=resolve(out,found['score_path'])
++                    if digest(p)!=found['score_sha256']:raise ValueError('Score identity changed')
++                    score=read_json(p);row.update(score.get('metrics',{}));row['score_status']=score['status']
++                rows.append(row)
++            tidx={x['case_id']:x for x in ledger.get('teacher_rows',[])}
++            for r in panels[tkey] if tkey else []:
++                found=tidx.get(r.get('teacher_id',r['case_id']),{})
++                teacher.append(dict(phase=phase,model_id=model,arm=_arm(model),step=_step(model),case_id=r['case_id'],
++                    split=r['split'],uid=r['uid'],patch_id=r['patch_id'],t=r['t'],status=found.get('status','NOT_RUN'),
++                    FM_error=found.get('FM_error'),D_edge=found.get('D_edge'),L5=found.get('L5'),
++                    Yhat_free_area=found.get('geometry',{}).get('Yhat_free',{}).get('total_area'),nfe=found.get('nfe')))
++    return rows,teacher,ledgers
++
++def historical_holdout(source,out,panels):
++    """Read-only old raw/score reuse, requiring input/checkpoint/scorer identity."""
++    from experiments.mf_h1_local0.control_mvp48.eval_scoring import METRIC_SPECS,source_identity
++    old_path=source/'evaluation/gpu_run.json'
++    if not old_path.exists():return []
++    old=read_json(old_path)
++    prep=read_json(source/'registration/eval_protocol.json')
++    old_sources=prep['scorer_identity']
++    if not old_sources:
++        fixture=source/'registration/eval_scoring_fixtures.json'
++        old_sources=read_json(fixture).get('source_identity',{}) if fixture.exists() else {}
++    scorer_matches=old_sources==source_identity()
++    indexed={(r.get('case_id'),r.get('model')):r for r in old.get('rows',[])}
++    result=[]
++    handoff=read_json(source/'registration/train_handoff.json')
++    verified_checkpoints={arm:digest(source/'checkpoints'/f'{arm}_step1000.pt')==next(v['sha256'] for v in handoff['completed_checkpoints'] if v['variant']==arm and v['logical_step']==1000) for arm in ('T1','Geo','Full')}
++    for r in panels['holdout']:
++        for arm in ('T1','Geo','Full'):
++            previous=indexed.get((r.get('source_case_id',r['case_id']),arm),{})
++            row=dict(phase='holdout',model_id=arm+'_1000',arm=arm,step=1000,case_id=r['case_id'],split='holdout',
++                uid=r['uid'],patch_id=r['patch_id'],noise_index=r['noise_index'],status='NOT_COMPARABLE',
++                reuse_generation_count=0,raw_path=None,raw_sha256=None)
++            row.update({k:None for k in METRIC_SPECS})
++            raw=source/previous.get('raw_path','missing')
++            compatible=(scorer_matches and previous.get('status')=='PASS' and raw.is_file()
++                and digest(raw)==previous.get('raw_sha256') and previous.get('input_file_sha256')==r['input_sha256'])
++            if compatible:
++                compatible=verified_checkpoints[arm]
++            if compatible:
++                scorepath=source/'evaluation/scores'/(previous['request_id']+'.json')
++                if scorepath.exists():
++                    score=read_json(scorepath)
++                    if score.get('raw_sha256')!=previous['raw_sha256']:raise ValueError('Historical score/raw identity mismatch')
++                    metrics=score['metrics']
++                else:
++                    # CPU only on actual raw; never regenerate old endpoints.
++                    score=score_record(out,r,arrays(raw)['raw'],phase='holdout');metrics=score['metrics']
++                    atomic_json(out/'evaluation/holdout_reused_scores'/(previous['request_id']+'.json'),score)
++                row.update(metrics);row.update(status='REUSED',score_status=score.get('scoring_status',score.get('status','UNKNOWN')),raw_path=str(raw),raw_sha256=previous['raw_sha256'],scorer_identity_match=True)
++            else:
++                row['reason']='Raw/input/checkpoint/scorer identity missing or mismatched; no old generation replay'
++            result.append(row)
++    return result
++
++def aggregate(rows,metrics):
++    per_parent=[];curves=[]
++    groups={}
++    for row in rows:
++        key=(row['phase'],row['model_id'],row['split'],row['uid'])
++        groups.setdefault(key,[]).append(row)
++    for (phase,model,split,uid),members in sorted(groups.items(),key=lambda p:str(p[0])):
++        row=dict(phase=phase,model_id=model,arm=_arm(model),step=_step(model),split=split,uid=uid,
++            requested_cases=len(members),completed_cases=sum(r['status'] in ('PASS','REUSED') for r in members),score_valid_cases=sum(r.get('score_status')=='PASS' for r in members))
++        for m in metrics:
++            row[m]=mean([r.get(m) for r in members if r.get('score_status')=='PASS']);row[m+'_valid_cases']=sum(finite(r.get(m)) and r.get('score_status')=='PASS' for r in members)
++        per_parent.append(row)
++    grouped={}
++    for row in per_parent:grouped.setdefault((row['phase'],row['model_id'],row['split']),[]).append(row)
++    for (phase,model,split),members in sorted(grouped.items(),key=lambda p:str(p[0])):
++        row=dict(phase=phase,model_id=model,arm=_arm(model),step=_step(model),split=split,
++            requested_parents=len(members),valid_parents=sum(r['score_valid_cases']>0 for r in members),
++            requested_cases=sum(r['requested_cases'] for r in members),completed_cases=sum(r['completed_cases'] for r in members),score_valid_cases=sum(r['score_valid_cases'] for r in members))
++        for m in metrics:
++            row[m]=mean([r.get(m) for r in members]);row[m+'_valid_parents']=sum(finite(r.get(m)) for r in members)
++        curves.append(row)
++    return per_parent,curves
++
++def paired(rows,kind):
++    result=[]
++    if kind=='control':
++        base={(r['model_id'],r['case_id']):r for r in rows if r['phase']=='curve'}
++        for wrong in [r for r in rows if r['phase']=='swap']:
++            correct=base.get((wrong['model_id'],wrong['recipient_case_id']),{})
++            item=dict(model_id=wrong['model_id'],step=wrong['step'],uid=wrong['uid'],case_id=wrong['case_id'],donor_uid=wrong['donor_uid'],
++                status='PASS' if correct.get('status')=='PASS' and wrong['status']=='PASS' else 'NOT_COMPARABLE',
++                absolute_quality_scope='recipient own free GT; wrong condition is a diagnostic')
++            for m in PRIMARY:
++                a,b=wrong.get(m),correct.get(m)
++                item[m+'_wrong']=a;item[m+'_correct']=b;item[m+'_wrong_minus_correct']=a-b if finite(a) and finite(b) else None
++            result.append(item)
++    else:
++        # Pair each parent at the same budget before averaging parents.
++        index={(r['model_id'],r['split'],r['uid']):r for r in rows if r['phase']=='curve'}
++        for step in (1000,2000,3500,5000):
++            for arm,ref in (('Geo','T1'),('Full','Geo'),('Full','T1')):
++                for (model,split,uid),a in sorted(index.items(),key=lambda p:str(p[0])):
++                    if model!=f'{arm}_{step}':continue
++                    b=index.get((f'{ref}_{step}',split,uid),{})
++                    item=dict(comparison=arm+'-'+ref,step=step,split=split,uid=uid)
++                    for m in PRIMARY:
++                        x,y=a.get(m),b.get(m);item[m]=x-y if finite(x) and finite(y) else None
++                    result.append(item)
++    return result
++
++def fmt(value):
++    return f'{float(value):.6g}' if finite(value) else NA
++
++def figures(out,panels,rows,curves):
++    import matplotlib
++    matplotlib.use('Agg')
++    import matplotlib.pyplot as plt
++    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
++    folder=out/'figures';folder.mkdir(parents=True,exist_ok=True)
++    fig,axes=plt.subplots(2,3,figsize=(13,7))
++    for ax,metric in zip(axes.flat,PRIMARY[:6]):
++        for split in ('train','validation'):
++            for arm,color in [('T1','#3974bc'),('Geo','#dc8a2c'),('Full','#469b62')]:
++                data=sorted([r for r in curves if r['phase']=='curve' and r['split']==split and (r['arm']==arm or (arm in ('Geo','Full') and r['model_id']=='Geo_shared_500')) and finite(r.get(metric))],key=lambda r:r['step'])
++                if data:ax.plot([r['step'] for r in data],[r[metric] for r in data],marker='o',color=color,linestyle='-' if split=='train' else '--',label=arm+' '+split)
++        native=[r[metric] for r in curves if r['phase']=='curve' and r['model_id']=='Native0' and finite(r.get(metric))]
++        for value in native:ax.axhline(value,color='#666666',linewidth=.8,linestyle=':',label='Native0 reference')
++        ax.set_title(metric,fontsize=8);ax.set_xlabel('MVP48 conditional updates');ax.grid(alpha=.2)
++    if any(ax.lines for ax in axes.flat):axes.flat[0].legend(fontsize=6)
++    fig.tight_layout();fig.savefig(folder/'train_validation_curves.png',dpi=150);plt.close(fig)
++    index={(r['model_id'],r['case_id']):r for r in rows if r['phase']=='curve'}
++    images=[]
++    for record in panels['generation']:
++        if record['noise_index']!=0:continue
++        bank=arrays(resolve(out,record['input_path']));C=bank['C'].reshape(-1,3,3);full=bank['full_target'].reshape(-1,3,3)
++        geometries=[('GT',full),('C',C)]
++        for model in ('Native0','T1_1000','T1_5000','Geo_5000','Full_5000'):
++            row=index.get((model,record['case_id']),{})
++            raw=arrays(resolve(out,row['raw_path']))['raw'].reshape(-1,3,3) if row.get('raw_path') and row['status']=='PASS' else None
++            geometries.append((model,raw))
++        if not any(g is not None for _,g in geometries[2:]):continue
++        pointsets=[g.reshape(-1,3) for _,g in geometries if g is not None]
++        points=np.concatenate(pointsets);low=points.min(0);high=points.max(0);center=(low+high)/2;radius=max(high-low)*.55
++        fig=plt.figure(figsize=(3*len(geometries),9))
++        reference=arrays(resolve(out,record['ref_npz']))
++        queries=reference['coverage_points']
++        coverage_distances={}
++        for model in ('Native0','T1_1000','T1_5000','Geo_5000','Full_5000'):
++            r=index.get((model,record['case_id']),{})
++            if r.get('score_path'):
++                score=read_json(resolve(out,r['score_path']))
++                coverage_distances[model]=score.get('detail',{}).get('fixed_GT_coverage',{}).get('per_point_distances')
++        for j,(label,geo) in enumerate(geometries):
++            for rownum in (0,1,2):
++                ax=fig.add_subplot(3,len(geometries),rownum*len(geometries)+j+1,projection='3d');ax.set_title(label+(' full' if rownum==0 else ' free' if rownum==1 else ' GT coverage'),fontsize=9)
++                if geo is None:
++                    ax.text2D(.2,.5,'NOT_RUN',transform=ax.transAxes)
++                else:
++                    selected=geo if rownum==0 or label=='C' else geo[int(bank['K']):] if label!='GT' else bank['gt_free'].reshape(-1,3,3)
++                    view=selected[:,:,[0,2,1]]
++                    if rownum!=2:ax.add_collection3d(Poly3DCollection(view,facecolors='#7195b8',edgecolors='#344b61',linewidths=.15,alpha=.65))
++                    else:
++                        distances=coverage_distances.get(label)
++                        colors=np.where(np.asarray(distances)<=.01*float(bank['L']),'#29964a','#c84135') if distances is not None else '#aaaaaa'
++                        ax.scatter(queries[:,0],queries[:,2],queries[:,1],c=colors,s=3)
++                        if distances is None:ax.text2D(.03,.02,'reference only',transform=ax.transAxes,fontsize=6)
++                ax.view_init(20,-55);ax.set_proj_type('ortho')
++                for setter,dim in ((ax.set_xlim,0),(ax.set_ylim,2),(ax.set_zlim,1)):setter(center[dim]-radius,center[dim]+radius)
++                ax.set_box_aspect((1,1,1));ax.set_axis_off()
++        fig.tight_layout();name=record['case_id']+'.png';fig.savefig(folder/name,dpi=110);plt.close(fig);images.append(name)
++    atomic_json(folder/'manifest.json',dict(curves='train_validation_curves.png',fixed_panels=images,scope='All registered noise0 cases; fixed views and common per-case extents; missing outputs labelled NOT_RUN'))
++
++def run(source,out,make_figures=True):
++    source,out=Path(source),Path(out)
++    if not (out/'panels.json').exists():
++        return dict(status='NOT_RUN',reason='No frozen panels')
++    panels=read_json(out/'panels.json')
++    from experiments.mf_h1_local0.control_mvp48.eval_scoring import METRIC_SPECS
++    rows,teacher,ledgers=collect(out,panels)
++    rows+=historical_holdout(source,out,panels)
++    parents,curves=aggregate(rows,list(METRIC_SPECS))
++    controls=paired(rows,'control');increments=paired(parents,'increments')
++    native={(r['split'],r['uid']):r for r in parents if r['phase']=='curve' and r['model_id']=='Native0'}
++    relative=[]
++    for r in parents:
++        if r['phase']!='curve' or r['model_id']=='Native0':continue
++        b=native.get((r['split'],r['uid']),{})
++        item={k:r[k] for k in ('model_id','arm','step','split','uid')}
++        for metric in METRIC_SPECS:
++            x,y=r.get(metric),b.get(metric);item[metric+'_minus_Native0']=x-y if finite(x) and finite(y) else None
++        relative.append(item)
++    write_csv(out/'relative_initialization.csv',relative)
++    rowindex={(r['model_id'],r['case_id']):r for r in rows if r['phase']=='curve'}
++    swapindex={(r['model_id'],r['case_id']):r for r in rows if r['phase']=='swap'}
++    for item in controls:
++        wrong=swapindex[(item['model_id'],item['case_id'])]
++        correct=rowindex.get((item['model_id'],wrong['recipient_case_id']),{})
++        if item['status']=='PASS':
++            a=arrays(resolve(out,wrong['raw_path']));b=arrays(resolve(out,correct['raw_path']))
++            k=len(a['C']);item['free_output_change_RMS_coordinates']=float(np.sqrt(np.square(a['raw'][k:]-b['raw'][k:]).mean()))
++        else:item['free_output_change_RMS_coordinates']=None
++    baseline={r['case_id']:r for r in controls if r['model_id']=='Native0'}
++    for r in controls:
++        b=baseline.get(r['case_id'],{})
++        for metric in PRIMARY:
++            key=metric+'_wrong_minus_correct';a,z=r.get(key),b.get(key)
++            r[metric+'_advantage_change_from_Native0']=a-z if finite(a) and finite(z) else None
++    hold=[]
++    oldindex={(r['arm'],r['case_id']):r for r in rows if r['phase']=='holdout' and r['step']==1000}
++    for row in [r for r in rows if r['phase']=='holdout' and r['step']==5000]:
++        old=oldindex.get((row['arm'],row['case_id']),{})
++        rec=dict(row)
++        rec['comparison_status']='PASS' if row['status']=='PASS' and old.get('status')=='REUSED' else 'NOT_COMPARABLE'
++        for metric in METRIC_SPECS:
++            value,previous=row.get(metric),old.get(metric)
++            rec[metric+'_1000']=previous;rec[metric+'_5000_minus_1000']=value-previous if finite(value) and finite(previous) else None
++        hold.append(rec)
++    write_csv(out/'per_case.csv',rows);write_csv(out/'per_parent.csv',parents)
++    write_csv(out/'train_validation_learning_curves.csv',[r for r in curves if r['phase']=='curve'])
++    write_csv(out/'teacher_curves.csv',teacher)
++    write_csv(out/'control_swap.csv',controls)
++    write_csv(out/'matched_budget_increments.csv',increments)
++    write_csv(out/'fit2_probe.csv',[r for r in rows if r['phase']=='fit'])
++    write_csv(out/'holdout_regression.csv',hold)
++    increment_summary=[]
++    for comparison in ('Geo-T1','Full-Geo','Full-T1'):
++        for step in (1000,2000,3500,5000):
++            for split in ('train','validation'):
++                members=[r for r in increments if (r['comparison'],r['step'],r['split'])==(comparison,step,split)]
++                row=dict(comparison=comparison,step=step,split=split,requested_parents=len(members))
++                for metric in PRIMARY:
++                    row[metric]=mean([r[metric] for r in members]);row[metric+'_valid_parents']=sum(finite(r[metric]) for r in members)
++                increment_summary.append(row)
++    write_csv(out/'matched_budget_increment_summary.csv',increment_summary)
++    teacher_summary=[]
++    for model in CURVE_MODELS+['T1_fit2_probe_500','T1_fit2_probe_1000']:
++        for phase in ('curve','fit'):
++            for split in ('train','validation'):
++                for t in (.2,.5,.8):
++                    members=[r for r in teacher if (r['model_id'],r['phase'],r['split'],r['t'])==(model,phase,split,t)]
++                    if not members:continue
++                    row=dict(model_id=model,phase=phase,split=split,t=t,requested_parents=len(members))
++                    for metric in ('FM_error','D_edge','L5','Yhat_free_area'):
++                        row[metric]=mean([r[metric] for r in members]);row[metric+'_valid_parents']=sum(finite(r[metric]) for r in members)
++                    teacher_summary.append(row)
++    write_csv(out/'teacher_curve_summary.csv',teacher_summary)
++
++    training=[read_json(path) for path in sorted((out/'training').glob('*_status.json'))]
++    main_updates=sum(r.get('counts',{}).get('optimizer_updates',0) for r in training if r.get('arm')!='T1_fit2_probe')
++    probe_updates=sum(r.get('counts',{}).get('optimizer_updates',0) for r in training if r.get('arm')=='T1_fit2_probe')
++    # Controller/worker ledger is authoritative; schema-dependent fields are
++    # surfaced verbatim, never inferred from checkpoint filenames.
++    accounting=dict(main_optimizer_updates=main_updates,probe_optimizer_updates=probe_updates,total_optimizer_updates=main_updates+probe_updates,evaluation_generations=sum(x.get('sampling_counts',{}).get('complete_rollouts',0) for x in ledgers),
++        evaluation_generation_attempts=sum(x.get('sampling_counts',{}).get('rollout_attempts',0) for x in ledgers),
++        teacher_forwards=sum(x.get('teacher_counts',{}).get('backbone_forward_attempts',0) for x in ledgers),
++        generation_forwards=sum(x.get('sampling_counts',{}).get('backbone_forward_attempts',0) for x in ledgers),
++        old_holdout_raw_reused=sum(r.get('status')=='REUSED' for r in rows if r['phase']=='holdout' and r['step']==1000),
++        failed_or_interrupted_requests=sum(r.get('status') in ('FAIL','RUNNING','STOPPED') for l in ledgers for r in l.get('rows',[])+l.get('teacher_rows',[])),
++        training_ledgers=training)
++    if (out/'run_state.json').exists():accounting['run_state']=read_json(out/'run_state.json')
++    atomic_json(out/'report_accounting.json',accounting)
++    if make_figures:figures(out,panels,rows,curves)
++    text=['# Control MVP48 全流程证据报告','',
++        f"本轮主训练实际新增 {main_updates}/12000 更新，fit2 新增 {probe_updates}/1000 更新；实际完成完整生成 {accounting['evaluation_generations']}，实际固定 teacher 前向 {accounting['teacher_forwards']}；旧留出 raw 严格复用 {accounting['old_holdout_raw_reused']}。以上来自实际训练/评价账本，未执行项均为 NA/NOT_RUN。",'',
++        '固定预算：主训练新增 12000 更新、独立 fit2 新增 1000 更新。所有生成固定原 Euler50，BF16 前向、FP32 状态与积分，C 在 51 状态保持。没有自动扩训、求解器扫描或默认模型变更。','',
++        '## 训练与验证：父对象等权','',
++        '| 状态 | 面板 | 完成/请求 | 剩余 RMS (% L) | coverage@1%L | Gamma 边 RMS (% L) |',
++        '|---|---|---:|---:|---:|---:|']
++    for row in [r for r in curves if r['phase']=='curve']:
++        text.append(f"| {row['model_id']} | {row['split']} | {row['completed_cases']}/{row['requested_cases']} | {fmt(row.get(PRIMARY[0]))} | {fmt(row.get(PRIMARY[1]))} | {fmt(row.get(PRIMARY[3]))} |")
++    text+=['','先对象内平均 C/噪声，再父对象等权。曲线包含 Native 起点、T1/Geo_shared 500 和三臂固定 1000/2000/3500/5000；不存在的历史状态保留 NA，不重训历史。','',
++        '## 条件利用、模块增量与拟合探针','',
++        'control_swap.csv 逐请求列出 E_wrong−E_correct、正确条件绝对质量和 free 输出变化。替换 C 使用 donor 自身原坐标，保持接收请求 N/K/Z/槽位；分数只对接收请求的原自由 GT/Gamma。非零响应不等于可用控制，正确优于错误也不证明绝对质量足够。','',
++        'matched_budget_increments.csv 在同一父对象、同一预算下逐项报告 Geo−T1、Full−Geo、Full−T1。未构造偏向 Full 的加权总分。fit2_probe.csv 与 teacher_curves.csv 的 fit 行记录独立双对象探针；该权重不进入主模型排名。','',
++        '## 留出回归与局限','',
++        'holdout_regression.csv 使用源 Session C 实际数组，列出固定 5000 对原 1000 的逐请求差值。原 raw 或身份缺失时写 NOT_COMPARABLE，不补跑历史生成。此集合是未参与条件微调、此前已观察的留出回归，不是全新确认集。','',
++        '训练/验证生成共同改善才支持当前预算延长的收益；仅 teacher 降低不能代替完整生成。训练改善而验证不改善时需区分迁移；主任务差而 fit2 改善仅支持小任务学习信号。缺失或未完成曲线不作方向结论，不把执行 PASS 当作几何成功。','',
++        '历史 BF16 置换 FAIL 保留：10/1008 坐标超旧容差，max_abs=0.064453125。repair_v2 仅按原修订删除精确零面积面与重复副本，未宣称修复水密性。精确拓扑/水密认证 NOT_RUN。','',
++        '全部逐 case/父对象表、完整 teacher、资源/失败/执行账本、checkpoint 清单和 code.diff 保留；图件见 figures/manifest.json。']
++    (out/'ALL_IN_ONE_REPORT.md').write_text('\n'.join(text)+'\n',encoding='utf-8')
++    from .finalize import finalize
++    finalize(source,out)
++    return accounting
++
++def main():
++    p=argparse.ArgumentParser();p.add_argument('--source',required=True);p.add_argument('--out',required=True);p.add_argument('--no-figures',action='store_true')
++    a=p.parse_args();run(a.source,a.out,not a.no_figures)
++
++if __name__=='__main__':main()
+--- /dev/null
++++ b/experiments/mf_h1_local0/control_mvp48_budget_single/run_all.py
+@@ -0,0 +1,397 @@
++"""One foreground controller for all authorized stages, with durable identities."""
++from __future__ import annotations
++import os
++for _var in ('OMP_NUM_THREADS','MKL_NUM_THREADS','OPENBLAS_NUM_THREADS','NUMEXPR_NUM_THREADS'):
++    os.environ[_var]='2'
++os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
++import argparse
++import difflib
++import json
++from pathlib import Path
++import shutil
++import shlex
++import signal
++import subprocess
++import sys
++import time
++import traceback
++from .common import REPO, LIMITS, GPU_LOCK, atomic_json, read_json, digest, json_hash, freeze_json, append_event, controller_lock
++
++MODULE='experiments.mf_h1_local0.control_mvp48_budget_single'
++
++def stages():
++    result=[]
++    def add(key,module,args,deps=()):
++        result.append(dict(key=key,module=module,args=args,dependencies=list(deps)))
++    add('wiring','precheck',[])
++    for model in ('Native0','T1_500','Geo_shared_500','T1_1000','Geo_1000','Full_1000'):
++        add('curve_'+model,'evaluation',['--model-id',model,'--phase','curve'],['wiring'])
++        if model in ('Native0','T1_1000','Geo_1000','Full_1000'):
++            add('swap_'+model,'evaluation',['--model-id',model,'--phase','swap'],['curve_'+model])
++    for step,prior in ((2000,None),(3500,2000),(5000,3500)):
++        for arm in ('T1','Geo','Full'):
++            model=f'{arm}_{step}'
++            deps=['wiring'] if prior is None else [f'train_{arm}_{prior}']
++            add('train_'+model,'training',['--arm',arm,'--target',str(step)],deps)
++            add('curve_'+model,'evaluation',['--model-id',model,'--phase','curve'],['train_'+model])
++            if step==5000:
++                add('swap_'+model,'evaluation',['--model-id',model,'--phase','swap'],['curve_'+model])
++    add('fit_T1_1000','evaluation',['--model-id','T1_1000','--phase','fit'],['wiring'])
++    for step in (500,1000):
++        model=f'T1_fit2_probe_{step}'
++        add('train_'+model,'training',['--arm','T1_fit2_probe','--target',str(step)],
++            ['wiring'] if step==500 else ['train_T1_fit2_probe_500'])
++        add('fit_'+model,'evaluation',['--model-id',model,'--phase','fit'],['train_'+model])
++    for arm in ('T1','Geo','Full'):
++        model=f'{arm}_5000'
++        add('holdout_'+model,'evaluation',['--model-id',model,'--phase','holdout'],
++            ['train_T1_5000','train_Geo_5000','train_Full_5000'])
++    return result
++
++def code_snapshot(out,verify=False):
++    own=Path(__file__).parent
++    files=sorted(own.glob('*.py'))
++    hashes={str(p.relative_to(REPO)):digest(p) for p in files}
++    path=out/'registration/code_hashes.json'
++    if verify:
++        if read_json(path)!=hashes:
++            raise RuntimeError('This run code changed after freezing; preserving state and stopping')
++        return hashes
++    freeze_json(path,hashes)
++    chunks=[]
++    for p in files:
++        chunks.extend(difflib.unified_diff([],p.read_text(encoding='utf-8').splitlines(keepends=True),
++            fromfile='/dev/null',tofile='b/'+str(p.relative_to(REPO))))
++    (out/'code.diff').write_text(''.join(chunks),encoding='utf-8')
++    return hashes
++
++def frozen_protocol(source,out,gate):
++    from .prepare import prepare
++    prepared=prepare(source,out)
++    plan_files={name:digest(out/name) for name in ('train_plan.json','fit_plan.json','panels.json')}
++    old=read_json(source/'registration/train_protocol.json')['protocol']
++    protocol=dict(schema='control_mvp48_budget_single_v1',source=str(source),out=str(out),
++        source_data_revision='repair_v2',source_data_ready_sha256=gate['data_ready_sha256'],
++        source_train_ready_sha256=gate['train_ready_sha256'],source_train_protocol=old,
++        restore_mode='RESTORE_ALL',source_checkpoints={k:v['hashes'] for k,v in gate['endpoints'].items()},
++        original_fork_sha256=gate['fork']['checkpoint_sha256'],frozen_files=plan_files,
++        main_arms=['T1','Geo','Full'],start_step=1000,checkpoints=[1000,2000,3500,5000],
++        main_updates_per_arm=4000,fit2_updates=1000,budgets=LIMITS,
++        effective_batch=8,microbatch=1,optimizer=old['optimizer'],loss=old['loss'],
++        full_ramp_index='logical_step_minus_500',sampler='Euler50',NFE=50,
++        precision=old['precision'],determinism=old['determinism'],gpu_workers=1,gpu_lock=GPU_LOCK,
++        source_plan_extension='new shared stateless seeds; original plan ends at 1000',
++        historical_missing='NOT_AVAILABLE; no reconstruction by training',
++        final_selection='all main arms at 5000',stages=stages(),
++        repetitions_authorized_max=4,repetitions_planned=0,
++        source_scorer_identity=read_json(source/'registration/eval_protocol.json')['scorer_identity'])
++    freeze_json(out/'protocol.json',protocol)
++    return protocol
++
++def validate_frozen_inputs(source,out,protocol):
++    for name,sha in protocol['frozen_files'].items():
++        if digest(out/name)!=sha: raise ValueError('Frozen plan changed: '+name)
++    for name,sha in protocol['source_scorer_identity'].items():
++        if digest(REPO/name)!=sha: raise ValueError('Protected scorer changed: '+name)
++    ready=read_json(source/'TRAIN_READY.json')
++    for name,sha in ready['source_hashes'].items():
++        if digest(REPO/name)!=sha: raise ValueError('Protected shared code changed: '+name)
++    if digest(source/'DATA_READY.json')!=protocol['source_data_ready_sha256'] or digest(source/'TRAIN_READY.json')!=protocol['source_train_ready_sha256']:
++        raise ValueError('Source readiness identity changed')
++
++def worker_status(out,stage):
++    out=Path(out)
++    if stage['module']=='evaluation':
++        args=stage['args']; model=args[args.index('--model-id')+1]; phase=args[args.index('--phase')+1]
++        return read_json(out/f'evaluation/{phase}/{model}/ledger.json')
++    if stage['module']=='precheck': return read_json(out/'registration/wiring_precheck.json')
++    if stage['module']!='training': raise ValueError('Unknown managed worker')
++    args=stage['args'];arm=args[args.index('--arm')+1];target=int(args[args.index('--target')+1])
++    summary=out/'training'/f'{arm}_to{target}_summary.json'
++    status_path=summary if summary.exists() else out/'training'/f'{arm}_status.json'
++    if not status_path.exists():
++        return dict(status='STOPPED',reason='Training worker has no persisted completion record')
++    actual=read_json(status_path)
++    if actual.get('status')!='SEGMENT_COMPLETE' or int(actual.get('logical_step',-1))<target:
++        return dict(actual,status='STOPPED',worker_status=actual.get('status'),reason='Training target not completed')
++    if actual.get('arm')!=arm:
++        raise ValueError('Training summary arm differs')
++    checkpoint=out/'checkpoints'/f'{arm}_step{target}.pt'
++    sidecar=checkpoint.with_suffix('.json')
++    if not checkpoint.is_file() or not sidecar.is_file():
++        return dict(status='STOPPED',reason='Fixed checkpoint or identity sidecar missing')
++    record=read_json(sidecar);metadata=record['metadata']
++    sha=digest(checkpoint)
++    if record['checkpoint_sha256']!=sha:
++        raise ValueError('Fixed checkpoint SHA differs: '+str(checkpoint))
++    if metadata['variant']!=arm or int(metadata['logical_step'])!=target:
++        raise ValueError('Fixed checkpoint arm/step differs')
++    protocol_hash=json_hash(read_json(out/'protocol.json'))
++    if metadata['protocol_sha256']!=protocol_hash or actual.get('protocol_sha256')!=protocol_hash:
++        raise ValueError('Fixed checkpoint/summary protocol identity differs')
++    if Path(record['path']).resolve()!=checkpoint.resolve():
++        raise ValueError('Fixed checkpoint sidecar path differs')
++    return dict(actual,status='PASS',worker_status='SEGMENT_COMPLETE',verified_checkpoint_sha256=sha,
++                verified_checkpoint=str(checkpoint),checkpoint_metadata=metadata)
++
++
++def orphan_budget_workers(out, process_table=None):
++    """Report live workers for this output; never terminate someone else's process."""
++    if process_table is None:
++        process_table=subprocess.run(['ps','-eo','pid,ppid,args'],capture_output=True,text=True,check=True).stdout
++    expected=Path(out).resolve(); found=[]
++    for line in process_table.splitlines()[1:]:
++        fields=line.strip().split(None,2)
++        if len(fields)!=3: continue
++        try: pid,ppid=int(fields[0]),int(fields[1]);argv=shlex.split(fields[2])
++        except (ValueError,TypeError): continue
++        if pid==os.getpid() or '-m' not in argv: continue
++        index=argv.index('-m')
++        if index+1>=len(argv) or argv[index+1] not in {MODULE+'.'+x for x in ('training','evaluation','precheck')}:
++            continue
++        output=None
++        if '--out' in argv:
++            position=argv.index('--out')
++            if position+1<len(argv): output=argv[position+1]
++        else:
++            output=next((x.split('=',1)[1] for x in argv if x.startswith('--out=')),None)
++        if output is None or (REPO/Path(output)).resolve()==expected:
++            found.append(dict(pid=pid,ppid=ppid,command=fields[2],reason='Live budget worker may own this output'))
++    return found
++
++
++def wait_managed_child(child):
++    """On controller interruption, ask only its own child to save, then reap it."""
++    try:
++        return child.wait()
++    except BaseException:
++        if child.poll() is None:
++            try:child.send_signal(signal.SIGTERM)
++            except ProcessLookupError:pass  # Child exited between poll and signal.
++            previous={sig:signal.signal(sig,signal.SIG_IGN) for sig in (signal.SIGINT,signal.SIGTERM)}
++            last_notice=time.monotonic()
++            try:
++                while child.poll() is None:
++                    try: child.wait(timeout=5)
++                    except subprocess.TimeoutExpired:
++                        if time.monotonic()-last_notice>=30:
++                            print('Waiting for owned worker to save safe progress and exit.',flush=True)
++                            last_notice=time.monotonic()
++            finally:
++                for sig,handler in previous.items():signal.signal(sig,handler)
++        raise
++
++
++def execution_budget_audit(out):
++    """Verify actual cumulative endpoints and all requested evaluation denominators."""
++    out=Path(out);errors=[]; arms={};total_updates=training_forwards=0
++    registered=stages();expected_keys={x['key'] for x in registered}
++    state=read_json(out/'run_state.json')
++    if set(state['stages'])!=expected_keys:
++        errors.append('Controller stage set is incomplete or has unregistered stages')
++    for arm,step,want in (('T1',5000,4000),('Geo',5000,4000),('Full',5000,4000),('T1_fit2_probe',1000,1000)):
++        try:
++            stage=next(x for x in registered if x['key']==f'train_{arm}_{step}')
++            actual=worker_status(out,stage)
++            counts=actual.get('counts',{})
++            updates=int(counts.get('optimizer_updates',-1));forwards=int(counts.get('forward_attempts',-1))
++            if actual.get('status')!='PASS' or int(actual.get('logical_step',-1))!=step:
++                errors.append(arm+' did not complete its exact fixed endpoint')
++            if updates!=want or forwards!=updates*8:
++                errors.append(arm+' optimizer/forward counts differ from fixed effective8 budget')
++            for key in ('forward_returns','backward_attempts','backward_returns'):
++                if int(counts.get(key,-1))!=forwards: errors.append(arm+' incomplete '+key)
++            if int(counts.get('optimizer_step_attempts',-1))!=updates:
++                errors.append(arm+' optimizer attempts differ from validated updates')
++            meta=actual.get('checkpoint_metadata',{})
++            if meta.get('counts')!=counts or int(meta.get('actual_new_updates',-1))!=want:
++                errors.append(arm+' final checkpoint counts differ from completed worker')
++            arms[arm]=dict(updates=updates,forward_attempts=forwards,status=actual.get('status'))
++            total_updates+=max(0,updates);training_forwards+=max(0,forwards)
++        except (OSError,ValueError,KeyError,StopIteration) as exc:
++            errors.append(arm+': '+repr(exc))
++    generations=teacher_forwards=sampling_calls=teacher_calls=0;eval_rows=[]
++    sizes=dict(curve=(64,48),swap=(16,0),fit=(8,6),holdout=(32,0))
++    for stage in registered:
++        if stage['module']!='evaluation':continue
++        args=stage['args'];phase=args[args.index('--phase')+1];model=args[args.index('--model-id')+1]
++        try:
++            data=worker_status(out,stage);sc=data.get('sampling_counts',{});tc=data.get('teacher_counts',{})
++            complete=int(sc.get('complete_rollouts',0));teachers=int(tc.get('teacher_returns',0))
++            gen_calls=int(sc.get('model_forward_attempts',0));t_calls=int(tc.get('model_forward_attempts',0))
++            generations+=complete;teacher_forwards+=teachers;sampling_calls+=gen_calls;teacher_calls+=t_calls
++            if data.get('status')=='NOT_AVAILABLE':
++                if model not in ('Native0','T1_500','Geo_shared_500') or complete or teachers or gen_calls or t_calls:
++                    errors.append(stage['key']+' has invalid historical NOT_AVAILABLE status')
++            elif data.get('status')=='PASS':
++                rows=data.get('rows',[]);trows=data.get('teacher_rows',[])
++                if len(rows)!=sizes[phase][0] or len(trows)!=sizes[phase][1]:errors.append(stage['key']+' request denominator differs')
++                if len({r['case_id'] for r in rows})!=len(rows) or len({r['case_id'] for r in trows})!=len(trows):
++                    errors.append(stage['key']+' duplicate request IDs')
++                allowed=('PASS','NOT_AVAILABLE') if phase=='swap' else ('PASS',)
++                if any(r.get('status') not in allowed for r in rows) or any(r.get('status')!='PASS' for r in trows):
++                    errors.append(stage['key']+' contains unfinished/failed requests')
++                if complete!=sum(r.get('status')=='PASS' for r in rows) or teachers!=len(trows):
++                    errors.append(stage['key']+' complete counters differ from actual rows')
++                if int(sc.get('rollout_attempts',0))!=complete or int(tc.get('teacher_attempts',0))!=teachers:
++                    errors.append(stage['key']+' attempts differ from completed work')
++                if gen_calls!=complete*50 or t_calls!=teachers:
++                    errors.append(stage['key']+' actual forward budget differs from Euler50/teacher definition')
++                for key in ('model_forward_returns','backbone_forward_attempts','backbone_forward_returns'):
++                    if int(sc.get(key,0))!=gen_calls or int(tc.get(key,0))!=t_calls:
++                        errors.append(stage['key']+' incomplete '+key)
++                if any(not r.get('score_path') for r in rows if r.get('status')=='PASS'):
++                    errors.append(stage['key']+' raw generation missing its score')
++            else:errors.append(stage['key']+' is not a completed evaluation')
++            eval_rows.append(dict(stage=stage['key'],status=data.get('status'),complete_rollouts=complete,
++                                 teacher_returns=teachers,sampling_forward_attempts=gen_calls,teacher_forward_attempts=t_calls))
++        except (OSError,ValueError,KeyError) as exc:errors.append(stage['key']+': '+repr(exc))
++    try:
++        wiring=read_json(out/'registration/wiring_precheck.json')
++        wiring_calls=int(wiring.get('forward_attempts',wiring.get('forwards_attempted',-1)))
++        returned=int(wiring.get('forward_returns',wiring.get('forwards_returned',-1)))
++        if wiring.get('status')!='PASS' or wiring_calls<0 or returned!=wiring_calls or wiring.get('optimizer_updates')!=0:
++            errors.append('Wiring counters are incomplete or include an optimizer update')
++    except (OSError,ValueError,KeyError) as exc:
++        errors.append('wiring: '+repr(exc));wiring_calls=0
++    total=training_forwards+sampling_calls+teacher_calls+wiring_calls
++    if total_updates!=13000 or training_forwards!=104000:errors.append('Main/probe update total differs from 12000+1000')
++    for actual,limit,name in ((generations,1192,'generations'),(teacher_forwards,738,'teacher'),(wiring_calls,80,'wiring'),(total,164618,'all model forwards')):
++        if actual>limit:errors.append(name+' exceeds its hard budget')
++    return dict(schema='control_mvp48_budget_execution_audit_v1',status='PASS' if not errors else 'FAIL',errors=errors,
++                arms=arms,optimizer_updates=total_updates,training_forward_attempts=training_forwards,
++                complete_rollouts=generations,teacher_returns=teacher_forwards,sampling_forward_attempts=sampling_calls,
++                teacher_forward_attempts=teacher_calls,wiring_forward_attempts=wiring_calls,model_forward_attempts=total,
++                limits=LIMITS,evaluation=eval_rows,
++                planned_forward_ceiling=1192*50+104000+738+80,repeat_forward_reserve=4*50)
++
++
++def bootstrap_report(out,state):
++    # A failed preflight still has a truthful artifact; final reporting replaces this.
++    lines=['# Control MVP48 All-in-One', '',
++           'Status: '+state['status'], '',
++           'This file is an execution status record, not evidence that training has completed.',
++           'Actual task counts must be read from the durable worker ledgers; queued stages are not results.', '',
++           'Fixed limits: main 12000 + fit2 1000 optimizer updates; 1192 planned generations; 738 teacher forwards.',
++           'Protected source assets and public defaults are unchanged.', '',
++           'Resume command:', '```bash',state['restart_command'],'```']
++    if state.get('error'): lines.extend(['',state['error']])
++    (out/'ALL_IN_ONE_REPORT.md').write_text('\n'.join(lines)+'\n',encoding='utf-8')
++
++def run(source,out):
++    source=source.resolve();out=out.resolve()
++    if source==out or not out.is_relative_to(REPO/'native_t1/runs'):
++        raise ValueError('Outputs must use an isolated run directory')
++    for name in ('registration','logs','training','evaluation','checkpoints'):
++        (out/name).mkdir(parents=True,exist_ok=True)
++    with controller_lock(out):
++        path=out/'run_state.json'
++        state=read_json(path) if path.exists() else dict(schema='control_mvp48_budget_state_v1',status='PREFLIGHT',stages={},created_unix=time.time())
++        state['restart_command']=f'cd /mnt/e/MeshFlow && {sys.executable} -B -m {MODULE}.run_all --source {source} --out {out}'
++        state['pid']=os.getpid();state['last_started_unix']=time.time()
++        atomic_json(path,state)
++        bootstrap_report(out,state)
++        try:
++            from experiments.mf_h1_local0.control_mvp48.eval_checkpoint_gate import inspect_ready
++            gate=inspect_ready(source,REPO)
++            atomic_json(out/'registration/source_identity.json',gate)
++            processes=subprocess.run(['ps','-eo','pid,ppid,args'],capture_output=True,text=True,check=True).stdout
++            atomic_json(out/'registration/processes_before.json',dict(time_unix=time.time(),processes=processes,
++                disk_free_bytes=shutil.disk_usage(out).free,duplicate_control='exclusive controller flock',gpu_workers=1))
++            orphaned=orphan_budget_workers(out,processes)
++            if orphaned: raise RuntimeError('Existing budget workers must exit before resuming: '+json.dumps(orphaned))
++            if shutil.disk_usage(out).free < 25*1024**3: raise RuntimeError('Less than 25 GiB disk headroom; no assets will be deleted')
++            protocol=frozen_protocol(source,out,gate)
++            state['protocol_sha256']=json_hash(protocol)
++            code_snapshot(out)
++            validate_frozen_inputs(source,out,protocol)
++            if state['status']=='COMPLETE':
++                budget=execution_budget_audit(out);atomic_json(out/'registration/execution_budget_audit.json',budget)
++                if budget['status']!='PASS':raise RuntimeError('Completed state failed actual budget audit: '+json.dumps(budget['errors']))
++                print('Already complete with matching identities; zero additional work.',flush=True)
++                return state
++            state['status']='RUNNING';atomic_json(path,state)
++            for stage in stages():
++                key=stage['key'];old=state['stages'].get(key,{})
++                if old.get('status') in ('PASS','NOT_AVAILABLE'):
++                    actual=worker_status(out,stage)
++                    if actual.get('status')!=old['status']:raise RuntimeError('Persisted completion no longer matches worker: '+key)
++                    continue
++                # A missing historical Native0 curve also makes its swap NA; let
++                # the same model worker persist that NA instead of inventing a failure.
++                acceptable=('PASS','NOT_AVAILABLE') if stage['module']=='evaluation' else ('PASS',)
++                failures=[d for d in stage['dependencies'] if state['stages'].get(d,{}).get('status') not in acceptable]
++                if failures:
++                    state['stages'][key]=dict(status='BLOCKED_DEPENDENCY',dependencies=failures)
++                    atomic_json(path,state);continue
++                code_snapshot(out,verify=True);validate_frozen_inputs(source,out,protocol)
++                orphaned=orphan_budget_workers(out)
++                if orphaned:raise RuntimeError('Live budget worker blocks duplicate dispatch: '+json.dumps(orphaned))
++                command=[sys.executable,'-B','-m',MODULE+'.'+stage['module'],'--source',str(source),'--out',str(out),*stage['args']]
++                state['active_stage']=key;state['stages'][key]=dict(status='RUNNING',command=command,started_unix=time.time())
++                atomic_json(path,state);append_event(out/'execution_ledger.jsonl',dict(event='STAGE_BEGIN',stage=key,command=command))
++                print(json.dumps(dict(event='STAGE_BEGIN',stage=key,time_unix=time.time())),flush=True)
++                tick=time.perf_counter()
++                with (out/'logs'/f'{key}.log').open('a',encoding='utf-8') as log:
++                    child=subprocess.Popen(command,cwd=REPO,stdout=log,stderr=subprocess.STDOUT)
++                    try:
++                        state['worker_pid']=child.pid;atomic_json(path,state)
++                        rc=wait_managed_child(child)
++                    except BaseException:
++                        # Also cover an interruption while recording the newly owned PID.
++                        if child.poll() is None:
++                            try:child.send_signal(signal.SIGTERM)
++                            except ProcessLookupError:pass
++                            wait_managed_child(child)
++                        raise
++                    finally:
++                        state['worker_pid']=child.pid if child.poll() is None else None
++                        atomic_json(path,state)
++                record=dict(status='PASS' if rc==0 else 'STOPPED',returncode=rc,elapsed_seconds=time.perf_counter()-tick,
++                            completed_unix=time.time(),log=f'logs/{key}.log')
++                if rc==0:
++                    actual=worker_status(out,stage)
++                    if actual is not None:
++                        record['status']=actual.get('status','STOPPED')
++                        if record['status'] not in ('PASS','NOT_AVAILABLE'):record['status']='STOPPED'
++                state['stages'][key]=record;state['worker_pid']=None
++                atomic_json(path,state);append_event(out/'execution_ledger.jsonl',dict(event='STAGE_END',stage=key,**record))
++                print(json.dumps(dict(event='STAGE_END',stage=key,**record)),flush=True)
++            code_snapshot(out,verify=True);validate_frozen_inputs(source,out,protocol)
++            complete=set(state['stages'])=={s['key'] for s in stages()} and all(r['status'] in ('PASS','NOT_AVAILABLE') for r in state['stages'].values())
++            if complete:
++                budget=execution_budget_audit(out);atomic_json(out/'registration/execution_budget_audit.json',budget)
++                if budget['status']!='PASS':raise RuntimeError('Final actual budget audit failed: '+json.dumps(budget['errors']))
++            state['status']='COMPLETE' if complete else 'PARTIAL_STOPPED'
++            state['active_stage']=None;state['finished_unix']=time.time();atomic_json(path,state)
++        except BaseException as exc:
++            state.update(status='STOPPED',error=repr(exc),traceback=traceback.format_exc())
++            atomic_json(path,state);bootstrap_report(out,state)
++            append_event(out/'execution_ledger.jsonl',dict(event='CONTROLLER_STOPPED',error=repr(exc)))
++            raise
++        finally:
++            if (Path(__file__).parent/'reporting.py').exists():
++                command=[sys.executable,'-B','-m',MODULE+'.reporting','--source',str(source),'--out',str(out)]
++                with (out/'logs/reporting.log').open('a',encoding='utf-8') as log:
++                    result=subprocess.run(command,cwd=REPO,stdout=log,stderr=subprocess.STDOUT)
++                if result.returncode:
++                    state['reporting_status']='STOPPED';atomic_json(path,state)
++                    print('Reporting failed; see logs/reporting.log',flush=True)
++        return state
++
++def main():
++    p=argparse.ArgumentParser();p.add_argument('--source',type=Path,default=REPO/'native_t1/runs/control_mvp48_v1')
++    p.add_argument('--out',type=Path,default=REPO/'native_t1/runs/control_mvp48_budget_single_v1');p.add_argument('--status',action='store_true')
++    a=p.parse_args()
++    if a.status:
++        print(json.dumps(read_json(a.out/'run_state.json'),indent=2));return
++    def interrupted(signum,frame):
++        raise KeyboardInterrupt('Controller received signal '+str(signum))
++    previous={sig:signal.signal(sig,interrupted) for sig in (signal.SIGINT,signal.SIGTERM)}
++    try:state=run(a.source,a.out)
++    finally:
++        for sig,handler in previous.items():signal.signal(sig,handler)
++    print(json.dumps(state,indent=2),flush=True)
++    if state['status']!='COMPLETE':raise SystemExit(2)
++
++if __name__=='__main__':main()
+--- /dev/null
++++ b/experiments/mf_h1_local0/control_mvp48_budget_single/stream.py
+@@ -0,0 +1,68 @@
++"""Extend the registered CPU stream without changing any original OT arithmetic."""
++from pathlib import Path
++from collections import Counter
++from experiments.mf_h1_local0.control_mvp48.train_stream import FrozenStream
++from .common import read_json, digest
++
++
++class BudgetStream(FrozenStream):
++    def __init__(self, source, out, arm):
++        source, out = Path(source), Path(out)
++        binding = read_json(source/'registration/train_data_binding.json')
++        super().__init__(binding, source/'data/train_plan.json', source/'data')
++        self.probe = arm == 'T1_fit2_probe'
++        self.offset, self.end = (0, 1000) if self.probe else (1000, 5000)
++        self.plan_path = out/('fit_plan.json' if self.probe else 'train_plan.json')
++        plan = read_json(self.plan_path)
++        self.records = plan['records']
++        self.plan_sha256 = digest(self.plan_path)
++        if len(self.records) != (self.end-self.offset)*8:
++            raise ValueError('Fixed extension plan budget differs')
++        self.batch_index = self.offset
++        self.seed = plan.get('seed', 2026100302 if self.probe else 2026100301)
++        allowed = set(binding['train_object_ids'])
++        pairs = Counter()
++        for r in self.records:
++            cid = (r['uid'], r['patch_id'])
++            if r['uid'] not in allowed or cid not in self.cases:
++                raise ValueError('Extension includes an unregistered training condition')
++            c = self.cases[cid]
++            if (r['N'], r['K']) != (c['N'], c['K']):
++                raise ValueError('Extension N/K identity differs')
++            for field in ('gaussian_seed', 't_seed', 'permutation_seed'):
++                if not isinstance(r[field], int):
++                    raise ValueError('Each input must have a frozen integer seed')
++            pairs[cid] += 1
++        if self.probe:
++            expected = {(uid, 'p0') for uid in sorted(allowed)[:2]}
++            if set(pairs) != expected:
++                raise ValueError('Fit2 must use the two registered UID-first training p0 cases')
++            for i in range(0, len(self.records), 8):
++                if sorted(Counter(r['uid'] for r in self.records[i:i+8]).values()) != [4, 4]:
++                    raise ValueError('Each fit2 batch must have four examples of each object')
++        elif len(pairs) != 128 or max(pairs.values())-min(pairs.values()) > 8:
++            raise ValueError('Main extension must retain balanced 32 x 4 conditions')
++
++    def state_dict(self):
++        return dict(seed=self.seed, batch_index=self.batch_index,
++                    sample_index=8*(self.batch_index-self.offset),
++                    RNG_mode='stateless_per_sample_frozen_seeds',
++                    plan_sha256=self.plan_sha256, offset=self.offset, end=self.end)
++
++    def load_state_dict(self, state):
++        expected = self.state_dict()
++        for key in ('seed','RNG_mode','plan_sha256','offset','end'):
++            if state.get(key) != expected[key]:
++                raise ValueError('Frozen extension stream identity differs: '+key)
++        b = state['batch_index']
++        if type(b) is not int or not self.offset <= b <= self.end or state['sample_index'] != 8*(b-self.offset):
++            raise ValueError('Invalid extension cursor')
++        self.batch_index = b
++
++    def next_effective_batch(self):
++        if not self.offset <= self.batch_index < self.end:
++            raise RuntimeError('Fixed extension plan exhausted')
++        i = 8*(self.batch_index-self.offset)
++        samples = [self._sample(r) for r in self.records[i:i+8]]
++        self.batch_index += 1
++        return samples
+--- /dev/null
++++ b/experiments/mf_h1_local0/control_mvp48_budget_single/training.py
+@@ -0,0 +1,317 @@
++"""One locked GPU worker; fixed budgets, durable accounting and no lost-update replay."""
++import os
++for _name in ('OMP_NUM_THREADS','MKL_NUM_THREADS','OPENBLAS_NUM_THREADS','NUMEXPR_NUM_THREADS'):
++    os.environ[_name] = '2'
++from native_t1 import runtime as _runtime
++import argparse
++import contextlib
++import csv
++import gc
++import hashlib
++import json
++from pathlib import Path
++import random
++import shutil
++import signal
++import time
++import traceback
++import numpy as np
++import torch
++from native_t1.training import make_optimizer
++from experiments.mf_h1_local0.control_mvp48.model_mvp import load_mvp_checkpoint
++from experiments.mf_h1_local0.control_mvp48.train_core import optimizer_update
++from experiments.mf_h1_local0.control_mvp48.train_stream import MVPObjective
++from experiments.mf_h1_local0.control_mvp48.train_io import (
++    gpu_lock, resource_snapshot, capture_rng, restore_rng, tree_hash)
++from experiments.mf_h1_local0.control_mvp48.train_run import GPUMonitor, dispatch_check
++from .common import read_json, atomic_json, append_event, digest, json_hash
++from .checkpoint import ARMS, load_checkpoint, save_checkpoint, validate_payload, tensor_state_hash
++from .stream import BudgetStream
++
++COLUMNS = ['arm','logical_step','new_updates','batch_sha256','FM','geometry','loss',
++           'free_coordinate_denominator','active_samples','grad_norm_before_clip',
++           'mean_active_D_edge','mean_active_L5','OT_seconds','train_seconds',
++           'cuda_peak_allocated_bytes','cuda_peak_reserved_bytes']
++
++
++
++@contextlib.contextmanager
++def process_gpu_lock(out):
++    """Keep the existing shared flock until this single-use worker exits."""
++    global _PROCESS_GPU_LOCK
++    held=gpu_lock(out)
++    wait=held.__enter__()
++    _PROCESS_GPU_LOCK=held
++    # Retaining the entered context covers exception cleanup and CUDA context
++    # destruction. OS process exit releases flock; the lock file is never removed.
++    yield wait
++
++
++def ledger_rows(path):
++    path=Path(path)
++    if not path.exists(): return []
++    rows=[]
++    for line in path.read_text().splitlines():
++        try: rows.append(json.loads(line))
++        except json.JSONDecodeError:
++            raise RuntimeError('Incomplete durable ledger; manual reconciliation required: '+str(path))
++    return rows
++
++
++def check_recovery(events, checkpoint_step, start):
++    """An attempted update not covered by the checkpoint is never replayed."""
++    begins=[int(r['logical_step']) for r in events if r['event']=='UPDATE_BEGIN']
++    dones=[int(r['logical_step']) for r in events if r['event']=='UPDATE_VALIDATED']
++    if len(begins)!=len(set(begins)) or len(dones)!=len(set(dones)):
++        raise RuntimeError('Duplicate update in durable ledger')
++    if max(begins+[start])>checkpoint_step or max(dones+[start])>checkpoint_step:
++        raise RuntimeError('BLOCKED_UNCHECKPOINTED_ATTEMPT: completed/attempted updates exceed reliable checkpoint; no automatic replay')
++    if dones and sorted(dones)!=list(range(start+1,max(dones)+1)):
++        raise RuntimeError('Training ledger has a non-contiguous update history')
++
++
++
++def reconcile_latest(out, arm, latest, protocol, stream, events):
++    """Recover an atomically installed full payload if pointer installation was interrupted."""
++    out=Path(out)
++    candidate=Path(latest['checkpoint']['path']) if latest else out/'checkpoints'/f'{arm}_latest.pt'
++    endpoint=out/'checkpoints'/f'{arm}_step{stream.end}.pt'
++    if endpoint.exists() and (not latest or latest['logical_step']<stream.end):
++        candidate=endpoint
++    if not candidate.exists(): return latest
++    if out not in candidate.resolve().parents:
++        raise ValueError('Latest recovery candidate outside isolated run')
++    payload=torch.load(candidate,map_location='cpu',weights_only=True,mmap=True)
++    meta=payload.get('metadata',{})
++    if latest and meta.get('logical_step')==latest['logical_step']:
++        return latest
++    meta=validate_payload(payload)
++    if not meta['full_recovery_state'] or 'optimizer' not in payload:
++        raise ValueError('Interrupted save has no complete recovery payload')
++    if meta['variant']!=arm or meta['protocol_sha256']!=json_hash(protocol):
++        raise ValueError('Interrupted save has an unrelated identity')
++    if payload['stream_state']['plan_sha256']!=stream.plan_sha256:
++        raise ValueError('Interrupted save has an unrelated plan')
++    if latest and meta['logical_step']<latest['logical_step']:
++        raise ValueError('Recovery candidate regressed behind durable pointer')
++    check_recovery(events,meta['logical_step'],stream.offset)
++    if tensor_state_hash(payload['model'])!=meta['model_state_sha256']:
++        raise ValueError('Interrupted save has corrupt model tensors')
++    if meta.get('counts',{}).get('optimizer_updates')!=meta['logical_step']-stream.offset:
++        raise ValueError('Recovery candidate update counter differs')
++    sha=digest(candidate)
++    recovery=dict(path=str(candidate.resolve()),checkpoint_sha256=sha,metadata=meta,strict_reload='PASS')
++    repaired=dict(logical_step=meta['logical_step'],protocol_sha256=json_hash(protocol),
++        plan_sha256=stream.plan_sha256,checkpoint=recovery,counts=meta['counts'])
++    atomic_json(out/'training'/f'{arm}_pointer_reconciliation_step{meta["logical_step"]}.json',
++        dict(previous_pointer=latest,recovered=repaired,model_forwards=0,optimizer_updates=0))
++    atomic_json(candidate.with_suffix('.json'),{k:recovery[k] for k in ('path','checkpoint_sha256','metadata')})
++    atomic_json(out/'training'/f'{arm}_latest.json',repaired)
++    append_event(out/'training'/f'{arm}_events.jsonl',dict(event='POINTER_RECONCILED',logical_step=meta['logical_step'],checkpoint_sha256=sha))
++    return repaired
++
++
++def _restore_source(source_path, device, probe):
++    model, meta, hashes=load_mvp_checkpoint(source_path,device)
++    if meta['logical_step']!=1000:
++        raise ValueError('Continuation requires MVP48 step1000')
++    payload=torch.load(source_path,map_location='cpu',weights_only=True,mmap=True)
++    model.set_trainable(True).eval();optimizer=make_optimizer(model)
++    if probe:
++        # A separate experiment RNG; no source/global training RNG is consumed by data.
++        random.seed(2026100302);np.random.seed(2026100302);torch.manual_seed(2026100302)
++        torch.cuda.manual_seed_all(2026100302)
++    else:
++        optimizer.load_state_dict(payload['optimizer'])
++        if tree_hash(optimizer.state_dict())!=meta['optimizer_state_sha256']:
++            raise ValueError('Restored optimizer content differs')
++        restore_rng(payload['rng'])
++        if tree_hash(capture_rng())!=meta['rng_sha256']:
++            raise ValueError('Restored training RNG differs')
++    del payload
++    return model,optimizer,hashes['checkpoint_sha256']
++
++
++def train_segment(source,out,arm,target,protocol):
++    source,out=Path(source).resolve(),Path(out).resolve()
++    if arm not in ARMS: raise ValueError('Unregistered arm')
++    probe=arm=='T1_fit2_probe';start,maximum=(0,1000) if probe else (1000,5000)
++    milestones=(500,1000) if probe else (2000,3500,5000)
++    if target not in milestones:
++        raise ValueError('Target must be a fixed checkpoint boundary')
++    if protocol.get('restore_mode','RESTORE_ALL')!='RESTORE_ALL':
++        raise ValueError('This verified run freezes RESTORE_ALL for every main arm')
++    for folder in ('training','checkpoints','registration'): (out/folder).mkdir(parents=True,exist_ok=True)
++    source_path=source/'checkpoints'/f'{"T1" if probe else arm}_step1000.pt'
++    status_path=out/'training'/f'{arm}_status.json'
++    latest_path=out/'training'/f'{arm}_latest.json'
++    events_path=out/'training'/f'{arm}_events.jsonl'
++    log_path=out/'training'/f'{arm}_training_log.csv'
++    state=dict(status='PREPARING',arm=arm,target=target,logical_step=start,new_updates=0,
++               counts={},plan_sha256=None,protocol_sha256=json_hash(protocol),gpu_workers=1)
++    if status_path.exists() and read_json(status_path).get('status')=='BLOCKED':
++        raise RuntimeError('Earlier affected stage is BLOCKED; no automatic retry: '+str(status_path))
++    if torch.cuda.is_initialized(): raise RuntimeError('Worker initialized CUDA before shared lock')
++    torch.set_num_threads(2);torch.set_num_interop_threads(2)
++    _runtime.configure_stable_runtime()
++    stream=BudgetStream(source,out,arm);state['plan_sha256']=stream.plan_sha256
++    latest=read_json(latest_path) if latest_path.exists() else None
++    latest=reconcile_latest(out,arm,latest,protocol,stream,ledger_rows(events_path))
++    if latest:
++        if latest['protocol_sha256']!=json_hash(protocol) or latest['plan_sha256']!=stream.plan_sha256:
++            raise ValueError('Continuation identity differs from reliable progress')
++        checkpoint_step=int(latest['logical_step'])
++    else: checkpoint_step=start
++    check_recovery(ledger_rows(events_path),checkpoint_step,start)
++    state.update(logical_step=checkpoint_step,new_updates=checkpoint_step-start)
++    if checkpoint_step>=target:
++        required=out/'checkpoints'/f'{arm}_step{target}.pt'
++        if not required.exists(): raise RuntimeError('Progress exists but fixed checkpoint is missing')
++        return dict(state,status='REUSED',checkpoint=str(required),actual_updates_this_worker=0)
++    expected_prior=start if target==milestones[0] else milestones[milestones.index(target)-1]
++    if checkpoint_step<expected_prior:
++        raise ValueError('Fixed stage dependencies require the prior boundary first')
++    if shutil.disk_usage(out).free<8*1024**3:
++        raise RuntimeError('Insufficient free storage for isolated checkpoint staging')
++    resources=resource_snapshot();atomic_json(out/'training'/f'{arm}_to{target}_resources_before.json',resources)
++    dispatch=dispatch_check(resources)
++    atomic_json(out/'training'/f'{arm}_to{target}_dispatch.json',dispatch)
++    stop_requested={'signal':None}
++    def on_signal(signum,frame): stop_requested['signal']=int(signum)
++    old_handlers={s:signal.signal(s,on_signal) for s in (signal.SIGTERM,signal.SIGINT)}
++    model=optimizer=monitor=None;counts={};finished_step=checkpoint_step
++    restored_update_count=checkpoint_step-start
++    tick=time.perf_counter();worker_ot=worker_train=worker_save=0.;source_sha=None
++    try:
++        with process_gpu_lock(out) as wait_seconds:
++            atomic_json(out/'training'/f'{arm}_to{target}_resources_locked.json',resource_snapshot())
++            dispatch_check(resource_snapshot())
++            load_tick=time.perf_counter()
++            if latest:
++                checkpoint=Path(latest['checkpoint']['path'])
++                if out not in checkpoint.resolve().parents:
++                    raise ValueError('Latest checkpoint outside this isolated experiment')
++                model,meta,hashes=load_checkpoint(checkpoint,'cuda',trainable=True)
++                if meta['variant']!=arm or meta['logical_step']!=checkpoint_step:
++                    raise ValueError('Reliable checkpoint arm/cursor differs')
++                payload=torch.load(checkpoint,map_location='cpu',weights_only=True,mmap=True)
++                optimizer=make_optimizer(model);optimizer.load_state_dict(payload['optimizer'])
++                if tree_hash(optimizer.state_dict())!=meta['optimizer_state_sha256']:
++                    raise ValueError('Resumed AdamW differs')
++                stream.load_state_dict(payload['stream_state']);restore_rng(payload['rng'])
++                if tree_hash(capture_rng())!=meta['rng_sha256']:
++                    raise ValueError('Resumed RNG differs')
++                source_sha=meta['source_checkpoint_sha256'];counts=dict(meta.get('counts',{}));del payload
++            else:
++                model,optimizer,source_sha=_restore_source(source_path,'cuda',probe)
++            if digest(source_path)!=source_sha:
++                raise ValueError('Immutable source checkpoint changed')
++            load_seconds=time.perf_counter()-load_tick
++            objective=MVPObjective(stream) if arm=='Full' else None
++            torch.cuda.reset_peak_memory_stats();monitor=GPUMonitor(out);monitor.start()
++            state.update(status='TRAINING',lock_wait_seconds=wait_seconds,load_seconds=load_seconds)
++            atomic_json(status_path,state)
++            shared_path=out/'training/shared_batch_hashes.jsonl'
++            shared={r['logical_step']:r['batch_sha256'] for r in ledger_rows(shared_path)} if not probe else {}
++            with log_path.open('a',newline='') as f:
++                writer=csv.DictWriter(f,fieldnames=COLUMNS)
++                if f.tell()==0:writer.writeheader();f.flush();os.fsync(f.fileno())
++                def persist(step,fixed=False):
++                    nonlocal worker_save,latest
++                    if fixed:
++                        path=out/'checkpoints'/f'{arm}_step{step}.pt'
++                        record=save_checkpoint(path,model,optimizer,stream,protocol,arm=arm,step=step,
++                            source_path=source_path,source_hash=source_sha,full_state=step==maximum,
++                            changes=True,counts=counts)
++                        worker_save+=record['save_and_verify_seconds']
++                        append_event(events_path,dict(event='FIXED_CHECKPOINT',logical_step=step,checkpoint=record))
++                    if fixed and step==maximum:
++                        recovery=record
++                    else:
++                        recovery=save_checkpoint(out/'checkpoints'/f'{arm}_latest.pt',model,optimizer,stream,protocol,
++                            arm=arm,step=step,source_path=source_path,source_hash=source_sha,full_state=True,
++                            changes=False,counts=counts,replace=True)
++                        worker_save+=recovery['save_and_verify_seconds']
++                    latest=dict(logical_step=step,protocol_sha256=json_hash(protocol),plan_sha256=stream.plan_sha256,
++                                checkpoint=recovery,counts=dict(counts))
++                    atomic_json(latest_path,latest)
++                    append_event(events_path,dict(event='RECOVERY_CHECKPOINT',logical_step=step,
++                                                  checkpoint_sha256=recovery['checkpoint_sha256']))
++                for step in range(checkpoint_step+1,target+1):
++                    if stop_requested['signal'] is not None:
++                        if finished_step>checkpoint_step and (not latest or latest['logical_step']!=finished_step):
++                            persist(finished_step)
++                        state.update(status='INTERRUPTED_SAFE',signal=stop_requested['signal'])
++                        break
++                    ot_tick=time.perf_counter();samples=stream.next_effective_batch();ot_seconds=time.perf_counter()-ot_tick
++                    worker_ot+=ot_seconds
++                    bh=hashlib.sha256(''.join(s['shared_input_sha256'] for s in samples).encode()).hexdigest()
++                    if not probe:
++                        if step in shared and shared[step]!=bh:
++                            raise ValueError('Shared T1/Geo/Full actual input bytes differ at '+str(step))
++                        if step not in shared:
++                            append_event(shared_path,dict(event='SHARED_INPUT_REGISTERED',logical_step=step,batch_sha256=bh,first_arm=arm))
++                            shared[step]=bh
++                    append_event(events_path,dict(event='UPDATE_BEGIN',arm=arm,logical_step=step,batch_sha256=bh,
++                        completed_before=finished_step,counts_before=dict(counts)))
++                    result=optimizer_update(model,optimizer,samples,objective=objective,
++                        additional_step=step-500 if arm=='Full' else None,counts=counts)
++                    finished_step=step;worker_train+=result['train_seconds']
++                    def active_mean(key):
++                        values=[x['raw_losses'][key] for x in result['geometry_diagnostics'] if key in x['raw_losses']]
++                        return sum(values)/len(values) if values else 0.
++                    row=dict(arm=arm,logical_step=step,new_updates=step-start,batch_sha256=bh,
++                        **{k:result[k] for k in ('FM','geometry','loss','free_coordinate_denominator','active_samples','grad_norm_before_clip')},
++                        mean_active_D_edge=active_mean('D_edge'),mean_active_L5=active_mean('L5'),
++                        OT_seconds=ot_seconds,train_seconds=result['train_seconds'],
++                        cuda_peak_allocated_bytes=torch.cuda.max_memory_allocated(),
++                        cuda_peak_reserved_bytes=torch.cuda.max_memory_reserved())
++                    append_event(events_path,dict(event='UPDATE_VALIDATED',**row,counts=dict(counts)))
++                    writer.writerow(row);f.flush();os.fsync(f.fileno())
++                    state.update(logical_step=step,new_updates=step-start,counts=dict(counts),last_row=row)
++                    atomic_json(status_path,state)
++                    if step%200==0 or step==target:
++                        observation=resource_snapshot()
++                        atomic_json(out/'training'/f'{arm}_step{step}_resources.json',observation)
++                        print(json.dumps(dict(event='TRAIN_PROGRESS',**row)),flush=True)
++                        persist(step,fixed=step in milestones)
++                    elif step in milestones:
++                        persist(step,fixed=True)
++                else:
++                    state['status']='SEGMENT_COMPLETE'
++            torch.cuda.synchronize()
++            state.update(actual_updates_this_worker=finished_step-checkpoint_step,
++                worker_OT_seconds=worker_ot,worker_train_seconds=worker_train,worker_save_seconds=worker_save,
++                worker_wall_seconds=time.perf_counter()-tick,OT_counts=dict(stream.counts),counts=dict(counts),
++                cuda_peak_allocated_bytes=torch.cuda.max_memory_allocated(),cuda_peak_reserved_bytes=torch.cuda.max_memory_reserved(),
++                global_gpu_used_peak_mib=monitor.peak_global_used_mib,process_gpu_used_peak_mib=monitor.peak_process_used_mib,
++                memory_scope='Per worker after restore, including backward/AdamW and geometry; nvidia-smi global includes other processes',
++                throughput_updates_per_train_second=(finished_step-checkpoint_step)/worker_train if worker_train else None)
++            atomic_json(status_path,state)
++            atomic_json(out/'training'/f'{arm}_to{target}_summary.json',state)
++            append_event(events_path,dict(event='SEGMENT_END',**state))
++            return state
++    except BaseException as exc:
++        actual_count=counts.get('optimizer_updates',restored_update_count)
++        state.update(status='BLOCKED',logical_step=finished_step,new_updates=actual_count,
++            counts=dict(counts),OT_counts=dict(stream.counts),error=type(exc).__name__+': '+str(exc),traceback=traceback.format_exc(),
++            actual_updates_this_worker=actual_count-restored_update_count,worker_wall_seconds=time.perf_counter()-tick)
++        atomic_json(status_path,state);append_event(events_path,dict(event='FAILURE',**state))
++        raise
++    finally:
++        if monitor:monitor.stop()
++        for s,handler in old_handlers.items():signal.signal(s,handler)
++        del model,optimizer;gc.collect()
++        if torch.cuda.is_initialized():torch.cuda.empty_cache()
++        atomic_json(out/'training'/f'{arm}_to{target}_resources_after.json',resource_snapshot())
++
++
++def main():
++    p=argparse.ArgumentParser();p.add_argument('--source',type=Path,required=True)
++    p.add_argument('--out',type=Path,required=True);p.add_argument('--arm',choices=ARMS,required=True)
++    p.add_argument('--target',type=int,required=True)
++    a=p.parse_args();protocol=read_json(a.out/'protocol.json')
++    print(json.dumps(train_segment(a.source,a.out,a.arm,a.target,protocol),sort_keys=True),flush=True)
++
++
++if __name__=='__main__':main()
+--- /dev/null
++++ b/experiments/mf_h1_local0/control_mvp48_budget_single/training_cpu_tests.py
+@@ -0,0 +1,31 @@
++"""CPU checks for real frozen stream identity and no-replay recovery boundaries."""
++import ast
++from pathlib import Path
++import torch
++from .common import atomic_json, REPO
++from .stream import BudgetStream
++from .training import check_recovery
++
++def run(source,out):
++    report=dict(status='PASS',model_forwards=0,optimizer_updates=0,actual_OT_calls=0,tests=[])
++    for name in ('training','stream','checkpoint'):
++        ast.parse((Path(__file__).parent/(name+'.py')).read_text())
++    for arm in ('T1','T1_fit2_probe'):
++        stream=BudgetStream(source,out,arm);state=stream.state_dict();stream.load_state_dict(state)
++        assert stream.state_dict()==state
++        report['tests'].append(dict(arm=arm,state=state,record_count=len(stream.records),restore='PASS'))
++    check_recovery([],1000,1000)
++    check_recovery([dict(event='UPDATE_BEGIN',logical_step=1001),dict(event='UPDATE_VALIDATED',logical_step=1001)],1001,1000)
++    for events,step in [([dict(event='UPDATE_BEGIN',logical_step=1001)],1000),
++                       ([dict(event='UPDATE_VALIDATED',logical_step=1002)],1002),
++                       ([dict(event='UPDATE_BEGIN',logical_step=1001)]*2,1001)]:
++        try:check_recovery(events,step,1000)
++        except RuntimeError:pass
++        else:raise AssertionError('Invalid replay accepted')
++    report['recovery_tests']=['fresh','reliable completed checkpoint','reject uncovered attempt','reject gap','reject duplicate']
++    assert not torch.cuda.is_initialized();report['CUDA_initialized']=False
++    atomic_json(Path(out)/'registration/training_cpu_tests.json',report)
++    return report
++
++if __name__=='__main__':
++    print(run(REPO/'native_t1/runs/control_mvp48_v1',REPO/'native_t1/runs/control_mvp48_budget_single_v1'))
+--- /dev/null
++++ b/native_t1/runs/control_mvp48_budget_single_v1/evaluation_adapter_cpu_test.py
+@@ -0,0 +1,41 @@
++"""Finite CPU adapter checks; no CUDA initialization, model calls or OT."""
++from pathlib import Path
++import sys
++sys.path.insert(0, '/mnt/e/MeshFlow')
++import ast
++import numpy as np
++import torch
++from native_t1.artifacts import array_hash
++from native_t1.losses import prepare_targets,evaluate
++from experiments.mf_h1_local0.control_mvp48.eval_teacher import offline_teacher_diagnostics
++from experiments.mf_h1_local0.control_mvp48_budget_single.common import read_json,atomic_json
++from experiments.mf_h1_local0.control_mvp48_budget_single.evaluation import arrays,resolve
++root=Path('/mnt/e/MeshFlow')
++out=root/'native_t1/runs/control_mvp48_budget_single_v1'
++torch.set_num_threads(1)
++for p in (root/'experiments/mf_h1_local0/control_mvp48_budget_single').glob('*.py'):
++    ast.parse(p.read_text())
++panel=read_json(out/'panels.json')
++checks=[]
++for record in panel['teacher'][:3]:
++    bank=arrays(resolve(out,record['input_path']));identity=record['identity']
++    for key,expected in identity['array_sha256'].items():assert array_hash(bank[key])==expected
++    velocity=np.zeros_like(bank['u'])
++    metrics,endpoint=offline_teacher_diagnostics(bank,identity,velocity)
++    free=~bank['known_mask']
++    assert np.array_equal(endpoint[free],bank['xt'][free])
++    expected=float(np.square(bank['u'][free],dtype=np.float32).sum()/int(free.sum()*9))
++    assert abs(metrics['FM_error']-expected)<1e-6
++    velocity=bank['u'].copy()
++    metrics,endpoint=offline_teacher_diagnostics(bank,identity,velocity)
++    assert metrics['FM_error']==0.
++    assert np.allclose(endpoint[free],bank['x1'][free],atol=3e-7,rtol=3e-7)
++    target=prepare_targets(dict(free_gt=bank['x1'][free].reshape(-1,3,3),known=bank['C'],
++        free_ids=bank['free_vertex_ids'],known_ids=bank['known_vertex_ids'],bbox_L=identity['bbox_L']))
++    with torch.no_grad():
++        vals={name:float(evaluate(name,torch.from_numpy(endpoint[free].reshape(-1,3,3)),target[name])['loss']) for name in ('D_edge','L5')}
++    assert all(np.isfinite(v) for v in vals.values())
++    checks.append(dict(t=float(bank['t']),FM_zero_velocity_matches=True,perfect_velocity_FM=0,perfect_velocity_endpoint_matches=True,auxiliary=vals))
++assert not torch.cuda.is_initialized()
++atomic_json(out/'registration/evaluation_adapter_cpu_tests.json',dict(status='PASS',checks=checks,CUDA_initialized=False,model_forwards=0,model_backwards=0,optimizer_updates=0,OT_calls=0))
++print('CPU_EVALUATION_ADAPTER_PASS',checks)
+--- /dev/null
++++ b/native_t1/runs/control_mvp48_budget_single_v1/reporting_cpu_test.py
+@@ -0,0 +1,15 @@
++import sys,os,ast
++sys.path.insert(0,'/mnt/e/MeshFlow')
++os.chdir('/mnt/e/MeshFlow')
++from pathlib import Path
++import torch
++from experiments.mf_h1_local0.control_mvp48_budget_single.reporting import run
++from experiments.mf_h1_local0.control_mvp48_budget_single.common import atomic_json
++source=Path('native_t1/runs/control_mvp48_v1');out=Path('native_t1/runs/control_mvp48_budget_single_v1')
++for name in ('evaluation.py','reporting.py'):ast.parse((Path('experiments/mf_h1_local0/control_mvp48_budget_single')/name).read_text())
++result=run(source,out,False)
++assert result['old_holdout_raw_reused']==96,result['old_holdout_raw_reused']
++assert result['evaluation_generations']==0
++assert not torch.cuda.is_initialized()
++atomic_json(out/'registration/reporting_cpu_test.json',dict(status='PASS',old_raw_reused=96,new_generations=0,CUDA_initialized=False,model_forwards=0))
++print('REPORTING_CPU_PASS',result['old_holdout_raw_reused'])
+--- /dev/null
++++ b/native_t1/runs/control_mvp48_budget_single_v1/audit/final_presentation.py
+@@ -0,0 +1,78 @@
++"""CPU-only presentation of existing final CSVs; no model, OT or scoring."""
++import csv
++import json
++from pathlib import Path
++import matplotlib
++matplotlib.use('Agg')
++import matplotlib.pyplot as plt
++
++ROOT = Path(__file__).resolve().parents[1]
++FIG = ROOT / 'figures'
++def read(name):
++    with (ROOT/name).open(encoding='utf-8-sig', newline='') as f:
++        return list(csv.DictReader(f))
++
++colors = {'T1':'#2869ad', 'Geo':'#d18324', 'Full':'#258453'}
++styles = {'train':'-', 'validation':'--'}
++generation = read('train_validation_learning_curves.csv')
++metrics = [
++    ('remainder_symmetric_RMS_bbox_pct','Free-surface symmetric RMS','% L',1),
++    ('fixed_R12_coverage_within_1pct_fraction','GT coverage at 1% L','%',100),
++    ('Gamma_to_free_edges_RMS_bbox_pct','Interface to free finite edges RMS','% L',1),
++    ('CF_proper_affected_free_fraction','CF proper: affected free faces','%',100),
++    ('FF_illegal_affected_free_fraction','FF illegal: affected free faces','%',100),
++]
++fig, axes = plt.subplots(2,3,figsize=(15,8), constrained_layout=True)
++for ax,(metric,title,unit,scale) in zip(axes.flat,metrics):
++    for arm,color in colors.items():
++        for split,style in styles.items():
++            selected=[r for r in generation if r['split']==split and (r['arm']==arm or (arm in ('Geo','Full') and r['model_id']=='Geo_shared_500'))]
++            selected=sorted(selected,key=lambda r:int(r['step']))
++            ax.plot([int(r['step']) for r in selected],[float(r[metric])*scale for r in selected],color=color,linestyle=style,marker='o',markersize=4,label=arm+' '+split)
++    for split,style in [('train',':'),('validation','-.')]:
++        native=next(r for r in generation if r['model_id']=='Native0' and r['split']==split)
++        ax.axhline(float(native[metric])*scale,color='#6c6c6c',linestyle=style,linewidth=1,label='Native0 '+split)
++    ax.set(title=title,xlabel='MVP48 conditional fine-tuning step',ylabel=unit)
++    ax.set_xticks([500,1000,2000,3500,5000]);ax.grid(alpha=.18)
++axes.flat[-1].axis('off')
++handles,labels=axes.flat[0].get_legend_handles_labels()
++axes.flat[-1].legend(handles,labels,loc='center',frameon=False)
++axes.flat[-1].text(.05,.05,'8 parents per split; equal parent weights\n2 patches x 2 fixed noises per parent\nFinal comparison fixed at step 5000\nCF/FF definitions follow the original scorer',transform=axes.flat[-1].transAxes,fontsize=10)
++fig.suptitle('Fixed generation panel: training gains and validation transfer',fontsize=15)
++fig.savefig(FIG/'summary_curves.png',dpi=160);plt.close(fig)
++
++teacher=read('teacher_curve_summary.csv')
++fig,axes=plt.subplots(3,3,figsize=(15,11),constrained_layout=True)
++for i,t in enumerate([.2,.5,.8]):
++    for j,metric in enumerate(['FM_error','D_edge','L5']):
++        ax=axes[i,j]
++        for arm,color in colors.items():
++            for split,style in styles.items():
++                selected=[]
++                for r in teacher:
++                    if r['phase']!='curve' or r['split']!=split or float(r['t'])!=t:continue
++                    model=r['model_id']
++                    if model.startswith(arm+'_') or (arm in ('Geo','Full') and model=='Geo_shared_500'):
++                        selected.append((int(model.rsplit('_',1)[1]),float(r[metric])))
++                selected.sort()
++                ax.plot([v[0] for v in selected],[v[1] for v in selected],color=color,linestyle=style,marker='o',markersize=3,label=arm+' '+split)
++        ax.set(title=metric+' | t='+str(t),xlabel='MVP48 conditional fine-tuning step',ylabel='Original scalar (log scale)',yscale='log')
++        ax.set_xticks([500,1000,2000,3500,5000]);ax.grid(alpha=.18)
++axes[0,0].legend(fontsize=8)
++fig.suptitle('Fixed teacher diagnostics: compare train and validation at the same t\n8 parents per split; shared OT/noise/permutations; generation remains the quality evidence',fontsize=14)
++fig.savefig(FIG/'teacher_curves.png',dpi=160);plt.close(fig)
++
++fit=read('fit2_probe.csv')
++for row in fit:
++    row['source_main_step']='1000'
++    row['probe_new_updates']='0' if row['model_id']=='T1_1000' else row['model_id'].rsplit('_',1)[1]
++    row['conditional_cumulative_step']=str(1000+int(row['probe_new_updates']))
++with (ROOT/'fit2_probe.csv').open('w',newline='',encoding='utf-8') as f:
++    w=csv.DictWriter(f,fieldnames=list(fit[0]));w.writeheader();w.writerows(fit)
++
++manifest=json.loads((FIG/'manifest.json').read_text())
++manifest['readable_generation_summary']='summary_curves.png'
++manifest['fixed_teacher_curves']='teacher_curves.png'
++manifest['presentation_note']='CPU-only plots of existing final CSVs. Native split references labelled separately. No model, OT, scoring, sampling or new updates.'
++(FIG/'manifest.json').write_text(json.dumps(manifest,indent=2)+'\n',encoding='utf-8')
++print(json.dumps({'status':'PASS','new_model_calls':0,'new_OT_calls':0,'new_score_calls':0,'figures':['summary_curves.png','teacher_curves.png'],'fit_step_mapping_added':True}))

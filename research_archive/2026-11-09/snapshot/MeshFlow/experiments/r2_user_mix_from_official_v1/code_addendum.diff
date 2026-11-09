@@ -1,0 +1,861 @@
+diff --git a/r2/pilots/user_mix_from_official_v1/audit_run.py b/r2/pilots/user_mix_from_official_v1/audit_run.py
+new file mode 100644
+--- /dev/null
++++ b/r2/pilots/user_mix_from_official_v1/audit_run.py
+@@ -0,0 +1,351 @@
++"""Independent end-of-run CPU audit. Never constructs or executes a model.
++
++Run after training, evaluation and rendering finish. Missing stages are BLOCKED;
++failures remain visible. Original inputs/results are read only. Only audit/ is
++written. CUDA, sample preparation, OT and scorers are never dispatched here.
++"""
++from __future__ import annotations
++import argparse
++from collections import Counter, defaultdict
++import csv
++import hashlib
++import importlib.util
++import json
++import math
++import os
++from pathlib import Path
++import sys
++import time
++import traceback
++
++os.environ['CUDA_VISIBLE_DEVICES']=''
++for name in ('OMP_NUM_THREADS','MKL_NUM_THREADS','OPENBLAS_NUM_THREADS'):
++    os.environ[name]='2'
++CODE=Path(__file__).resolve().parent
++DEFAULT=CODE.parents[2]/'experiments/r2_user_mix_from_official_v1'
++ARM='R2_USER_MIX'
++LABELS=('R2_FROZEN','R2_CONT_OLD','R2_CONT_USER',ARM)
++LIMITS={'train_forward':48000,'train_backward':48000,'optimizer_update':6000}
++
++
++def resolve(value):
++    value=str(value)
++    if os.name!='nt' and len(value)>2 and value[1]==':':
++        return Path('/mnt/'+value[0].lower()+'/'+value[3:].replace('\\','/'))
++    return Path(value)
++
++
++def read(path):return json.loads(resolve(path).read_text(encoding='utf-8-sig'))
++def jsonl(path):return [json.loads(line) for line in resolve(path).read_text(encoding='utf8').splitlines() if line.strip()]
++def table(path):
++    with resolve(path).open(newline='',encoding='utf-8-sig') as handle:return list(csv.DictReader(handle))
++def digest(path):
++    h=hashlib.sha256()
++    with resolve(path).open('rb') as handle:
++        for block in iter(lambda:handle.read(8<<20),b''):h.update(block)
++    return h.hexdigest()
++def atomic(path,value):
++    path=resolve(path);path.parent.mkdir(parents=True,exist_ok=True)
++    temp=path.with_suffix(path.suffix+'.tmp')
++    temp.write_text(json.dumps(value,ensure_ascii=False,indent=2,allow_nan=False)+'\n',encoding='utf8')
++    os.replace(temp,path)
++def require(ok,message):
++    if not ok:raise AssertionError(message)
++def number(value):return isinstance(value,(int,float)) and not isinstance(value,bool) and math.isfinite(value)
++def mean(values):return math.fsum(values)/len(values) if values and all(number(v) for v in values) else None
++def same(actual,expected):
++    if expected is None:return actual in ('',None)
++    try:return math.isclose(float(actual),float(expected),rel_tol=2e-12,abs_tol=2e-12)
++    except (ValueError,TypeError):return False
++def module(name,path):
++    spec=importlib.util.spec_from_file_location(name,path);value=importlib.util.module_from_spec(spec)
++    sys.modules[name]=value;spec.loader.exec_module(value);return value
++
++
++class Audit:
++    def __init__(self,out):self.out=out;self.checks=[];self.details={};self.cache={}
++    def section(self,name,function):
++        begin=time.perf_counter()
++        try:
++            details=function();self.details[name]=details
++            row=dict(name=name,status='PASS',seconds=time.perf_counter()-begin,details=details)
++        except FileNotFoundError as exc:
++            row=dict(name=name,status='BLOCKED',reason='MISSING_ASSET: '+str(exc),seconds=time.perf_counter()-begin)
++        except Exception as exc:
++            row=dict(name=name,status='FAIL',reason=repr(exc),traceback=traceback.format_exc(),seconds=time.perf_counter()-begin)
++        self.checks.append(row);print(name,row['status'],flush=True)
++    def hashed_files(self,values):
++        failures=[]
++        for path,record in values.items():
++            expected=record if isinstance(record,str) else record['sha256']
++            if not resolve(path).is_file():failures.append(dict(path=path,status='MISSING'))
++            elif digest(path)!=expected:failures.append(dict(path=path,status='HASH_MISMATCH'))
++        require(not failures,'Changed/missing files: '+json.dumps(failures[:20]))
++        return len(values)
++    def source(self):
++        manifest=read(self.out/'code_manifest.json')
++        count=self.hashed_files(manifest['source_hashes'])
++        ev=read(self.out/'evaluation/registration.json')
++        scorer_count=self.hashed_files(ev['scorer_sources'])
++        for path,h in ev['scorer_sources'].items():
++            require(digest(self.out/'source_external_snapshot'/Path(path).name)==h,'Actual scorer snapshot differs')
++        return dict(frozen_sources=count,actual_scoring_sources=scorer_count,
++            code_manifest_sha256=digest(self.out/'code_manifest.json'),audit_source_sha256=digest(__file__),
++            audit_added_after_training_source_freeze=str(Path(__file__).resolve()) not in manifest['source_hashes'])
++    def protected(self):
++        rows=read(self.out/'protected_before.json')['files']
++        require(len(rows)==1059,'Protected manifest count differs from registered1059')
++        count=self.hashed_files(rows)
++        return dict(files=count,changed=0,missing=0,total_bytes=sum(r['bytes'] for r in rows.values()))
++    def train_calls(self):
++        path=self.out/'training'/ARM/'calls.jsonl';rows=jsonl(path)
++        begun={};closed=set();counts=Counter();steps=[];order=[]
++        for row in rows:
++            require(row['arm']==ARM,'Wrong ledger arm')
++            kind,event,ident=row['kind'],row['event'],row['call_id']
++            require(kind in LIMITS,'Extra call kind: '+kind)
++            counts[event+'__'+kind]+=1
++            if event=='CALL_BEGIN':
++                require(ident not in begun,'Duplicate call reservation')
++                require(len(begun)==len(closed),'Call overlaps an unresolved reservation')
++                begun[ident]=row;order.append(kind)
++                if kind=='optimizer_update':steps.append(row['context']['step'])
++            elif event in ('CALL_DONE','CALL_FAILED'):
++                require(ident in begun and ident not in closed,'Completion missing reservation or repeated')
++                require(begun[ident]['kind']==kind and begun[ident]['context']==row['context'],'Call return identity differs')
++                closed.add(ident)
++            else:raise AssertionError('Unknown ledger event '+event)
++        for kind,count in LIMITS.items():
++            require(counts['CALL_BEGIN__'+kind]==counts['CALL_DONE__'+kind]==count,'Call budget/count differs '+kind)
++            require(counts['CALL_FAILED__'+kind]==0,'Failed calls '+kind)
++        require(steps==list(range(1,6001)),'Optimizer update replay or skip')
++        expected_order=(['train_forward','train_backward']*8+['optimizer_update'])*6000
++        require(order==expected_order,'Forward/backward/optimizer execution order differs')
++        require(set(begun)==closed,'Unresolved calls')
++        status=read(self.out/'training'/ARM/'completed.json')
++        require(status['status']=='COMPLETE' and status['global_step']==6000,'Training not complete')
++        self.cache['training_status']=status
++        return dict(rows=len(rows),counts=dict(counts),optimizer_steps=6000,unresolved=0,failed=0,replayed=0)
++    def exposures(self):
++        registration=read(self.out/'data/input_registration.json')
++        plan=read(self.out/'data/mixed_plan.json')['records'][ARM]
++        inputs=read(self.out/'data'/ARM/'paired_inputs.json')['records']
++        paths=sorted((self.out/'training'/ARM/'attempts').glob('*/exposure.jsonl'))
++        require(paths,'No actual exposure ledger')
++        rows=[r for p in paths for r in jsonl(p)]
++        rows.sort(key=lambda r:(r['step'],r['sample_index']))
++        require(len(rows)==len(plan)==len(inputs)==48000,'Actual/planned/materialized exposure count differs')
++        require([r['sample_index'] for r in rows]==list(range(48000)),'Exposure repeated/missing')
++        parents=set(registration['parents'])
++        require(len(parents)==25 and Counter(r['uid'] for r in rows)=={p:1920 for p in parents},'Parent exposure imbalance')
++        held=set(registration['held_condition_ids']);users=registration['tasks'][registration['condition_source_task_keys']['USER']]
++        old=registration['tasks'][registration['condition_source_task_keys']['OLD']]
++        require(len(users)==117 and len(old)==395,'Training condition pools differ')
++        dev=set(q['parent_id'] for q in read(self.out/'evaluation/registration.json')['requests'])
++        require(not parents&dev,'Train/DEV parent overlap')
++        for i,(r,p,inp) in enumerate(zip(rows,plan,inputs)):
++            for key in ('task_id','uid','N','K','ratio','alpha','t','source_kind','step'):
++                require(r[key]==p[key],f'Actual exposure differs from plan index{i}: '+key)
++            require(r['task_id'] not in held,'HOLD condition trained')
++            tasks=users if r['source_kind']=='USER' else old
++            require(r['task_id'] in tasks and tasks[r['task_id']]['uid']==r['uid'],'Foreign condition or parent')
++            require(tasks[r['task_id']].get('split','train')=='train' and tasks[r['task_id']].get('role','train')=='train','DEV/HOLD task trained')
++            require(r['free_coordinates']==9*(r['N']-r['K']),'Free coordinate denominator differs')
++            for key in ('input_bytehash','label_bytehash','ot_cache_key'):
++                require(r[key]==inp[key],'Exposure consumed different materialized input '+key)
++        by_source=Counter(r['source_kind'] for r in rows)
++        require(by_source=={'USER':36000,'OLD':12000},'6:2 mix count differs')
++        for source,perparent in (('USER',1440),('OLD',480)):
++            rr=[r for r in rows if r['source_kind']==source]
++            require(Counter(r['uid'] for r in rr)=={p:perparent for p in parents},'Source parent balance differs')
++            require(Counter(r['uid'] for r in rr if r['alpha']==1.)=={p:perparent//2 for p in parents},'Source clean balance differs')
++        old_counts=Counter((r['ratio'],r['alpha']==1.) for r in rows if r['source_kind']=='OLD')
++        require(old_counts=={(.2,True):3000,(.2,False):3000,(.4,True):3000,(.4,False):3000},'OLD ratio/augmentation imbalance')
++        for start in range(0,48000,8):
++            batch=rows[start:start+8]
++            require(len({r['uid'] for r in batch})==8,'Batch duplicate parent')
++            require(Counter((r['source_kind'],r['alpha']==1.) for r in batch)=={('USER',True):3,('USER',False):3,('OLD',True):1,('OLD',False):1},'Batch source/width differs')
++        free={kind:sum(r['free_coordinates'] for r in rows if r['source_kind']==kind) for kind in ('USER','OLD')}
++        self.cache['actual_exposures']=rows
++        return dict(exposures=len(rows),parents=len(parents),per_parent=1920,by_source=dict(by_source),
++            held_exposures=0,dev_exposures=0,free_coordinates=free,
++            USER_free_coordinate_fraction=free['USER']/sum(free.values()),distinct_USER_conditions=len({r['task_id'] for r in rows if r['source_kind']=='USER'}),
++            actual_exposure_files=[str(p) for p in paths])
++    def cpu_ot(self):
++        receipt=read(self.out/'data/precompute_receipt.json')
++        require(receipt['status']=='PASS' and receipt['total_samples']==48000,'CPU preparation not complete')
++        paths=sorted((self.out/'data'/ARM/'batches').glob('*.attempt.json'))
++        require(len(paths)==6000,'OT batch attempt count differs')
++        indices=[];returns=0;plansha=digest(self.out/'data/mixed_plan.json')
++        for path in paths:
++            r=read(path);require(r['status'] in ('COMPLETE','RECOVERED_COMPLETE'),'Unresolved OT attempt')
++            require(r['plan_sha256']==plansha,'OT used different frozen plan')
++            require(len(r['OT_attempts'])==8 and all(a['status']=='RETURNED' for a in r['OT_attempts']),'OT failure or incomplete return')
++            batch=path.with_suffix('').with_suffix('.npz')
++            require(digest(batch)==r['batch_npz_sha256'],'Materialized batch hash differs')
++            indices.extend(r['sample_indices']);returns+=len(r['OT_attempts'])
++        require(sorted(indices)==list(range(48000)),'OT sample repeated/missing')
++        require(returns==48000,'OT return budget differs')
++        require(digest(self.out/'data'/ARM/'paired_inputs.json')==receipt['arm_cache_index_sha256'][ARM],'OT input index changed')
++        require(receipt['model_forwards']==receipt['model_backwards']==receipt['optimizer_updates']==receipt['sampling_calls']==0,'CPU preparation ran model calls')
++        return dict(OT_attempts=48000,OT_returns=returns,batches=len(paths),failures=0,materialized_hashes_verified=len(paths),model_calls=0)
++    def checkpoints(self):
++        import torch
++        torch.set_num_threads(2)
++        trainer=module('_r2_mix_independent_checkpoint_audit',CODE/'trainer.py')
++        full=self.out/'checkpoints/R2_USER_MIX_step6000.pt'
++        export=self.out/'inference/R2_USER_MIX_generator_step6000.pt'
++        p=torch.load(full,map_location='cpu',weights_only=True,mmap=True)
++        trainer.validate_payload(p)
++        require(p['global_step']==6000,'Wrong final endpoint')
++        require(p['lineage']['selected_state']=='ema' and p['lineage']['fresh_AdamW'] and p['lineage']['new_optimizer_step']==0,'Nonofficial or continued optimizer initialization')
++        require(p['lineage']['official_file_sha256']==trainer.base.OFFICIAL_FILE_SHA256,'Official lineage hash differs')
++        require(p['lineage']['role_nonzero']==p['lineage']['geo_exit_nonzero']==0,'Wrong initialization contract')
++        require(p['identities']['registration_sha256']==digest(self.out/'registration.json'),'Training registration identity differs')
++        require(p['identities']['code_manifest_sha256']==digest(self.out/'code_manifest.json'),'Training code identity differs')
++        groups=p['optimizer']['param_groups'];require(len(groups)==1,'Extra optimizer/head group')
++        group=groups[0];names=p['optimizer_parameter_names'];require(len(names)==1,'Optimizer names groups differ')
++        require(group['lr']==1e-5 and tuple(group['betas'])==(.9,.95) and group['weight_decay']==0.,'AdamW settings differ')
++        ids=group['params'];require(len(ids)==len(names[0])==len(p['optimizer']['state']),'Optimizer parameter count mismatch')
++        for ident,name in zip(ids,names[0]):
++            state=p['optimizer']['state'][ident];require(set(state)=={'step','exp_avg','exp_avg_sq'},'AdamW state fields differ')
++            require(float(state['step'])==6000.,'Perparameter AdamW step differs')
++            tensor=p['generator_state'][name.removeprefix('generator.')]
++            require(tensor.dtype==torch.float32 and bool(torch.isfinite(tensor).all()),'Nonfinite/nonFP32 generator tensor')
++            for key in ('exp_avg','exp_avg_sq'):
++                require(state[key].shape==tensor.shape and state[key].dtype==torch.float32 and bool(torch.isfinite(state[key]).all()),'AdamW moment shape/dtype/finite differs')
++        v=torch.load(export,map_location='cpu',weights_only=True,mmap=True)
++        require(v['schema']==trainer.INFERENCE_SCHEMA and v['global_step']==6000 and v['arm']==ARM,'Wrong generator export')
++        require(not any(k in v for k in ('optimizer','rng','teacher_state','aligner_state')),'Training/teacher tensors in export')
++        require(v['training_checkpoint_sha256']==digest(full),'Generator/full binding differs')
++        require(trainer.state_hash(v['generator_state'])==p['generator_state_sha256']==v['generator_state_sha256'],'Export does not match trained state')
++        require(not torch.cuda.is_initialized(),'Unexpected CUDA initialization in CPU audit')
++        result=dict(global_step=6000,AdamW_parameters=len(ids),all_parameter_steps=6000,full_sha256=digest(full),generator_sha256=digest(export),model_constructed=False,model_forward=0,CUDA_initialized=False)
++        del p,v
++        return result
++    def rollouts(self):
++        ev=module('_r2_mix_independent_eval_audit',CODE/'evaluation.py')
++        reg=ev.load_registration(self.out);requests=reg['requests'];queries=reg['queries']
++        require(len(requests)==12 and len(queries)==6,'USER evaluation budget differs')
++        require(all(q['panel']=='NEWDEV' for q in requests),'Unexpected OLD panel generation')
++        new=cache=0;forwards=rollouts=0;contracts=0
++        for label in LABELS:
++            for q in requests:
++                basepath=self.out/'evaluation/outputs'/label/q['request_id']
++                r=read(basepath/'receipt.json')
++                expected=reg['historical_checkpoints'][label]['sha256'] if label!=ARM else read(self.out/'evaluation/checkpoints'/f'{ARM}.json')['sha256']
++                _,facts=ev.verify_output(q,r,expected);require(all(facts.values()),'RAW preservation/runtime contract failed');contracts+=len(facts)
++                if label==ARM:
++                    require(r['new_rollouts']==1 and r['generation_status']=='NEW_EULER50','New output provenance differs');new+=1
++                    rows=jsonl(basepath/'calls.jsonl');counts=Counter((a['event'],a.get('kind')) for a in rows)
++                    require(counts['RESERVE','sampling_forward']==counts['RETURN','sampling_forward']==50,'Sampling forward budget differs')
++                    require(counts['RESERVE','rollout_attempt']==1 and counts['ROLLOUT_COMPLETE',None]==1,'Rollout attempt/completion budget differs')
++                    require(not any(a['event']=='ERROR' for a in rows),'Sampling failed')
++                    require([a['ordinal'] for a in rows if a['event']=='RESERVE' and a['kind']=='sampling_forward']==list(range(1,51)),'Sampling forward sequence replayed/skipped')
++                    forwards+=50;rollouts+=1
++                else:
++                    require(not (basepath/'calls.jsonl').exists(),'Historical output regenerated')
++                    require(digest(r['historical_score_path'])==r['historical_score_sha256'],'Historical score changed')
++                    require(digest(r['historical_receipt_path'])==r['historical_receipt_sha256'],'Historical receipt changed');cache+=1
++        require((new,cache,forwards,rollouts)==(12,36,600,12),'Sampling total differs')
++        for q in queries:ev.load_queries(q)
++        self.cache['eval_registration']=reg
++        return dict(new_outputs=new,historical_RAW=cache,sampling_forward_begin=forwards,sampling_forward_return=forwards,rollout_attempts=rollouts,failures=0,RAW_contract_checks=contracts,C_query_banks=6,new_Gaussian_arrays=0)
++    def scores(self):
++        reg=read(self.out/'evaluation/registration.json');queries={q['condition_id']:q for q in reg['queries']}
++        requests={q['request_id']:q for q in reg['requests']}
++        source=read(self.out/'evaluation/scores_all.json');rows=source['rows']
++        require(source['status']=='COMPLETE' and len(rows)==48,'Not all48 scores complete')
++        by={(r['label'],r['request_id']):r for r in rows}
++        require(len(by)==48,'Duplicated score identity')
++        numeric=sorted({k for r in rows for k,v in r['metrics'].items() if number(v)})
++        csvrows=table(self.out/'evaluation/per_output.csv')
++        require(len(csvrows)==48,'Per-output CSV missing rows')
++        csvby={(r['label'],r['request_id']):r for r in csvrows};cells=0
++        for label in LABELS:
++            for rid,q in requests.items():
++                r=by[label,rid];individual=read(self.out/'evaluation/scores'/label/(rid+'.json'))
++                require(r==individual and r['status']=='PASS','Aggregate/peroutput score mismatch')
++                require(r['identity']['query_sha256']==queries[q['condition_id']]['sha256'],'Scoring changed query bank')
++                require(r['free_face_denominator']==q['N']-q['K'] and r['C_query_count']==2048,'Scoring denominator changed')
++                for path,h in r['files'].items():require(digest(path)==h,'Score detail file hash differs')
++                for key,value in r['metrics'].items():
++                    if number(value):require(same(csvby[label,rid].get(key),value),'Peroutput CSV numeric mismatch '+key);cells+=1
++                if label!=ARM:require(r['metrics']==read(r['historical_score_path'])['metrics'],'Historical score was redefined')
++        condition_values={}
++        percondition=table(self.out/'evaluation/per_condition.csv');require(len(percondition)==24,'Percondition count differs')
++        condition_csv={(r['label'],r['condition_id']):r for r in percondition}
++        for label in LABELS:
++            for cid in queries:
++                rr=[r for r in rows if r['label']==label and r['condition_id']==cid]
++                require(len(rr)==2,'Two-noise condition incomplete')
++                values={k:mean([r['metrics'].get(k) for r in rr]) for k in numeric}
++                condition_values[label,cid]=values
++                for key,value in values.items():require(same(condition_csv[label,cid].get(key),value),'Condition mean mismatch '+key);cells+=1
++        summaries=(('summary_equal_parent.csv','ALL'),('summary_by_region.csv','region_type'),('summary_by_tier.csv','tier'))
++        for filename,grouping in summaries:
++            for row in table(self.out/'evaluation'/filename):
++                relevant=[r for r in percondition if r['label']==row['label'] and (grouping=='ALL' or r[grouping]==row['group'])]
++                parent_ids=sorted({r['parent_id'] for r in relevant})
++                require(int(row['registered_parents'])==len(parent_ids),'Summary parent count differs')
++                for key in numeric:
++                    expected=mean([mean([condition_values[r['label'],r['condition_id']][key] for r in relevant if r['parent_id']==pid]) for pid in parent_ids])
++                    require(same(row.get(key),expected),'Equalparent summary mismatch '+filename+' '+key);cells+=1
++        paired=table(self.out/'evaluation/paired_noise.csv');require(len(paired)==36,'Paired-noise count differs')
++        for row in paired:
++            baseline=row['comparison'].split(' minus ')[1];rid=row['request_id']
++            for key in numeric:
++                a,b=by[ARM,rid]['metrics'].get(key),by[baseline,rid]['metrics'].get(key)
++                require(same(row.get(key),a-b if number(a) and number(b) else None),'Paired-noise delta mismatch');cells+=1
++        pairedc=table(self.out/'evaluation/paired_conditions.csv');require(len(pairedc)==18,'Pairedcondition count differs')
++        for row in pairedc:
++            baseline=row['comparison'].split(' minus ')[1];cid=row['condition_id']
++            for key in numeric:
++                a,b=condition_values[ARM,cid][key],condition_values[baseline,cid][key]
++                require(same(row.get(key),a-b if number(a) and number(b) else None),'Pairedcondition delta mismatch');cells+=1
++        diversity=table(self.out/'evaluation/diversity.csv')
++        require(len(diversity)==24 and all(r['status']=='PASS' and int(r['noise_pairs'])==1 and math.isfinite(float(r['D_free'])) for r in diversity),'Diversity records incomplete')
++        return dict(scored=48,new_scored=12,historical_reused=36,numeric_metrics=len(numeric),numeric_cells_checked=cells,per_condition=24,paired_noise=36,paired_conditions=18,diversity_records=24,rescoring_calls=0,diversity_distance_recomputed=False)
++    def gallery(self):
++        manifest=read(self.out/'gallery/manifest.json')
++        require(manifest['status']=='COMPLETE' and manifest['PNG_count']==24 and len(manifest['pages'])==24,'Gallery incomplete')
++        for page in manifest['pages']:
++            require(page['status']=='COMPLETE' and digest(page['image'])==page['image_sha256'],'Gallery image changed')
++            require(page['identity']['columns']==list(LABELS),'Gallery omits a comparison model')
++        require(len(list((self.out/'gallery').rglob('*.png')))==24,'Extra/missing gallery PNG')
++        require((self.out/'gallery/index.html').is_file(),'Missing gallery index')
++        return dict(PNG_count=24,requests=12,outputs=48,full_qualitative_review='SEPARATE_REVIEW_REQUIRED; rendered images alone do not establish actually_viewed')
++    def delivery(self):
++        required=['registration.json','code_manifest.json','code.diff','evaluation/per_output.csv','evaluation/per_condition.csv','evaluation/paired_noise.csv','evaluation/paired_conditions.csv','evaluation/summary_equal_parent.csv','evaluation/diversity.csv','gallery/index.html']
++        for relative in required:require((self.out/relative).is_file(),'Missing delivery artifact '+relative)
++        roots=['source_snapshot','source_external_snapshot','evaluation','gallery','review']
++        paths={self.out/r for r in required}
++        for name in roots:
++            path=self.out/name
++            if path.is_dir():
++                paths.update(p for p in path.rglob('*') if p.is_file() and p.suffix.lower() in ('.py','.json','.csv','.md','.html','.png','.diff') and p.stat().st_size<20_000_000)
++        paths.update(p for p in self.out.glob('*') if p.is_file() and p.suffix.lower() in ('.md','.json','.diff'))
++        target=self.out/'audit/delivery_hashes.csv';target.parent.mkdir(parents=True,exist_ok=True)
++        with target.open('w',newline='',encoding='utf8') as handle:
++            writer=csv.DictWriter(handle,fieldnames=['relative_path','bytes','sha256']);writer.writeheader()
++            for path in sorted(paths):writer.writerow(dict(relative_path=path.relative_to(self.out).as_posix(),bytes=path.stat().st_size,sha256=digest(path)))
++        return dict(files=len(paths),hash_manifest=str(target),hash_manifest_sha256=digest(target),scope='Small review artifacts; excludes weight tensors, data/OT caches and RAW binary arrays. RAWs/weights independently checked above.')
++
++
++def main():
++    p=argparse.ArgumentParser();p.add_argument('--out',default=str(DEFAULT));args=p.parse_args()
++    out=resolve(args.out).resolve()
++    require(out.name=='r2_user_mix_from_official_v1' and out.parent.name=='experiments','Unexpected output root')
++    audit=Audit(out);started=time.perf_counter()
++    for name,function in [('source_hashes',audit.source),('training_ledger',audit.train_calls),('actual_training_exposures',audit.exposures),('CPU_OT',audit.cpu_ot),('CPU_checkpoints',audit.checkpoints),('RAW_rollouts',audit.rollouts),('scores_and_aggregation',audit.scores),('gallery',audit.gallery),('protected_original_files',audit.protected),('delivery',audit.delivery)]:audit.section(name,function)
++    statuses=Counter(r['status'] for r in audit.checks)
++    result=dict(schema='r2_user_mix_independent_execution_audit_v1',status='FAIL' if statuses['FAIL'] else 'BLOCKED' if statuses['BLOCKED'] else 'PASS',
++        checks=audit.checks,check_counts=dict(statuses),seconds=time.perf_counter()-started,time_unix=time.time(),
++        audit_source_sha256=digest(__file__),model_constructed=False,model_forwards=0,model_backwards=0,optimizer_updates=0,OT_calls=0,sampling_calls=0,scorer_calls=0,
++        limitation='CPU artifact and accounting verification; no new geometry scores and no claim of visual usefulness or independent generalization.')
++    atomic(out/'audit/execution_audit.json',result)
++    print(json.dumps(dict(status=result['status'],checks=dict(statuses),seconds=result['seconds'])),flush=True)
++    return 0 if result['status']=='PASS' else 2
++
++
++if __name__=='__main__':raise SystemExit(main())
+diff --git a/r2/pilots/user_mix_from_official_v1/score_parallel.py b/r2/pilots/user_mix_from_official_v1/score_parallel.py
+new file mode 100644
+--- /dev/null
++++ b/r2/pilots/user_mix_from_official_v1/score_parallel.py
+@@ -0,0 +1,247 @@
++"""Two CPU workers for the 12 registered new RAWs; historical scores stay cached.
++
++Registration imports no model and performs no score. The root dispatcher starts
++the explicit run stage only after all 48 RAWs have been saved and verified.
++"""
++from __future__ import annotations
++
++import argparse
++from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
++import datetime as dt
++import hashlib
++import importlib.util
++import json
++import multiprocessing
++import os
++from pathlib import Path
++import sys
++import time
++import traceback
++
++for _key in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
++    os.environ[_key] = "2"
++os.environ["CUDA_VISIBLE_DEVICES"] = ""
++os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
++
++VERSION = "r2_user_mix_parallel_cpu_score_v1"
++EVALUATION_PATH = Path(__file__).with_name("evaluation.py")
++DEFAULT_OUT = Path(__file__).resolve().parents[3] / "experiments/r2_user_mix_from_official_v1"
++
++
++def digest(path):
++    value = hashlib.sha256()
++    with Path(path).open("rb") as handle:
++        for chunk in iter(lambda: handle.read(1 << 20), b""):
++            value.update(chunk)
++    return value.hexdigest()
++
++
++def read(path):
++    return json.loads(Path(path).read_text(encoding="utf-8-sig"))
++
++
++def write(path, value, freeze=True):
++    path = Path(path)
++    path.parent.mkdir(parents=True, exist_ok=True)
++    if path.exists() and freeze:
++        if read(path) != value:
++            raise ValueError("Frozen CPU helper artifact changed: " + str(path))
++        return
++    payload = json.dumps(value, sort_keys=True, indent=2, ensure_ascii=False, allow_nan=False) + "\n"
++    temporary = path.with_suffix(path.suffix + ".tmp")
++    temporary.write_text(payload, encoding="utf8")
++    temporary.replace(path)
++
++
++def root(path):
++    path = Path(path).resolve()
++    if path != DEFAULT_OUT.resolve():
++        raise ValueError("Only the registered USER mix root is writable")
++    return path
++
++
++def resources():
++    memory = {}
++    if Path("/proc/meminfo").exists():
++        for line in Path("/proc/meminfo").read_text().splitlines():
++            key, value = line.split(":", 1)
++            if key in ("MemTotal", "MemAvailable", "MemFree"):
++                memory[key + "_bytes"] = int(value.split()[0]) * 1024
++    return {"time_utc": dt.datetime.now(dt.timezone.utc).isoformat(), "pid": os.getpid(),
++            "logical_cpu_count": os.cpu_count(), "cpu_affinity_count": len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count(),
++            "load_average_1_5_15": list(os.getloadavg()) if hasattr(os, "getloadavg") else None,
++            "memory": memory, "threads_per_worker": 2, "CUDA_VISIBLE_DEVICES": os.environ["CUDA_VISIBLE_DEVICES"]}
++
++
++def stable_identity(out):
++    return {"version": VERSION, "helper_path": str(Path(__file__).resolve()), "helper_sha256": digest(__file__),
++            "evaluation_path": str(EVALUATION_PATH.resolve()), "evaluation_sha256": digest(EVALUATION_PATH),
++            "evaluation_registration_sha256": digest(out / "evaluation/registration.json"),
++            "registered_new_outputs": 12, "historical_outputs": 36, "maximum_workers": 2,
++            "threads_per_worker": 2, "new_model_calls": 0, "new_queries": 0, "new_Gaussians": 0,
++            "execution": "Process-local evaluation modules; disjoint per-request score outputs; serial deterministic cache aggregation"}
++
++
++def register(out):
++    out = root(out)
++    identity = stable_identity(out)
++    write(out / "audit/score_helper_identity.json", identity)
++    target = out / "audit/score_helper_registration_resources.json"
++    if not target.exists():
++        write(target, resources())
++    return {"status": "REGISTERED", **identity, "scoring_executed": False}
++
++
++def load_evaluation():
++    name = "_r2_user_mix_cpu_scoring_process_" + str(os.getpid())
++    if name not in sys.modules:
++        spec = importlib.util.spec_from_file_location(name, EVALUATION_PATH)
++        module = importlib.util.module_from_spec(spec)
++        sys.modules[name] = module
++        spec.loader.exec_module(module)
++    module = sys.modules[name]
++    if "torch" in sys.modules:
++        raise RuntimeError("CPU-only scorer unexpectedly imported torch")
++    return module
++
++
++def score_request(out_string, request_id, expected_identity):
++    """Process-owned module, RNG and one unique score path; never catches failure."""
++    out = root(out_string)
++    if stable_identity(out) != expected_identity:
++        raise ValueError("Worker source/registration identity changed")
++    evaluator = load_evaluation()
++    registration = evaluator.load_registration(out)
++    matches = [q for q in registration["requests"] if q["request_id"] == request_id]
++    if len(matches) != 1:
++        raise ValueError("Request not uniquely registered")
++    q = matches[0]
++    queries = [q0 for q0 in registration["queries"] if q0["condition_id"] == q["condition_id"]]
++    if len(queries) != 1:
++        raise ValueError("Query not uniquely registered")
++    receipt = evaluator.read(out / "evaluation/outputs" / evaluator.NEW_LABEL / request_id / "receipt.json")
++    destination = out / "evaluation/scores" / evaluator.NEW_LABEL / (request_id + ".json")
++    cached_before = destination.exists()
++    started = time.perf_counter()
++    result = evaluator.score_one(out, q, receipt, queries[0], expected_identity["evaluation_registration_sha256"])
++    if result["status"] != "PASS":
++        raise RuntimeError("Scorer did not PASS: " + request_id + " | " + result.get("reason", result["status"]))
++    if "torch" in sys.modules:
++        raise RuntimeError("Geometry scoring unexpectedly imported torch")
++    return {"status": "PASS", "request_id": request_id, "pid": os.getpid(), "cached_before": cached_before,
++            "new_geometry_scans": 0 if cached_before else 1, "score_path": str(destination),
++            "score_sha256": digest(destination), "seconds": time.perf_counter() - started, "model_calls": 0}
++
++
++def choose_workers(snapshot, requested, remaining):
++    if requested not in (1, 2):
++        raise ValueError("Only one or two CPU workers are registered")
++    cores = snapshot["cpu_affinity_count"] or 1
++    average = (snapshot["load_average_1_5_15"] or [0])[0]
++    available = snapshot["memory"].get("MemAvailable_bytes")
++    if available is None:
++        raise RuntimeError("Cannot schedule CPU workers without available-RAM observation")
++    if available < 1024**3:
++        raise RuntimeError("Less than 1 GiB available RAM; wait instead of dispatching")
++    count = min(requested, remaining)
++    reason = "Two workers / two threads each fit observed CPU and RAM headroom"
++    if count > 1 and (cores - average < 6 or available < 2 * 1024**3):
++        count = 1
++        reason = "One CPU worker: retain CPU/RAM headroom under current measured load"
++    return max(1, count), reason
++
++
++def run(out, requested_workers=2, controller_owned=False):
++    if not controller_owned:
++        raise ValueError("Root dispatcher must explicitly start CPU scoring with --controller-owned")
++    out = root(out)
++    identity = stable_identity(out)
++    if read(out / "audit/score_helper_identity.json") != identity:
++        raise ValueError("CPU scoring helper identity differs from registration")
++    evaluator = load_evaluation()
++    registration = evaluator.load_registration(out)
++    # All RAWs must exist, including historical read-only references, before any
++    # geometry score starts. This also checks every model/request/hash contract.
++    raw = evaluator.collect_outputs(out, require_complete=True)
++    if len(raw) != 48:
++        raise ValueError("Expected exactly 48 verified RAWs")
++    requests = sorted(q["request_id"] for q in registration["requests"])
++    if len(requests) != 12:
++        raise ValueError("Only 12 NEWDEV requests are authorized")
++    observed = resources()
++    workers, reason = choose_workers(observed, requested_workers, len(requests))
++    audit = out / "audit"
++    tag = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S_%f")
++    run_dir = audit / "cpu_score_runs" / tag
++    run_dir.mkdir(parents=True, exist_ok=False)
++    dispatch = {"status": "DISPATCHED", "identity": identity, "resources": observed,
++                "requested_workers": requested_workers, "actual_workers": workers, "threads_per_worker": 2,
++                "reason": reason, "registered_requests": requests, "historical_scans": 0}
++    write(run_dir / "dispatch.json", dispatch)
++    started = time.perf_counter()
++    completed, pending = [], {}
++    queue = iter(requests)
++    try:
++        # Spawn gives each worker a clean module/RNG namespace. At most the
++        # chosen number of jobs are live; a failure stops dispatching new jobs.
++        with ProcessPoolExecutor(max_workers=workers, mp_context=multiprocessing.get_context("spawn")) as pool:
++            for _ in range(workers):
++                rid = next(queue, None)
++                if rid is not None:
++                    pending[pool.submit(score_request, str(out), rid, identity)] = rid
++            while pending:
++                done, _ = wait(pending, return_when=FIRST_COMPLETED)
++                for future in sorted(done, key=lambda f: pending[f]):
++                    rid = pending.pop(future)
++                    result = future.result()
++                    completed.append(result)
++                    write(run_dir / "progress.json", {"status": "RUNNING", "completed": len(completed), "registered": 12,
++                                                      "results": completed, "seconds": time.perf_counter() - started}, freeze=False)
++                    print(json.dumps({"stage": "parallel_score", **result, "completed": len(completed)}, allow_nan=False), flush=True)
++                for _ in range(workers - len(pending)):
++                    rid = next(queue, None)
++                    if rid is not None:
++                        pending[pool.submit(score_request, str(out), rid, identity)] = rid
++        if len(completed) != 12 or len({r["request_id"] for r in completed}) != 12:
++            raise ValueError("Incomplete new-score coverage")
++        # Every new-row score now exists, so score_all can only verify its cache.
++        # Historical rows follow the immutable historical-cache branch. The
++        # unchanged aggregator computes summaries/diversity, not geometry scans.
++        new_hashes = {r["score_path"]: r["score_sha256"] for r in completed}
++        aggregated = evaluator.score_all(out)
++        if any(digest(path) != sha for path, sha in new_hashes.items()):
++            raise ValueError("Serial aggregation changed a parallel score")
++        if aggregated["scored"] != 48:
++            raise ValueError("48-row aggregation is incomplete")
++        all_scores = evaluator.read(out / "evaluation/scores_all.json")["rows"]
++        historical = [r for r in all_scores if r["label"] in evaluator.HISTORICAL_LABELS]
++        if len(historical) != 36 or any(r.get("score_execution") != "VERIFIED_EXACT_DEFINITION_HISTORICAL_CACHE" or r.get("new_cpu_geometry_scans") != 0 for r in historical):
++            raise ValueError("Historical results were not uniformly reused")
++        result = {"status": "COMPLETE", "actual_workers": workers, "threads_per_worker": 2, "results": sorted(completed, key=lambda r: r["request_id"]),
++                  "new_geometry_scans_this_invocation": sum(r["new_geometry_scans"] for r in completed), "historical_geometry_scans": 0,
++                  "aggregation": aggregated, "model_calls": 0, "seconds": time.perf_counter() - started, "resources_after": resources()}
++        write(run_dir / "completed.json", result)
++        write(audit / "cpu_score_parallel_result.json", result, freeze=False)
++        return {k: value for k, value in result.items() if k != "results"}
++    except BaseException as exc:
++        for future in pending:
++            future.cancel()
++        write(run_dir / "failure.json", {"status": "FAILED", "error": repr(exc), "traceback": traceback.format_exc(),
++                                         "completed_results": completed, "pending_requests": sorted(pending.values()),
++                                         "seconds": time.perf_counter() - started, "model_calls": 0})
++        raise
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--stage", choices=("register", "run"), required=True)
++    parser.add_argument("--out", default=str(DEFAULT_OUT))
++    parser.add_argument("--workers", type=int, choices=(1, 2), default=2)
++    parser.add_argument("--controller-owned", action="store_true")
++    args = parser.parse_args()
++    result = register(args.out) if args.stage == "register" else run(args.out, args.workers, args.controller_owned)
++    print(json.dumps(result, ensure_ascii=False, allow_nan=False), flush=True)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/r2/pilots/user_mix_from_official_v1/resource_monitor.py b/r2/pilots/user_mix_from_official_v1/resource_monitor.py
+new file mode 100644
+--- /dev/null
++++ b/r2/pilots/user_mix_from_official_v1/resource_monitor.py
+@@ -0,0 +1,248 @@
++"""Read-only nvidia-smi observations around the sole registered sampling phase.
++
++Start this monitor before sample; its ready receipt follows the first resource
++observation. No torch, model, generation, process termination or retry is used.
++"""
++from __future__ import annotations
++
++import argparse
++import csv
++import datetime as dt
++import hashlib
++import io
++import json
++import os
++from pathlib import Path
++import shutil
++import subprocess
++import sys
++import time
++import traceback
++
++VERSION = "r2_user_mix_sampling_nvidia_monitor_v1"
++DEFAULT_OUT = Path(__file__).resolve().parents[3] / "experiments/r2_user_mix_from_official_v1"
++INTERVAL_SECONDS = 2.0
++TIMEOUT_SECONDS = 600.0
++GPU_COMMAND = ["nvidia-smi", "--query-gpu=index,uuid,name,memory.total,memory.used,memory.free,utilization.gpu", "--format=csv,noheader,nounits"]
++PROCESS_COMMAND = ["nvidia-smi", "--query-compute-apps=pid,process_name,used_gpu_memory,gpu_uuid", "--format=csv,noheader,nounits"]
++
++
++def sha256(path):
++    value = hashlib.sha256()
++    with Path(path).open("rb") as handle:
++        for chunk in iter(lambda: handle.read(1 << 20), b""):
++            value.update(chunk)
++    return value.hexdigest()
++
++
++def root(path):
++    path = Path(path).resolve()
++    if path != DEFAULT_OUT.resolve():
++        raise ValueError("Wrong experiment output root")
++    return path
++
++
++def read(path):
++    return json.loads(Path(path).read_text(encoding="utf-8-sig"))
++
++
++def write(path, value):
++    path = Path(path)
++    path.parent.mkdir(parents=True, exist_ok=True)
++    if path.exists():
++        if read(path) != value:
++            raise ValueError("Refuse overwrite of existing sampling resource record")
++        return
++    temporary = path.with_suffix(path.suffix + ".tmp")
++    temporary.write_text(json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False) + "\n", encoding="utf8")
++    temporary.replace(path)
++
++
++def identity():
++    return {"version": VERSION, "source_path": str(Path(__file__).resolve()), "source_sha256": sha256(__file__),
++            "interval_seconds": INTERVAL_SECONDS, "maximum_wall_seconds": TIMEOUT_SECONDS,
++            "gpu_command": GPU_COMMAND, "process_command": PROCESS_COMMAND,
++            "sampler_pid_source": "evaluation/sampling/R2_USER_MIX/initial_dispatch.json:pid",
++            "process_attribution": "Exact sampler PID match in nvidia-smi process table; unreported/N/A is UNAVAILABLE, never zero",
++            "device_memory_scope": "Whole GPU including background processes and driver/context allocations",
++            "memory_rule": "Observed device used and observed per-process used are separate; allocated/reserved never added",
++            "model_calls": 0, "process_termination": False}
++
++
++def register(out):
++    out = root(out)
++    value = identity()
++    write(out / "audit/sampling_resource_monitor_identity.json", value)
++    return {"status": "REGISTERED", "monitor_started": False, **value}
++
++
++def _number(raw):
++    try:
++        value = float(raw.strip())
++        if not (float("-inf") < value < float("inf")):
++            return None
++        return value
++    except (ValueError, TypeError):
++        return None
++
++
++def query(command, remaining_seconds):
++    started = time.monotonic()
++    timeout = max(.001, min(8., remaining_seconds))
++    actual_command = list(command)
++    if shutil.which(actual_command[0]) is None and Path("/usr/lib/wsl/lib/nvidia-smi").exists():
++        actual_command[0] = "/usr/lib/wsl/lib/nvidia-smi"
++    try:
++        result = subprocess.run(actual_command, text=True, encoding="utf8", errors="replace", capture_output=True, timeout=timeout, check=False)
++        return {"status": "PASS" if result.returncode == 0 else "ERROR", "returncode": result.returncode,
++                "stdout": result.stdout, "stderr": result.stderr, "command": actual_command, "seconds": time.monotonic() - started}
++    except (OSError, subprocess.TimeoutExpired) as exc:
++        return {"status": "ERROR", "error": repr(exc), "stdout": "", "stderr": "", "returncode": None,
++                "command": actual_command, "seconds": time.monotonic() - started}
++
++
++def snapshot(out, deadline, reason, sequence):
++    observed_unix = time.time()
++    dispatch_path = out / "evaluation/sampling/R2_USER_MIX/initial_dispatch.json"
++    dispatch_error = None
++    try:
++        dispatch = read(dispatch_path) if dispatch_path.exists() else None
++    except (json.JSONDecodeError, OSError) as exc:
++        # A partially written dispatch is pending, never a guessed sampler PID.
++        dispatch, dispatch_error = None, repr(exc)
++    gpu = query(GPU_COMMAND, deadline - time.monotonic())
++    process = query(PROCESS_COMMAND, deadline - time.monotonic())
++    devices, processes, parse_errors = [], [], []
++    if gpu["status"] == "PASS":
++        for fields in csv.reader(io.StringIO(gpu["stdout"]), skipinitialspace=True):
++            if len(fields) != 7:
++                parse_errors.append({"table": "gpu", "row": fields})
++                continue
++            index, uuid, name, total, used, free, utilization = (f.strip() for f in fields)
++            devices.append({"index": index, "uuid": uuid, "name": name, "total_MiB": _number(total),
++                            "used_MiB": _number(used), "free_MiB": _number(free), "utilization_percent": _number(utilization)})
++    if process["status"] == "PASS":
++        for fields in csv.reader(io.StringIO(process["stdout"]), skipinitialspace=True):
++            if not fields:
++                continue
++            if len(fields) != 4:
++                parse_errors.append({"table": "compute_processes", "row": fields})
++                continue
++            pid, name, used, uuid = (f.strip() for f in fields)
++            parsed_pid = int(pid) if pid.isdigit() else None
++            processes.append({"pid": parsed_pid, "pid_raw": pid, "process_name": name,
++                              "used_MiB": _number(used), "used_MiB_raw": used, "gpu_uuid": uuid,
++                              "matches_sampler_pid": bool(dispatch is not None and parsed_pid == dispatch["pid"])})
++    return {"sequence": sequence, "reason": reason, "time_unix": observed_unix,
++            "time_utc": dt.datetime.fromtimestamp(observed_unix, dt.timezone.utc).isoformat(),
++            "sampler_pid": dispatch.get("pid") if dispatch else None,
++            "sampler_dispatch_started_unix": dispatch.get("started") if dispatch else None,
++            "sampler_dispatch_path": str(dispatch_path), "dispatch_seen": dispatch is not None, "dispatch_read_error": dispatch_error,
++            "devices": devices, "compute_processes": processes, "parse_errors": parse_errors,
++            "gpu_query": gpu, "process_query": process,
++            "status": "PASS" if devices and not parse_errors and gpu["status"] == process["status"] == "PASS" else "PARTIAL_UNAVAILABLE"}
++
++
++def summarize(rows, terminal, started_unix, elapsed, completion, failure):
++    # PID may first become known after model loading starts. Reattribute earlier
++    # rows by the eventual exact PID without inventing unreported memory values.
++    pids = sorted({row["sampler_pid"] for row in rows if row["sampler_pid"] is not None})
++    if len(pids) > 1:
++        raise ValueError("Sampler PID changed within a single registered phase")
++    sampler_pid = pids[0] if pids else None
++    processes = [proc for row in rows for proc in row["compute_processes"] if sampler_pid is not None and proc["pid"] == sampler_pid]
++    process_values = [proc["used_MiB"] for proc in processes if proc["used_MiB"] is not None]
++    devices = []
++    for uuid in sorted({gpu["uuid"] for row in rows for gpu in row["devices"]}):
++        values = [gpu for row in rows for gpu in row["devices"] if gpu["uuid"] == uuid]
++        used = [gpu["used_MiB"] for gpu in values if gpu["used_MiB"] is not None]
++        free = [gpu["free_MiB"] for gpu in values if gpu["free_MiB"] is not None]
++        utilization = [gpu["utilization_percent"] for gpu in values if gpu["utilization_percent"] is not None]
++        devices.append({"uuid": uuid, "name": values[0]["name"], "total_MiB": values[0]["total_MiB"],
++                        "observed_peak_used_MiB": max(used) if used else None, "observed_minimum_free_MiB": min(free) if free else None,
++                        "observed_peak_utilization_percent": max(utilization) if utilization else None,
++                        "observed_mean_utilization_percent": sum(utilization) / len(utilization) if utilization else None,
++                        "scope": "Whole-device observations including background; not sampler-only process peak"})
++    dispatch_starts = [row["sampler_dispatch_started_unix"] for row in rows if row["sampler_dispatch_started_unix"] is not None]
++    first_observation = rows[0]["time_unix"] if rows else None
++    before_dispatch = bool(dispatch_starts and first_observation is not None and first_observation <= min(dispatch_starts))
++    return {"status": terminal, "version": VERSION, "started_unix": started_unix, "wall_seconds": elapsed,
++            "interval_seconds": INTERVAL_SECONDS, "samples": len(rows), "sampling_pid": sampler_pid,
++            "first_observation_before_sampling_dispatch": before_dispatch,
++            "loading_observation_status": "STARTED_BEFORE_DISPATCH_INCLUDES_MODEL_LOAD_WINDOW" if before_dispatch else "UNVERIFIED_OR_STARTED_AFTER_DISPATCH",
++            "completion_receipt_seen": completion, "failure_receipt_seen": failure,
++            "device_summary": devices,
++            "sampler_process_memory": {"status": "OBSERVED" if process_values else "UNAVAILABLE",
++                                       "observed_peak_used_MiB": max(process_values) if process_values else None,
++                                       "exact_pid_rows": len(processes), "numeric_memory_rows": len(process_values),
++                                       "reason": None if process_values else "nvidia-smi did not report numeric used memory for the exact sampler PID",
++                                       "scope": "Per-process used VRAM sampled every 2s; an observed maximum, not a guaranteed exact peak"},
++            "memory_semantics": "Device total/used/free and per-process used kept separate; no sum of PyTorch allocated and reserved",
++            "model_calls": 0, "observations": rows}
++
++
++def monitor(out, controller_owned=False):
++    if not controller_owned:
++        raise ValueError("Root must explicitly start this phase observer with --controller-owned")
++    out = root(out)
++    frozen = identity()
++    if read(out / "audit/sampling_resource_monitor_identity.json") != frozen:
++        raise ValueError("Resource-monitor source identity changed")
++    audit = out / "audit"
++    result_path = audit / "sampling_resources.json"
++    rows_path = audit / "sampling_resources_samples.jsonl"
++    if result_path.exists() or rows_path.exists():
++        raise ValueError("A resource observation already exists; no silent overwrite/restart")
++    phase = out / "evaluation/sampling/R2_USER_MIX"
++    completion_path, failure_path = phase / "completed.json", phase / "initial_failure.json"
++    started_unix, started = time.time(), time.monotonic()
++    deadline = started + TIMEOUT_SECONDS
++    next_observation = started
++    rows = []
++    with rows_path.open("x", encoding="utf8") as handle:
++        try:
++            terminal = "TIMEOUT"
++            while time.monotonic() < deadline:
++                completion, failure = completion_path.exists(), failure_path.exists()
++                reason = "TERMINAL_FOLLOWUP" if completion or failure else "PERIODIC"
++                row = snapshot(out, deadline, reason, len(rows))
++                rows.append(row)
++                handle.write(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n")
++                handle.flush()
++                os.fsync(handle.fileno())
++                if len(rows) == 1:
++                    write(audit / "sampling_resources_monitor_ready.json", {"status": "READY" if row["status"] == "PASS" else "READY_WITH_UNAVAILABLE_FIELDS",
++                                                                          "pid": os.getpid(), "first_observation_unix": row["time_unix"],
++                                                                          "source_sha256": frozen["source_sha256"], "samples_path": str(rows_path)})
++                    print(json.dumps({"status": "MONITOR_READY", "pid": os.getpid(), "first_observation_status": row["status"]}), flush=True)
++                if completion or failure:
++                    terminal = "SAMPLING_COMPLETE" if completion and not failure else "SAMPLING_FAILED"
++                    break
++                remaining = deadline - time.monotonic()
++                if remaining > 0:
++                    next_observation += INTERVAL_SECONDS
++                    delay = max(0., next_observation - time.monotonic())
++                    time.sleep(min(delay, remaining))
++            result = summarize(rows, terminal, started_unix, time.monotonic() - started, completion_path.exists(), failure_path.exists())
++            result.update(identity=frozen, samples_path=str(rows_path), samples_sha256=sha256(rows_path))
++            write(result_path, result)
++            return {key: value for key, value in result.items() if key != "observations"}
++        except BaseException as exc:
++            write(audit / "sampling_resource_monitor_failure.json", {"status": "MONITOR_FAILED", "error": repr(exc),
++                                                                    "traceback": traceback.format_exc(), "samples_written": len(rows),
++                                                                    "wall_seconds": time.monotonic() - started, "model_calls": 0})
++            raise
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--stage", required=True, choices=("register", "monitor"))
++    parser.add_argument("--out", default=str(DEFAULT_OUT))
++    parser.add_argument("--controller-owned", action="store_true")
++    args = parser.parse_args()
++    result = register(args.out) if args.stage == "register" else monitor(args.out, args.controller_owned)
++    print(json.dumps(result, ensure_ascii=False, allow_nan=False), flush=True)
++
++
++if __name__ == "__main__":
++    main()

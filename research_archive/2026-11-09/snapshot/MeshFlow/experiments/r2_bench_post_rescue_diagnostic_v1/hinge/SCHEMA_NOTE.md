@@ -1,0 +1,1 @@
+Before interpretation, the metadata field name collision was corrected in tables_v2. The original numerical scorer, meshes, frozen definitions, pair caches and all previous tables remain unchanged. Use tables_v2 for complete 135-field tables; tables/connectivity_ledger.csv and illegal_pairs_by_role.csv are unaffected. No scoring, decoder, model or noise calls were repeated.

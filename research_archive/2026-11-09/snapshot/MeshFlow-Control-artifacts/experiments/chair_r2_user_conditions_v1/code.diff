@@ -1,0 +1,2533 @@
+--- /dev/null
++++ b/r2/data_tools/user_conditions_v1/README.md
+@@ -0,0 +1,32 @@
++# R2 用户式条件数据准备（CPU）
++
++本目录是独立的数据准备工具，接续 R2 配方；不修改已有 R2 训练/采样入口，不加载模型。
++实际主清单在：
++
++`E:/MeshFlow-Control-artifacts/experiments/chair_r2_user_conditions_v1/active_conditions.json`
++
++117 条 train（25 父、47 区域）+ 6 条新 DEV。原129份导出和全部图片保持，6条小档细边条作为HOLD证据。26原训练父中的400a因座/背均不能可靠分区而不进共同池，不能解读为“过滤掉有缺陷父”。语义为AI_PROXY而非人工标注。
++
++在已有WSL NumPy/Matplotlib环境中检查或恢复：
++```bash
++/mnt/e/MeshFlow-Control-artifacts/venv/bin/python -B /mnt/e/MeshFlow/r2/data_tools/user_conditions_v1/run.py --stage check
++/mnt/e/MeshFlow-Control-artifacts/venv/bin/python -B /mnt/e/MeshFlow/r2/data_tools/user_conditions_v1/run.py --stage resume
++```
++
++总入口核验现有来源、全部NPZ和PNG及活动清单身份，写入ledger.jsonl。resume仅补建缺失条件构造和条件质量分区；已有同身份结果复用。缺失语义审阅、活动选择或最终审计时明确BLOCKED，需要从对应保存证据恢复；不会自动猜标签、重抽噪声或开训。JSON阶段文件默认不可用不同内容覆盖。
++
++实际阶段源码：
++- prepare.py / inventory.py：来源、ID与几何候选；候选不是语义标签。
++- quality.py：调用保留的原CPU面对分类器，复用26父既有缓存并检查8DEV；不是重新评分模型输出。
++- freeze_regions.py：记录本次逐父实际图审决策，实例专用，不是可泛化的自动语义分割器。
++- construct.py：完整原边图上嵌套区域、去重、原FP32的C/Y及映射。
++- render.py：真实来源网格固定相机的CPU图，不使用生成图。
++- review_usability.py：本次6条细边条图审HOLD决策，保留原导出。
++- verify_export.py / verify_active.py：独立几何、映射、来源和活动子集回读检查。
++- summarize.py / publish.py：全部候选表及最终主池表、图集、报告。
++
++查看结果优先打开输出目录 gallery/index.html、DATA_PREPARATION_REPORT.md、dataset_handoff_active.json。初始conditions.json/summary/handoff仅是122train+7DEV候选阶段，不能误用作后续主池。
++
++后续训练仍走R2（Native/T1+role+Geo、FM、全程HYBRID=.25），拟从主实验完整step6000及对应AdamW建立新的1000步续训分支。当前R2公共入口绑定旧26父/C20/C40/6000步，不直接支持这个清单；后续实现需独立分支合同。该目录没有训练授权、训练入口、权重或新噪声。C区域标签不输入模型，Y是来源补集，不是唯一正确生成答案。
++
++独立审计不是“全网格干净”认证；主池仍有源几何CF/FF问题与UNKNOWN。后续评价应同时看C实际用途、整体形状与几何代价。
+--- /dev/null
++++ b/r2/data_tools/user_conditions_v1/construct.py
+@@ -0,0 +1,134 @@
++"""Construct reviewed region subsets; no noise, OT, model or mesh repair."""
++from pathlib import Path
++import collections, heapq, json, hashlib
++import numpy as np
++from prepare import sha, read, write, event, geometry, DEFAULT_OUT
++
++def area(tri):
++    t=np.asarray(tri,dtype=np.float64).reshape(-1,3,3)
++    return np.linalg.norm(np.cross(t[:,1]-t[:,0],t[:,2]-t[:,0]),axis=1)/2
++
++def graph(faces, ids):
++    chosen=set(map(int,ids));edges=collections.defaultdict(list)
++    for i in chosen:
++        for j in range(3):
++            e=tuple(sorted((int(faces[i,j]),int(faces[i,(j+1)%3]))))
++            edges[e].append(i)
++    adj={i:set() for i in chosen}
++    for v in edges.values():
++        for i in v:adj[i].update(set(v)-{i})
++    return adj,edges
++
++def growth_order(tri, faces, ids, kind):
++    ids=sorted(set(map(int,ids)));t=np.asarray(tri).reshape(-1,3,3).astype(float)
++    centers=t.mean(1);points=t[ids].reshape(-1,3)
++    lo,hi=points.min(0),points.max(0);anchor=(lo+hi)/2
++    if kind=="seat":anchor[[0,2]]=lo[[0,2]]
++    elif kind=="back":anchor[0]=lo[0];anchor[1]=hi[1]
++    else:raise ValueError("Reviewed semantic region type required")
++    adj,edges=graph(faces,ids)
++    boundary_faces=set(i for fs in edges.values() if len(fs)==1 for i in fs)
++    candidates=sorted(boundary_faces or ids)
++    seed=min(candidates,key=lambda i:(float(np.linalg.norm(centers[i]-anchor)),i))
++    heap=[(0.,seed)];distance={seed:0.};seen=set();order=[]
++    while heap:
++        d,i=heapq.heappop(heap)
++        if i in seen:continue
++        seen.add(i);order.append(i)
++        for j in sorted(adj[i]):
++            nd=d+float(np.linalg.norm(centers[i]-centers[j]))
++            if j not in seen and nd<distance.get(j,float("inf")):
++                distance[j]=nd;heapq.heappush(heap,(nd,j))
++    if len(order)!=len(ids):raise ValueError("Reviewed region is not full-edge connected")
++    return order,dict(seed_source_face_id=seed,anchor=anchor.tolist(),
++        growth="Dijkstra centroid distance on source-face complete-edge graph; fixed face-ID ties")
++
++def nested_extents(tri,faces,ids,kind):
++    ids=sorted(set(map(int,ids)))
++    if not ids:raise ValueError("Empty region")
++    a=area(tri);order,audit=growth_order(tri,faces,ids,kind)
++    cum=np.cumsum(a[order]);total=float(cum[-1])
++    if total<=0:raise ValueError("Zero area region")
++    extents=[];seen={}
++    for tier,fraction in (("small",.25),("medium",.5),("full",1.)):
++        n=len(ids) if tier=="full" else min(range(1,len(ids)+1),key=lambda k:(abs(float(cum[k-1])-fraction*total),k))
++        selected=sorted(order[:n]);key=tuple(selected)
++        if key in seen:
++            extents[seen[key]]["requested_tiers"].append(tier)
++            extents[seen[key]]["requested_area_fractions"].append(fraction)
++        else:
++            seen[key]=len(extents)
++            extents.append(dict(source_face_ids=selected,requested_tiers=[tier],
++                requested_area_fractions=[fraction],region_area_fraction=float(a[selected].sum()/total)))
++    for row in extents:
++        row["tier"]="full" if "full" in row["requested_tiers"] else ("medium" if "medium" in row["requested_tiers"] else "small")
++    return extents,audit
++
++def partition_arrays(a,ids):
++    M=a["full_target"];n=len(M);ids=np.asarray(sorted(set(map(int,ids))),dtype=np.int64)
++    if M.dtype!=np.float32 or not 0<len(ids)<n or ids.min()<0 or ids.max()>=n:raise ValueError("Invalid FP32/M/K/source IDs")
++    free=np.setdiff1d(np.arange(n,dtype=np.int64),ids)
++    C=M[ids].reshape(-1,3,3).copy();Y=M[free].reshape(-1,3,3).copy()
++    reconstructed=np.empty_like(M);reconstructed[ids]=C.reshape(-1,9);reconstructed[free]=Y.reshape(-1,9)
++    assert reconstructed.tobytes()==M.tobytes()
++    assert np.array_equal(np.sort(np.r_[ids,free]),np.arange(n))
++    result=dict(C=C,Y=Y,source_face_ids=ids,free_source_ids=free,
++        original_source_face_ids=a["retained_to_original_face"][ids],
++        free_original_source_face_ids=a["retained_to_original_face"][free],
++        C_source_vertex_ids=a["source_face_vertex_ids"][ids],
++        Y_source_vertex_ids=a["source_face_vertex_ids"][free],
++        C_source_corner_permutations=a["source_corner_permutations"][ids],
++        Y_source_corner_permutations=a["source_corner_permutations"][free],
++        C_pre_ot=a["pre_ot_full"][ids],Y_pre_ot=a["pre_ot_full"][free],
++        N=np.asarray(n,np.int64),K=np.asarray(len(ids),np.int64))
++    assert (result["C_pre_ot"]*np.float32(2)).tobytes()==C.tobytes()
++    assert (result["Y_pre_ot"]*np.float32(2)).tobytes()==Y.tobytes()
++    return result
++
++def build(out=DEFAULT_OUT):
++    out=Path(out)
++    parents={p["uid"]:p for p in read(out/"parent_inventory.json")["rows"]}
++    reviewed=read(out/"regions.json")["rows"];results=[];regions=[]
++    for r in reviewed:
++        if r["status"] not in ("ACCEPTED_AI_PROXY","ACCEPTED_WITH_RISK_AI_PROXY"):continue
++        p=parents[r["uid"]];a=geometry(p);M=a["full_target"];aa=area(M)
++        ids=r["source_face_ids"];extents,growth=nested_extents(M,a["source_faces"],ids,r["region_type"])
++        regions.append(dict(r,growth=growth,unique_extent_count=len(extents),requested_extent_count=3))
++        for e in extents:
++            # DEV selects one reviewed requested tier per parent; no hidden extra DEV examples.
++            if p["split"]=="dev" and r["dev_requested_tier"] not in e["requested_tiers"]:continue
++            cid=r["uid"]+"__"+r["region_type"]+"__"+e["tier"]
++            arrays=partition_arrays(a,e["source_face_ids"])
++            path=out/"conditions"/(cid+".npz");path.parent.mkdir(parents=True,exist_ok=True)
++            if path.exists():
++                with np.load(path,allow_pickle=False) as z:
++                    assert set(z.files)==set(arrays)
++                    assert all(z[k].dtype==v.dtype and z[k].shape==v.shape and z[k].tobytes()==v.tobytes() for k,v in arrays.items())
++            else:
++                with path.open("xb") as f:np.savez_compressed(f,**arrays)
++            row=dict(condition_id=cid,uid=r["uid"],split=p["split"],region_id=r["region_id"],
++                     region_type=r["region_type"],region_source_face_ids=ids,region_status=r["status"],
++                     source_face_ids=e["source_face_ids"],free_source_ids=arrays["free_source_ids"].tolist(),
++                     N=len(M),K=len(e["source_face_ids"]),face_fraction=len(e["source_face_ids"])/len(M),
++                     region_area_fraction=e["region_area_fraction"],
++                     parent_area_fraction=float(aa[e["source_face_ids"]].sum()/aa.sum()),
++                     C_area=float(aa[e["source_face_ids"]].sum()),R_area=float(aa[ids].sum()),M_area=float(aa.sum()),
++                     area_definition="sum of triangle areas; not visible area or union area",
++                     tier=e["tier"],requested_tiers=e["requested_tiers"],
++                     npz=str(path),sha256=sha(path),parent_npz=p["npz"],parent_sha256=p["sha256"],
++                     growth=growth,review_kind="AI_PROXY",source_partition_bitwise=True,
++                     full_mesh_repaired=False,training_status="NOT_RUN")
++            results.append(row)
++    train=[r for r in results if r["split"]=="train"];dev=[r for r in results if r["split"]=="dev"]
++    assert len(train)<=156 and len(dev)<=8 and len({r["uid"] for r in dev})==len(dev)
++    value=dict(schema="r2_reviewed_user_conditions_v1",source_region_manifest_sha256=sha(out/"regions.json"),
++               rows=results,train_condition_count=len(train),dev_condition_count=len(dev),
++               train_parents=sorted({r["uid"] for r in train}),dev_parents=sorted({r["uid"] for r in dev}),
++               created_noise_arrays=0,OT_calls=0,model_calls=0,training_updates=0,
++               pending="Data preparation; no training until review of this package")
++    write(out/"conditions.json",value);write(out/"region_extent_audit.json",dict(rows=regions))
++    event(out,"REVIEWED_CONDITIONS_EXPORTED",train=len(train),dev=len(dev),model_calls=0,OT_calls=0)
++    print(json.dumps({"train":len(train),"dev":len(dev),"train_parents":len(value["train_parents"])}),flush=True)
++if __name__=="__main__":
++    import argparse
++    p=argparse.ArgumentParser();p.add_argument("--out",type=Path,default=DEFAULT_OUT);args=p.parse_args();build(args.out)
+--- /dev/null
++++ b/r2/data_tools/user_conditions_v1/finish_package.py
+@@ -0,0 +1,60 @@
++"""Snapshot source and audit all local review links. No experiments."""
++from pathlib import Path
++from html.parser import HTMLParser
++from collections import Counter
++import csv,json,difflib
++from prepare import DEFAULT_OUT,read,write,sha,event
++
++class Links(HTMLParser):
++ def __init__(self):super().__init__();self.links=[];self.articles=[]
++ def handle_starttag(self,tag,attrs):
++  a=dict(attrs)
++  if tag=='article':self.articles.append(a)
++  for key in ('href','src'):
++   if key in a:self.links.append(a[key])
++
++def main(out=DEFAULT_OUT):
++ out=Path(out);code=Path(__file__).parent
++ parser=Links();parser.feed((out/'gallery/index.html').read_text(encoding='utf-8'))
++ assert len(parser.articles)==129
++ assert Counter(r['data-usage'] for r in parser.articles)=={'active':123,'held':6}
++ missing=[p for p in parser.links if not (out/'gallery'/p).resolve().exists()]
++ assert not missing,missing
++ with (out/'tables/active_conditions.csv').open(encoding='utf-8',newline='') as f:
++  table=list(csv.DictReader(f))
++ assert len(table)==123 and Counter(r['split'] for r in table)=={'train':117,'dev':6}
++ snap=out/'source_snapshot';snap.mkdir(exist_ok=True)
++ hashes={};diff=[]
++ for p in sorted(code.iterdir()):
++  if p.suffix not in ('.py','.md'):continue
++  target=snap/p.name
++  if target.exists():assert target.read_bytes()==p.read_bytes()
++  else:target.write_bytes(p.read_bytes())
++  hashes[str(p)]=dict(sha256=sha(p),snapshot=str(target),bytes=p.stat().st_size)
++  diff.extend(difflib.unified_diff([],p.read_text(encoding='utf-8').splitlines(keepends=True),
++   fromfile='/dev/null',tofile='b/r2/data_tools/user_conditions_v1/'+p.name))
++ score_dir=out/'scoring_source';score_dir.mkdir(exist_ok=True)
++ frozen=Path('/mnt/e/MeshFlow-Control-artifacts/experiments/chair_user_condition_data_audit_v1/geometry/source_snapshot/src/meshflow_control/evaluation')
++ for name in ('intersections.py','pair_audit.py','seams.py'):
++  p=frozen/name;target=score_dir/name
++  if target.exists():assert target.read_bytes()==p.read_bytes()
++  else:target.write_bytes(p.read_bytes())
++  hashes[str(p)]=dict(sha256=sha(p),snapshot=str(target),bytes=p.stat().st_size)
++ write(out/'source_hashes.json',hashes)
++ delta=''.join(diff);dpath=out/'code.diff'
++ if dpath.exists():assert dpath.read_text(encoding='utf-8')==delta
++ else:dpath.write_text(delta,encoding='utf-8')
++ receipt=dict(status='PASS',candidate_images=129,active_gallery_cards=123,held_cards=6,
++  checked_local_link_occurrences=len(parser.links),broken_links=0,active_csv_rows=123,
++  source_files_snapshotted=len(hashes),source_hashes_sha256=sha(out/'source_hashes.json'),
++  original_scorers_preserved=True,model_calls=0,training_updates=0,OT_calls=0)
++ write(out/'package_validation.json',receipt)
++ event(out,'DATA_PREPARATION_COMPLETED',active_train=117,active_dev=6,old_requests=16,model_calls=0,training_updates=0)
++ # Exclude changing execution ledger and this file's own manifest to avoid circular hashes.
++ records=[]
++ for p in sorted(out.rglob('*')):
++  if p.is_file() and p.name not in ('files_manifest.json','ledger.jsonl'):
++   records.append(dict(path=str(p.relative_to(out)),sha256=sha(p),bytes=p.stat().st_size))
++ write(out/'files_manifest.json',dict(rows=records,total_bytes=sum(r['bytes'] for r in records)))
++ print(json.dumps(dict(receipt,files=len(records),total_bytes=sum(r['bytes'] for r in records))))
++if __name__=='__main__':main()
+--- /dev/null
++++ b/r2/data_tools/user_conditions_v1/freeze_regions.py
+@@ -0,0 +1,66 @@
++"""Apply recorded AI visual decisions; this is not a semantic classifier."""
++from pathlib import Path
++from collections import Counter
++from prepare import DEFAULT_OUT,read,write,sha,geometry,event
++from construct import nested_extents
++from quality import partition_condition
++
++def main(out=DEFAULT_OUT):
++ out=Path(out); draft=read(out/'reviews/draft_regions.json')['rows']
++ parents={p['uid']:p for p in read(out/'parent_inventory.json')['rows']}
++ supplemental={'12c2','3ede','5869','71db','73b3','e682'}
++ rows=[]
++ for r in draft:
++  r=dict(r);uid=r['uid'];kind=r['region_type']
++  r['original_review_status']=r['status']
++  r['reviewer']='root AI_PROXY, using independent per-parent AI visual reviews'
++  r['human_semantic_annotation']=False
++  r['labels_fed_to_model']=False
++  r['final_approval']=False
++  r['data_preparation_decision']='FINAL_FOR_REVIEW_PACKAGE; no training authorization implied'
++  if uid.startswith('5574') and kind=='back':
++   r['status']='NA_DISCONNECTED_REGION'
++   r['reason']='The two seat-facing supporting panels p01+p04 do not share complete source edges. This pilot does not bridge them or relabel one isolated panel as the complete back region.'
++  elif uid.startswith('e682') and kind=='back':
++   r['source_face_ids']=[168,170,172,173,174,175,176]
++   r['status']='REVIEWED_SUBSET'
++   r['reason']='Supplemental views confirm the complete fan-shaped seat-facing supporting panel. Omit face30, which extends below the seat to a rear leg. The bevel/top shell and reverse face remain in Y; full means this front panel R.'
++  if r['source_face_ids'] and not r['status'].startswith('NA'):
++   a=geometry(parents[uid])
++   ext,growth=nested_extents(a['full_target'],a['source_faces'],r['source_face_ids'],kind)
++   q=partition_condition(uid,r['source_face_ids'],out/'quality')
++   r['quality_at_R']={k:dict(confirmed_pairs=v['confirmed_illegal_pair_count'],unknown_pairs=v['unknown_pair_count']) for k,v in q['partitions'].items()}
++   assert not q['C_nonfinite_source_face_ids'] and not q['C_zero_area_source_face_ids'] and not q['C_duplicate_groups']
++   risk=q['parent_confirmed_illegal_pair_count']>0 or q['parent_unknown_pair_count']>0
++   r['status']='ACCEPTED_WITH_RISK_AI_PROXY' if risk else 'ACCEPTED_AI_PROXY'
++   r['whole_source_risk']=risk
++   r['extent_preview']=[dict(K=len(e['source_face_ids']),tier=e['tier'],requested_tiers=e['requested_tiers'],region_area_fraction=e['region_area_fraction']) for e in ext]
++   if uid.startswith('3ede') and kind=='seat':
++    pp=q['partitions']['CF']['problem_pairs']
++    overlap_sum=sum(p['detector']['primary'].get('coplanar_overlap_area',0) for p in pp)
++    assert len(pp)==6 and all(p['category']=='coplanar_positive_overlap' for p in pp)
++    r['reason']+=' Retain with localized known risk: six positive-area overlap pairs with support end caps at rear seat corners; pair-area sum '+str(overlap_sum)+' (not union area). No duplicate full seat layer is inferred. M remains unchanged.'
++   if uid.startswith('7f82') and kind=='back':
++    r['reason']+=' One internal pair (192,195) is UNKNOWN in the frozen detector; retained explicitly as unresolved, not certified intersection-free.'
++   if uid.startswith('3ede') and kind=='back':
++    r['reason']='The sole upper backrest board front face, excluding both descending posts. Full means the entire declared supporting board R, not a filled solid rectangle between seat and top nor the whole frame.'
++   if uid.startswith('71db'):
++    r['reason']+=' Curved inner shell divided at its approximately 45-degree transition; an operational whole-face boundary, not a semantic ground-truth boundary. Border/transition faces outside the declared R stay in Y.'
++   if any(uid.startswith(prefix) for prefix in supplemental):
++    image=out/'gallery/subset_02'/f'{uid}__regions.png'
++    assert image.exists()
++    r['visual_evidence'].append(dict(path=str(image),sha256=sha(image),actually_viewed=True,reviewer='root AI_PROXY',purpose='Exact whole-source-face subset review'))
++  rows.append(r)
++ rows.extend(read(out/'reviews/dev_root.json')['rows'])
++ assert len([r for r in rows if r['split']=='train'])==52
++ assert len(rows)==60
++ accepted=[r for r in rows if r['status'].startswith('ACCEPTED')]
++ value=dict(schema='chair_r2_user_conditions_reviewed_regions_v1',rows=rows,
++  counts=dict(Counter(r['status'] for r in rows)),semantic_authority='AI_PROXY only; not human annotated or externally validated',
++  fraction_denominator='Declared coherent surface region R, not necessarily all faces of an anatomical part or of M',
++  model_input_semantics=False,training_authorization=False,
++  original_reviews={str(p):sha(p) for p in [out/'reviews/train_first13.json',out/'reviews/train_last13.json',out/'reviews/dev_root.json',out/'reviews/draft_region_checks.json']})
++ write(out/'regions.json',value)
++ event(out,'REGIONS_FROZEN_FOR_REVIEW',train_regions=sum(r['split']=='train' for r in accepted),dev_regions=sum(r['split']=='dev' for r in accepted),review_kind='AI_PROXY')
++ print(value['counts'])
++if __name__=='__main__':main()
+--- /dev/null
++++ b/r2/data_tools/user_conditions_v1/inspect_extents.py
+@@ -0,0 +1,4 @@
++from prepare import DEFAULT_OUT,read
++for r in sorted(read(DEFAULT_OUT/'conditions.json')['rows'],key=lambda r:r['region_area_fraction']):
++ if r['region_area_fraction']<.15 or r['region_area_fraction']>.8 and r['tier']!='full':
++  print(r['condition_id'],r['K'],'C/R',round(r['region_area_fraction'],4),'C/M',round(r['parent_area_fraction'],4),r['requested_tiers'])
+--- /dev/null
++++ b/r2/data_tools/user_conditions_v1/inspect_local_risks.py
+@@ -0,0 +1,13 @@
++from pathlib import Path
++import json
++import numpy as np
++from prepare import DEFAULT_OUT,read,geometry
++from quality import partition_condition
++out=DEFAULT_OUT
++parents={r['uid']:r for r in read(out/'parent_inventory.json')['rows']}
++for uid in parents:
++ if uid.startswith('3ede'):
++  c=read(out/'candidates'/f'{uid}.json'); ids=next(r['source_face_ids'] for r in c['candidates'] if r['candidate_id']=='p01')
++  q=partition_condition(uid,ids,out/'quality'); m=geometry(parents[uid])['full_target'].reshape(-1,3,3)
++  print(json.dumps({'uid':uid,'seat_ids':ids,'seat_bounds':[m[ids].reshape(-1,3).min(0).tolist(),m[ids].reshape(-1,3).max(0).tolist()]}))
++  for pair in q['partitions']['CF']['problem_pairs']: print(json.dumps(pair))
+--- /dev/null
++++ b/r2/data_tools/user_conditions_v1/inventory.py
+@@ -0,0 +1,271 @@
++"""Prepare source identities and an existing-output regression panel; no model calls."""
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++from pathlib import Path
++
++import numpy as np
++
++
++ARTIFACTS = Path('/mnt/e/MeshFlow-Control-artifacts')
++REPO = Path('/mnt/e/MeshFlow')
++HIST = ARTIFACTS / 'experiments/chair_condition_recipe_factorial_v1'
++DEFAULT_OUT = ARTIFACTS / 'experiments/chair_r2_user_conditions_v1'
++
++
++def digest(path):
++    h = hashlib.sha256()
++    with Path(path).open('rb') as f:
++        for block in iter(lambda: f.read(1024 * 1024), b''):
++            h.update(block)
++    return h.hexdigest()
++
++
++def read(path):
++    return json.loads(Path(path).read_text(encoding='utf-8-sig'))
++
++
++def array_hash(a):
++    a = np.ascontiguousarray(a)
++    h = hashlib.sha256()
++    h.update(str(a.dtype).encode('ascii'))
++    h.update(str(a.shape).encode('ascii'))
++    h.update(a.tobytes())
++    return h.hexdigest()
++
++
++def bits(a, b):
++    return a.shape == b.shape and a.dtype == b.dtype and a.tobytes() == b.tobytes()
++
++
++def frozen_write(path, value):
++    path.parent.mkdir(parents=True, exist_ok=True)
++    if path.exists():
++        if read(path) != value:
++            raise ValueError('Existing prepared identity differs: ' + str(path))
++    else:
++        path.write_text(json.dumps(value, indent=2, sort_keys=True, allow_nan=False) + '\n', encoding='utf-8')
++
++
++def load_parent(path, uid):
++    with np.load(path, allow_pickle=False) as z:
++        a = {k: z[k] for k in z.files}
++    m = a['full_target']
++    n = len(m)
++    assert str(a['uid'].item()) == uid
++    assert 128 <= n <= 256 and m.shape == (n, 9) and m.dtype == np.float32
++    assert np.isfinite(m).all() and a['pre_ot_full'].dtype == np.float32
++    assert bits(a['pre_ot_full'] * np.float32(2), m.reshape(n, 3, 3))
++    ids = a['source_face_vertex_ids']
++    assert ids.shape == (n, 3) and np.issubdtype(ids.dtype, np.integer)
++    assert (ids >= 0).all() and (ids < len(a['model_vertices'])).all()
++    assert bits(a['model_vertices'][ids], m.reshape(n, 3, 3))
++    kept = a['retained_to_original_face']
++    assert len(np.unique(kept)) == n
++    assert (kept >= 0).all() and (kept < len(a['original_source_faces'])).all()
++    inverse = np.full(len(a['original_source_faces']), -1, np.int64)
++    inverse[kept] = np.arange(n)
++    assert np.array_equal(inverse, a['original_to_retained_face'])
++    assert np.array_equal(a['original_source_faces'][kept], a['source_faces'])
++    cp = a['source_corner_permutations']
++    assert np.array_equal(np.sort(cp, axis=1), np.tile(np.arange(3), (n, 1)))
++    assert np.array_equal(np.take_along_axis(a['source_faces'], cp, axis=1), ids)
++    return a
++
++
++def prepare_inventory(out):
++    train_path = ARTIFACTS / 'data/train_manifest.json'
++    requests_path = HIST / 'evaluation/requests.json'
++    split_path = REPO / 'native_t1/runs/control_mvp48_v1/data/splits.json'
++    a40_path = ARTIFACTS / 'experiments/chair_early_alignment_schedule40_v1/evaluation/condition_construction.json'
++    sources = {str(p): digest(p) for p in (train_path, requests_path, split_path, a40_path)}
++    train, requests, splits, a40 = map(read, (train_path, requests_path, split_path, a40_path))
++    train_ids = sorted({r['uid'] for r in train['tasks'] if r['ratio'] == .4})
++    dev_ids = sorted({r['parent_id'] for r in requests['rows']})
++    assert len(train_ids) == 26 and len(dev_ids) == 8 and not set(train_ids).intersection(dev_ids)
++    assert set(dev_ids) == set(splits['validation'])
++    parent_meta = {r['uid']: r for r in train['parents']}
++    rows = []
++    for split, uids in (('train', train_ids), ('dev', dev_ids)):
++        for uid in uids:
++            path = ((ARTIFACTS / 'data' / parent_meta[uid]['npz']) if split == 'train' else
++                    REPO / 'native_t1/runs/control_mvp48_v1/data/meshes' / (uid + '.npz'))
++            h = digest(path)
++            if split == 'train':
++                assert h == parent_meta[uid]['sha256']
++            a = load_parent(path, uid)
++            n = len(a['full_target'])
++            checks = []
++            if split == 'dev':
++                for ratio in (.2, .4):
++                    request = next(r for r in requests['rows'] if r['parent_id'] == uid and r['ratio'] == ratio and r['candidate'] == 0)
++                    input_path = Path(request['input_path'])
++                    assert digest(input_path) == request['input_sha256']
++                    sources[str(input_path)] = request['input_sha256']
++                    with np.load(input_path, allow_pickle=False) as z:
++                        c = z['C'].copy()
++                        assert int(z['N']) == n and int(z['K']) == len(c)
++                    if ratio == .2:
++                        reference_path = Path(request['reference_path'])
++                        sources[str(reference_path)] = digest(reference_path)
++                        assert sources[str(reference_path)] == request['reference_sha256']
++                        reference = read(reference_path)
++                        condition_path = Path(reference['condition_path'])
++                        sources[str(condition_path)] = digest(condition_path)
++                        assert sources[str(condition_path)] == reference['condition_sha256']
++                        with np.load(condition_path, allow_pickle=False) as z:
++                            face_ids = z['source_face_ids'].copy()
++                            assert bits(c, z['C']) and bits(a['full_target'].reshape(n, 3, 3), z['GT_full'])
++                            assert np.array_equal(z['retained_to_original_face'], a['retained_to_original_face'])
++                            assert np.array_equal(z['source_face_vertex_ids'], a['source_face_vertex_ids'])
++                        mapping_path = condition_path
++                    else:
++                        construction = next(r for r in a40['rows'] if r['parent_id'] == uid)
++                        origin = Path(construction['source_path'])
++                        sources[str(origin)] = digest(origin)
++                        assert sources[str(origin)] == construction['source_sha256']
++                        if 'source_face_ids' in construction:
++                            face_ids = np.asarray(construction['source_face_ids'], np.int64)
++                        else:
++                            assert construction['construction'] == 'OLD_C_PLUS_NEAREST_FREE_CENTROIDS_EXACT_COORDINATES'
++                            with np.load(origin, allow_pickle=False) as z:
++                                appended = np.asarray(construction['appended_free_indices'], np.int64)
++                                face_ids = np.r_[z['source_face_ids'], z['free_source_ids'][appended]]
++                        mapping_path = a40_path
++                    assert len(face_ids) == len(c) and len(set(face_ids.tolist())) == len(c)
++                    assert (face_ids >= 0).all() and (face_ids < n).all()
++                    assert bits(a['full_target'][face_ids].reshape(-1, 3, 3), c)
++                    assert array_hash(c) == request['C_sha256']
++                    checks.append({'ratio': ratio, 'condition_id': request['condition_id'],
++                                   'input_path': str(input_path), 'input_sha256': request['input_sha256'],
++                                   'source_face_ids': face_ids.tolist(), 'mapping_path': str(mapping_path),
++                                   'mapping_sha256': sources[str(mapping_path)], 'C_source_bitwise': True})
++            sources[str(path)] = h
++            rows.append({'uid': uid, 'split': split, 'npz': str(path), 'sha256': h, 'N': n,
++                         'official_split': splits['official_splits'][uid],
++                         'group_id': splits['group_ids'][uid], 'full_target_sha256': array_hash(a['full_target']),
++                         'identity_status': 'PASS', 'existing_condition_checks': checks})
++    for p, h in sources.items():
++        assert digest(p) == h, p
++    result = {'schema': 'chair_r2_user_conditions_parent_inventory_v1', 'rows': rows,
++              'counts': {'train': 26, 'dev': 8, 'total': 34}, 'train_dev_uid_overlap': [],
++              'source_files': sources, 'source_before_after_equal': True,
++              'parent_selection': 'Exact historical R2 READY40-compatible train26 plus observed DEV8; no mesh quality filtering.',
++              'dev_interpretation': 'Repeatedly observed development parents, all official train; not independent test.',
++              'coordinate_contract': 'Unchanged repaired full_target FP32; no copying, normalization, repair, or model.',
++              'model_calls': 0, 'OT_calls': 0, 'training_updates': 0, 'sampling_calls': 0}
++    frozen_write(out / 'parent_inventory.json', result)
++    return result
++
++
++
++def prepare_regression(out):
++    inventory_path = out / 'parent_inventory.json'
++    requests_path = HIST / 'evaluation/requests.json'
++    completed_path = HIST / 'phases/main/sampling/R2_MIX_H_ALL/completed.json'
++    report_path = HIST / 'EXPERIMENT_REPORT.md'
++    inventory, requests, completed = map(read, (inventory_path, requests_path, completed_path))
++    dev = sorted(r['uid'] for r in inventory['rows'] if r['split'] == 'dev')
++    mandatory40 = {uid for uid in dev if uid.startswith(('341b', 'c1b', 'f596'))}
++    assert len(mandatory40) == 3
++    c40 = mandatory40 | {next(uid for uid in dev if uid not in mandatory40)}
++    c20 = set(dev) - c40
++    assert len(c40) == len(c20) == 4
++    sources = {str(p): digest(p) for p in (inventory_path, requests_path, completed_path, report_path)}
++    old_by_id = {r['request_id']: r for r in completed['rows']}
++    parent_by_id = {r['uid']: r for r in inventory['rows']}
++    rows = []
++    checkpoint_ids = set()
++    for uid in dev:
++        ratio = .4 if uid in c40 else .2
++        condition_check = next(c for c in parent_by_id[uid]['existing_condition_checks'] if c['ratio'] == ratio)
++        if uid.startswith('341b'):
++            reason = 'Existing report line81: C40 has enclosing walls/base; outputs often box/tub-like. Old appended-free C40, no trusted interface.'
++        elif uid.startswith('c1b'):
++            reason = 'Existing report line81: main R2 C40 n1 has a penetrating blade. Old appended-free C40, no trusted interface.'
++        elif uid.startswith('f596'):
++            reason = 'Existing report line81: several methods show free back panel close to C back panel; image alone cannot establish weld or legal thickness.'
++        elif uid in c40:
++            reason = 'Lexicographically first remaining DEV parent fills the fourth C40 slot; no new-output selection.'
++        else:
++            reason = 'Remaining DEV parents assigned C20 to balance four conditions per ratio; no new-output selection.'
++        for noise in (0, 1):
++            request = next(r for r in requests['rows'] if r['parent_id'] == uid and r['ratio'] == ratio and r['candidate'] == noise)
++            input_path = Path(request['input_path'])
++            sources[str(input_path)] = digest(input_path)
++            assert sources[str(input_path)] == request['input_sha256']
++            with np.load(input_path, allow_pickle=False) as z:
++                c, gaussian = z['C'].copy(), z['z'].copy()
++                assert array_hash(c) == request['C_sha256']
++                assert array_hash(gaussian) == request['Gaussian_sha256']
++                assert int(z['N']) == request['N'] and int(z['K']) == request['K']
++            original = old_by_id[request['request_id']]
++            assert original['status'] == 'COMPLETE' and original['label'] == 'R2_MIX_H_ALL'
++            assert original['input_sha256'] == request['input_sha256']
++            raw_path, run_path = Path(original['raw_path']), Path(original['result_path'])
++            sources[str(raw_path)], sources[str(run_path)] = digest(raw_path), digest(run_path)
++            assert sources[str(raw_path)] == original['raw_sha256']
++            assert sources[str(run_path)] == original['result_sha256']
++            run = read(run_path)
++            checkpoint_ids.add(original['checkpoint_sha256'])
++            assert run['request']['checkpoint_sha256'] == original['checkpoint_sha256']
++            assert run['request']['input_sha256'] == request['input_sha256']
++            assert run['nfe'] == 50 and run['output_stage'] == 'RAW' and run['postprocessing'] is None
++            with np.load(raw_path, allow_pickle=False) as z:
++                raw = z['raw']
++                assert raw.shape == (request['N'], 9) and raw.dtype == np.float32 and np.isfinite(raw).all()
++                assert bits(z['C'], c) and bits(z['z'], gaussian)
++                assert bits(raw[:len(c)].reshape(-1, 3, 3), c)
++                assert bits(z['free'], raw[len(c):].reshape(-1, 3, 3))
++                trajectory = z['trajectory']
++                assert trajectory.shape == (51, request['N'], 9) and bits(trajectory[-1], raw)
++                assert all(bits(s[:len(c)].reshape(-1, 3, 3), c) for s in trajectory)
++            rows.append({'uid': uid, 'split': 'dev', 'ratio': ratio, 'candidate': noise,
++                         'condition_id': request['condition_id'], 'request_id': request['request_id'],
++                         'selection_reason': reason, 'original_request': request,
++                         'input_path': str(input_path), 'input_sha256': sources[str(input_path)],
++                         'source_face_ids': condition_check['source_face_ids'],
++                         'source_mapping': condition_check,
++                         'existing_R2_RAW': {'status': 'VERIFIED_REUSABLE_FOR_RECORDED_MAIN_ENDPOINT',
++                            'checkpoint_sha256': original['checkpoint_sha256'],
++                            'reuse_condition': 'Frozen R2 endpoint must equal this recorded SHA256; a different R2 endpoint requires separate authorization and generation.',
++                            'raw_path': str(raw_path), 'raw_sha256': sources[str(raw_path)],
++                            'result_path': str(run_path), 'result_sha256': sources[str(run_path)],
++                            'original_completed_row': original,
++                            'current_identity_checks': {'input_hash': True, 'RAW_hash': True,
++                                'C_bitwise': True, 'Gaussian_bitwise': True, 'C_all51_bitwise': True,
++                                'N_FP32_finite': True, 'Euler50_recorded': True},
++                            'checkpoint_file_rehashed': False, 'scientific_scores_recomputed': 0}})
++    assert len(rows) == 16 and len(checkpoint_ids) == 1
++    for p, h in sources.items():
++        assert digest(p) == h, p
++    result = {'schema': 'chair_r2_user_conditions_old_regression_selection_v1', 'rows': rows,
++              'counts': {'parents': 8, 'conditions': 8, 'C20_conditions': 4, 'C40_conditions': 4,
++                         'existing_noises_per_condition': 2, 'registered_requests': 16, 'verified_old_R2_RAW': 16},
++              'selected_C40_parents': sorted(c40), 'selected_C20_parents': sorted(c20),
++              'selection_rule': 'Freeze reported c1b40/f59640/341b40; fourth C40 is lexicographically first remaining parent; others C20; use original n0/n1 arrays without redraw.',
++              'representation': 'Purposeful historical regression coverage, not representative prevalence, a random test, or selection on new outputs.',
++              'historical_evidence': {'path': str(report_path), 'sha256': sources[str(report_path)], 'line': 81},
++              'endpoint_binding': {'label': 'historical main R2_MIX_H_ALL', 'checkpoint_sha256': next(iter(checkpoint_ids)),
++                                   'checkpoint_identity_source': str(completed_path), 'automatic_default_selection': False},
++              'source_files': sources, 'source_before_after_equal': True,
++              'model_calls': 0, 'OT_calls': 0, 'training_updates': 0, 'sampling_calls': 0,
++              'new_Gaussian_draws': 0, 'scientific_scores_recomputed': 0}
++    frozen_write(out / 'old_regression_selection.json', result)
++    return result
++
++
++def main():
++    p = argparse.ArgumentParser(description=__doc__)
++    p.add_argument('--out', type=Path, default=DEFAULT_OUT)
++    p.add_argument('--stage', choices=('inventory', 'regression', 'all'), default='all')
++    args = p.parse_args()
++    for stage in (('inventory', 'regression') if args.stage == 'all' else (args.stage,)):
++        result = (prepare_inventory if stage == 'inventory' else prepare_regression)(args.out)
++        print(json.dumps({'status': 'PASS', 'stage': stage, 'counts': result['counts']}))
++
++
++if __name__ == '__main__':
++    main()
+--- /dev/null
++++ b/r2/data_tools/user_conditions_v1/prepare.py
+@@ -0,0 +1,124 @@
++"""R2 user-condition data preparation. CPU only; source meshes are immutable."""
++from pathlib import Path
++import os
++for key in ("OMP_NUM_THREADS","MKL_NUM_THREADS","OPENBLAS_NUM_THREADS","NUMEXPR_NUM_THREADS"):
++    os.environ[key]="2"
++os.environ["CUDA_VISIBLE_DEVICES"]=""
++import argparse, collections, hashlib, json, platform, subprocess, sys, time
++import numpy as np
++
++DEFAULT_OUT=Path("/mnt/e/MeshFlow-Control-artifacts/experiments/chair_r2_user_conditions_v1")
++def sha(path):
++    h=hashlib.sha256()
++    with Path(path).open("rb") as f:
++        for b in iter(lambda:f.read(1048576),b""):h.update(b)
++    return h.hexdigest()
++def read(path):
++    return json.loads(Path(path).read_text(encoding="utf-8-sig"))
++def write(path,value):
++    path=Path(path);path.parent.mkdir(parents=True,exist_ok=True)
++    text=json.dumps(value,indent=2,ensure_ascii=False,allow_nan=False)+"\n"
++    if path.exists() and path.read_text(encoding="utf-8-sig")!=text:
++        raise RuntimeError("Refuse differing immutable JSON: "+str(path))
++    if not path.exists():
++        tmp=path.with_suffix(path.suffix+".tmp");tmp.write_text(text,encoding="utf-8");tmp.replace(path)
++def event(out,name,**fields):
++    path=Path(out)/"ledger.jsonl"
++    with path.open("a",encoding="utf-8") as f:
++        f.write(json.dumps(dict(time_unix=time.time(),event=name,**fields),ensure_ascii=False,allow_nan=False)+"\n")
++        f.flush();os.fsync(f.fileno())
++def initialize(out):
++    out.mkdir(parents=True,exist_ok=True)
++    protocol=dict(schema="chair_r2_user_conditions_v1",stage="DATA_PREPARATION_ONLY",
++       maintained_future_training_recipe="R2: Native/T1+role+Geo; FM; full-course HYBRID=.25",
++       future_initial_checkpoint="main R2 full training step6000 (not loaded this stage)",
++       max_training_parents=26,max_training_regions=52,max_unique_training_conditions=156,
++       max_dev_parents=8,max_new_dev_conditions=8,old_dev_conditions=8,
++       target_dev_cells={"seat_small":1,"seat_medium":1,"seat_full":2,"back_small":1,"back_medium":1,"back_full":2},
++       region_definition={"seat":"coherent sitting upper surface, excluding underside and side walls",
++                          "back":"coherent seat-facing supporting surface; curved allowed; no isolated rail called complete back"},
++       extent_reference="region area 25/50/100 percent; exact source-face subsets, nested and deduplicated",
++       no_forced_counts=True,manual_review_kind="AI_PROXY; geometry-informed visual review, not human ground truth",
++       preservation="Existing FP32 repair_v2 M, source face and corner maps unchanged; Y exact source-ID complement",
++       forbidden=["training","model_loading","model_forward","teacher","OT","Gaussian_generation","full_mesh_generation",
++                  "retessellation","mesh_repair","old_data_mutation","automatic_git_commit_push"],
++       cpu_dispatch={"max_concurrent_heavy_processes":2,"threads_per_process":2,
++                     "stages":"one quality process + one render process; source/metadata work may overlap"},
++       stop="Deliver actual accepted/rejected/uncertain regions, C/Y arrays, images and audits; no training until data review")
++    write(out/"PROTOCOL.json",protocol)
++    if not (out/"resources_before.json").exists():
++        facts=dict(time_unix=time.time(),cpu_cores=os.cpu_count(),platform=platform.platform(),cpu_threads_per_process=2,
++                   GPU_workers=0,model_calls=0)
++        for key,cmd in [
++          ("gpu",["nvidia-smi","--query-gpu=name,memory.total,memory.used,memory.free,utilization.gpu","--format=csv"]),
++          ("gpu_processes",["nvidia-smi","--query-compute-apps=pid,process_name,used_memory","--format=csv"]),
++          ("RAM",["free","-b"]),("cpu_load",["ps","-eo","pid,pcpu,pmem,comm","--sort=-pcpu"])]:
++            p=subprocess.run(cmd,capture_output=True,text=True,timeout=20)
++            facts[key]=dict(exit_code=p.returncode,stdout="\n".join(p.stdout.splitlines()[:35]),stderr=p.stderr)
++        write(out/"resources_before.json",facts)
++        event(out,"PREPARATION_STARTED",protocol_sha256=sha(out/"PROTOCOL.json"),model_calls=0)
++
++def geometry(parent):
++    assert sha(parent["npz"])==parent["sha256"], "Source mesh hash changed"
++    with np.load(parent["npz"],allow_pickle=False) as z:
++        a={k:z[k].copy() for k in z.files}
++    t=a["full_target"].reshape(-1,3,3)
++    assert t.dtype==np.float32 and len(t)==parent["N"] and np.isfinite(t).all()
++    assert a["model_vertices"][a["source_face_vertex_ids"]].tobytes()==t.tobytes()
++    return a
++def components(nodes,adj):
++    left=set(map(int,nodes));groups=[]
++    while left:
++        todo=[min(left)];left.remove(todo[0]);group=[]
++        while todo:
++            i=todo.pop();group.append(i)
++            for j in sorted(adj.get(i,set())):
++                if j in left:left.remove(j);todo.append(j)
++        groups.append(sorted(group))
++    return groups
++def propose(parent):
++    a=geometry(parent); t=a["full_target"].astype(np.float64).reshape(-1,3,3); f=a["source_faces"]
++    cent=t.mean(1); cross=np.cross(t[:,1]-t[:,0],t[:,2]-t[:,0]);length=np.linalg.norm(cross,axis=1)
++    area=length/2;norm=cross/np.maximum(length[:,None],1e-300)
++    edges=collections.defaultdict(list)
++    for i,face in enumerate(f):
++        for j in range(3):edges[tuple(sorted((int(face[j]),int(face[(j+1)%3]))))].append(i)
++    adj={i:set() for i in range(len(t))}
++    full_adj={i:set() for i in range(len(t))}
++    for faces in edges.values():
++        for i in faces:full_adj[i].update(set(faces)-{i})
++        if len(faces)==2:
++            i,j=faces
++            # Candidate patches only. These numerical proposals are NOT semantic labels.
++            if abs(float(norm[i]@norm[j]))>=np.cos(np.deg2rad(25)):
++                adj[i].add(j);adj[j].add(i)
++    groups=components(range(len(t)),adj)
++    groups.sort(key=lambda ids:(-float(area[ids].sum()),min(ids)))
++    candidates=[]
++    for k,ids in enumerate(groups):
++        w=area[ids]; pts=t[ids].reshape(-1,3); center=(cent[ids]*w[:,None]).sum(0)/max(w.sum(),1e-300)
++        # unsigned dominant axis; canonical corner permutations need not preserve winding.
++        normal_abs=(np.abs(norm[ids])*w[:,None]).sum(0)/max(w.sum(),1e-300)
++        candidates.append(dict(candidate_id=f"p{k:02d}",source_face_ids=ids,K=len(ids),
++            area=float(w.sum()),parent_area_fraction=float(w.sum()/area.sum()),
++            center=center.tolist(),bounds=[pts.min(0).tolist(),pts.max(0).tolist()],
++            normal_abs=normal_abs.tolist(),proposal_only=True))
++    return dict(uid=parent["uid"],split=parent["split"],npz=parent["npz"],sha256=parent["sha256"],N=parent["N"],
++                area=float(area.sum()),bounds=[t.reshape(-1,3).min(0).tolist(),t.reshape(-1,3).max(0).tolist()],
++                candidates=candidates,adjacency={str(k):sorted(v) for k,v in full_adj.items()},
++                face_centers=cent.tolist(),face_areas=area.tolist())
++
++def candidates(out):
++    inventory=read(out/"parent_inventory.json");rows=[]
++    for p in inventory["rows"]:
++        path=out/"candidates"/(p["uid"]+".json")
++        value=propose(p);write(path,value);rows.append(dict(uid=p["uid"],split=p["split"],path=str(path),sha256=sha(path),count=len(value["candidates"])))
++    write(out/"candidate_inventory.json",dict(schema="geometric_proposals_v1",semantic_status="UNREVIEWED",rows=rows))
++    event(out,"GEOMETRIC_PROPOSALS_READY",parents=len(rows),model_calls=0,semantic_labels_accepted=0)
++    print(json.dumps({"status":"CANDIDATES_READY","parents":len(rows)}),flush=True)
++def main():
++    ap=argparse.ArgumentParser();ap.add_argument("stage",choices=["init","candidates"]);ap.add_argument("--out",type=Path,default=DEFAULT_OUT)
++    args=ap.parse_args()
++    if args.stage=="init":initialize(args.out)
++    else:candidates(args.out)
++if __name__=="__main__":main()
+--- /dev/null
++++ b/r2/data_tools/user_conditions_v1/publish.py
+@@ -0,0 +1,111 @@
++"""Publish the active review package, preserving all earlier candidate evidence."""
++from pathlib import Path
++from collections import Counter
++import csv,io,json,html,shutil,difflib
++from prepare import DEFAULT_OUT,read,write,sha,event
++from summarize import text_file,csv_file
++
++def main(out=DEFAULT_OUT):
++ out=Path(out); active=read(out/'active_conditions.json');rows=active['rows']
++ all_rows=read(out/'conditions.json')['rows'];held=read(out/'usability_review.json')['rows']
++ held_map={r['condition_id']:r for r in held};active_ids={r['condition_id'] for r in rows}
++ source_summary=read(out/'data_summary.json');q=read(out/'quality/condition_summary.json')['rows']
++ qmap={r['condition_id']:r['counts'] for r in q}
++ val=read(out/'validation_export.json');va=read(out/'validation_active.json')
++ train=[r for r in rows if r['split']=='train'];dev=[r for r in rows if r['split']=='dev']
++ summary=dict(source_candidate_train=122,source_candidate_dev=7,active_train_conditions=len(train),active_dev_conditions=len(dev),
++  train_parents=len({r['uid'] for r in train}),train_regions=len({r['region_id'] for r in train}),
++  active_train_by_part=dict(Counter(r['region_type'] for r in train)),active_train_by_tier=dict(Counter(r['tier'] for r in train)),
++  hold_train=5,hold_dev=1,old_dev_conditions=8,old_requests=16,
++  future_logical_outputs=84,future_new_generations_if_old16_reusable=68,
++  active_train_K_range=[min(r['K'] for r in train),max(r['K'] for r in train)],
++  active_train_face_fraction_range=[min(r['face_fraction'] for r in train),max(r['face_fraction'] for r in train)],
++  active_train_area_fraction_range=[min(r['parent_area_fraction'] for r in train),max(r['parent_area_fraction'] for r in train)],
++  source_export_checks=6154,active_subset_checks=669,check_failures=0,
++  quality_condition_incidence={s:{p:{kind:sum(qmap[r['condition_id']][p][kind]>0 for r in rows if r['split']==s)
++    for kind in ('confirmed_illegal_pair_count','unknown_pair_count')} for p in ('CC','CF','FF')} for s in ('train','dev')},
++  data_arrays_bytes=source_summary['source_CY_npz_bytes'],semantic_authority='AI_PROXY',
++  future_recipe='R2: Native/T1 + role + Geo; FM; full-course HYBRID=.25; reviewed C pool',
++  training_status='NOT_STARTED',model_calls=0,training_updates=0,OT_calls=0,new_Gaussian_draws=0,generated_meshes=0,
++  canonical_manifest='active_conditions.json',canonical_handoff='dataset_handoff_active.json',
++  initial_exports_preserved='conditions.json + data_summary.json + dataset_handoff.json describe the earlier122/7 candidate stage')
++ write(out/'FINAL_SUMMARY.json',summary)
++ with (out/'tables/conditions.csv').open(encoding='utf-8-sig',newline='') as f:all_table=list(csv.DictReader(f))
++ csv_file(out/'tables/active_conditions.csv',[r for r in all_table if r['condition_id'] in active_ids])
++ csv_file(out/'tables/condition_usage.csv',[dict(condition_id=r['condition_id'],split=r['split'],
++   active=r['condition_id'] in active_ids,status=held_map[r['condition_id']]['status'] if r['condition_id'] in held_map else 'ACTIVE_FOR_DATA_REVIEW',
++   reason=held_map[r['condition_id']]['reason'] if r['condition_id'] in held_map else 'Declared source region accepted; full condition quality risks retained',
++   image=f"gallery/conditions/{r['condition_id']}.png",npz=r['npz'],sha256=r['sha256']) for r in all_rows])
++ page=(out/'gallery/all_exported.html').read_text(encoding='utf-8')
++ page=page.replace('25个训练父 / 47个区域 / 122条去重条件；7条新DEV条件。','最终主池：25个训练父 / 47个区域 / 117条训练条件；6条新DEV条件。全部129条原候选仍可查看，其中6条细长边条仅保留为HOLD证据。')
++ page=page.replace('../tables/conditions.csv','../tables/active_conditions.csv').replace('../dataset_handoff.json','../dataset_handoff_active.json')
++ page=page.replace('<nav>集合','<nav>用途<select id="u"><option value="active">主池</option><option value="">所有候选</option><option value="held">HOLD证据</option></select>集合')
++ for r in all_rows:
++  cid=r['condition_id'];used=cid in active_ids
++  marker='data-uid="'+r['uid']+'"><h2>'+html.escape(cid)
++  page=page.replace(marker,'data-uid="'+r['uid']+'" data-usage="'+('active' if used else 'held')+'"><h2>'+html.escape(cid))
++  if not used:
++   page=page.replace('<h2>'+html.escape(cid)+'</h2>','<h2>HOLD · '+html.escape(cid)+'</h2><p style="color:#9a3b13">图审显示为窄边条／针状，仅保留为准备阶段证据，不进入本轮主池；不是模型生成失败。</p>')
++ page=page.replace('["s","p","t","q"]','["s","p","t","q","u"]').replace('let[s,p,t,q]=','let[s,p,t,q,u]=')
++ page=page.replace('(q&&!a.dataset.uid.includes(q)))','(q&&!a.dataset.uid.includes(q))||(u&&a.dataset.usage!==u))')
++ text_file(out/'gallery/index.html',page)
++ report="""# R2 用户式条件数据准备报告
++
++当前主池已经实际构造完成：**25个训练父、47个区域、117条训练C/Y；6条新DEV条件。** 后续训练统一以R2为基础：Native/T1 + role + Geo、FM、全程HYBRID（lambda=0.25）。拟定续训起点仍是主实验R2完整step6000；本轮没有加载任何模型、训练、OT、抽噪声或生成完整mesh。
++
++先打开 [检查图集](gallery/index.html)。默认显示主池，可切换到所有候选或HOLD证据。权威主清单是 [active_conditions.json](active_conditions.json)，未来训练交接见 [README_HANDOFF_ACTIVE.md](README_HANDOFF_ACTIVE.md) 和 [dataset_handoff_active.json](dataset_handoff_active.json)。
++
++|项目|实际结果|
++|---|---:|
++|核查来源父|26 train + 8 DEV|
++|主池训练父|25|
++|训练区域|25座面 + 22靠背|
++|最初导出去重训练条件|122（59座面 + 63靠背）|
++|图审后主池训练条件|117（56座面 + 61靠背）|
++|主池独立档位|small 23 / medium 47 / full 47|
++|主池新DEV|6（2座面 + 4靠背）|
++|旧DEV回归登记|8条件 × 原2噪声 = 16请求|
++|全量C/Y文件|129 NPZ，合计906,551字节；包含HOLD证据|
++
++构造方法：在原FP32完整M上保存核对区域R的原面ID。座面取上方承坐表面；靠背取朝向座位的承靠表面，明确区分背面、边框、下延支撑和装饰。曲面和镂空连贯结构可以保留。完整（full）只表示声明区域R完整，不表示整个解剖部件的所有正反面及厚度均包含。
++
++在R的原顶点ID完整共边图上，从固定边界角附近开始按图测地距离扩展，选择最接近R面积25%/50%的嵌套面前缀，再加完整R；只取整张原三角面。原面很粗时两档会相同，记录别名并去重。47个区域本可形成141档，去掉19个重复后得122条。构造和几何数值不依赖语义文本；seat/back标签只用于数据组织与审阅，不输入生成器。Y严格是M减去C的原面ID补集，保存了原始/保留面ID、顶点ID、角点排列及pre-OT坐标映射。
++
++**这不是固定40%面数数据集。** 最初候选训练K=1..54，N=133..245，K/N约0.41%..22.13%；25/50/100%是区域R的面积参考。后续“走R2”指继承模型和FM/HYBRID配方，并用本次新条件池替换旧C构造，不能继续用旧C20/C40比例去解释本池。
++
++来源审阅实际覆盖了34父的候选图；复杂区域另看原面ID/子集高亮图。语义判断全部标记**AI_PROXY**，不是人工语义标注或外部认证。程序验证覆盖全部129条C/Y；没有宣称逐张人工检查129张档位图。
++
++未采用的区域没有补造：
++
++|父ID前缀|区域|处理|
++|---|---|---|
++|103b|back|与扶手/侧壁缠连，含义边界不清，NA；保留seat|
++|400a|seat/back|曲壳跨座背且分区不明确，两类NA；这个父从未来两条续训共同子集同步排除|
++|5574|back|两个朝座位的面板在原完整边图不连通，NA；保留seat|
++|8e94|back|原大三角跨到座下，无法不切面地分离，NA；保留seat|
++|341b（DEV）|seat|区域接续处15对确认穿插，NA；原旧任务仍保留|
++
++导出后对低面积小档进一步实际看图，发现5条训练C和1条DEV C只剩细长边条／针状。已从主池中排除：21f-seat-small、21f-back-small、47da-seat-small、47da-back-small、73b-seat-small，以及DEV的c1b-seat-small。这是**构造完成后的输入图审**，没有看新模型输出。C/R低于10%仅用来定位需要重点查看的候选；不是通用几何非法阈值。没有删除这6份数据、图片或原阶段清单，理由及图哈希见 [usability_review.json](usability_review.json)。这些条带未来可用于单独的边沿输入任务，本轮不当作主示范。没有另选DEV填补缺口，因此新DEV只剩6条，小/中/完整覆盖也相应收窄。
++
++原26父中的14个已知相交/重叠父仍全部包含在25父共同池内；本轮没有用“检出缺陷”自动删父。25父合计仍有310对确认问题和3对未决问题，不能称为已经洗净的数据，也不能据此归因过去实验失败。
++
++|活动训练条件中的来源诊断|有确认问题的条件数|有未决问题的条件数|
++|---|---:|---:|
++|C内部（CC）|0|3|
++|C与Y（CF）|2|0|
++|Y内部（FF）|64|10|
++
++3ede座面中/全档与后侧支撑端盖有局部正面积共面重叠，保留WITH_RISK，完整座面共有6个问题面对；它不是一整层重复座面的证据。7f82靠背三档包含同一个未决面对192/195，保留UNKNOWN，没有把它算成无交。不同C会重复引用同一来源问题，逐条件出现次数不能相加当作独立缺陷数。6个活动DEV在此固定检测器下CC/CF/FF均无确认或未决对，这不认证来源完美。完整分区、原面对与旧检测器身份保留在 [quality/](quality/)；几何不会因改了清单而被修复。
++
++独立验证：初始129份导出6154项检查通过，活动主池再做669项子集检查，均0失败。C/Y及pre-OT来源逐位一致、面集合互斥完备、嵌套/去重/连通、原面/顶点/角点映射、train/DEV分离均通过；289个受保护文件哈希未变，包括34源网格、旧诊断依赖、旧回归输入与RAW。检查证据见 [validation_export.json](validation_export.json)、[validation_active.json](validation_active.json)。本轮只运行CPU流程：源诊断单进程2线程约23.0秒；最终条件129PNG渲染约37.75秒，接受区域64PNG约11.91秒；独立导出验证约3.15秒，活动池验证约0.49秒。数据查看/人工推理式AI审阅与文件操作另计，不能把这些CPU内核时间当作总用时。
++
++下一步的数据合同已经登记，**尚未执行训练**：两个分支用同一25父、同一完整M和R2完整step6000及AdamW状态，各续训1000步。旧条件对照保持R2的C20/C40混合及增强安排，新条件分支先均匀取父再均匀取该父可用新C，不按122或117行全局均匀采样。旧池共同子集有200条C20和195条C40，具体采样规则见交接文件。新K及free集合会变化，未来必须另建对应噪声和OT目标；当前没有物化它们。
++
++现有公开R2入口仍绑定旧26父、C20/C40及6000步恢复合同，**不能直接将本清单塞进去续训**。未来需独立续训分支支持已登记合同，不改变主干、FM、HYBRID、精度或引入B。新DEV每条件两噪声仅登记槽位；旧16请求保留原C/噪声及坏例。三模型新旧合计84个逻辑输出；若冻结主R2旧16份RAW身份及评分合同匹配，新增生成68份。已核对旧RAW身份，尚未确认可复用旧分数。DEV为反复使用的开发对象且来自官方训练split，不是独立泛化测试。
++
++本轮停止在数据准备和审阅包。持久化记忆已记录后续R2路线，没有自动切换旧采样默认、改loss、训练、提交或推送Git。原始候选阶段的conditions.json、data_summary.json、dataset_handoff.json保持原样；实际后续入口只引用active_conditions.json和dataset_handoff_active.json。
++"""
++ text_file(out/'DATA_PREPARATION_REPORT.md',report)
++ event(out,'REVIEW_REPORT_PUBLISHED',active_train=117,active_dev=6,training_updates=0,model_calls=0)
++ print(json.dumps(summary,ensure_ascii=False,indent=2))
++if __name__=='__main__':main()
+--- /dev/null
++++ b/r2/data_tools/user_conditions_v1/quality.py
+@@ -0,0 +1,350 @@
++"""CPU-only source mesh diagnostics, with hash-checked historical scan reuse.
++
++No model, OT, repair, mesh generation or automatic parent rejection. Run under
++WSL Python. ``partition_condition(uid, source_face_ids, quality_root)`` is a
++read-only API over the resulting parent files; source IDs are retained rows.
++"""
++from __future__ import annotations
++
++import os
++for _name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
++    os.environ[_name] = "2"
++
++import argparse
++from collections import Counter, defaultdict
++import hashlib
++import json
++import math
++from pathlib import Path
++import resource
++import subprocess
++import sys
++import time
++import types
++
++import numpy as np
++
++VERSION = "chair_r2_user_conditions_quality_v1"
++OLD_ROOT = Path("/mnt/e/MeshFlow-Control-artifacts/experiments/chair_user_condition_data_audit_v1/geometry")
++L = math.sqrt(3) * 2 / .3762
++FROZEN_HASHES = {
++    "pair_audit.py": "2e1e1b5520d808d6f11e3660373118d309dfadf18dd2e3cf90f15a7856ae3d8d",
++    "intersections.py": "23a2e8c8deefcceb51ace60ad8d8a58d352d7c38bdcba2e8f85d6ceabd447d86",
++    "seams.py": "9ce6927710d80eedec19aa10e2100ade582cf00e6942e9de4ef987618a005e4b",
++}
++PROPER = "proper_transverse_penetration"
++COPLANAR = "coplanar_positive_area_overlap"
++CONTACTS = frozenset(("shared_edge_contact", "shared_vertex_contact",
++    "coplanar_boundary_or_tolerance_contact", "noncoplanar_edge_or_tangent_contact",
++    "point_or_tangent_contact"))
++
++
++def sha(path):
++    h = hashlib.sha256()
++    with Path(path).open("rb") as handle:
++        for block in iter(lambda: handle.read(1048576), b""):
++            h.update(block)
++    return h.hexdigest()
++
++
++def read(path):
++    return json.loads(Path(path).read_text(encoding="utf-8-sig"))
++
++
++def write_new(path, value):
++    """Immutable content write: identical repeat is harmless; change is refused."""
++    path = Path(path)
++    data = json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False) + "\n"
++    path.parent.mkdir(parents=True, exist_ok=True)
++    if path.exists():
++        if path.read_text(encoding="utf-8") != data:
++            raise FileExistsError("Existing quality artifact differs: " + str(path))
++        return
++    with path.open("x", encoding="utf-8") as handle:
++        handle.write(data)
++        handle.flush()
++        os.fsync(handle.fileno())
++
++
++def resources():
++    import psutil
++    gpu = {}
++    for name, query in (("gpu", "--query-gpu=name,memory.total,memory.used,memory.free,utilization.gpu"),
++                        ("gpu_processes", "--query-compute-apps=pid,process_name,used_memory")):
++        proc = subprocess.run(["nvidia-smi", query, "--format=csv"], text=True, capture_output=True, check=False)
++        gpu[name] = dict(returncode=proc.returncode, stdout=proc.stdout, stderr=proc.stderr)
++    return dict(time_unix=time.time(), pid=os.getpid(), cpu_cores=os.cpu_count(),
++        cpu_affinity_count=len(os.sched_getaffinity(0)), load_average=list(os.getloadavg()), cpu_utilization_percent=psutil.cpu_percent(interval=.2),
++        available_ram_bytes=psutil.virtual_memory().available,
++        process_rss_bytes=psutil.Process().memory_info().rss,
++        peak_process_rss_bytes=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024,
++        workers=1, numeric_threads=2, cuda_calls=0, **gpu)
++
++
++def frozen_detector(old_root=OLD_ROOT):
++    root = Path(old_root) / "source_snapshot/src/meshflow_control/evaluation"
++    paths = {name: root / name for name in FROZEN_HASHES}
++    for name, expected in FROZEN_HASHES.items():
++        if sha(paths[name]) != expected:
++            raise ValueError("Frozen geometry source differs: " + str(paths[name]))
++    package = "_r2_quality_frozen_geometry_v1"
++    if package not in sys.modules:
++        module = types.ModuleType(package)
++        module.__path__ = [str(root)]
++        sys.modules[package] = module
++    # Isolated namespace; never resolves through the installed model package.
++    import importlib
++    pair = importlib.import_module(package + ".pair_audit")
++    detector = importlib.import_module(package + ".intersections")
++    return pair.pair_scan, detector.DETECTOR_POLICY, {str(p): sha(p) for p in paths.values()}
++
++
++def category(label):
++    if label == PROPER:
++        return "proper"
++    if label == COPLANAR:
++        return "coplanar_positive_overlap"
++    if label == "disjoint":
++        return "disjoint"
++    if label in CONTACTS:
++        return "legal_contact"
++    return "UNKNOWN"
++
++
++def load_mesh(row):
++    path = Path(row["npz"])
++    if sha(path) != row["sha256"]:
++        raise ValueError("Parent NPZ hash differs: " + row["uid"])
++    with np.load(path, allow_pickle=False) as data:
++        arrays = {k: data[k].copy() for k in data.files}
++    tri = arrays["full_target"].reshape(-1, 3, 3)
++    if len(tri) != row["N"] or tri.dtype != np.float32:
++        raise ValueError("Expected registered FP32 full_target and N")
++    original = arrays.get("retained_to_original_face")
++    if original is not None and (original.shape != (len(tri),) or len(set(original.tolist())) != len(tri)):
++        raise ValueError("Invalid retained-to-original face mapping")
++    face_vertex_ids = arrays.get("source_face_vertex_ids")
++    mapping = "NA_NOT_PROVIDED"
++    if face_vertex_ids is not None:
++        reconstructed = arrays["model_vertices"][face_vertex_ids]
++        if reconstructed.dtype != tri.dtype or reconstructed.tobytes() != tri.tobytes():
++            raise ValueError("Source vertex-ID coordinate mapping differs")
++        mapping = "BITWISE_VERIFIED"
++    if "pre_ot_full" in arrays and (arrays["pre_ot_full"] * np.float32(2)).tobytes() != tri.tobytes():
++        raise ValueError("Saved model scale differs")
++    return tri, original, face_vertex_ids, mapping
++
++
++def basic_geometry(tri, original):
++    t = tri.astype(np.float64)
++    finite = np.isfinite(t).all(axis=(1, 2))
++    area = .5 * np.linalg.norm(np.cross(t[:, 1] - t[:, 0], t[:, 2] - t[:, 0]), axis=1)
++    groups = defaultdict(list)
++    for i, face in enumerate(t):
++        if finite[i]:
++            groups[tuple(sorted(tuple(p) for p in face))].append(i)
++    duplicate_groups = [g for g in groups.values() if len(g) > 1]
++    per_face = []
++    for i, face in enumerate(t):
++        angle = None
++        if finite[i] and area[i] > 0:
++            angles = []
++            for j in range(3):
++                a, b = face[(j + 1) % 3] - face[j], face[(j + 2) % 3] - face[j]
++                angles.append(float(np.degrees(np.arccos(np.clip(a @ b / (np.linalg.norm(a) * np.linalg.norm(b)), -1, 1)))))
++            angle = min(angles)
++        per_face.append(dict(source_face_id=i,
++            original_face_id=None if original is None else int(original[i]), finite=bool(finite[i]),
++            area=float(area[i]) if finite[i] else None,
++            exact_zero_area=bool(finite[i] and area[i] == 0), minimum_angle_degrees=angle))
++    return dict(nonfinite_source_face_ids=np.flatnonzero(~finite).tolist(),
++        exact_zero_area_source_face_ids=np.flatnonzero(finite & (area == 0)).tolist(),
++        exact_duplicate_groups=duplicate_groups, per_face=per_face,
++        angle_policy="Descriptive only; no minimum-angle cleaning gate introduced")
++
++
++def summarize_pairs(rows, expected_pairs):
++    counts = Counter(category(r["classification"]) for r in rows)
++    labels = Counter(r["classification"] for r in rows)
++    omitted = expected_pairs - len(rows)
++    if omitted < 0:
++        raise ValueError("More pair rows than expected")
++    counts["disjoint"] += omitted
++    labels["disjoint"] += omitted
++    for name in ("proper", "coplanar_positive_overlap", "legal_contact", "UNKNOWN", "disjoint"):
++        counts.setdefault(name, 0)
++    problems = [r for r in rows if category(r["classification"]) in ("proper", "coplanar_positive_overlap", "UNKNOWN")]
++    return dict(expected_pairs=expected_pairs, category_counts=dict(counts),
++        detector_classification_counts=dict(labels),
++        confirmed_illegal_pair_count=counts["proper"] + counts["coplanar_positive_overlap"],
++        unknown_pair_count=counts["UNKNOWN"],
++        confirmed_illegal_source_face_ids=sorted({i for r in problems if category(r["classification"]) != "UNKNOWN" for i in r["pair"]}),
++        unknown_source_face_ids=sorted({i for r in problems if category(r["classification"]) == "UNKNOWN" for i in r["pair"]}),
++        problem_pairs=problems,
++        status="PARTIAL_UNKNOWN" if counts["UNKNOWN"] else "COMPLETE_STATIC_DIAGNOSTIC")
++
++
++def partition_condition(uid, source_face_ids, quality_root):
++    """Return CC/CF/FF counts and problematic original/source IDs, no new tests."""
++    parent = read(Path(quality_root) / "parents" / (uid + ".json"))
++    ids = list(source_face_ids)
++    n = parent["N"]
++    if any(type(i) is not int or not 0 <= i < n for i in ids) or len(set(ids)) != len(ids):
++        raise ValueError("C source face IDs must be unique integer retained rows")
++    if not 0 < len(ids) < n:
++        raise ValueError("C must be nonempty and leave at least one free face")
++    known = set(ids)
++    groups = {k: [] for k in ("CC", "CF", "FF")}
++    for row in parent["pair_contacts"]:
++        i, j = row["pair"]
++        group = "CC" if i in known and j in known else "FF" if i not in known and j not in known else "CF"
++        groups[group].append(row)
++    k, f = len(ids), n - len(ids)
++    expected = dict(CC=k * (k - 1) // 2, CF=k * f, FF=f * (f - 1) // 2)
++    duplicate_c = [sorted(known.intersection(g)) for g in parent["basic_geometry"]["exact_duplicate_groups"] if len(known.intersection(g)) > 1]
++    return dict(schema=VERSION + "_condition", uid=uid, N=n, K=k,
++        source_face_ids=ids, parent_quality_sha256=sha(Path(quality_root) / "parents" / (uid + ".json")),
++        partitions={g: summarize_pairs(rows, expected[g]) for g, rows in groups.items()},
++        C_nonfinite_source_face_ids=sorted(known.intersection(parent["basic_geometry"]["nonfinite_source_face_ids"])),
++        C_zero_area_source_face_ids=sorted(known.intersection(parent["basic_geometry"]["exact_zero_area_source_face_ids"])),
++        C_duplicate_groups=duplicate_c,
++        parent_confirmed_illegal_pair_count=parent["whole_parent"]["confirmed_illegal_pair_count"],
++        parent_unknown_pair_count=parent["whole_parent"]["unknown_pair_count"],
++        automatic_rejection=False, face_id_policy=parent["face_id_policy"],
++        contact_policy="Legal contact is the frozen geometric detector class; does not certify shared original vertex-ID topology")
++
++
++def run(inventory, out, old_root=OLD_ROOT):
++    inventory, out, old_root = Path(inventory), Path(out), Path(old_root)
++    if out.exists() and (out / "summary.json").exists():
++        raise FileExistsError("Completed quality run already exists")
++    out.mkdir(parents=True, exist_ok=True)
++    started = time.perf_counter()
++    data = read(inventory)
++    parents = data if isinstance(data, list) else data.get("rows", data.get("parents"))
++    if not isinstance(parents, list) or len(parents) != 34 or len({p["uid"] for p in parents}) != 34:
++        raise ValueError("Registered preparation requires 34 distinct parents")
++    scan_fn, policy, source_hashes = frozen_detector(old_root)
++    manifest_path = old_root / "pair_cache_manifest.json"
++    cache = {r["uid"]: r for r in read(manifest_path)["parents"]}
++    protected = dict(source_hashes)
++    protected[str(inventory)] = sha(inventory)
++    protected[str(manifest_path)] = sha(manifest_path)
++    before = resources()
++    write_new(out / "resources_before.json", before)
++    rows = []
++    ledger = dict(new_unique_pair_tests=0, reused_unique_pair_tests=0, model_calls=0,
++        training_updates=0, OT_calls=0, generated_meshes=0, source_modifications=0,
++        workers=1, numeric_threads=2)
++    for parent in sorted(parents, key=lambda p: p["uid"]):
++        tick = time.perf_counter()
++        uid, n = parent["uid"], parent["N"]
++        tri, original, face_vertex_ids, mapping = load_mesh(parent)
++        protected[parent["npz"]] = parent["sha256"]
++        basic = basic_geometry(tri, original)
++        if basic["nonfinite_source_face_ids"]:
++            raise ValueError("Nonfinite source parent; preserve as blocked rather than call detector")
++        old = cache.get(uid)
++        if old is not None:
++            path = old_root / old["relative_path"]
++            if old["input_npz_sha256"] != parent["sha256"] or old["N"] != n or old["L"] != L or sha(path) != old["sha256"]:
++                raise ValueError("Historical scan reuse identity differs: " + uid)
++            scan = read(path)
++            protected[str(path)] = old["sha256"]
++            origin = dict(mode="HASH_VERIFIED_HISTORICAL_REUSE", path=str(path), sha256=old["sha256"])
++            ledger["reused_unique_pair_tests"] += scan["tested_pairs"]
++        else:
++            calls = {}
++            scan = scan_fn(tri, tri, L, self_pairs=True, independent=True, ledger=calls)
++            scan.update(uid=uid, input_npz_sha256=parent["sha256"], L=L, ledger=calls)
++            for contact in scan["contacts"]:
++                contact["original_face_ids"] = None if original is None else [int(original[i]) for i in contact["pair"]]
++            path = out / "new_pair_scans" / (uid + ".json")
++            write_new(path, scan)
++            origin = dict(mode="NEW_CPU_DUAL_DETECTOR_SCAN", path=str(path), sha256=sha(path))
++            ledger["new_unique_pair_tests"] += scan["tested_pairs"]
++        if scan["uid"] != uid or scan["input_npz_sha256"] != parent["sha256"] or scan["L"] != L:
++            raise ValueError("Scan parent metadata differs")
++        expected = n * (n - 1) // 2
++        if scan["tested_pairs"] != expected or sum(scan["classification_counts"].values()) != expected or not scan["independent_verification"]:
++            raise ValueError("Incomplete dual-detector scan")
++        contacts, seen = [], set()
++        for contact in scan["contacts"]:
++            pair = contact["pair"]
++            if len(pair) != 2 or not 0 <= pair[0] < pair[1] < n or tuple(pair) in seen:
++                raise ValueError("Invalid or duplicate source pair")
++            seen.add(tuple(pair))
++            raw_ids = None if original is None else [int(original[i]) for i in pair]
++            if contact.get("original_face_ids") != raw_ids:
++                raise ValueError("Original face mapping differs from frozen scan")
++            item = dict(pair=pair, original_face_ids=raw_ids, classification=contact["classification"],
++                category=category(contact["classification"]))
++            if item["category"] in ("proper", "coplanar_positive_overlap", "UNKNOWN"):
++                item["detector"] = contact["detector"]
++            contacts.append(item)
++        whole = summarize_pairs(contacts, expected)
++        value = dict(schema=VERSION + "_parent", uid=uid, split=parent["split"], N=n,
++            input_npz=parent["npz"], input_npz_sha256=parent["sha256"],
++            full_target_sha256=hashlib.sha256(tri.tobytes()).hexdigest(), L=L,
++            face_id_policy="source IDs are unchanged retained full_target rows; original IDs map to saved raw source rows or NA",
++            source_vertex_mapping=mapping, original_face_ids=None if original is None else original.tolist(),
++            scan_origin=origin, basic_geometry=basic, pair_contacts=contacts, whole_parent=whole,
++            automatic_rejection=False)
++        destination = out / "parents" / (uid + ".json")
++        write_new(destination, value)
++        report = dict(uid=uid, split=parent["split"], N=n, origin=origin["mode"],
++            confirmed_illegal_pair_count=whole["confirmed_illegal_pair_count"],
++            unknown_pair_count=whole["unknown_pair_count"], category_counts=whole["category_counts"],
++            quality_path=str(destination), quality_sha256=sha(destination), wall_seconds=time.perf_counter() - tick)
++        rows.append(report)
++        print(json.dumps(report), flush=True)
++    for path, expected_hash in protected.items():
++        if sha(path) != expected_hash:
++            raise ValueError("Protected input/source changed: " + path)
++    summary = dict(schema=VERSION, rows=rows, parents=len(rows),
++        parents_with_confirmed_illegal_pairs=sum(r["confirmed_illegal_pair_count"] > 0 for r in rows),
++        parents_with_unknown_pairs=sum(r["unknown_pair_count"] > 0 for r in rows),
++        confirmed_illegal_pair_count=sum(r["confirmed_illegal_pair_count"] for r in rows),
++        unknown_pair_count=sum(r["unknown_pair_count"] for r in rows),
++        reused_parents=sum(r["origin"] == "HASH_VERIFIED_HISTORICAL_REUSE" for r in rows),
++        newly_scanned_parents=sum(r["origin"] == "NEW_CPU_DUAL_DETECTOR_SCAN" for r in rows),
++        fixed_scale=L, scale_policy="Frozen canonical training cube diagonal sqrt(3)*2/.3762",
++        detector_policy=policy, source_hashes=source_hashes, protected_hashes=protected,
++        implementation_sha256=sha(__file__), ledger=ledger, wall_seconds=time.perf_counter() - started,
++        automatic_parent_or_condition_rejection=False,
++        limitations=["Static source geometry, not generated output quality or semantics",
++            "UNKNOWN is not clean or confirmed illegal", "Legal geometric contact does not certify shared vertex IDs",
++            "Condition partition counts repeat source pairs and are not independent defect totals"])
++    write_new(out / "resources_after.json", resources())
++    write_new(out / "summary.json", summary)
++    return summary
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--inventory")
++    parser.add_argument("--out", required=True)
++    parser.add_argument("--old-root", default=str(OLD_ROOT))
++    parser.add_argument("--conditions")
++    args = parser.parse_args()
++    if args.conditions:
++        data = read(args.conditions)
++        rows = data if isinstance(data, list) else data.get("rows", data.get("conditions"))
++        results = []
++        for row in rows:
++            item = partition_condition(row["uid"], row["source_face_ids"], args.out)
++            item["condition_id"] = row["condition_id"]
++            write_new(Path(args.out) / "conditions" / (row["condition_id"] + ".json"), item)
++            results.append(dict(condition_id=row["condition_id"], uid=row["uid"],
++                counts={p: {k: item["partitions"][p][k] for k in ("confirmed_illegal_pair_count", "unknown_pair_count")} for p in ("CC", "CF", "FF")}))
++        write_new(Path(args.out) / "condition_summary.json", dict(schema=VERSION, rows=results,
++            conditions_sha256=sha(args.conditions), additional_pair_tests=0))
++    elif args.inventory:
++        result = run(args.inventory, args.out, args.old_root)
++        print(json.dumps({k: result[k] for k in ("parents", "reused_parents", "newly_scanned_parents", "confirmed_illegal_pair_count", "unknown_pair_count", "wall_seconds")}), flush=True)
++    else:
++        parser.error("--inventory or --conditions required")
++
++
++if __name__ == "__main__":
++    main()
+--- /dev/null
++++ b/r2/data_tools/user_conditions_v1/render.py
+@@ -0,0 +1,391 @@
++"""CPU-only views of exact source-mesh subsets; no model or mesh generation.
++
++The Y column is the source-parent complement M\\C, never a generated target.
++All panels on one page use the same parent bounds and orthographic camera.
++"""
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import os
++import re
++import sys
++import textwrap
++from pathlib import Path
++
++for _name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
++    os.environ[_name] = "2"
++os.environ["CUDA_VISIBLE_DEVICES"] = ""
++
++import numpy as np
++import matplotlib
++matplotlib.use("Agg")
++import matplotlib.pyplot as plt
++from matplotlib.colors import to_rgb
++from mpl_toolkits.mplot3d.art3d import Poly3DCollection
++
++SCHEMA = "chair_r2_user_conditions_render_v1"
++COLORS = {"M": "#b8bec4", "R": "#51a795", "C": "#2387c9", "Y": "#dc9a60"}
++CAMERAS = ((22.0, -60.0), (22.0, 120.0))
++PARENT_CAMERAS = CAMERAS + ((65.0, -60.0), (0.0, 30.0))
++DPI = 150
++
++
++def sha256(path):
++    h = hashlib.sha256()
++    with Path(path).open("rb") as handle:
++        for chunk in iter(lambda: handle.read(1 << 20), b""):
++            h.update(chunk)
++    return h.hexdigest()
++
++
++def read_json(path):
++    return json.loads(Path(path).read_text(encoding="utf-8-sig"))
++
++
++def _json_bytes(value):
++    return (json.dumps(value, sort_keys=True, ensure_ascii=False, indent=2, allow_nan=False) + "\n").encode("utf8")
++
++
++def _path(value):
++    raw = str(value)
++    if os.name != "nt" and re.match(r"^[A-Za-z]:[\\/]", raw):
++        return Path("/mnt/" + raw[0].lower() + "/" + raw[3:].replace("\\", "/"))
++    return Path(raw)
++
++
++def _safe_name(value):
++    if not re.fullmatch(r"[A-Za-z0-9_.-]+", str(value)):
++        raise ValueError("Identifier contains path separators or unsupported characters")
++    return str(value)
++
++
++def _face_ids(values, n, name, allow_empty=False):
++    a = np.asarray(values)
++    if a.ndim != 1 or (a.size and not np.issubdtype(a.dtype, np.integer)):
++        raise ValueError(f"{name} must be a one-dimensional integer source-face-ID list")
++    a = a.astype(np.int64)
++    if (not allow_empty and not len(a)) or len(set(a.tolist())) != len(a):
++        raise ValueError(f"{name} must be nonempty and unique")
++    if len(a) and (a.min() < 0 or a.max() >= n):
++        raise ValueError(f"{name} has out-of-range retained source-face IDs")
++    return np.sort(a)
++
++
++def load_parent(parent):
++    """Read one frozen NPZ, preserving stored FP32 triangles and source IDs."""
++    path = _path(parent["npz"])
++    actual_sha = sha256(path)
++    if actual_sha != parent["sha256"]:
++        raise ValueError(f"Parent source hash mismatch: {parent['uid']}")
++    with np.load(path, allow_pickle=False) as data:
++        raw = data["full_target"]
++        if raw.dtype != np.float32 or raw.ndim != 2 or raw.shape[1] != 9:
++            raise ValueError("Expected unchanged FP32 full_target[N,9]")
++        full = raw.reshape(-1, 3, 3).copy()
++        if "source_face_vertex_ids" in data and "model_vertices" in data:
++            indexed = data["model_vertices"][data["source_face_vertex_ids"]]
++            if not np.array_equal(indexed.view(np.uint32), full.view(np.uint32)):
++                raise ValueError("Source corner coordinates differ from full_target")
++    if len(full) != int(parent["N"]) or not np.isfinite(full).all():
++        raise ValueError("Parent N/finite contract failed")
++    lo = full.reshape(-1, 3).min(0).astype(float)
++    hi = full.reshape(-1, 3).max(0).astype(float)
++    span = float(np.max(hi - lo)) * 1.14
++    if span <= 0:
++        raise ValueError("Parent has no nonzero spatial extent")
++    area = np.linalg.norm(np.cross(full[:, 1].astype(float) - full[:, 0], full[:, 2].astype(float) - full[:, 0]), axis=1) / 2
++    return full, {"center_model_xyz": ((lo + hi) / 2).tolist(), "span": span,
++                  "parent_bounds_model_xyz": [lo.tolist(), hi.tolist()], "projection": "orthographic",
++                  "axis_transform": "model[x,y,z] -> plot[x,z,y] (model Y is vertical)",
++                  "same_bounds_all_panels": True, "coordinate_rescaling": False}, area
++
++
++def _shaded(tri, color):
++    tri = np.asarray(tri, dtype=float)
++    normal = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
++    lengths = np.linalg.norm(normal, axis=1)
++    normal = np.divide(normal, lengths[:, None], out=np.zeros_like(normal), where=lengths[:, None] > 0)
++    light = np.array([.3, .7, .6]); light /= np.linalg.norm(light)
++    # Absolute dot: original triangle winding is not a global orientation contract.
++    strength = .70 + .30 * np.abs(normal @ light)
++    return np.clip(np.asarray(to_rgb(color))[None, :] * strength[:, None], 0, 1)
++
++
++def _draw(ax, triangles, colors, bounds, camera, face_ids=None):
++    plot_tri = np.asarray(triangles, dtype=float)[:, :, [0, 2, 1]]
++    if len(plot_tri):
++        ax.add_collection3d(Poly3DCollection(plot_tri, facecolors=colors, edgecolors="#38424b",
++                                            linewidths=.35, alpha=1, zsort="average"))
++    center = np.asarray(bounds["center_model_xyz"])[[0, 2, 1]]
++    half = bounds["span"] / 2
++    ax.set(xlim=(center[0] - half, center[0] + half), ylim=(center[1] - half, center[1] + half),
++           zlim=(center[2] - half, center[2] + half))
++    ax.set_box_aspect((1, 1, 1)); ax.set_proj_type("ortho")
++    ax.view_init(elev=camera[0], azim=camera[1]); ax.set_axis_off()
++    if face_ids is not None:
++        for face_id, point in zip(face_ids, plot_tri.mean(1)):
++            ax.text(*point, str(int(face_id)), fontsize=5.5, color="#121b2a", ha="center", va="center",
++                    bbox={"facecolor": "white", "edgecolor": "none", "alpha": .6, "pad": .1})
++
++
++def _identity(parent, kind, camera, extra):
++    return {"schema": SCHEMA, "kind": kind, "uid": str(parent["uid"]), "split": parent.get("split"),
++            "parent_npz": str(_path(parent["npz"])), "parent_sha256": parent["sha256"], "N": int(parent["N"]),
++            "render_source_sha256": sha256(__file__), "camera": camera, "colors": COLORS,
++            "matplotlib_version": matplotlib.__version__, "numpy_version": np.__version__,
++            "dpi": DPI, "source_mesh_modified": False, "new_vertices": 0, "new_faces": 0,
++            "model_calls": 0, "GPU": 0, "training": 0, "Y_definition": "exact source-parent complement M minus C; NOT generated output",
++            **extra}
++
++
++def _reusable(path, identity):
++    sidecar = path.with_suffix(path.suffix + ".json")
++    if not path.exists() and not sidecar.exists():
++        return None
++    if not path.exists() or not sidecar.exists():
++        raise RuntimeError(f"Incomplete existing render, refusing overwrite: {path}")
++    previous = read_json(sidecar)
++    if previous.get("identity") != identity or previous.get("image_sha256") != sha256(path):
++        raise RuntimeError(f"Existing render source/identity/image hash differs: {path}")
++    return previous
++
++
++def _save(fig, path, identity):
++    path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)
++    temp = path.with_suffix(path.suffix + ".tmp")
++    fig.savefig(temp, format="png", facecolor="white", dpi=DPI)
++    plt.close(fig)
++    if sha256(_path(identity["parent_npz"])) != identity["parent_sha256"]:
++        raise RuntimeError("Parent source changed during rendering")
++    temp.replace(path)
++    result = {"identity": identity, "image": str(path), "image_sha256": sha256(path),
++              "status": "COMPLETE", "AI_visual_review": "PENDING"}
++    path.with_suffix(path.suffix + ".json").write_bytes(_json_bytes(result))
++    return result
++
++
++def render_condition(parent, region_ids, condition_ids, path, caption):
++    """Render 2x5 M/R/C/Y/C+Y; caller assigns semantic regions, this function only displays."""
++    path = Path(path); full, bounds, area = load_parent(parent); n = len(full)
++    region = _face_ids(region_ids, n, "region_ids")
++    condition = _face_ids(condition_ids, n, "condition_ids")
++    if not set(condition) <= set(region) or len(condition) >= n:
++        raise ValueError("Require nonempty C subset of R subset of M and a nonempty source complement")
++    free = np.setdiff1d(np.arange(n), condition)
++    identity = _identity(parent, "condition_2views_5columns", {**bounds, "views_elev_azim": CAMERAS},
++                         {"region_source_face_ids": region.tolist(), "condition_source_face_ids": condition.tolist(),
++                          "source_complement_face_ids": free.tolist(), "caption": str(caption),
++                          "region_face_count": len(region), "condition_face_count": len(condition),
++                          "condition_face_fraction_parent": len(condition) / n,
++                          "condition_area_fraction_parent": float(area[condition].sum() / area.sum()),
++                          "condition_area_fraction_region": float(area[condition].sum() / area[region].sum()),
++                          "columns": ["M source parent", "R selected source region", "C input", "Y source complement", "C+Y source assembly"]})
++    # JSON lists normalize tuples for exact resume identity checks.
++    identity = json.loads(json.dumps(identity))
++    old = _reusable(path, identity)
++    if old: return old
++    full_colors = _shaded(full, COLORS["Y"]); full_colors[condition] = _shaded(full[condition], COLORS["C"])
++    panels = [(full, _shaded(full, COLORS["M"]), f"M | source parent | N={n}"),
++              (full[region], _shaded(full[region], COLORS["R"]), f"R | selected region | {len(region)} faces"),
++              (full[condition], _shaded(full[condition], COLORS["C"]), f"C | input | K={len(condition)} ({100*len(condition)/n:.1f}% faces)"),
++              (full[free], _shaded(full[free], COLORS["Y"]), f"Y | SOURCE complement | {len(free)} faces"),
++              (full, full_colors, "C + Y | source assembly")]
++    fig = plt.figure(figsize=(20, 8.6), facecolor="white")
++    for row, view in enumerate(CAMERAS):
++        for col, (tri, colors, label) in enumerate(panels):
++            ax = fig.add_subplot(2, 5, row * 5 + col + 1, projection="3d")
++            _draw(ax, tri, colors, bounds, view); ax.set_title(label, fontsize=9)
++    title = f"SOURCE DATA ONLY | {parent['uid']} | {caption}"
++    fig.suptitle("\n".join(textwrap.wrap(title, 155)), fontsize=11, y=.989)
++    fig.text(.5, .018, "BLUE = C | ORANGE = source remainder Y (NOT generated) | Same parent bounds in every panel | Two opposite views", ha="center", fontsize=10)
++    fig.subplots_adjust(left=.003, right=.997, top=.89, bottom=.05, wspace=0, hspace=.02)
++    return _save(fig, path, identity)
++
++
++def render_parent_sheet(parent, regions, out, annotate_faces=False):
++    """Four-view source sheet, optional face-ID selector, and separate region rows."""
++    out = Path(out); uid = _safe_name(parent["uid"]); full, bounds, _ = load_parent(parent)
++    normalized = []
++    for index, region in enumerate(regions):
++        ids = _face_ids(region["source_face_ids"], len(full), "region.source_face_ids", allow_empty=True)
++        normalized.append({"region_id": str(region.get("region_id", index)), "label": str(region.get("label", "candidate region")),
++                           "source_face_ids": ids.tolist(), "status": str(region.get("status", "CANDIDATE"))})
++    pages = []
++    for annotations in ([False, True] if annotate_faces else [False]):
++        path = out / (uid + ("__face_ids.png" if annotations else "__parent.png"))
++        identity = _identity(parent, "parent_face_ids" if annotations else "parent_selection", {**bounds, "views_elev_azim": PARENT_CAMERAS},
++                             {"face_annotations": annotations, "face_id_domain": "retained row/source_face_ids"})
++        identity = json.loads(json.dumps(identity)); old = _reusable(path, identity)
++        if old: pages.append(old); continue
++        fig = plt.figure(figsize=(18, 5.4), facecolor="white")
++        for col, view in enumerate(PARENT_CAMERAS):
++            ax = fig.add_subplot(1, 4, col + 1, projection="3d")
++            _draw(ax, full, _shaded(full, COLORS["M"]), bounds, view, np.arange(len(full)) if annotations else None)
++            ax.set_title(f"elev {view[0]:g} / azim {view[1]:g}", fontsize=10)
++        fig.suptitle(f"SOURCE PARENT | {uid} | {parent.get('split', 'NA')} | N={len(full)}" +
++                     (" | ALL FACE IDs (selection aid; labels may overlap/occlude)" if annotations else " | NO GENERATED MESH"), fontsize=11)
++        fig.subplots_adjust(left=0, right=1, top=.91, bottom=.01, wspace=0)
++        pages.append(_save(fig, path, identity))
++    if normalized:
++        path = out / (uid + "__regions.png")
++        identity = _identity(parent, "region_selection", {**bounds, "views_elev_azim": CAMERAS}, {"regions": normalized})
++        identity = json.loads(json.dumps(identity)); old = _reusable(path, identity)
++        if old: pages.append(old)
++        else:
++            fig = plt.figure(figsize=(18, 4.6 * len(normalized) + .7), facecolor="white")
++            for row, region in enumerate(normalized):
++                ids = np.array(region["source_face_ids"], dtype=int)
++                mixed = _shaded(full, COLORS["M"]); mixed[ids] = _shaded(full[ids], COLORS["R"])
++                for col, (view, isolated) in enumerate(((CAMERAS[0], False), (CAMERAS[1], False), (CAMERAS[0], True), (CAMERAS[1], True))):
++                    ax = fig.add_subplot(len(normalized), 4, row * 4 + col + 1, projection="3d")
++                    _draw(ax, full[ids] if isolated else full, _shaded(full[ids], COLORS["R"]) if isolated else mixed, bounds, view)
++                    label = f"#{row+1} {region['region_id']} | {region['label']} | {region['status']} | {len(ids)} faces"
++                    ax.set_title(label + ("\nregion only" if isolated else "\nregion in source"), fontsize=9)
++            fig.suptitle(f"REGION CANDIDATES | {uid} | Caller-supplied labels; visual review required | NO GENERATED MESH", fontsize=11)
++            fig.subplots_adjust(left=0, right=1, top=.93, bottom=.01, wspace=0, hspace=.04)
++            pages.append(_save(fig, path, identity))
++    return {"status": "COMPLETE", "uid": uid, "pages": pages, "model_calls": 0}
++
++
++
++def render_candidate_sheet(parent, candidates, path):
++    """Display geometric patch partition without assigning semantic labels."""
++    path = Path(path); full, bounds, area = load_parent(parent)
++    seen = set(); rows = []; colors = _shaded(full, COLORS["M"])
++    for index, candidate in enumerate(candidates):
++        ids = _face_ids(candidate["source_face_ids"], len(full), "candidate.source_face_ids")
++        if seen & set(ids): raise ValueError("Candidate partition contains overlapping source-face IDs")
++        seen.update(ids)
++        color = matplotlib.colors.hsv_to_rgb([(index * .618033988749895) % 1., .50, .88])
++        colors[ids] = _shaded(full[ids], color)
++        rows.append({"candidate_id": str(candidate["candidate_id"]), "source_face_ids": ids.tolist(), "K": len(ids),
++                     "area": float(area[ids].sum()), "parent_area_fraction": float(area[ids].sum()/area.sum()),
++                     "color_rgb": color.tolist(), "area_weighted_center_model_xyz": np.average(full[ids].mean(1), axis=0, weights=area[ids]).tolist()})
++    ranked = sorted(rows, key=lambda row: (-row["area"], row["candidate_id"]))
++    labeled = {row["candidate_id"] for row in ranked[:20]}
++    identity = _identity(parent, "geometric_candidate_partition", {**bounds, "views_elev_azim": PARENT_CAMERAS},
++                         {"candidates": rows, "unassigned_source_face_ids": sorted(set(range(len(full))) - seen),
++                          "labeled_candidate_ids": sorted(labeled), "label_rule": "Largest20 by actual surface area; all patches rendered",
++                          "semantic_labels": "NONE; geometric smooth-patch candidates only"})
++    identity = json.loads(json.dumps(identity)); old = _reusable(path, identity)
++    if old: return old
++    legend_rows = max(1, int(np.ceil(len(rows)/4)))
++    legend_height = .21 * legend_rows + .45; height = 5.3 + legend_height
++    fig = plt.figure(figsize=(18, height), facecolor="white")
++    for column, view in enumerate(PARENT_CAMERAS):
++        ax = fig.add_axes((column*.25, legend_height/height, .25, 4.7/height), projection="3d")
++        _draw(ax, full, colors, bounds, view)
++        for row in rows:
++            if row["candidate_id"] not in labeled: continue
++            xyz = np.asarray(row["area_weighted_center_model_xyz"])[[0,2,1]]
++            ax.text(*xyz, row["candidate_id"], fontsize=7, ha="center", va="center", color="#122031",
++                    bbox={"facecolor":"white", "edgecolor":"none", "alpha":.8, "pad":.35})
++        ax.set_title(f"elev {view[0]:g} / azim {view[1]:g}", fontsize=10)
++    for index, row in enumerate(rows):
++        col = index//legend_rows; rr = index % legend_rows
++        label = f"{row['candidate_id']}  K={row['K']}  area={row['area']:.4g}  ({100*row['parent_area_fraction']:.1f}%)"
++        yy = (legend_height - .28 - .21*rr) / height
++        fig.text(.008+col*.25, yy, "■", color=row["color_rgb"], fontsize=11)
++        fig.text(.020+col*.25, yy, label, fontsize=8)
++    fig.suptitle(f"GEOMETRIC PATCH CANDIDATES | {parent['uid']} | N={len(full)} | {len(rows)} patches | NO SEAT/BACK CLAIM", fontsize=11, y=.989)
++    return _save(fig, path, identity)
++
++
++def render_parent_montage(parents, out):
++    """Six parents per page, two views each; per-parent scale explicitly stated."""
++    out = Path(out); pages = []
++    for offset in range(0, len(parents), 6):
++        group = parents[offset:offset+6]; loaded = [(p, *load_parent(p)[:2]) for p in group]
++        path = out / f"parents_montage_{offset//6+1:03d}.png"
++        identity = {"schema":SCHEMA, "kind":"six_parent_montage", "render_source_sha256":sha256(__file__),
++                    "parents":[{"uid":p["uid"],"split":p.get("split"),"npz":str(_path(p["npz"])),"sha256":p["sha256"],"N":p["N"],"camera":bounds} for p,_,bounds in loaded],
++                    "views_elev_azim":[list(v) for v in CAMERAS], "dpi":DPI,
++                    "scale_contract":"Same bounds for the two views of each parent; each parent fitted separately, NOT a common cross-parent physical scale",
++                    "matplotlib_version":matplotlib.__version__,"numpy_version":np.__version__,"model_calls":0,"GPU":0}
++        old = _reusable(path,identity)
++        if old: pages.append(old);continue
++        fig = plt.figure(figsize=(18,8.4),facecolor="white")
++        for i,(p,full,bounds) in enumerate(loaded):
++            for j,view in enumerate(CAMERAS):
++                ax=fig.add_subplot(2,6,(i//3)*6+(i%3)*2+j+1,projection="3d")
++                _draw(ax,full,_shaded(full,COLORS["M"]),bounds,view)
++                ax.set_title(f"{p['uid'][:12]}… | {p.get('split','NA')} | N={len(full)}\nview {j+1}",fontsize=9)
++        fig.suptitle("SOURCE PARENTS ONLY | 6 parents/page | Each parent independently fitted; two views share its bounds",fontsize=11,y=.985)
++        fig.subplots_adjust(left=0,right=1,top=.91,bottom=.01,wspace=0,hspace=.04)
++        path.parent.mkdir(parents=True,exist_ok=True);temp=path.with_suffix(".png.tmp")
++        fig.savefig(temp,format="png",facecolor="white",dpi=DPI);plt.close(fig)
++        for p,_,_ in loaded:
++            if sha256(_path(p["npz"]))!=p["sha256"]:raise RuntimeError("Montage source changed")
++        temp.replace(path)
++        result={"status":"COMPLETE","identity":identity,"image":str(path),"image_sha256":sha256(path),"AI_visual_review":"PENDING"}
++        path.with_suffix(".png.json").write_bytes(_json_bytes(result));pages.append(result)
++    return {"status":"COMPLETE","parents":len(parents),"pages":pages,"model_calls":0}
++
++
++def _rows(value, keys):
++    if isinstance(value, list): return value
++    for key in keys:
++        if isinstance(value.get(key), list): return value[key]
++    raise ValueError(f"Expected list or list under one of {keys}")
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--stage", choices=("parents", "conditions", "candidates", "montage", "proposals"), required=True)
++    parser.add_argument("--inventory", type=Path, required=True)
++    parser.add_argument("--regions", type=Path)
++    parser.add_argument("--conditions", type=Path)
++    parser.add_argument("--candidate-dir", type=Path)
++    parser.add_argument("--out", type=Path, required=True)
++    parser.add_argument("--uid", action="append", default=[])
++    parser.add_argument("--annotate-faces", action="store_true")
++    args = parser.parse_args()
++    parents = {p["uid"]: p for p in _rows(read_json(args.inventory), ("rows", "parents"))}
++    selected = set(args.uid) if args.uid else set(parents)
++    if not selected <= set(parents): raise ValueError("UID outside registered inventory")
++    regions = _rows(read_json(args.regions), ("rows", "regions")) if args.regions else []
++    results = []
++    if args.stage == "parents":
++        for uid in sorted(selected):
++            result = render_parent_sheet(parents[uid], [r for r in regions if r["uid"] == uid], args.out, args.annotate_faces)
++            results.append(result); print(json.dumps({"uid": uid, "pages": len(result["pages"]), "status": "COMPLETE"}), flush=True)
++    elif args.stage in ("candidates", "proposals"):
++        if args.candidate_dir is None: parser.error("candidates stage requires --candidate-dir")
++        if args.stage == "proposals":
++            result = render_parent_montage([parents[uid] for uid in sorted(selected)], args.out)
++            results.append(result)
++            print(json.dumps({"stage":"montage", "parents":len(selected), "pages":len(result["pages"]), "status":"COMPLETE"}),flush=True)
++        for uid in sorted(selected):
++            source=args.candidate_dir/(uid+".json"); candidates=read_json(source)["candidates"]
++            result=render_candidate_sheet(parents[uid],candidates,args.out/(_safe_name(uid)+"__candidates.png"))
++            results.append(result);print(json.dumps({"uid":uid,"candidates":len(candidates),"status":"COMPLETE"}),flush=True)
++    elif args.stage == "montage":
++        result=render_parent_montage([parents[uid] for uid in sorted(selected)],args.out)
++        results.append(result);print(json.dumps({"parents":len(selected),"pages":len(result["pages"]),"status":"COMPLETE"}),flush=True)
++    else:
++        if args.conditions is None: parser.error("conditions stage requires --conditions")
++        conditions = _rows(read_json(args.conditions), ("rows", "conditions"))
++        region_map = {(r["uid"], r["region_id"]): r for r in regions}
++        for row in conditions:
++            if row["uid"] not in selected: continue
++            if row.get("status", "PASS") not in ("PASS", "ACCEPTED", "COMPLETE"):
++                results.append({"uid": row["uid"], "condition_id": row["condition_id"], "status": "NA_NOT_RENDERED", "reason": row.get("reason")}); continue
++            region_ids = row.get("region_source_face_ids")
++            if region_ids is None: region_ids = region_map[(row["uid"], row["region_id"])]["source_face_ids"]
++            path = args.out / (_safe_name(row["condition_id"]) + ".png")
++            result = render_condition(parents[row["uid"]], region_ids, row["source_face_ids"], path, row.get("caption", row["condition_id"]))
++            results.append(result); print(json.dumps({"condition_id": row["condition_id"], "status": "COMPLETE"}), flush=True)
++    receipt = {"schema": SCHEMA, "status": "COMPLETE", "stage": args.stage, "inventory_sha256": sha256(args.inventory),
++               "regions_sha256": sha256(args.regions) if args.regions else None, "conditions_sha256": sha256(args.conditions) if args.conditions else None,
++               "render_source_sha256": sha256(__file__), "results": results, "torch_imported": "torch" in sys.modules, "model_calls": 0, "GPU": 0}
++    args.out.mkdir(parents=True, exist_ok=True)
++    receipt_path = args.out / ("render_" + args.stage + "_receipt.json")
++    if receipt_path.exists() and receipt_path.read_bytes() != _json_bytes(receipt):
++        raise RuntimeError("Refuse overwrite different batch receipt; use a distinct output directory")
++    receipt_path.write_bytes(_json_bytes(receipt))
++
++
++if __name__ == "__main__":
++    main()
+--- /dev/null
++++ b/r2/data_tools/user_conditions_v1/review_dev.py
+@@ -0,0 +1,41 @@
++"""Root AI_PROXY visual decisions after viewing all eight DEV candidate sheets."""
++from pathlib import Path
++from prepare import read,write,sha,DEFAULT_OUT
++from quality import partition_condition
++from construct import nested_extents,geometry
++out=DEFAULT_OUT
++parents={p["uid"]:p for p in read(out/"parent_inventory.json")["rows"]}
++decisions={
++"33ec":("seat","p04","medium","Flat upper circular cushion surface, distinct from the cylindrical side and surrounding seat frame."),
++"341b":("seat","p05","full","Identifiable sitting surface, but 15 confirmed C/free penetration pairs occur at/near its junction; not a clean user-input demonstration."),
++"534b":("back","p01","full","Seat-facing rectangular backrest plane consists of two original triangles; excludes rear plane, thickness rims and legs."),
++"866e":("seat","p01","full","Two original triangles form the complete horizontal sitting upper surface, distinct from underside/apron."),
++"86ec":("back","p01","full","Seat-facing continuous openwork backrest surface; includes the arched upper section and its connected front members, excludes side walls/rear legs."),
++"bdd2":("back","p03","medium","Continuous seat-facing gently curved back panel; rear face and top thickness cap excluded."),
++"c1b8":("seat","p00","small","Six original coplanar faces cover the sitting top; underside and narrow frame/leg faces excluded."),
++"f596":("back","p01","small","Continuous tall seat-facing slightly curved back panel; rear face and side posts excluded."),
++}
++rows=[]
++for uid,p in parents.items():
++ if p["split"]!="dev":continue
++ kind,tag,tier,note=decisions[uid[:4]]
++ candidate=next(c for c in read(out/"candidates"/(uid+".json"))["candidates"] if c["candidate_id"]==tag)
++ image=out/"gallery/proposals"/(uid+"__candidates.png")
++ q=partition_condition(uid,candidate["source_face_ids"],out/"quality")
++ rejected=uid.startswith("341b")
++ ext,growth=nested_extents(geometry(p)["full_target"],geometry(p)["source_faces"],candidate["source_face_ids"],kind)
++ rows.append(dict(uid=uid,split="dev",region_id=uid+"__"+kind,region_type=kind,
++     source_face_ids=candidate["source_face_ids"],candidate_ids=[tag],dev_requested_tier=tier,
++     status="NA_LOCAL_TARGET_CONFLICT" if rejected else "ACCEPTED_AI_PROXY",reason=note,
++     reviewer="root AI_PROXY",human_semantic_annotation=False,
++     visual_evidence=[dict(path=str(image),sha256=sha(image))],
++     quality_at_R={k:dict(confirmed_pairs=v["confirmed_illegal_pair_count"],unknown_pairs=v["unknown_pair_count"]) for k,v in q["partitions"].items()},
++     extent_preview=[dict(K=len(e["source_face_ids"]),tier=e["tier"],requested_tiers=e["requested_tiers"],area_fraction=e["region_area_fraction"]) for e in ext],
++     notes=(["Full source has 88 confirmed source-pair conflicts and 1 unresolved pair.",
++             "Alternative front-back p10 was examined; region is partial and has 1 C/free penetration. Not substituted merely to fill the quota.",
++             "Old regression condition and both frozen noises remain in the regression panel; no old bad case removed."] if rejected else [])))
++write(out/"reviews/dev_root.json",dict(schema="region_visual_review_v1",reviewer="root AI_PROXY",rows=rows,
++     accepted_new_dev_parents=7,NA_new_dev_parents=1,
++     semantics_note="AI geometry-informed visual review, not human ground truth; no model output consulted.",
++     noise_created=0,training_updates=0))
++print("DEV review saved: 7 accepted, 1 NA (341b local target conflict); old regression retains all eight.")
+--- /dev/null
++++ b/r2/data_tools/user_conditions_v1/review_usability.py
+@@ -0,0 +1,36 @@
++"""Recorded visual screen after export; preserve every rejected artifact."""
++from prepare import DEFAULT_OUT,read,write,sha,event
++def main(out=DEFAULT_OUT):
++ src=read(out/'conditions.json');rows=src['rows']
++ held={('21f2','seat'),('21f2','back'),('47da','seat'),('47da','back'),('73b3','seat'),('c1b8','seat')}
++ decisions=[]
++ for r in rows:
++  hold=r['tier']=='small' and any(r['uid'].startswith(p) and r['region_type']==k for p,k in held)
++  if not hold:continue
++  image=out/'gallery/conditions'/(r['condition_id']+'.png')
++  assert image.exists() and r['region_area_fraction']<.1
++  decisions.append(dict(condition_id=r['condition_id'],uid=r['uid'],split=r['split'],
++   status='HOLD_TINY_EDGE_STRIP_AI_PROXY',include_in_active_pool=False,
++   reason='Actual two-view five-column image shows only a narrow boundary strip/needle, not a substantial small patch. Whole-face prefix cannot approximate the intended small region at this source resolution; preserve as rejected preparation evidence, omit from this pilot main pool. This is not a universal claim that an edge strip can never be a valid user input.',
++   region_area_fraction=r['region_area_fraction'],image=str(image),image_sha256=sha(image),
++   image_actually_viewed=True,reviewer='root AI_PROXY',original_npz=r['npz'],original_npz_sha256=r['sha256']))
++ assert len(decisions)==6 and sum(r['split']=='train' for r in decisions)==5
++ write(out/'usability_review.json',dict(schema='post_construction_input_fidelity_review_v1',
++  policy='AI visual input-fidelity review before any training/output generation; region area fraction below 10 percent triggered close inspection, not an automatic geometric-invalidity label. All six inspected candidates were thin strips and held. No data or pictures deleted, no new seed or task substituted.',
++  source_manifest_sha256=sha(out/'conditions.json'),rows=decisions,model_output_selection=False,
++  coverage_limitation='Not every one of 129 extent images separately visually audited. All source regions and these six low-area cases reviewed; full geometry/partition programmatic validation covers all129.',
++  training_authorization=False))
++ exclude={r['condition_id'] for r in decisions}
++ active=[r for r in rows if r['condition_id'] not in exclude]
++ value=dict(schema='r2_user_conditions_active_v1',rows=active,source_all_exported_manifest=str(out/'conditions.json'),
++  source_all_exported_sha256=sha(out/'conditions.json'),usability_review_sha256=sha(out/'usability_review.json'),
++  train_condition_count=sum(r['split']=='train' for r in active),dev_condition_count=sum(r['split']=='dev' for r in active),
++  train_parents=sorted({r['uid'] for r in active if r['split']=='train'}),
++  held_condition_ids=sorted(exclude),new_generated_arrays=0,
++  readiness='REVIEW_PACKAGE_COMPLETE; future training requires its own R2 continuation contract',
++  future_recipe='R2 Native/T1+role+Geo, FM, full-course HYBRID=.25')
++ assert value['train_condition_count']==117 and value['dev_condition_count']==6 and len(value['train_parents'])==25
++ write(out/'active_conditions.json',value)
++ event(out,'POST_CONSTRUCTION_USABILITY_REVIEW',active_train=117,active_dev=6,held_train=5,held_dev=1,model_calls=0)
++ print('Active117 train /6DEV; all129 original exports retained; six narrow strips held.')
++if __name__=='__main__':main()
+--- /dev/null
++++ b/r2/data_tools/user_conditions_v1/run.py
+@@ -0,0 +1,48 @@
++"""Recover/check this CPU-only data package. Never dispatches models or training."""
++from pathlib import Path
++import argparse,subprocess,sys,time,json
++from prepare import DEFAULT_OUT,read,sha,event
++
++def child(name,args=()):
++ subprocess.run([sys.executable,'-B',str(Path(__file__).parent/name),*map(str,args)],check=True)
++
++def main():
++ p=argparse.ArgumentParser(description=__doc__)
++ p.add_argument('--out',type=Path,default=DEFAULT_OUT)
++ p.add_argument('--stage',choices=['resume','check'],default='check')
++ a=p.parse_args();out=a.out;t0=time.perf_counter()
++ # Decisions are reviewed inputs. Never infer them from an absent implementation or missing file.
++ for path in ('parent_inventory.json','regions.json','usability_review.json'):
++  if not (out/path).exists():raise RuntimeError('BLOCKED: missing reviewed input '+path)
++ if a.stage=='resume':
++  # Construction is idempotent at existing NPZ byte identity; differing existing JSON is refused.
++  if not (out/'conditions.json').exists():child('construct.py',['--out',out])
++  if not (out/'quality/condition_summary.json').exists():child('quality.py',['--conditions',out/'conditions.json','--out',out/'quality'])
++  if not (out/'active_conditions.json').exists():
++   raise RuntimeError('BLOCKED: active selection must be restored from its reviewed evidence; no silent reselection')
++  # The final verifier/report files are preserved snapshots. If absent, run the explicit stage script,
++  # not an old R2 training entrypoint. README lists each source stage.
++ required=['conditions.json','active_conditions.json','dataset_handoff_active.json','FINAL_SUMMARY.json',
++  'validation_export.json','validation_active.json','DATA_PREPARATION_REPORT.md','gallery/index.html']
++ for name in required:
++  if not (out/name).exists():raise RuntimeError('BLOCKED: missing stage artifact '+name+'; see README stage entry')
++ active=read(out/'active_conditions.json');all_rows=read(out/'conditions.json')['rows'];checks=0
++ for r in read(out/'parent_inventory.json')['rows']:
++  assert sha(r['npz'])==r['sha256'];checks+=1
++ for r in all_rows:
++  assert sha(r['npz'])==r['sha256'];checks+=1
++  image=out/'gallery/conditions'/(r['condition_id']+'.png');sidecar=read(image.with_suffix('.png.json'))
++  assert sha(image)==sidecar['image_sha256'];checks+=1
++ original={r['condition_id']:r for r in all_rows}
++ for r in active['rows']:
++  assert r==original[r['condition_id']];checks+=1
++ assert sum(r['split']=='train' for r in active['rows'])==117
++ assert sum(r['split']=='dev' for r in active['rows'])==6
++ assert sha(out/'conditions.json')==active['source_all_exported_sha256']
++ assert sha(out/'usability_review.json')==active['usability_review_sha256']
++ receipt=dict(stage=a.stage,status='PASS',hash_and_row_checks=checks,
++  active_train=117,active_dev=6,source_candidates=129,wall_seconds=time.perf_counter()-t0,
++  model_calls=0,training_updates=0,OT_calls=0,new_Gaussian_draws=0)
++ event(out,'RESUMABLE_ENTRY_CHECK',**receipt)
++ print(json.dumps(receipt))
++if __name__=='__main__':main()
+--- /dev/null
++++ b/r2/data_tools/user_conditions_v1/summarize.py
+@@ -0,0 +1,109 @@
++"""Tabulate and browse actual exported source-face conditions, CPU only."""
++from pathlib import Path
++from collections import Counter
++import csv,io,html,json
++from prepare import DEFAULT_OUT,read,write,sha,event
++
++def text_file(path,text):
++ path=Path(path);path.parent.mkdir(parents=True,exist_ok=True)
++ if path.exists():
++  if path.read_text(encoding='utf-8-sig')!=text:raise RuntimeError('Refuse differing artifact '+str(path))
++ else:path.write_text(text,encoding='utf-8')
++
++def csv_file(path,rows):
++ if not rows:raise ValueError('No rows')
++ buf=io.StringIO(newline='');writer=csv.DictWriter(buf,fieldnames=list(rows[0]),lineterminator='\n')
++ writer.writeheader()
++ for r in rows:
++  writer.writerow({k:json.dumps(v,ensure_ascii=False) if isinstance(v,(dict,list)) else v for k,v in r.items()})
++ text_file(path,buf.getvalue())
++
++def main(out=DEFAULT_OUT):
++ out=Path(out);conds=read(out/'conditions.json');rows=conds['rows'];regions=read(out/'regions.json')['rows']
++ parents=read(out/'parent_inventory.json')['rows']
++ qq={r['condition_id']:r for r in read(out/'quality/condition_summary.json')['rows']}
++ regmap={r['region_id']:r for r in regions}
++ tables=[]
++ for r in rows:
++  qr=qq[r['condition_id']]['counts']
++  base={k:r[k] for k in ('condition_id','uid','split','region_type','region_id','region_status','tier','requested_tiers','N','K','face_fraction','region_area_fraction','parent_area_fraction','C_area','R_area','M_area','source_face_ids','free_source_ids','npz','sha256','parent_sha256','source_partition_bitwise')}
++  for part in ('CC','CF','FF'):
++   base[part+'_confirmed_pairs']=qr[part]['confirmed_illegal_pair_count']
++   base[part+'_unknown_pairs']=qr[part]['unknown_pair_count']
++  base['review_kind']='AI_PROXY';base['R_definition']=regmap[r['region_id']]['reason']
++  tables.append(base)
++ csv_file(out/'tables/conditions.csv',tables)
++ rtable=[]
++ for r in regions:
++  rtable.append(dict(uid=r['uid'],split=r['split'],region_type=r['region_type'],region_id=r['region_id'],
++   status=r['status'],K_R=len(r['source_face_ids']),source_face_ids=r['source_face_ids'],reason=r['reason'],
++   accepted_unique_conditions=sum(c['region_id']==r['region_id'] for c in rows),
++   quality_at_R=r.get('quality_at_R',{}),review_kind='AI_PROXY'))
++ csv_file(out/'tables/regions.csv',rtable)
++ byparent=[]
++ for p in parents:
++  cc=[c for c in rows if c['uid']==p['uid']]
++  q=read(out/'quality/parents'/f"{p['uid']}.json")
++  # Parent totals inferred from any condition partition, without counting repeated pair occurrences.
++  if cc:
++   qr=qq[cc[0]['condition_id']]['counts']
++   defects=sum(x['confirmed_illegal_pair_count'] for x in qr.values());unknown=sum(x['unknown_pair_count'] for x in qr.values())
++  else:
++   from quality import partition_condition
++   qr=partition_condition(p['uid'],[0],out/'quality')['partitions']
++   defects=sum(x['confirmed_illegal_pair_count'] for x in qr.values());unknown=sum(x['unknown_pair_count'] for x in qr.values())
++  byparent.append(dict(uid=p['uid'],split=p['split'],N=p['N'],accepted_conditions=len(cc),
++    accepted_seat_conditions=sum(c['region_type']=='seat' for c in cc),
++    accepted_back_conditions=sum(c['region_type']=='back' for c in cc),
++    parent_confirmed_pairs=defects,parent_unknown_pairs=unknown,
++    included_in_new_pool=bool(cc),parent_npz=p['npz'],sha256=p['sha256']))
++ csv_file(out/'tables/parents.csv',byparent)
++ alias=[]
++ for r in regions:
++  for e in r.get('extent_preview',[]):
++   for tier in e['requested_tiers']:
++    alias.append(dict(uid=r['uid'],split=r['split'],region_type=r['region_type'],requested_tier=tier,
++      actual_unique_tier=e.get('tier','NA'),K=e['K'],region_area_fraction=e.get('region_area_fraction',e.get('area_fraction')),
++      note='Full dev extent previews are not extra exported DEV conditions'))
++ csv_file(out/'tables/extent_aliases.csv',alias)
++ train=[r for r in rows if r['split']=='train'];dev=[r for r in rows if r['split']=='dev']
++ accepted=[r for r in regions if r['status'].startswith('ACCEPTED')]
++ tr=[r for r in accepted if r['split']=='train']
++ summary=dict(train_parents=len({r['uid'] for r in train}),train_regions=len(tr),train_conditions=len(train),
++   train_seat_regions=sum(r['region_type']=='seat' for r in tr),train_back_regions=sum(r['region_type']=='back' for r in tr),
++   training_conditions_by_part=dict(Counter(r['region_type'] for r in train)),
++   unique_training_conditions_by_tier=dict(Counter(r['tier'] for r in train)),
++   deduplicated_training_tier_aliases=3*len(tr)-len(train),
++   dev_conditions=len(dev),dev_parents=len({r['uid'] for r in dev}),old_regression_conditions=8,old_regression_requests=16,
++   future_total_output_requests=3*(len(dev)*2+16),future_new_generation_if_old16_reusable=3*(len(dev)*2+16)-16,
++   train_K_min=min(r['K'] for r in train),train_K_max=max(r['K'] for r in train),
++   train_N_min=min(r['N'] for r in train),train_N_max=max(r['N'] for r in train),
++   train_face_fraction_range=[min(r['face_fraction'] for r in train),max(r['face_fraction'] for r in train)],
++   train_whole_area_fraction_range=[min(r['parent_area_fraction'] for r in train),max(r['parent_area_fraction'] for r in train)],
++   dev_requested_tiers=dict(Counter(regmap[r['region_id']]['dev_requested_tier'] for r in dev)),
++   rejected_regions=[dict(uid=r['uid'],split=r['split'],region_type=r['region_type'],status=r['status'],reason=r['reason']) for r in regions if not r['status'].startswith('ACCEPTED')],
++   excluded_training_parents=[r['uid'] for r in byparent if r['split']=='train' and not r['included_in_new_pool']],
++   source_CY_arrays=len(rows),source_CY_npz_bytes=sum(Path(r['npz']).stat().st_size for r in rows),
++   training_updates=0,model_calls=0,OT_calls=0,new_Gaussian_draws=0,generated_full_meshes=0,
++   route='R2 Native/T1+role+Geo, FM, full-course HYBRID=.25; new C pool replaces the old C20/C40 construction',
++   semantic_status='AI_PROXY; data ready for review, not human certified or training executed')
++ write(out/'data_summary.json',summary)
++ esc=html.escape
++ blocks=[]
++ for r in tables:
++  rel=r['condition_id']+'.png'
++  meta=f"{r['split']} | {r['region_type']} | {'/'.join(r['requested_tiers'])} | K/N={r['K']}/{r['N']} | C/R={r['region_area_fraction']:.1%} | C/M area={r['parent_area_fraction']:.1%}"
++  quality=' / '.join(f"{p} {r[p+'_confirmed_pairs']} + {r[p+'_unknown_pairs']}?" for p in ('CC','CF','FF'))
++  ids=json.dumps(r['source_face_ids'])
++  blocks.append(f'<article data-split="{r["split"]}" data-part="{r["region_type"]}" data-tier="{r["tier"]}" data-uid="{r["uid"]}"><h2>{esc(r["condition_id"])}</h2><p>{esc(meta)}<br>来源几何对数（确认 + 未决?）：{esc(quality)}<br>{esc(r["R_definition"])}</p><a href="conditions/{rel}"><img loading="lazy" src="conditions/{rel}" alt="{esc(r["condition_id"])}"></a><details><summary>原面ID及数据</summary><p>C IDs: {esc(ids)}</p><a href="../conditions/{r["condition_id"]}.npz">C / Y NPZ</a></details></article>')
++ nas=''.join(f'<tr><td>{esc(r["uid"])}</td><td>{r["split"]} / {r["region_type"]}</td><td>{esc(r["status"])}</td><td>{esc(r["reason"])}</td><td><a href="proposals/{r["uid"]}__candidates.png">原模型</a></td></tr>' for r in summary['rejected_regions'])
++ page='''<!doctype html><html lang="zh"><meta charset="utf-8"><title>R2 条件数据审阅</title>
++<style>body{font:15px system-ui,sans-serif;margin:24px auto;max-width:1500px;padding:0 20px;color:#192b35;background:#f6f8fa}header,article{background:white;padding:18px 24px;border-radius:10px;margin:16px 0}h1{font-size:28px}h2{font-size:16px;overflow-wrap:anywhere}p{line-height:1.65}img{width:100%;height:auto}nav{position:sticky;top:0;background:#e5eff4;padding:12px;z-index:2}select,input{margin:0 12px 0 4px;padding:6px}table{border-collapse:collapse;width:100%;background:white;font-size:13px}td,th{border:1px solid #ddd;padding:9px;overflow-wrap:anywhere}details{padding:8px;background:#f5f7f9}[hidden]{display:none!important}a{color:#005b88}</style>
++<header><h1>R2 用户式条件数据审阅</h1><p>25个训练父 / 47个区域 / 122条去重条件；7条新DEV条件。所有图均为来源数据划分，不是模型生成结果。两行是同一对象的两个视角；每张图从左到右为 M｜R｜C｜Y｜C+Y。蓝色为输入C，橙色为来源补集Y。每对象各栏共享相机和尺度。</p><p>AI_PROXY视觉核对，不等于人工语义标注。完整（full）指声明的区域R；原网格缺陷未修复。数值分开列CC／CF／FF，“0”不认证几何完美；“?”是未决。后续训练配方保持R2。</p><a href="../DATA_PREPARATION_REPORT.md">报告</a> · <a href="../tables/conditions.csv">逐条件CSV</a> · <a href="../tables/regions.csv">区域与NA表</a> · <a href="../dataset_handoff.json">后续数据合同</a></header>
++<nav>集合<select id="s"><option value="">全部</option><option>train</option><option>dev</option></select>区域<select id="p"><option value="">全部</option><option>seat</option><option>back</option></select>独立档位<select id="t"><option value="">全部</option><option>small</option><option>medium</option><option>full</option></select>父ID<input id="q" placeholder="如 12c2"><b id="n"></b></nav>'''
++ page+=''.join(blocks)+f'<header><h2>未采用区域：完整记录</h2><table><tr><th>父ID</th><th>集合／区域</th><th>状态</th><th>原因</th><th>查看</th></tr>{nas}</table></header>'
++ page+='''<script>const controls=["s","p","t","q"].map(x=>document.getElementById(x));function filter(){let[s,p,t,q]=controls.map(x=>x.value.toLowerCase());let n=0;for(let a of document.querySelectorAll("article")){a.hidden=!!((s&&a.dataset.split!==s)||(p&&a.dataset.part!==p)||(t&&a.dataset.tier!==t)||(q&&!a.dataset.uid.includes(q)));if(!a.hidden)n++;}document.getElementById("n").textContent=n+" 条";}controls.forEach(x=>x.addEventListener("input",filter));filter();</script></html>'''
++ text_file(out/'gallery/all_exported.html',page)
++ event(out,'TABLES_AND_GALLERY_INDEX_WRITTEN',conditions=len(rows),csv_tables=4,model_calls=0)
++ print(json.dumps(summary,ensure_ascii=False,indent=2))
++if __name__=='__main__':main()
+--- /dev/null
++++ b/r2/data_tools/user_conditions_v1/test_construct.py
+@@ -0,0 +1,33 @@
++import numpy as np
++import pytest
++from construct import nested_extents,partition_arrays
++
++def fixture():
++    vertices=np.array([[0,0,0],[1,0,0],[0,0,1],[1,0,1],[0,-1,0]],np.float32)
++    faces=np.array([[0,1,2],[1,3,2],[0,4,1]],np.int64)
++    target=vertices[faces].reshape(-1,9)
++    return dict(full_target=target,source_faces=faces,pre_ot_full=target.reshape(-1,3,3)/np.float32(2),
++        retained_to_original_face=np.array([9,11,20]),source_face_vertex_ids=faces,
++        source_corner_permutations=np.tile(np.arange(3),(3,1)))
++
++def test_two_triangle_surface_deduplicates_and_is_nested():
++    a=fixture();rows,audit=nested_extents(a["full_target"],a["source_faces"],[0,1],"seat")
++    assert len(rows)==2
++    assert rows[0]["requested_tiers"]==["small","medium"]
++    assert rows[0]["region_area_fraction"]==.5 and rows[1]["region_area_fraction"]==1.
++    assert set(rows[0]["source_face_ids"])<set(rows[1]["source_face_ids"])
++
++def test_parent_partition_preserves_bits_and_original_ids():
++    a=fixture();a["full_target"][0,0]=np.float32(-0.)
++    a["pre_ot_full"]=a["full_target"].reshape(-1,3,3)/np.float32(2)
++    result=partition_arrays(a,[1,0])
++    assert result["C"].tobytes()==a["full_target"][[0,1]].reshape(-1,3,3).tobytes()
++    assert result["Y"].tobytes()==a["full_target"][[2]].reshape(-1,3,3).tobytes()
++    assert result["original_source_face_ids"].tolist()==[9,11]
++    assert result["free_original_source_face_ids"].tolist()==[20]
++
++def test_disconnected_region_fails():
++    a=fixture()
++    faces=a["source_faces"].copy();faces[1]=[7,8,9]
++    with pytest.raises(ValueError,match="connected"):
++        nested_extents(a["full_target"],faces,[0,1],"seat")
+--- /dev/null
++++ b/r2/data_tools/user_conditions_v1/test_quality.py
+@@ -0,0 +1,38 @@
++"""Small CPU tests for the new partition adapter; no source data rescans."""
++import json
++from pathlib import Path
++import tempfile
++import unittest
++import quality
++
++class QualityTest(unittest.TestCase):
++    def test_unknown_not_clean(self):
++        rows = [{"pair": [0, 1], "classification": quality.PROPER},
++                {"pair": [0, 2], "classification": quality.COPLANAR},
++                {"pair": [1, 2], "classification": "UNRESOLVED"},
++                {"pair": [2, 3], "classification": "shared_edge_contact"}]
++        value = quality.summarize_pairs(rows, 6)
++        self.assertEqual(value["category_counts"], dict(proper=1, coplanar_positive_overlap=1, UNKNOWN=1, legal_contact=1, disjoint=2))
++        self.assertEqual(value["confirmed_illegal_pair_count"], 2)
++        self.assertEqual(value["unknown_pair_count"], 1)
++        self.assertEqual(value["status"], "PARTIAL_UNKNOWN")
++
++    def test_partition_ids_and_denominators(self):
++        rows = [{"pair": [0, 1], "original_face_ids": [10, 11], "classification": quality.PROPER},
++                {"pair": [0, 2], "original_face_ids": [10, 12], "classification": "UNRESOLVED"},
++                {"pair": [2, 3], "original_face_ids": [12, 13], "classification": quality.COPLANAR}]
++        parent = dict(N=4, pair_contacts=rows, face_id_policy="test", whole_parent=quality.summarize_pairs(rows, 6),
++            basic_geometry=dict(exact_duplicate_groups=[], nonfinite_source_face_ids=[], exact_zero_area_source_face_ids=[]))
++        with tempfile.TemporaryDirectory() as folder:
++            path = Path(folder) / "parents/u.json"
++            path.parent.mkdir()
++            path.write_text(json.dumps(parent))
++            groups = quality.partition_condition("u", [0, 1], folder)["partitions"]
++            self.assertEqual([groups[g]["expected_pairs"] for g in ("CC", "CF", "FF")], [1, 4, 1])
++            self.assertEqual(groups["CC"]["confirmed_illegal_pair_count"], 1)
++            self.assertEqual(groups["CF"]["unknown_pair_count"], 1)
++            self.assertEqual(groups["FF"]["problem_pairs"][0]["original_face_ids"], [12, 13])
++            with self.assertRaises(ValueError): quality.partition_condition("u", [0, 0], folder)
++            with self.assertRaises(ValueError): quality.partition_condition("u", [], folder)
++
++if __name__ == "__main__": unittest.main()--- /dev/null
++++ b/r2/data_tools/user_conditions_v1/test_verify_export.py
+@@ -0,0 +1,34 @@
++"""Negative controls for preservation and original-ID connectivity checks."""
++import unittest
++
++import numpy as np
++
++from verify_export import connected_components, same_bytes, triangle_areas
++
++
++class IndependentVerifierTests(unittest.TestCase):
++    def test_bitwise_detects_signed_zero_dtype_and_shape(self):
++        positive = np.asarray([0.0], dtype=np.float32)
++        negative = np.asarray([-0.0], dtype=np.float32)
++        self.assertTrue(np.array_equal(positive, negative))
++        self.assertFalse(same_bytes(positive, negative))
++        self.assertFalse(same_bytes(positive, positive.astype(np.float64)))
++        self.assertFalse(same_bytes(positive, positive.reshape(1, 1)))
++        self.assertTrue(same_bytes(positive, positive.copy()))
++
++    def test_shared_vertex_is_not_edge_connectivity(self):
++        faces = np.asarray([[0, 1, 2], [2, 1, 3], [3, 4, 5], [5, 4, 6]])
++        self.assertEqual(connected_components(faces, [0, 1]), [[0, 1]])
++        self.assertEqual(connected_components(faces, [0, 1, 2, 3]), [[0, 1], [2, 3]])
++        self.assertEqual(connected_components(faces, [0, 3]), [[0], [3]])
++
++    def test_degenerate_and_small_positive_triangles_remain_distinct(self):
++        faces = np.asarray([[[0, 0, 0], [1, 0, 0], [2, 0, 0]],
++                            [[0, 0, 0], [1e-8, 0, 0], [0, 1e-8, 0]]], dtype=np.float32)
++        values = triangle_areas(faces)
++        self.assertEqual(values[0], 0)
++        self.assertGreater(values[1], 0)
++
++
++if __name__ == "__main__":
++    unittest.main()
+--- /dev/null
++++ b/r2/data_tools/user_conditions_v1/verify_active.py
+@@ -0,0 +1,173 @@
++"""Verify active subset references without rerunning or modifying export validation."""
++from __future__ import annotations
++
++import argparse
++from collections import Counter, defaultdict
++import json
++from pathlib import Path
++import resource
++import time
++
++from verify_export import ACCEPTED, Verifier, quality_summary, read, sha
++
++
++FROZEN_EXPORT_VALIDATION_SHA256 = "0eae505428b082f6474e11ee664ea3e3975ce64c916854a1ef694371c9da9649"
++EXPECTED_HELD = {
++    "21f2927b04e2f22830ddb6ead95f49cc__seat__small",
++    "21f2927b04e2f22830ddb6ead95f49cc__back__small",
++    "47da08d9c7cd7e104b3c42e318f3affc__seat__small",
++    "47da08d9c7cd7e104b3c42e318f3affc__back__small",
++    "73b369b9808bc2d0f6ba522682be8978__seat__small",
++    "c1b8c2f0c4f3cc43aff7c08b060f5ed6__seat__small",
++}
++
++
++def verify_active(out):
++    started = time.perf_counter()
++    out = Path(out)
++    validator = Verifier()
++    filenames = ("validation_export.json", "conditions.json", "regions.json",
++                 "quality/summary.json", "usability_review.json", "active_conditions.json")
++    hashes_before = {str(out / name): sha(out / name) for name in filenames}
++    baseline = read(out / "validation_export.json")
++    original = read(out / "conditions.json")
++    active = read(out / "active_conditions.json")
++    review = read(out / "usability_review.json")
++    regions = read(out / "regions.json")
++    quality = read(out / "quality/summary.json")
++    originals = {r["condition_id"]: r for r in original["rows"]}
++    rows = active["rows"]
++    active_ids = [r["condition_id"] for r in rows]
++    held_ids = [r["condition_id"] for r in review["rows"]]
++    baseline_quality = {r["condition_id"]: r for r in baseline["per_condition_source_geometry"]}
++    baseline_results = {r["condition_id"]: r for r in baseline["condition_results"]}
++    quality_parents = {r["uid"]: r for r in quality["rows"]}
++    validator.hash(out / "validation_export.json", FROZEN_EXPORT_VALIDATION_SHA256,
++                   "ORIGINAL_6154_CHECK_REPORT_UNCHANGED")
++    validator.check(baseline["status"] == "PASS" and baseline["check_count"] == 6154 and baseline["failure_count"] == 0,
++                    "FROZEN_EXPORT_VALIDATION_PASS", "validation_export")
++    for name in ("conditions.json", "regions.json", "quality/summary.json"):
++        validator.hash(out / name, baseline["input_manifests"][str(out / name)], "baseline_binding/" + name)
++    validator.hash(active["source_all_exported_manifest"], active["source_all_exported_sha256"], "active_source_binding")
++    validator.check(Path(active["source_all_exported_manifest"]) == out / "conditions.json",
++                    "ACTIVE_REFERENCES_ORIGINAL_CONDITIONS", "active_conditions")
++    validator.hash(out / "usability_review.json", active["usability_review_sha256"], "active_review_binding")
++    validator.hash(out / "conditions.json", review["source_manifest_sha256"], "review_source_binding")
++    validator.check(len(originals) == len(original["rows"]) == 129, "ORIGINAL_129_UNIQUE_EXPORTS_PRESERVED", "conditions")
++    validator.check(len(active_ids) == len(set(active_ids)) == 123, "ACTIVE_123_UNIQUE_REFERENCES", "active_conditions")
++    validator.check(len(held_ids) == len(set(held_ids)) == 6 and set(held_ids) == EXPECTED_HELD,
++                    "EXACT_SIX_REGISTERED_HOLDS", "usability_review")
++    validator.check(set(active_ids).isdisjoint(held_ids) and set(active_ids) | set(held_ids) == set(originals),
++                    "ACTIVE_AND_HOLD_DISJOINT_COMPLETE_ORIGINAL_PARTITION", "active_conditions")
++    validator.check(set(active["held_condition_ids"]) == EXPECTED_HELD and len(active["held_condition_ids"]) == 6,
++                    "ACTIVE_HELD_LIST_MATCHES_REVIEW", "active_conditions")
++    counts = Counter(r["split"] for r in rows)
++    hold_counts = Counter(r["split"] for r in review["rows"])
++    validator.check(counts == {"train": 117, "dev": 6}, "ACTIVE_SPLIT_COUNTS_117_6", "active_conditions")
++    validator.check(hold_counts == {"train": 5, "dev": 1}, "HELD_SPLIT_COUNTS_5_1", "usability_review")
++    validator.check(active["train_condition_count"] == 117 and active["dev_condition_count"] == 6,
++                    "ACTIVE_REPORTED_COUNTS_ACCURATE", "active_conditions")
++    train_parents = {r["uid"] for r in rows if r["split"] == "train"}
++    original_train_parents = {r["uid"] for r in original["rows"] if r["split"] == "train"}
++    validator.check(train_parents == original_train_parents and len(train_parents) == 25,
++                    "ALL_25_TRAIN_PARENTS_RETAINED", "active_conditions")
++    validator.check(set(active["train_parents"]) == train_parents and len(active["train_parents"]) == 25,
++                    "ACTIVE_PARENT_LIST_ACCURATE", "active_conditions")
++    validator.check(train_parents.isdisjoint({r["uid"] for r in rows if r["split"] == "dev"}),
++                    "ACTIVE_TRAIN_DEV_DISJOINT", "active_conditions")
++    by_region = defaultdict(list)
++    for row in rows:
++        cid = row["condition_id"]
++        validator.check(cid in originals and row == originals[cid], "ACTIVE_ROW_EXACT_ORIGINAL_REFERENCE", cid)
++        validator.hash(row["npz"], row["sha256"], "active_npz/" + cid)
++        validator.check(cid in baseline_results and baseline_results[cid]["status"] == "PASS",
++                        "ACTIVE_REFERENCES_PREVIOUSLY_VERIFIED_EXPORT", cid)
++        validator.check(cid in baseline_quality, "ACTIVE_HAS_FROZEN_SOURCE_QUALITY", cid)
++        by_region[row["region_id"]].append(row)
++    held_evidence = []
++    for row in review["rows"]:
++        cid = row["condition_id"]
++        source = originals[cid]
++        validator.check(row["uid"] == source["uid"] and row["split"] == source["split"], "HELD_SOURCE_IDENTITY", cid)
++        validator.check(row["include_in_active_pool"] is False and row["status"] == "HOLD_TINY_EDGE_STRIP_AI_PROXY",
++                        "HELD_EXPLICIT_NEGATIVE_DISPOSITION", cid)
++        validator.check(isinstance(row["reason"], str) and len(row["reason"].strip()) > 20,
++                        "HELD_HAS_NEGATIVE_REASON", cid)
++        validator.check(row["image_actually_viewed"] is True and "AI_PROXY" in row["reviewer"],
++                        "HELD_HAS_ACTUAL_AI_PROXY_REVIEW_RECORD", cid)
++        validator.check(row["original_npz"] == source["npz"] and row["original_npz_sha256"] == source["sha256"],
++                        "HELD_ORIGINAL_DATA_REFERENCE", cid)
++        validator.hash(row["original_npz"], row["original_npz_sha256"], "held_npz/" + cid)
++        validator.hash(row["image"], row["image_sha256"], "held_image/" + cid)
++        with Path(row["image"]).open("rb") as stream:
++            validator.check(stream.read(8) == b"\x89PNG\r\n\x1a\n", "HELD_IMAGE_PNG_RETAINED", cid)
++        validator.check(row["region_area_fraction"] == source["region_area_fraction"], "HELD_AREA_REFERENCE_UNCHANGED", cid)
++        held_evidence.append(dict(condition_id=cid, split=row["split"], status=row["status"], reason=row["reason"],
++            npz=row["original_npz"], npz_sha256=row["original_npz_sha256"], image=row["image"],
++            image_sha256=row["image_sha256"], image_actually_viewed_recorded=True,
++            independent_validator_visual_review=False))
++    region_coverage = []
++    accepted_train_regions = [r for r in regions["rows"] if r["split"] == "train" and r["status"] in ACCEPTED]
++    validator.check(len(accepted_train_regions) == 47, "47_ACCEPTED_TRAIN_REGIONS", "regions")
++    for region in accepted_train_regions:
++        rid = region["region_id"]
++        selections = by_region[rid]
++        tiers = defaultdict(list)
++        for row in selections:
++            for tier in row["requested_tiers"]:
++                tiers[tier].append(row["condition_id"])
++        validator.check(len(tiers["medium"]) == 1 and len(tiers["full"]) == 1,
++                        "TRAIN_REGION_MEDIUM_AND_FULL_RETAINED", rid)
++        if tiers["full"]:
++            full = originals[tiers["full"][0]]
++            validator.check(set(full["source_face_ids"]) == set(region["source_face_ids"]), "FULL_REMAINS_COMPLETE_R", rid)
++        region_coverage.append(dict(region_id=rid, uid=region["uid"], available_requested_tiers=sorted(tiers),
++            medium_condition_ids=tiers["medium"], full_condition_ids=tiers["full"],
++            held_small_condition_ids=sorted(cid for cid in EXPECTED_HELD if originals[cid]["region_id"] == rid)))
++    validator.check(review["model_output_selection"] is False and review["training_authorization"] is False,
++                    "REVIEW_PRE_MODEL_AND_NOT_TRAINING_AUTHORIZATION", "usability_review")
++    validator.check(active["new_generated_arrays"] == 0, "ACTIVE_SUBSET_CREATES_NO_ARRAYS", "active_conditions")
++    selected_quality = [baseline_quality[cid] for cid in active_ids]
++    summary = quality_summary(selected_quality, quality_parents)
++    for path, expected in hashes_before.items():
++        validator.check(sha(path) == expected, "INPUT_UNCHANGED_DURING_ACTIVE_VALIDATION", path)
++    result = dict(schema="r2_user_conditions_active_subset_independent_validation_v1",
++        status="PASS" if not validator.failures else "FAIL", check_count=validator.check_count,
++        failure_count=len(validator.failures), failures=validator.failures,
++        implementation_sha256=sha(__file__), input_hashes=hashes_before,
++        original_validation=dict(path=str(out / "validation_export.json"), sha256=FROZEN_EXPORT_VALIDATION_SHA256,
++            checks=6154, unchanged=True, rerun=False),
++        counts=dict(original_exports=129, active_train=counts["train"], active_dev=counts["dev"],
++            held_train=hold_counts["train"], held_dev=hold_counts["dev"], train_parents=len(train_parents),
++            accepted_train_regions_with_medium_and_full=len(region_coverage)),
++        checked_file_hashes=validator.hashes, held_evidence=held_evidence,
++        accepted_train_region_coverage=region_coverage,
++        active_condition_source_geometry=summary,
++        active_condition_quality_reference=dict(path=str(out / "validation_export.json"),
++            key="per_condition_source_geometry", selected_condition_ids=active_ids),
++        limitations=[
++            "Independent check verifies preserved references and recorded visual evidence; it does not claim a second visual review of the six images.",
++            "Medium/full coverage applies to the 47 accepted TRAIN regions; DEV retains only its originally registered single tier.",
++            "The original 129 exports and their 6154-check validation remain unchanged; six holds are preparation evidence, not deleted data.",
++            "Subset quality is re-aggregation of frozen source-pair classifications, without new geometry scoring.",
++            "Zero confirmed CC does not mean source geometry is clean; CC UNKNOWN, CF and FF remain separately reported.",
++            "Condition pair occurrences repeat source pairs; unique parent totals count each source parent once."],
++        execution=dict(workers=1, numeric_threads=2, wall_seconds=time.perf_counter() - started,
++            peak_process_rss_bytes=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024,
++            model_calls=0, OT_calls=0, CUDA_calls=0, training_updates=0, new_geometry_pair_tests=0,
++            source_mutations=0, original_validation_rewrites=0))
++    target = out / "validation_active.json"
++    temporary = out / "validation_active.json.tmp"
++    temporary.write_text(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False) + "\n", encoding="utf-8")
++    temporary.replace(target)
++    print(json.dumps(dict(status=result["status"], check_count=result["check_count"], failure_count=result["failure_count"],
++        failures=result["failures"], counts=result["counts"], source_quality=summary,
++        execution=result["execution"], output=str(target)), ensure_ascii=False))
++    return not validator.failures
++
++
++if __name__ == "__main__":
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--out", type=Path, required=True)
++    arguments = parser.parse_args()
++    raise SystemExit(0 if verify_active(arguments.out) else 1)
+--- /dev/null
++++ b/r2/data_tools/user_conditions_v1/verify_export.py
+@@ -0,0 +1,406 @@
++"""Independent CPU-only verifier for reviewed source triangle exports.
++
++Never imports the constructor, loads a model, computes OT, or repairs a mesh.
++Quality partitioning reads the already frozen source-pair classifications.
++"""
++from __future__ import annotations
++
++import os
++for _key in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
++    os.environ[_key] = "2"
++
++import argparse
++from collections import Counter, defaultdict
++import hashlib
++import json
++from pathlib import Path
++import resource
++import time
++
++import numpy as np
++
++from quality import partition_condition
++
++
++ACCEPTED = {"ACCEPTED_AI_PROXY", "ACCEPTED_WITH_RISK_AI_PROXY"}
++TIERS = ("small", "medium", "full")
++
++
++def read(path):
++    return json.loads(Path(path).read_text(encoding="utf-8-sig"))
++
++
++def sha(path):
++    digest = hashlib.sha256()
++    with Path(path).open("rb") as stream:
++        for block in iter(lambda: stream.read(1048576), b""):
++            digest.update(block)
++    return digest.hexdigest()
++
++
++def same_bytes(actual, expected):
++    return (actual.dtype == expected.dtype and actual.shape == expected.shape
++            and actual.tobytes(order="C") == expected.tobytes(order="C"))
++
++
++def inventory_array_sha(array):
++    digest = hashlib.sha256()
++    digest.update(str(array.dtype).encode())
++    digest.update(str(array.shape).encode())
++    digest.update(array.tobytes(order="C"))
++    return digest.hexdigest()
++
++
++def connected_components(source_faces, ids):
++    """Exact original vertex-ID edge adjacency, with no coordinate welding."""
++    selected = set(map(int, ids))
++    links = {face: set() for face in selected}
++    edge_faces = defaultdict(list)
++    for face in selected:
++        vertices = list(map(int, source_faces[face]))
++        for i in range(3):
++            edge_faces[tuple(sorted((vertices[i], vertices[(i + 1) % 3])))].append(face)
++    for group in edge_faces.values():
++        for face in group:
++            links[face].update(set(group) - {face})
++    result = []
++    while selected:
++        pending = [min(selected)]
++        component = set()
++        while pending:
++            face = pending.pop()
++            if face in component:
++                continue
++            component.add(face)
++            pending.extend(links[face] - component)
++        selected -= component
++        result.append(sorted(component))
++    return result
++
++
++def triangle_areas(triangles):
++    points = np.asarray(triangles, dtype=np.float64).reshape(-1, 3, 3)
++    return np.linalg.norm(np.cross(points[:, 1] - points[:, 0], points[:, 2] - points[:, 0]), axis=1) * .5
++
++
++def final_status(value):
++    return (value in ACCEPTED or value == "NA" or value.startswith("NA_")
++            or value == "REJECTED" or value.startswith("REJECTED_"))
++
++
++class Verifier:
++    def __init__(self):
++        self.failures = []
++        self.check_count = 0
++        self.hashes = {}
++
++    def check(self, truth, code, subject, details=None):
++        self.check_count += 1
++        if not truth:
++            row = dict(code=code, subject=subject)
++            if details is not None:
++                row["details"] = details
++            self.failures.append(row)
++        return bool(truth)
++
++    def hash(self, path, expected, subject):
++        path = str(path)
++        try:
++            actual = self.hashes.get(path)
++            if actual is None:
++                actual = sha(path)
++                self.hashes[path] = actual
++            return self.check(actual == expected, "SHA256_UNCHANGED", subject,
++                              dict(path=path, expected=expected, actual=actual))
++        except Exception as exc:
++            return self.check(False, "HASH_READ_EXCEPTION", subject, str(exc))
++
++
++def quality_summary(rows, parents):
++    result = {}
++    for split in ("train", "dev", "all"):
++        selected = [r for r in rows if split == "all" or r["split"] == split]
++        unique = sorted({r["uid"] for r in selected})
++        pp = [parents[u] for u in unique]
++        partitions = {}
++        for name in ("CC", "CF", "FF"):
++            parts = [r["partitions"][name] for r in selected]
++            partitions[name] = dict(
++                confirmed_pair_occurrences=sum(p["confirmed_illegal_pair_count"] for p in parts),
++                unknown_pair_occurrences=sum(p["unknown_pair_count"] for p in parts),
++                conditions_with_confirmed_pairs=sum(p["confirmed_illegal_pair_count"] > 0 for p in parts),
++                conditions_with_unknown_pairs=sum(p["unknown_pair_count"] > 0 for p in parts),
++                expected_pair_occurrences=sum(p["expected_pairs"] for p in parts))
++        result[split] = dict(condition_count=len(selected), unique_parent_count=len(unique),
++            unique_parent_uids=unique,
++            unique_parent_confirmed_pairs=sum(p["confirmed_illegal_pair_count"] for p in pp),
++            unique_parent_unknown_pairs=sum(p["unknown_pair_count"] for p in pp),
++            unique_parents_with_confirmed_pairs=sum(p["confirmed_illegal_pair_count"] > 0 for p in pp),
++            unique_parents_with_unknown_pairs=sum(p["unknown_pair_count"] > 0 for p in pp),
++            partitions=partitions,
++            conditions_without_confirmed_or_unknown_pairs_in_any_partition=sum(
++                all(r["partitions"][n]["confirmed_illegal_pair_count"] == 0 and
++                    r["partitions"][n]["unknown_pair_count"] == 0 for n in ("CC", "CF", "FF")) for r in selected))
++    return result
++
++
++def verify(out):
++    started = time.perf_counter()
++    out = Path(out)
++    verifier = Verifier()
++    inventory = read(out / "parent_inventory.json")
++    regions = read(out / "regions.json")
++    conditions = read(out / "conditions.json")
++    quality = read(out / "quality/summary.json")
++    parent_rows = inventory["rows"]
++    parent_by_uid = {r["uid"]: r for r in parent_rows}
++    region_rows = regions["rows"]
++    region_by_id = {r["region_id"]: r for r in region_rows}
++    quality_by_uid = {r["uid"]: r for r in quality["rows"]}
++    manifest_rows = conditions["rows"]
++    arrays = {}
++    condition_quality = []
++    condition_results = []
++    region_results = []
++    before_hashes = {str(out / name): sha(out / name) for name in
++                     ("parent_inventory.json", "regions.json", "conditions.json", "quality/summary.json")}
++    verifier.check(len(parent_rows) == len(parent_by_uid) == 34, "34_UNIQUE_SOURCE_PARENTS", "inventory")
++    verifier.check(Counter(r["split"] for r in parent_rows) == {"train": 26, "dev": 8},
++                   "SOURCE_SPLIT_COUNTS", "inventory")
++    for key in ("uid", "group_id", "sha256", "full_target_sha256"):
++        train = {r[key] for r in parent_rows if r["split"] == "train"}
++        dev = {r[key] for r in parent_rows if r["split"] == "dev"}
++        verifier.check(not train.intersection(dev), "TRAIN_DEV_SEPARATION", key,
++                       sorted(train.intersection(dev)))
++    for row in parent_rows:
++        uid = row["uid"]
++        verifier.hash(row["npz"], row["sha256"], uid)
++        with np.load(row["npz"], allow_pickle=False) as data:
++            arrays[uid] = {key: data[key].copy() for key in data.files}
++        source = arrays[uid]
++        target = source["full_target"]
++        verifier.check(target.shape == (row["N"], 9) and target.dtype == np.float32,
++                       "PARENT_FP32_N", uid)
++        verifier.check(inventory_array_sha(target) == row["full_target_sha256"],
++                       "PARENT_ARRAY_INVENTORY_HASH", uid)
++        verifier.check(same_bytes(source["model_vertices"][source["source_face_vertex_ids"]],
++                                  target.reshape(-1, 3, 3)), "PARENT_VERTEX_MAPPING", uid)
++        verifier.check(same_bytes(source["pre_ot_full"] * np.float32(2), target.reshape(-1, 3, 3)),
++                       "PARENT_PRE_OT_SCALE", uid)
++        qrow = quality_by_uid[uid]
++        verifier.hash(qrow["quality_path"], qrow["quality_sha256"], "quality/" + uid)
++        qparent = read(qrow["quality_path"])
++        verifier.check(hashlib.sha256(target.tobytes()).hexdigest() == qparent["full_target_sha256"],
++                       "QUALITY_RAW_BYTE_HASH", uid)
++        verifier.hash(qparent["scan_origin"]["path"], qparent["scan_origin"]["sha256"], "scan/" + uid)
++    for path, expected in quality["protected_hashes"].items():
++        verifier.hash(path, expected, "quality_protected")
++    verifier.hash(Path(__file__).with_name("quality.py"), quality["implementation_sha256"], "quality_implementation")
++    old = read(out / "old_regression_selection.json")
++    skipped_weight_hashes = []
++    for path, expected in old["source_files"].items():
++        if Path(path).suffix.lower() in {".pt", ".pth", ".ckpt", ".safetensors"}:
++            skipped_weight_hashes.append(path)
++            continue
++        verifier.hash(path, expected, "old_regression_protected")
++    verifier.check(len({r["condition_id"] for r in old["rows"]}) == 8 and len(old["rows"]) == 16,
++                   "OLD_REGRESSION_8_CONDITIONS_16_REGISTERED_REQUESTS", "old_regression")
++    expected_train = {(r["uid"], kind) for r in parent_rows if r["split"] == "train" for kind in ("seat", "back")}
++    actual_train = [(r["uid"], r["region_type"]) for r in region_rows if parent_by_uid[r["uid"]]["split"] == "train"]
++    verifier.check(len(actual_train) == 52 and set(actual_train) == expected_train,
++                   "52_TRAIN_REGION_RECORDS", "regions")
++    verifier.check(len(region_rows) == len(region_by_id), "REGION_ID_UNIQUE", "regions")
++    for row in region_rows:
++        rid, uid = row["region_id"], row["uid"]
++        status = row["status"]
++        verifier.check(final_status(status), "REGION_FINAL_STATUS", rid, status)
++        if status not in ACCEPTED:
++            continue
++        ids = row["source_face_ids"]
++        n = parent_by_uid[uid]["N"]
++        good_ids = bool(ids) and len(set(ids)) == len(ids) and all(isinstance(i, int) and 0 <= i < n for i in ids)
++        verifier.check(good_ids, "REGION_SOURCE_IDS", rid)
++        components = connected_components(arrays[uid]["source_faces"], ids) if good_ids else []
++        verifier.check(len(components) == 1, "REGION_EDGE_CONNECTED", rid, components)
++        region_results.append(dict(region_id=rid, uid=uid, split=parent_by_uid[uid]["split"],
++                                   status=status, source_face_count=len(ids), components=components))
++    verifier.hash(out / "regions.json", conditions["source_region_manifest_sha256"], "conditions_region_binding")
++    ids_seen = set()
++    face_sets_by_parent = defaultdict(set)
++    by_region = defaultdict(list)
++    for row in manifest_rows:
++        cid, uid = row["condition_id"], row["uid"]
++        failures_before = len(verifier.failures)
++        try:
++            verifier.check(cid not in ids_seen, "CONDITION_ID_UNIQUE", cid)
++            ids_seen.add(cid)
++            parent = parent_by_uid[uid]
++            region = region_by_id[row["region_id"]]
++            verifier.check(region["status"] in ACCEPTED, "EXPORTED_REGION_ACCEPTED", cid)
++            verifier.check(row["split"] == parent["split"] and region["uid"] == uid,
++                           "CONDITION_PARENT_SPLIT", cid)
++            verifier.check(row["region_status"] == region["status"] and row["region_type"] == region["region_type"],
++                           "CONDITION_REGION_BINDING", cid)
++            verifier.check(set(row["region_source_face_ids"]) == set(region["source_face_ids"]),
++                           "CONDITION_REGION_FACE_BINDING", cid)
++            verifier.check(row["parent_npz"] == parent["npz"] and row["parent_sha256"] == parent["sha256"],
++                           "CONDITION_PARENT_FILE_BINDING", cid)
++            verifier.hash(row["npz"], row["sha256"], cid)
++            with np.load(row["npz"], allow_pickle=False) as data:
++                exported = {key: data[key].copy() for key in data.files}
++            source = arrays[uid]
++            n = len(source["full_target"])
++            selected = np.asarray(row["source_face_ids"], dtype=np.int64)
++            free = np.asarray(row["free_source_ids"], dtype=np.int64)
++            k = len(selected)
++            valid_ids = (len(set(selected.tolist())) == k and k > 0 and
++                         bool(np.all((selected >= 0) & (selected < n))))
++            verifier.check(valid_ids, "CONDITION_SOURCE_IDS", cid)
++            if not valid_ids:
++                raise ValueError("Invalid source IDs prevent dependent checks")
++            expected_free = np.asarray([i for i in range(n) if i not in set(selected.tolist())], dtype=np.int64)
++            verifier.check(same_bytes(free, expected_free), "DISJOINT_COMPLETE_COMPLEMENT", cid)
++            verifier.check(set(selected.tolist()) <= set(region["source_face_ids"]), "C_SUBSET_R", cid)
++            verifier.check(row["N"] == n and row["K"] == k and int(exported["N"]) == n and int(exported["K"]) == k,
++                           "N_K_CONTRACT", cid)
++            expected_arrays = {
++                "C": source["full_target"][selected].reshape(k, 3, 3),
++                "Y": source["full_target"][expected_free].reshape(n - k, 3, 3),
++                "source_face_ids": selected, "free_source_ids": expected_free,
++                "original_source_face_ids": source["retained_to_original_face"][selected],
++                "free_original_source_face_ids": source["retained_to_original_face"][expected_free],
++                "C_source_vertex_ids": source["source_face_vertex_ids"][selected],
++                "Y_source_vertex_ids": source["source_face_vertex_ids"][expected_free],
++                "C_source_corner_permutations": source["source_corner_permutations"][selected],
++                "Y_source_corner_permutations": source["source_corner_permutations"][expected_free],
++                "C_pre_ot": source["pre_ot_full"][selected],
++                "Y_pre_ot": source["pre_ot_full"][expected_free],
++            }
++            for name, expected in expected_arrays.items():
++                verifier.check(name in exported and same_bytes(exported[name], expected),
++                               "EXACT_SOURCE_ARRAY_" + name, cid)
++            reconstructed = np.empty_like(source["full_target"].reshape(n, 3, 3))
++            reconstructed[selected] = exported["C"]
++            reconstructed[expected_free] = exported["Y"]
++            verifier.check(same_bytes(reconstructed, source["full_target"].reshape(n, 3, 3)),
++                           "C_Y_REASSEMBLE_M_BITWISE", cid)
++            verifier.check(np.isfinite(exported["C"]).all(), "C_FINITE", cid)
++            areas = triangle_areas(exported["C"])
++            verifier.check(bool(np.all(areas > 0)), "C_NO_EXACT_DEGENERATE_FACE", cid,
++                           selected[areas <= 0].tolist())
++            points = exported["C"]
++            tri_keys = [tuple(sorted(tuple(float(v) for v in corner) for corner in face)) for face in points]
++            verifier.check(len(set(tri_keys)) == k, "C_NO_EXACT_DUPLICATE_GEOMETRY", cid)
++            comps = connected_components(source["source_faces"], selected)
++            verifier.check(len(comps) == 1, "C_EDGE_CONNECTED", cid, comps)
++            key = tuple(sorted(selected.tolist()))
++            verifier.check(key not in face_sets_by_parent[uid], "C_DEDUP_PER_PARENT", cid)
++            face_sets_by_parent[uid].add(key)
++            all_areas = triangle_areas(source["full_target"])
++            c_area = float(areas.sum())
++            r_area = float(all_areas[region["source_face_ids"]].sum())
++            m_area = float(all_areas.sum())
++            expected_numbers = dict(C_area=c_area, R_area=r_area, M_area=m_area,
++                                    face_fraction=k / n, region_area_fraction=c_area / r_area,
++                                    parent_area_fraction=c_area / m_area)
++            for name, expected in expected_numbers.items():
++                verifier.check(np.isclose(row[name], expected, rtol=1e-12, atol=1e-12),
++                               "AREA_OR_FRACTION_" + name, cid)
++            requested = row["requested_tiers"]
++            verifier.check(bool(requested) and len(requested) == len(set(requested)) and set(requested) <= set(TIERS),
++                           "VALID_REQUESTED_TIERS", cid)
++            by_region[row["region_id"]].append(row)
++            q = partition_condition(uid, selected.tolist(), out / "quality")
++            verifier.check(q["C_nonfinite_source_face_ids"] == [] and q["C_zero_area_source_face_ids"] == [],
++                           "C_QUALITY_FINITE_NONDEGENERATE", cid)
++            for name, denominator in (("CC", k * (k - 1) // 2), ("CF", k * (n - k)), ("FF", (n - k) * (n - k - 1) // 2)):
++                verifier.check(q["partitions"][name]["expected_pairs"] == denominator,
++                               "PARTITION_DENOMINATOR_" + name, cid)
++            verifier.check(sum(q["partitions"][name]["confirmed_illegal_pair_count"] for name in ("CC", "CF", "FF")) ==
++                           quality_by_uid[uid]["confirmed_illegal_pair_count"], "QUALITY_CONFIRMED_PARTITION_COMPLETENESS", cid)
++            verifier.check(sum(q["partitions"][name]["unknown_pair_count"] for name in ("CC", "CF", "FF")) ==
++                           quality_by_uid[uid]["unknown_pair_count"], "QUALITY_UNKNOWN_PARTITION_COMPLETENESS", cid)
++            condition_quality.append(dict(condition_id=cid, uid=uid, split=row["split"], region_id=row["region_id"],
++                N=n, K=k, parent_quality_sha256=q["parent_quality_sha256"], partitions=q["partitions"]))
++            condition_results.append(dict(condition_id=cid, status="PASS" if len(verifier.failures) == failures_before else "FAIL",
++                K=k, N=n, minimum_C_area=float(areas.min()), source_edge_component_count=len(comps)))
++        except Exception as exc:
++            verifier.check(False, "CONDITION_CHECK_EXCEPTION", cid, repr(exc))
++            condition_results.append(dict(condition_id=cid, status="FAIL"))
++    for rid, region in region_by_id.items():
++        rows = by_region[rid]
++        if region["status"] not in ACCEPTED:
++            verifier.check(not rows, "UNACCEPTED_REGION_HAS_NO_EXPORT", rid)
++            continue
++        split = parent_by_uid[region["uid"]]["split"]
++        tier_rows = defaultdict(list)
++        for row in rows:
++            for tier in row["requested_tiers"]:
++                tier_rows[tier].append(row)
++        if split == "train":
++            verifier.check(set(tier_rows) == set(TIERS) and all(len(v) == 1 for v in tier_rows.values()),
++                           "TRAIN_ALL_THREE_TIERS_EXACTLY_ONCE_AFTER_DEDUP", rid)
++            if set(tier_rows) == set(TIERS):
++                sets = [set(tier_rows[t][0]["source_face_ids"]) for t in TIERS]
++                verifier.check(sets[0] <= sets[1] <= sets[2] == set(region["source_face_ids"]),
++                               "TIERS_NESTED_FULL_IS_R", rid)
++        else:
++            verifier.check(len(rows) == 1 and region["dev_requested_tier"] in rows[0]["requested_tiers"],
++                           "DEV_SINGLE_REGISTERED_TIER", rid)
++        if "full" in tier_rows:
++            verifier.check(set(tier_rows["full"][0]["source_face_ids"]) == set(region["source_face_ids"]),
++                           "FULL_TIER_EQUALS_R", rid)
++    counts = Counter(r["split"] for r in manifest_rows)
++    verifier.check(counts["train"] <= 156 and counts["dev"] <= 8,
++                   "AUTHORIZED_CONDITION_CAPS", "conditions", dict(counts))
++    verifier.check(all(n <= 1 for n in Counter(r["uid"] for r in manifest_rows if r["split"] == "dev").values()),
++                   "DEV_MAX_ONE_C_PER_PARENT", "conditions")
++    verifier.check(conditions["train_condition_count"] == counts["train"] and conditions["dev_condition_count"] == counts["dev"],
++                   "MANIFEST_COUNT_ACCURACY", "conditions")
++    for name in ("created_noise_arrays", "OT_calls", "model_calls", "training_updates"):
++        verifier.check(conditions.get(name) == 0, "ZERO_STAGE_EXECUTION_LEDGER", name)
++    for path, expected in before_hashes.items():
++        # Deliberately bypass the earlier read cache to catch a concurrent write.
++        verifier.check(sha(path) == expected, "MANIFEST_UNCHANGED_DURING_VERIFICATION", path)
++    accepted_summary = quality_summary(condition_quality, quality_by_uid)
++    result = dict(schema="chair_r2_user_conditions_independent_export_validation_v1",
++        status="PASS" if not verifier.failures else "FAIL", check_count=verifier.check_count,
++        failure_count=len(verifier.failures), failures=verifier.failures,
++        implementation_sha256=sha(__file__), input_manifests=before_hashes,
++        checked_protected_file_count=len(verifier.hashes), checked_protected_file_hashes=verifier.hashes,
++        skipped_checkpoint_file_rehashes=skipped_weight_hashes,
++        counts=dict(source_parents=len(parent_rows), train_region_records=len(actual_train),
++                    accepted_regions=len(region_results), train_conditions=counts["train"], dev_conditions=counts["dev"],
++                    old_regression_conditions=8, old_regression_registered_requests=16),
++        condition_results=condition_results, accepted_region_results=region_results,
++        accepted_condition_source_geometry=accepted_summary,
++        source_geometry_all_34=dict(parents=quality["parents"], confirmed_illegal_pair_count=quality["confirmed_illegal_pair_count"],
++            unknown_pair_count=quality["unknown_pair_count"], parents_with_confirmed_illegal_pairs=quality["parents_with_confirmed_illegal_pairs"],
++            parents_with_unknown_pairs=quality["parents_with_unknown_pairs"]),
++        per_condition_source_geometry=condition_quality,
++        geometry_interpretation=[
++            "Export integrity PASS does not assert that source geometry is clean or that semantic AI_PROXY review is human approval.",
++            "CC, CF and FF refer to frozen source M, not generated output; UNKNOWN remains unresolved.",
++            "Condition aggregate pair occurrences repeat source pairs; unique parent totals count each parent once.",
++            "No automatic parent rejection, repair, new intersection scoring or source mutation was performed.",
++            "Degenerate C gate is exact zero area in float64 from stored FP32 coordinates; no new near-degenerate threshold was introduced.",
++            "Inventory full_target hashes include dtype and shape; quality full_target hashes cover raw contiguous FP32 bytes."],
++        execution=dict(workers=1, numeric_threads=2, cpu_cores=os.cpu_count(), cpu_affinity_count=len(os.sched_getaffinity(0)),
++            load_average=list(os.getloadavg()), peak_process_rss_bytes=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024,
++            wall_seconds=time.perf_counter() - started, model_calls=0, OT_calls=0, training_updates=0, CUDA_calls=0,
++            generated_meshes=0, source_mutations=0))
++    output = out / "validation_export.json"
++    temporary = out / "validation_export.json.tmp"
++    temporary.write_text(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False) + "\n", encoding="utf-8")
++    temporary.replace(output)
++    print(json.dumps(dict(status=result["status"], check_count=result["check_count"], failure_count=result["failure_count"],
++        failures=result["failures"], counts=result["counts"], accepted_condition_source_geometry=accepted_summary,
++        wall_seconds=result["execution"]["wall_seconds"], output=str(output)), ensure_ascii=False))
++    return not verifier.failures
++
++
++if __name__ == "__main__":
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--out", type=Path, required=True)
++    options = parser.parse_args()
++    raise SystemExit(0 if verify(options.out) else 1)

@@ -1,0 +1,1087 @@
+diff --git a/experiments/mf_h1_local0/t1_time_gate_evaluation.py b/experiments/mf_h1_local0/t1_time_gate_evaluation.py
+new file mode 100755
+index 0000000..5b54fa2
+--- /dev/null
++++ b/experiments/mf_h1_local0/t1_time_gate_evaluation.py
+@@ -0,0 +1,192 @@
++"""Fixed full offline evaluation for saved A/C and newly trained C_gate.
++
++The historical complete CPU evaluator is reused verbatim. Nothing in this
++module trains, samples, repairs, computes guidance, or chooses a checkpoint.
++"""
++from __future__ import annotations
++
++import json
++import hashlib
++from pathlib import Path
++import numpy as np
++
++from .t1_native_confirmation_evaluation import (
++    score_output, audit_context, cross_binding, scalar_metrics as _core_scalars,
++    summarize_values, concentration, PROTOCOL as ORIGINAL_METRIC_PROTOCOL,
++)
++
++MODELS = ("A", "C", "C_gate")
++PAIRINGS = (("C_gate", "A"), ("C_gate", "C"))
++HIGHER_BETTER = frozenset(("fixed_R12_coverage_within_1pct_fraction", "boundary_coverage_fraction", "free_angle_p05_degrees"))
++DESCRIPTIVE_ONLY = frozenset(("near_C_area_fraction", "near_C_boundary_band_area_fraction", "near_C_outside_boundary_band_area_fraction", "C_surface_area_fraction", "exact_C_free_shared_edge_count", "exact_C_free_shared_vertex_count", "C_inherited_nonmanifold_vertex_count", "C_current_winding_conflict_count", "shared_edge_component_count"))
++ERROR_METRIC = "remainder_symmetric_RMS_bbox_pct"
++QUALITY_METRICS = ("CF_proper_affected_free_fraction", "CF_proper_pair_count", "FF_illegal_pair_count", "CF_coplanar_pair_count", "FF_coplanar_pair_count", "free_minimum_angle_lt5_fraction", "free_q_gt10_fraction", "free_near_degenerate_count", "free_exact_zero_area_count")
++PROTOCOL = dict(original_metric_protocol=ORIGINAL_METRIC_PROTOCOL,
++    model_order=list(MODELS), paired_comparisons=[f"{candidate}_minus_{reference}" for candidate,reference in PAIRINGS],
++    pair_sign="candidate minus reference; negative lowers an error/count, positive increases coverage/angle/binding",
++    statistics="Per training parent, paired fixed Gaussian seeds; mean/median/Q25/Q75/worst; no independent-object inference",
++    interpretation="Compare C_gate independently with A for precision and C for intersection reduction. Gating changes both temporal allocation and total auxiliary exposure; without a full-time lower-weight control, temporal placement is not uniquely identified. No composite score or automatic Pareto claim.",
++    binding="Baseline binding was already established; 8/8 positive is descriptive, not a newly invented success gate")
++
++
++def _get(value, *keys):
++    for key in keys:
++        if not isinstance(value,dict) or key not in value:
++            return None
++        value=value[key]
++    return value
++
++
++def scalar_metrics(metrics):
++    values=_core_scalars(metrics)
++    extra=metrics.get("t1_native_confirmation",{})
++    topo=extra.get("exact_coordinate_topology",{})
++    attribution=topo.get("attribution",{})
++    values.update(
++        nan_coordinate_count=extra.get("nan_coordinate_count"),
++        inf_coordinate_count=extra.get("inf_coordinate_count"),
++        exact_C_free_shared_vertex_count=attribution.get("exact_C_free_shared_vertex_count"),
++        C_inherited_nonmanifold_vertex_count=len(attribution["inherited_C_only_unmodified_link_vertex_ids"]) if "inherited_C_only_unmodified_link_vertex_ids" in attribution else None,
++        C_current_winding_conflict_count=len(attribution["orientation_conflicts_C_only"]) if "orientation_conflicts_C_only" in attribution else None,
++        free_related_current_winding_conflict_count=len(attribution["orientation_conflicts_free_related"]) if "orientation_conflicts_free_related" in attribution else None,
++        shared_edge_component_count=_get(topo,"topology","shared_edge_components","count"),
++        exact_index_boundary_edge_count=_get(topo,"topology","edge_incidence","one"),
++        exact_index_overincident_edge_count=_get(topo,"topology","edge_incidence","more_than_two"))
++    return values
++
++
++def _counts(values, name):
++    finite=[float(row[name]) for row in values if row.get(name) is not None and np.isfinite(float(row[name]))]
++    if name in DESCRIPTIVE_ONLY:
++        return dict(available=len(finite),better=None,tie=None,worse=None,scope="Descriptive proximity/connectivity count; no universal improvement direction assigned")
++    sign=1 if name in HIGHER_BETTER else -1
++    return dict(available=len(finite),better=sum(sign*x>0 for x in finite),tie=sum(x==0 for x in finite),worse=sum(sign*x<0 for x in finite),
++        improvement_direction="positive candidate-reference" if sign==1 else "negative candidate-reference")
++
++
++def aggregate_results(rows, seeds, phase="confirmation"):
++    """Only saved scalar arithmetic. Complete three-model fixed matrix required; old metrics are reused."""
++    seeds=tuple(int(seed) for seed in seeds)
++    if not seeds or len(set(seeds))!=len(seeds):
++        raise ValueError("Require a nonempty fixed list of distinct seeds")
++    selected=[row for row in rows if row.get("model") in MODELS and int(row.get("K",12))==12 and int(row["seed"]) in seeds]
++    index={(row["model"],int(row["parent"]),int(row["seed"])):row for row in selected}
++    expected={(model,parent,seed) for model in MODELS for parent in (0,1) for seed in seeds}
++    if set(index)!=expected or len(selected)!=len(expected):
++        raise ValueError("Require exactly A/C/C_gate x P0/P1 x every registered seed, without duplicates")
++    result=dict(schema="t1_time_gate_summary_v1",phase=phase,seeds=list(seeds),models={},paired={},bindings=[],
++        training_parents=2,noise_trials_per_parent=len(seeds),protocol=PROTOCOL,
++        automatic_winner="NOT_DEFINED",checkpoint_selection="Fixed step500 only",geometry_calls=0,model_calls=0)
++    for model in MODELS:
++        group=dict(parents={},binding={})
++        for parent in (0,1):
++            values=[dict(seed=seed,**scalar_metrics(index[model,parent,seed]["metrics"])) for seed in seeds]
++            names=[key for key in values[0] if key!="seed"]
++            summaries={key:summarize_values(values,key,higher_better=key in HIGHER_BETTER) for key in names}
++            group["parents"][str(parent)]=dict(per_seed=values,metrics=summaries,worst_RMS=summaries[ERROR_METRIC]["worst"],
++                C_all_bitwise_preserved=all(_get(index[model,parent,seed]["metrics"],"t1_native_confirmation","C_PRESERVED")=="PASS" for seed in seeds),
++                N_all_112_free_all_100=all(index[model,parent,seed]["metrics"].get("total_faces")==112 and index[model,parent,seed]["metrics"].get("free_faces")==100 for seed in seeds))
++        binding=[dict(seed=seed,**cross_binding(index[model,0,seed]["metrics"],index[model,1,seed]["metrics"])) for seed in seeds]
++        result["bindings"].extend(dict(phase=phase,model=model,seed=row["seed"],K=12,metrics=row) for row in binding)
++        group["binding"]=dict(per_seed=binding,metrics={key:summarize_values(binding,key,higher_better=True) for key in ("Delta0","Delta1","B")},
++            both_positive_count=sum(row["both_directions_positive"] for row in binding),
++            direction0_positive_count=sum(row["Delta0"]>0 for row in binding),direction1_positive_count=sum(row["Delta1"]>0 for row in binding),
++            concentration=concentration(binding),criterion="Descriptive; baseline binding is already established")
++        result["models"][model]=group
++    for candidate,reference in PAIRINGS:
++        pair=dict(candidate=candidate,reference=reference,parents={},binding={})
++        for parent in (0,1):
++            old=result["models"][reference]["parents"][str(parent)]["per_seed"]
++            new=result["models"][candidate]["parents"][str(parent)]["per_seed"]
++            values=[dict(seed=a["seed"],**{key:b[key]-a[key] if b[key] is not None and a[key] is not None else None for key in a if key!="seed"}) for a,b in zip(old,new)]
++            names=[key for key in values[0] if key!="seed"]
++            improvements={key:_counts(values,key) for key in names}
++            tradeoffs=[]
++            for row in values:
++                if row[ERROR_METRIC] is None:
++                    continue
++                worse_quality=[key for key in QUALITY_METRICS if row.get(key) is not None and row[key]>0]
++                tradeoffs.append(dict(seed=row["seed"],remainder_RMS_change=row[ERROR_METRIC],
++                    error_lower=row[ERROR_METRIC]<0,quality_metrics_increased=worse_quality,
++                    lower_error_with_quality_cost=bool(row[ERROR_METRIC]<0 and worse_quality)))
++            pair["parents"][str(parent)]=dict(per_seed_candidate_minus_reference=values,
++                metrics={key:summarize_values(values,key,higher_better=key in HIGHER_BETTER) for key in names},
++                improvement_counts=improvements,remainder_better_count=improvements[ERROR_METRIC]["better"],
++                remainder_tie_count=improvements[ERROR_METRIC]["tie"],remainder_worse_count=improvements[ERROR_METRIC]["worse"],
++                tradeoffs=tradeoffs,sign=PROTOCOL["pair_sign"])
++        old=result["models"][reference]["binding"]["per_seed"]
++        new=result["models"][candidate]["binding"]["per_seed"]
++        binding=[dict(seed=a["seed"],**{key:b[key]-a[key] for key in ("Delta0","Delta1","B")}) for a,b in zip(old,new)]
++        pair["binding"]=dict(per_seed_candidate_minus_reference=binding,
++            metrics={key:summarize_values(binding,key,higher_better=True) for key in ("Delta0","Delta1","B")},
++            higher_B_count=sum(row["B"]>0 for row in binding),both_direction_increments_positive_count=sum(row["Delta0"]>0 and row["Delta1"]>0 for row in binding),
++            concentration=concentration(binding),sign="candidate minus reference; positive means stronger binding")
++        result["paired"][f"{candidate}_minus_{reference}"]=pair
++    json.dumps(result,allow_nan=False)
++    return result
++
++
++aggregate_confirmation=aggregate_results
++
++
++EXPECTED_BASELINE_SHA={
++    'A':'43e56e107b0c6d28766aebd8cf8a0a764d8d52ef62ba2ca6e756d881634f876b',
++    'C':'8a40651bcf54aebb2c48cd19a2433fb4e0679370c0da6e79e916cc727f067168',
++}
++
++
++def _file_sha(path):
++    h=hashlib.sha256()
++    with Path(path).open('rb') as stream:
++        for block in iter(lambda:stream.read(4*1024*1024),b''):h.update(block)
++    return h.hexdigest()
++
++
++def load_saved_baselines(source_run,seeds=tuple(range(9501,9509))):
++    """Reuse 32 saved metrics/raw references, without loading model or geometry.
++
++    Large checkpoint bytes are validated by the root asset audit, not here.
++    """
++    source=Path(source_run).resolve();rp=source/'results.json';report=source/'THREE_ARM_INTERFACE_REPORT.md'
++    if not rp.is_file() or not report.is_file():raise FileNotFoundError('Require original three-arm report and results')
++    before={str(p):_file_sha(p) for p in (rp,report)}
++    old=json.loads(rp.read_text(encoding='utf-8-sig'))
++    for model,expected in EXPECTED_BASELINE_SHA.items():
++        if _get(old,'arms',model,'checkpoints','500','sha256')!=expected:raise ValueError('Saved baseline checkpoint identity differs')
++    seeds=tuple(int(x) for x in seeds)
++    rows=[row for row in old.get('scores',[]) if row.get('model') in ('A','C') and int(row.get('K',12))==12 and int(row['seed']) in seeds]
++    expected={(m,p,seed) for m in ('A','C') for p in (0,1) for seed in seeds}
++    keys={(row['model'],int(row['parent']),int(row['seed'])) for row in rows}
++    if keys!=expected or len(rows)!=len(expected):raise ValueError('Original baseline score matrix missing or duplicated')
++    rows=[dict(row,phase='reused_baseline',metrics_recomputed=False) for row in rows]
++    generated=[dict(row,phase='reused_baseline',new_generation=False) for row in old.get('generated',[]) if (row.get('model'),int(row.get('parent',-1)),int(row.get('seed',-1))) in expected]
++    if before!={str(p):_file_sha(p) for p in (rp,report)}:raise RuntimeError('Source changed during read-only import')
++    return dict(scores=rows,generated=generated,source_identity=dict(source_run=str(source),files=before,
++        checkpoint_recorded_sha256=EXPECTED_BASELINE_SHA,large_checkpoint_byte_hash_scope='Root asset audit'),
++        reused_score_count=len(rows),geometry_calls=0,model_calls=0,new_generations=0)
++
++
++def run_cpu_tests():
++    """Bounded synthetic scalar arithmetic only; caller opts in explicitly."""
++    rows=[];seeds=(1,2)
++    for model in MODELS:
++        for parent in (0,1):
++            for seed in seeds:
++                own={'A':3.,'C':4.,'C_gate':2.}[model]+seed*.01
++                cross=[dict(symmetric_rms_bbox_pct=own+(0 if p==parent else 2.),predicted_to_target_rms_bbox_pct=own,target_to_predicted_rms_bbox_pct=own) for p in (0,1)]
++                common=[dict(rms_bbox_pct=own+(0 if p==parent else 2.),fraction_target_points_within_1pct_bbox=.5) for p in (0,1)]
++                metric=dict(K=12,variant='raw',parent_index=parent,total_faces=112,free_faces=100,
++                    remainder=dict(own=cross[parent],cross=cross),whole=dict(surface=cross[parent]),common_unknown_R12=dict(own=common[parent],cross=common),
++                    guided_geometry_audit=dict(C_free=dict(proper_pair_count=1,proper_affected_face_fraction=.01),free_free=dict(proper_pair_count=1 if model=='C' else 2,coplanar_positive_area_pairs=0),boundary=dict(rms_bbox_pct=own,p95_bbox_pct=own,coverage_fraction=.5)),
++                    t1_native_confirmation=dict(C_PRESERVED='PASS'))
++                rows.append(dict(model=model,parent=parent,seed=seed,K=12,metrics=metric))
++    out=aggregate_results(rows,seeds,phase='SYNTHETIC_FIXED')
++    assert len(out['bindings'])==6
++    assert out['paired']['C_gate_minus_A']['parents']['0']['remainder_better_count']==2
++    assert np.isclose(out['paired']['C_gate_minus_C']['parents']['0']['metrics'][ERROR_METRIC]['mean'],-2.,rtol=0.,atol=1e-12)
++    assert all(row['lower_error_with_quality_cost'] for row in out['paired']['C_gate_minus_C']['parents']['0']['tradeoffs'])
++    assert out['paired']['C_gate_minus_C']['binding']['higher_B_count']==0
++    try:aggregate_results(rows+[rows[0]],seeds)
++    except ValueError:pass
++    else:raise AssertionError('Duplicate fixed matrix accepted')
++    return dict(status='PASS',checks=6,model_calls=0,geometry_calls=0,optimizer_updates=0,new_generations=0)
+diff --git a/experiments/mf_h1_local0/t1_time_gate_loss.py b/experiments/mf_h1_local0/t1_time_gate_loss.py
+new file mode 100755
+index 0000000..99fb3ba
+--- /dev/null
++++ b/experiments/mf_h1_local0/t1_time_gate_loss.py
+@@ -0,0 +1,277 @@
++"""Fixed t>=0.5 relation gate for the separately authorized C_gate arm.
++
++The caller supplies the original effective-batch FC/FF group denominators,
++including every inactive sample. This module never changes FM, the time
++distribution, the optimizer, or the original relation definitions. Importing
++does not execute fixtures, autograd, a model, data OT, or an update.
++"""
++from __future__ import annotations
++
++from collections.abc import Mapping
++from numbers import Integral
++
++import numpy as np
++import torch
++
++from .t1_interface_relations import endpoint_from_velocity, relation_sums
++
++
++GATE_THRESHOLD = 0.5
++FC_WEIGHT = 0.1
++FF_WEIGHT = 0.1
++
++
++def _denominator(value, local_count, name):
++    if isinstance(value, bool) or not isinstance(value, Integral):
++        raise TypeError(name + ' must be the integer effective-batch group count.')
++    value = int(value)
++    if value < local_count or value < 0:
++        raise ValueError(name + ' excludes groups in this microbatch (including inactive groups).')
++    return value
++
++
++def gated_terms(batch, velocity, prepared, fc_den, ff_den):
++    """Return (FC, FF, JSON-ready audit), normalized over the effective batch.
++
++    ``prepared`` is an original prepare_relations mapping for B=1, or one
++    mapping per sample for B>1. Group indices remain local to each sample.
++    The caller must pass *all* effective-batch groups, not only active groups;
++    local validation cannot prove the composition of samples outside this call.
++
++    Below threshold, the sample contributes exactly ``velocity.sum()*0`` to
++    each auxiliary term and does not execute endpoint/relation calculations.
++    On/above threshold, endpoint and relation arithmetic are the old functions
++    in their original order. This training helper reads the detached scalar
++    times to CPU for an explicit gate/audit; it is not a sampling-loop kernel.
++    Returned FC/FF do not include the fixed 0.1 outer coefficients.
++    """
++    if velocity.ndim != 3 or velocity.shape[-1] != 9 or velocity.dtype != torch.float32:
++        raise ValueError('Require original FP32 velocity [B,N,9].')
++    batch_size = velocity.shape[0]
++    if not batch_size:
++        raise ValueError('Empty microbatches are not supported.')
++    for key in ('xt', 'context'):
++        value = batch[key]
++        if value.shape != velocity.shape or value.dtype != torch.float32 or value.device != velocity.device:
++            raise ValueError(key + ' must match original FP32 velocity shape/device.')
++    times = batch['t']
++    mask = batch['known_mask']
++    if times.shape != (batch_size,) or times.dtype != torch.float32 or times.device != velocity.device:
++        raise ValueError('Require one original FP32 time per sample on the same device.')
++    if mask.shape != velocity.shape[:2] or mask.dtype != torch.bool or mask.device != velocity.device:
++        raise ValueError('Require original boolean known mask.')
++    if isinstance(prepared, Mapping):
++        if batch_size != 1:
++            raise ValueError('B>1 requires one local prepared relation mapping per sample.')
++        packs = [prepared]
++    else:
++        packs = list(prepared)
++        if len(packs) != batch_size or not all(isinstance(p, Mapping) for p in packs):
++            raise ValueError('Prepared relation mappings must match batch size.')
++    counts = [(int(p['FC_count']), int(p['FF_count'])) for p in packs]
++    if any(fc < 0 or ff < 0 for fc, ff in counts):
++        raise ValueError('Negative relation group count.')
++    fc_den = _denominator(fc_den, sum(x[0] for x in counts), 'fc_den')
++    ff_den = _denominator(ff_den, sum(x[1] for x in counts), 'ff_den')
++    stored_times = times.detach().cpu().tolist()
++    if any(not np.isfinite(t) or not 0.0 <= t <= 1.0 for t in stored_times):
++        raise ValueError('Nonfinite/out-of-range original training time.')
++
++    fc_parts, ff_parts, rows = [], [], []
++    with torch.autocast(device_type=velocity.device.type, enabled=False):
++        for i, (pack, t, (fc_count, ff_count)) in enumerate(zip(packs, stored_times, counts)):
++            active = t >= GATE_THRESHOLD
++            v = velocity[i:i + 1]
++            if active:
++                endpoint = endpoint_from_velocity(
++                    batch['xt'][i:i + 1], v, times[i:i + 1],
++                    mask[i:i + 1], batch['context'][i:i + 1])
++                terms = relation_sums(endpoint, pack)
++                fc = terms['FC_sum'] / max(fc_den, 1)
++                ff = terms['FF_sum'] / max(ff_den, 1)
++            else:
++                zero = v.sum() * 0
++                fc, ff = zero, zero
++            fc_parts.append(fc)
++            ff_parts.append(ff)
++            rows.append(dict(sample_index=i, stored_t=t, active=active,
++                             FC_count=fc_count, FF_count=ff_count))
++        # B=1 does not gain an extra zero-addition relative to the old formula.
++        fc, ff = fc_parts[0], ff_parts[0]
++        for next_fc, next_ff in zip(fc_parts[1:], ff_parts[1:]):
++            fc, ff = fc + next_fc, ff + next_ff
++    active_count = sum(row['active'] for row in rows)
++    audit = dict(
++        threshold=GATE_THRESHOLD, predicate='stored_FP32_t >= 0.5',
++        FC_weight=FC_WEIGHT, FF_weight=FF_WEIGHT,
++        FC_group_denominator=fc_den, FF_group_denominator=ff_den,
++        local_FC_groups=sum(x[0] for x in counts), local_FF_groups=sum(x[1] for x in counts),
++        active_FC_groups=sum(row['FC_count'] for row in rows if row['active']),
++        active_FF_groups=sum(row['FF_count'] for row in rows if row['active']),
++        active_samples=active_count, inactive_samples=batch_size-active_count,
++        normalization='Original effective-batch group totals including inactive groups',
++        active_fraction_compensation=False, FM_changed=False,
++        endpoint_calls=active_count, legacy_relation_calls=active_count, samples=rows)
++    return fc, ff, audit
++
++
++def gated_relation_loss(fm, batch, velocity, prepared, fc_den, ff_den):
++    """Return (FM + .1 FC + .1 FF, unweighted components, audit)."""
++    if not torch.is_tensor(fm) or fm.ndim != 0:
++        raise ValueError('Pass the already normalized scalar original FM loss.')
++    fc, ff, audit = gated_terms(batch, velocity, prepared, fc_den, ff_den)
++    return fm + FC_WEIGHT * fc + FF_WEIGHT * ff, dict(FM=fm, FC=fc, FF=ff), audit
++
++
++def run_cpu_tests():
++    """Explicit small CPU fixtures; caller owns invocation and accounting.
++
++    All equivalence checks use identical original FP32 operations and require
++    bitwise equality (no relaxed numerical tolerance). No model or OT is used.
++    """
++    from .t1_interface_relations import build_relation_labels, prepare_relations
++    from native_t1.training import masked_fm_loss
++
++    counts = dict(model_forwards=0, model_backwards=0, optimizer_updates=0,
++                  OT_calls=0, CPU_autograd_grad_calls=0, CPU_autograd_grad_returns=0,
++                  gated_terms_calls=0, legacy_reference_endpoint_calls=0,
++                  legacy_reference_relation_calls=0, gated_endpoint_calls=0,
++                  gated_legacy_relation_calls=0, validation_rejection_calls=0)
++    fixture_names = []
++    rng = np.random.RandomState(64051)
++    ids = np.asarray([[0,1,2], [0,2,3], [0,3,4], [1,3,4]], dtype=np.int64)
++    vertices = rng.randn(5,3).astype(np.float32)
++
++    def fixture(times):
++        b = len(times)
++        known = np.asarray([[True, True, False, False] if i % 2 == 0
++                            else [True, False, False, False] for i in range(b)])
++        context = np.zeros((b,4,3,3), dtype=np.float32)
++        packs = []
++        for i in range(b):
++            context[i,known[i]] = vertices[ids[known[i]]]
++            labels = build_relation_labels(ids, known[i], context[i])
++            pack = prepare_relations(labels, 'cpu')
++            pack['fc_anchors'].requires_grad_(True)
++            packs.append(pack)
++        batch = dict(xt=torch.from_numpy(rng.randn(b,4,9).astype(np.float32)),
++                     context=torch.from_numpy(context.reshape(b,4,9)).requires_grad_(),
++                     known_mask=torch.from_numpy(known), valid_mask=torch.ones((b,4),dtype=torch.bool),
++                     t=torch.tensor(times,dtype=torch.float32),
++                     u=torch.from_numpy(rng.randn(b,4,9).astype(np.float32)))
++        velocity = torch.from_numpy(rng.randn(b,4,9).astype(np.float32)).requires_grad_()
++        return batch, velocity, packs
++
++    def grad(loss, args):
++        counts['CPU_autograd_grad_calls'] += 1
++        result = torch.autograd.grad(loss, args, allow_unused=True)
++        counts['CPU_autograd_grad_returns'] += 1
++        return result
++
++    def gated(batch, velocity, packs, fc_den, ff_den):
++        counts['gated_terms_calls'] += 1
++        result = gated_terms(batch, velocity, packs, fc_den, ff_den)
++        counts['gated_endpoint_calls'] += result[2]['endpoint_calls']
++        counts['gated_legacy_relation_calls'] += result[2]['legacy_relation_calls']
++        return result
++
++    def old(batch, v, pack, fc_den, ff_den):
++        counts['legacy_reference_endpoint_calls'] += 1
++        endpoint = endpoint_from_velocity(batch['xt'], v, batch['t'], batch['known_mask'], batch['context'])
++        counts['legacy_reference_relation_calls'] += 1
++        terms = relation_sums(endpoint, pack)
++        return terms['FC_sum']/max(fc_den,1), terms['FF_sum']/max(ff_den,1)
++
++    for t in (.25, .5, .75):
++        batch, v, packs = fixture([t])
++        pack = packs[0]
++        den = (8*pack['FC_count'], 8*pack['FF_count'])
++        fc, ff, audit = gated(batch, v, pack, *den)
++        ref_fc, ref_ff = old(batch, v, pack, *den)
++        args = (v, batch['context'], pack['fc_anchors'])
++        actual_grad = grad(.1*fc+.1*ff, args)
++        old_grad = grad(.1*ref_fc+.1*ref_ff, args)
++        assert actual_grad[1:] == (None,None) and old_grad[1:] == (None,None)
++        if t < .5:
++            assert fc.item() == ff.item() == 0 and not torch.count_nonzero(actual_grad[0])
++            assert ref_fc.item()+ref_ff.item()>0 and torch.count_nonzero(old_grad[0])>0
++            assert audit['endpoint_calls'] == audit['legacy_relation_calls'] == 0
++        else:
++            assert torch.equal(fc,ref_fc) and torch.equal(ff,ref_ff)
++            assert torch.equal(actual_grad[0],old_grad[0])
++        assert torch.count_nonzero(actual_grad[0][batch['known_mask']]) == 0
++    fixture_names.append('below_at_above_threshold_original_loss_and_gradient_bitwise_or_exact_zero')
++    fixture_names.append('known_context_and_C_anchors_detached')
++
++    near = [float(np.nextafter(np.float32(.5),np.float32(0))),
++            float(np.nextafter(np.float32(.5),np.float32(1)))]
++    batch, v, packs = fixture(near)
++    fc_den, ff_den = (sum(p[k] for p in packs) for k in ('FC_count','FF_count'))
++    _, _, audit = gated(batch,v,packs,fc_den,ff_den)
++    assert [row['active'] for row in audit['samples']] == [False,True]
++    fixture_names.append('adjacent_representable_FP32_times')
++
++    batch, v, packs = fixture([.25,.5,.75,.1,.2,.9,.49,.5001])
++    fc_den, ff_den = (sum(p[k] for p in packs) for k in ('FC_count','FF_count'))
++    fc, ff, audit = gated(batch,v,packs,fc_den,ff_den)
++    ref_parts, micro_parts = [], []
++    for i, pack in enumerate(packs):
++        one = {k:value[i:i+1] for k,value in batch.items()}
++        if float(batch['t'][i]) >= .5:
++            ref_parts.append(old(one,v[i:i+1],pack,fc_den,ff_den))
++        else:
++            z = v[i:i+1].sum()*0
++            ref_parts.append((z,z))
++        micro_parts.append(gated(one,v[i:i+1],pack,fc_den,ff_den)[:2])
++    def add(parts, column):
++        value = parts[0][column]
++        for part in parts[1:]:
++            value = value + part[column]
++        return value
++    ref_fc,ref_ff = add(ref_parts,0),add(ref_parts,1)
++    micro_fc,micro_ff = add(micro_parts,0),add(micro_parts,1)
++    assert fc_den==24 and ff_den==20 and audit['active_FC_groups']==12 and audit['active_FF_groups']==11
++    assert torch.equal(fc,ref_fc) and torch.equal(ff,ref_ff)
++    assert torch.equal(fc,micro_fc) and torch.equal(ff,micro_ff)
++    g, = grad(.1*fc+.1*ff,(v,))
++    ref_g, = grad(.1*ref_fc+.1*ref_ff,(v,))
++    micro_g, = grad(.1*micro_fc+.1*micro_ff,(v,))
++    assert torch.equal(g,ref_g) and torch.equal(g,micro_g)
++    inactive = batch['t'] < .5
++    assert torch.count_nonzero(g[inactive]) == 0
++    fixture_names.append('mixed_effective8_denominators_include_inactive_and_microbatch_accumulation_matches')
++    try:
++        gated_terms(batch,v,packs,audit['active_FC_groups'],audit['active_FF_groups'])
++    except ValueError:
++        counts['validation_rejection_calls'] += 1
++    else:
++        raise AssertionError('Active-only group denominators were accepted.')
++    fixture_names.append('active_only_denominator_rejected_for_full_effective_batch')
++
++    batch, v, packs = fixture([.1,.3])
++    fc_den, ff_den = (sum(p[k] for p in packs) for k in ('FC_count','FF_count'))
++    fc,ff,audit = gated(batch,v,packs,fc_den,ff_den)
++    g, = grad(fc+ff,(v,))
++    assert fc.item()==ff.item()==0 and torch.count_nonzero(g)==0 and audit['active_samples']==0
++    fixture_names.append('all_inactive_graph_connected_zero')
++
++    batch, v, packs = fixture([.25,.75])
++    fc_den,ff_den = (sum(p[k] for p in packs) for k in ('FC_count','FF_count'))
++    fm = masked_fm_loss(v,batch['u'],batch['valid_mask'],batch['known_mask'])
++    total,components,audit = gated_relation_loss(fm,batch,v,packs,fc_den,ff_den)
++    counts['gated_terms_calls'] += 1
++    counts['gated_endpoint_calls'] += audit['endpoint_calls']
++    counts['gated_legacy_relation_calls'] += audit['legacy_relation_calls']
++    assert components['FM'] is fm
++    actual, = grad(total,(v,))
++    reference_fm = masked_fm_loss(v,batch['u'],batch['valid_mask'],batch['known_mask'])
++    one = {k:value[1:2] for k,value in batch.items()}
++    ref_fc,ref_ff = old(one,v[1:2],packs[1],fc_den,ff_den)
++    reference, = grad(reference_fm+.1*ref_fc+.1*ref_ff,(v,))
++    assert torch.equal(actual,reference) and torch.count_nonzero(actual[0])>0
++    fixture_names.append('FM_keeps_full_time_support_and_fixed_outer_weights')
++
++    return dict(status='PASS',fixtures=fixture_names,counts=counts,
++                numerical_policy='Identical FP32 formula: bitwise equivalence; inactive exact zero',
++                model_forwards=0,model_backwards=0,optimizer_updates=0,
++                CPU_autograd_grad_calls=counts['CPU_autograd_grad_calls'])
+diff --git a/experiments/mf_h1_local0/t1_time_gate_report.py b/experiments/mf_h1_local0/t1_time_gate_report.py
+new file mode 100755
+index 0000000..32aa14f
+--- /dev/null
++++ b/experiments/mf_h1_local0/t1_time_gate_report.py
+@@ -0,0 +1,236 @@
++"""Report saved A/C baselines versus one newly trained C_gate arm.
++
++Consumes saved JSON and six fixed raw endpoints for plotting only. Does not
++train, sample, recompute metrics, call autograd, repair, or write results.json.
++"""
++from __future__ import annotations
++
++import hashlib
++import json
++from pathlib import Path
++import time
++
++import numpy as np
++
++from .t1_time_gate_evaluation import MODELS, PAIRINGS, ERROR_METRIC
++from .t1_interface_report import _get, _fmt, _stats, _table
++
++MAIN=(ERROR_METRIC,'free_to_R12_RMS_bbox_pct','R12_to_free_RMS_bbox_pct','whole_symmetric_RMS_bbox_pct')
++BOUNDARY=('boundary_RMS_bbox_pct','boundary_p95_bbox_pct','boundary_coverage_fraction')
++QUALITY=('CF_proper_affected_free_fraction','CF_proper_pair_count','FF_illegal_pair_count',
++         'CF_coplanar_pair_count','FF_coplanar_pair_count','CF_unresolved_or_degenerate_pair_count',
++         'FF_unresolved_or_degenerate_pair_count','free_minimum_angle_lt5_fraction','free_q_gt10_fraction',
++         'free_near_degenerate_count','free_exact_zero_area_count','nan_coordinate_count','inf_coordinate_count')
++TOPOLOGY=('exact_C_free_shared_edge_count','exact_C_free_shared_vertex_count',
++          'C_inherited_nonmanifold_vertex_count','new_free_related_nonmanifold_vertex_count',
++          'free_related_current_winding_conflict_count','shared_edge_component_count')
++
++
++def _training(r):
++    return r.get('training') or r.get('arm') or r.get('arms',{}).get('C_gate',{})
++
++
++def _path(value):
++    path=Path(value)
++    if path.is_file():return path
++    value=str(value).replace('\\','/')
++    if len(value)>2 and value[1]==':':path=Path('/mnt/'+value[0].lower()+value[2:])
++    elif value.startswith('/mnt/') and len(value)>7:path=Path(value[5].upper()+':/'+value[7:])
++    return path
++
++
++def fixed_figure(r,out,bank=None):
++    """First preregistered seed only, actual A/C/C_gate full/free; no scoring."""
++    found={};seed=9501
++    for row in r.get('scores',[]):
++        if row.get('model') not in MODELS or int(row['seed'])!=seed:continue
++        with np.load(_path(row['raw_path']),allow_pickle=False) as archive:
++            raw=archive['output'].copy().reshape(112,3,3)
++        if raw.dtype!=np.float32 or not np.isfinite(raw).all():raise ValueError('Require actual finite FP32 fixed raw output')
++        key=int(row['parent']),row['model']
++        if key in found:raise ValueError('Duplicate fixed raw endpoint')
++        found[key]=raw
++    if set(found)!={(p,m) for p in (0,1) for m in MODELS}:raise ValueError('Missing registered seed9501 raw figure matrix')
++    import matplotlib
++    matplotlib.use('Agg')
++    import matplotlib.pyplot as plt
++    from mpl_toolkits.mplot3d.art3d import Line3DCollection
++    points=np.concatenate([a.reshape(-1,3)[:,[0,2,1]] for a in found.values()])
++    lower,upper=points.min(0),points.max(0);center=(lower+upper)/2;radius=max(float((upper-lower).max())*.55,1e-3)
++    fig=plt.figure(figsize=(14,17),constrained_layout=True)
++    for parent in (0,1):
++        for free_only in (False,True):
++            row=2*parent+int(free_only)
++            for col,model in enumerate(MODELS):
++                ax=fig.add_subplot(4,3,row*3+col+1,projection='3d')
++                triangles=found[parent,model][:,:,[0,2,1]];shown=triangles[12:] if free_only else triangles
++                loops=np.concatenate((shown,shown[:,:1]),axis=1);colors=['#485c69']*len(shown)
++                if not free_only:colors[:12]=['#1a78cc']*12
++                ax.add_collection3d(Line3DCollection(loops,colors=colors,linewidths=.65,alpha=.85))
++                ax.set_title(f"P{parent} | {model} | seed9501 | {'free100' if free_only else 'full112'}",fontsize=10)
++                ax.set_xlim(center[0]-radius,center[0]+radius);ax.set_ylim(center[1]-radius,center[1]+radius);ax.set_zlim(center[2]-radius,center[2]+radius)
++                ax.set_box_aspect((1,1,1));ax.view_init(elev=24,azim=-54);ax.set_axis_off()
++    fig.suptitle('Time-gated relation loss: fixed seed9501\nShared camera and complete bounds; blue=known C, gray=free; raw outputs',fontsize=13)
++    path=Path(out)/'fixed_9501_A_C_C_gate_full_and_free.png'
++    if path.exists():raise FileExistsError(path)
++    fig.savefig(path,dpi=145);plt.close(fig)
++    return dict(path=str(path),sha256=hashlib.sha256(path.read_bytes()).hexdigest(),seed=seed,
++        parents=[0,1],models=list(MODELS),panels=12,actual_raw_outputs=6,
++        camera=dict(elevation=24,azimuth=-54),display_axis_order=['X','Z','Y'],
++        common_center=center.tolist(),common_radius=radius,
++        selection='Prespecified seed9501; no output-quality selection',model_calls=0,scoring_calls=0,geometry_changes=0)
++
++
++def _training_tables(r):
++    arm=_training(r);checkpoints=arm.get('checkpoints',{});logs=arm.get('diagnostics',[])
++    if isinstance(logs,dict):logs=[dict(step=k,**v) for k,v in logs.items()]
++    result=[_table(['实际更新数','参数数','可训练参数','训练秒','峰值显存字节','同流审计数'],[[
++        arm.get('completed_updates',arm.get('steps_completed')),arm.get('parameters'),arm.get('trainable_parameters'),arm.get('training_seconds',arm.get('train_seconds')),arm.get('peak_cuda_allocated'),len(arm.get('stream_audits',[]))]]),
++        _table(['检查点','累计更新','本地路径','实际SHA256','优化器已存'],[[step,value.get('cumulative_updates'),value.get('path'),value.get('sha256'),value.get('optimizer_saved')] for step,value in checkpoints.items()]),
++        _table(['更新','FM','门控后FC','门控后FF','实际加权辅助','总loss','clip前grad范数'],[[
++            v.get('step'),v.get('fm_loss'),v.get('fc_loss'),v.get('ff_loss'),v.get('auxiliary_weighted'),v.get('total_loss'),v.get('grad_norm_before_clip')] for v in logs]),
++        '少数训练日志对应不同目标、噪声和t，不能据此宣称loss单调下降、收敛或完整生成改善。每条梯度/参数更新审计与门控暴露原始值保留在JSON。']
++    result.append('FC/FF日志是门控后实际施加的项；没有额外计算 inactive 样本的未门控关系损失，因此不把它们标为原始FC/FF。')
++    gradient_rows=[]
++    for log in logs:
++        updates=log.get('parameter_updates',{})
++        for name,value in log.get('gradients',{}).items():
++            changed=updates.get(name,{})
++            gradient_rows.append([log.get('step'),name,value.get('RMS'),changed.get('RMS'),value.get('finite'),changed.get('finite')])
++    result.append(_table(['更新','记录参数','梯度RMS','实际参数更新RMS','梯度有限','更新有限'],gradient_rows))
++    return '\n\n'.join(result)
++
++
++def _quality_costs(summary,candidate,reference):
++    rows=[]
++    for parent in (0,1):
++        a=summary['models'][candidate]['parents'][str(parent)]['metrics']
++        b=summary['models'][reference]['parents'][str(parent)]['metrics']
++        for key in QUALITY:
++            av,bv=a.get(key,{}).get('mean'),b.get(key,{}).get('mean')
++            if av is not None and bv is not None and av>bv:rows.append([f'{candidate}−{reference}',parent,key,bv,av,av-bv])
++    return rows
++
++
++def render_report(r,figure=None):
++    s=r.get('summary',{});models=s.get('models',{});pieces=[]
++    def add(value):pieces.append(value)
++    add('# C_gate 时间门控关系损失：固定预算验证')
++    add('本轮只有一个新训练臂 C_gate；旧 A/C 的32份终点评分与原始输出只读复用。新增完整生成固定为两个父对象×9501–9508、K12，每份 N112/free100。评价沿用完整独立 CF/FF/CC、边界、形状与拓扑审计，不更改阈值或分母。')
++    add('9501–9508 是前轮已观察过的固定配对噪声；这轮属于已知 seed 上的探索性跟进，不包装成独立新噪声确认。')
++    add('门控同时降低辅助损失总暴露并改变时间分配。没有全时段降低权重的对照，不能把结果唯一归因于时间定位；本轮也不是泛化实验。')
++    interpretation=r.get('interpretation',{})
++    add('## 六个问题的回答')
++    if interpretation.get('answers'):
++        for i,text in enumerate(interpretation['answers'],1):add(f'{i}. {text}')
++    else:add('NOT_YET_INTERPRETED：等待固定48份评分的最终复核，不根据训练中途loss选结论。')
++    add('## 两个假设与判断边界')
++    add('假设1检验 C_gate 是否相对 A 保持或恢复几何精度；假设2检验其是否相对 C 保留相交方面的收益。两种参照分开报告，不因优于其中一个模型就判定另一假设成立。')
++    for key,text in interpretation.get('hypotheses',{}).items():add(f'**{key}**：{text}')
++    add('仅凭剩余RMS与FF相交两个均值不能称为全指标 Pareto 改善。双向误差、Gamma RMS/p95/coverage、CF、FF、窄角、退化、绑定以及逐seed结果均需检查；均值取舍与困难噪声不能从报告移除。')
++    add('## 稳定入口、资产与实际训练')
++    add('运行状态：'+_fmt(r.get('status'))+'；共同运行配置：'+_fmt(_get(r,'protocol','runtime')))
++    add('初始化与固定方案：'+_fmt(_get(r,'protocol','initial'))+'；训练配置：'+_fmt(_get(r,'protocol','training')))
++    add('门控阈值：'+_fmt(_get(r,'protocol','gate_threshold'))+'；完整有效组分母保持：'+_fmt(_get(r,'protocol','full_effective_group_denominators'))+'；实际公式：'+_fmt(_get(r,'protocol','auxiliary_formula')))
++    identity=_get(r,'assets','saved_baseline_identity',default={})
++    add('旧 A/C 结果来源：'+_fmt(identity.get('source_run'))+'。旧32份评分仅复用，不重算。')
++    add(_table(['旧模型','已记录step500 SHA256'],list(identity.get('checkpoint_recorded_sha256',{}).items())))
++    add('源报告/结果 SHA 与实际大checkpoint字节复核保留在 results.assets；本轮新 checkpoint 的本地路径和身份如下。')
++    add(_training_tables(r))
++    actual_exposure=_get(r,'gates','gate_exposure','actual')
++    exposures=[('预登记',r.get('preregistered_gate_exposure'))]
++    if actual_exposure is not None:exposures.append(('实际',actual_exposure))
++    add('门控暴露（仍用完整effective8组分母，不按active比例补偿）：')
++    add(_table(['记录','样本','active样本','FC active/total','FF active/total','全inactive更新'],[[
++        label,value.get('samples'),value.get('active_samples'),
++        str(value.get('active_FC_groups'))+'/'+str(value.get('total_FC_groups')),
++        str(value.get('active_FF_groups'))+'/'+str(value.get('total_FF_groups')),value.get('inactive_only_steps')]
++        for label,value in exposures if value is not None]))
++    if actual_exposure is None:add('实际曝光尚未写入；上表仅预登记值，不冒充实际训练结果。')
++    failures=r.get('implementation_fixture_failures',[])
++    if failures:
++        add('实现夹具中断记录：'+str(len(failures))+'次，发生在模型前向和优化器更新均为0时。合成配对均值为 -1.9999999999999998，相对期望 -2 的 FP64 误差2.22e-16；仅将该测试的精确相等断言改为 rtol=0、atol=1e-12。实际评分、损失和超参数没有改变。')
++        add('评价合成夹具累计调用3次：1次失败、2次通过（包含独立复查）；原CPU数学12次梯度门禁复用，没有重跑。完整失败堆栈保留在JSON。修正记录：'+_fmt(r.get('implementation_fixture_resolution')))
++    add('GPU范围为模型前向/反向、FM及关系损失与采样积分。沿用的CPU nested OT训练预处理与源索引标签构造不冒称GPU；离线几何审计不参与生成，不修补输出。')
++    add('实际调用账本：')
++    add(_table(['项目','实际次数/分账'],[[key,value] for key,value in r.get('counts',{}).items() if isinstance(value,(int,float,str))]))
++    add('## 三模型逐对象完整生成')
++    add('每个单元为均值 / 中位数 / [Q25,Q75] / 最差值@seed。RMS和p95单位为% bbox，比例使用原评价分母。所有8个seed保留，两个父对象分别报告。')
++    geometry=[];boundary=[];quality=[];topology=[]
++    for model in MODELS:
++        for parent in (0,1):
++            group=_get(models,model,'parents',str(parent),default={});metrics=group.get('metrics',{});label=f'{model}/P{parent}'
++            geometry.append([label]+[_stats(metrics.get(key)) for key in MAIN])
++            boundary.append([label]+[_stats(metrics.get(key)) for key in BOUNDARY])
++            quality.append([label]+[_stats(metrics.get(key)) for key in QUALITY])
++            topology.append([label,group.get('C_all_bitwise_preserved'),group.get('N_all_112_free_all_100')]+[_stats(metrics.get(key)) for key in TOPOLOGY])
++    add(_table(['模型/对象','剩余对称RMS','free→R12','R12→free','完整表面对称RMS'],geometry))
++    add(_table(['模型/对象','Gamma RMS','Gamma p95','Gamma coverage'],boundary))
++    add(_table(['模型/对象']+list(QUALITY),quality))
++    add('## 同噪声配对差与质量代价')
++    add('差值统一为 C_gate−参考：误差/非法pair负值为降低，coverage正值为增加。改善次数完全沿用原精确差值规则；未用新阈值筛选seed。')
++    paired=[];per_seed=[];tradeoffs=[]
++    for candidate,reference in PAIRINGS:
++        pair=s.get('paired',{}).get(f'{candidate}_minus_{reference}',{})
++        for parent in (0,1):
++            group=pair.get('parents',{}).get(str(parent),{});metrics=group.get('metrics',{});counts=group.get('improvement_counts',{})
++            for key in (*MAIN[:3],*BOUNDARY,'CF_proper_affected_free_fraction','FF_illegal_pair_count','free_minimum_angle_lt5_fraction','free_q_gt10_fraction'):
++                n=counts.get(key,{});paired.append([f'{candidate}−{reference}/P{parent}',key,_stats(metrics.get(key)),n.get('better'),n.get('tie'),n.get('worse')])
++            for row in group.get('per_seed_candidate_minus_reference',[]):
++                per_seed.append([f'{candidate}−{reference}/P{parent}',row['seed']]+[row.get(key) for key in (*MAIN[:3],*BOUNDARY,'CF_proper_affected_free_fraction','FF_illegal_pair_count')])
++            for row in group.get('tradeoffs',[]):
++                if row.get('quality_metrics_increased'):tradeoffs.append([f'{candidate}−{reference}/P{parent}',row['seed'],row.get('remainder_RMS_change'),row.get('quality_metrics_increased')])
++    add(_table(['配对','指标','差值分布','改善','平','变差'],paired))
++    add(_table(['配对','seed','Δ剩余RMS','Δfree→R12','ΔR12→free','ΔGammaRMS','ΔGammap95','Δcoverage','ΔCFfraction','ΔFFillegal'],per_seed))
++    costs=[]
++    if models:
++        for candidate,reference in PAIRINGS:costs.extend(_quality_costs(s,candidate,reference))
++    add('质量均值上升项单列；比较两个保存的边际均值以免把舍入零误写成趋势，原配对计数保持不变。')
++    add(_table(['配对','父对象','质量项','参考均值','门控均值','差'],costs) if costs else '已有质量指标未出现边际均值上升；这不表示每个seed或未执行指标都改善。')
++    add(_table(['配对','seed','Δ剩余RMS','增加的质量代价项'],tradeoffs) if tradeoffs else '未记录到逐seed质量计数上升；不自动等于全指标优势。')
++    add('## 同噪声条件绑定四格')
++    add('复用每个seed两个已生成上下文的完整交叉评分，不额外生成错配样本。既有绑定已成立，8/8正值仅为描述，不能作为新成功证据；考察相对 A/C 的增量。')
++    binding=[];four=[];bp=[]
++    for model in MODELS:
++        item=_get(models,model,'binding',default={})
++        binding.append([model]+[_stats(item.get('metrics',{}).get(k)) for k in ('Delta0','Delta1','B')]+[item.get('both_positive_count'),item.get('concentration')])
++        for v in item.get('per_seed',[]):four.append([model,v['seed']]+[v.get(k) for k in ('E00','E01','E11','E10','Delta0','Delta1','B','both_directions_positive')])
++    for candidate,reference in PAIRINGS:
++        item=_get(s,'paired',f'{candidate}_minus_{reference}','binding',default={})
++        bp.append([f'{candidate}−{reference}']+[_stats(item.get('metrics',{}).get(k)) for k in ('Delta0','Delta1','B')]+[item.get('higher_B_count'),item.get('both_direction_increments_positive_count')])
++    add(_table(['模型','Delta0','Delta1','B','双向正次数','集中度/留一'],binding))
++    add(_table(['配对','ΔDelta0','ΔDelta1','ΔB','B增加次数','双向增量均正次数'],bp))
++    add(_table(['模型','seed','E00','E01','E11','E10','Delta0','Delta1','B','双向正'],four))
++    add('## 接口拓扑与原始输出保护')
++    add(_table(['模型/对象','C全保持','N112/free100全保持']+list(TOPOLOGY),topology))
++    add('输入继承的C异常与新增free相关异常分开。孤立三角形的合法link不能证明有效连接曲面，精确共边缺失也不是肉眼裂缝大小。CF/FF/CC完整静态数值检测不等于精确谓词或连续碰撞认证。未执行项目保持NOT_RUN，不用轻量scorer替代完整审计。')
++    add('## 固定 seed9501 图')
++    if figure:
++        add('P0/P1各显示 A、C、C_gate 的full112/free100，共12面板；相机与完整坐标范围相同，蓝色已知C，灰色自由面。图不根据得分选择。')
++        add(f"![固定9501完整与自由面]({Path(figure['path']).name})")
++    else:add('NOT_RUN：最终导出时要求完整固定6个raw端点。')
++    add('## 成本、保护与停止')
++    add('A/C为旧16+16输出复用，不能计入本轮新增生成。实际新增生成数按 C_gate 记录与调用账本，门禁/失败/中断分别保留。')
++    add(_table(['耗时项目','秒数'],[[key,value] for key,value in (r.get('timing_summary') or r.get('timing') or {}).items() if isinstance(value,(int,float))]))
++    protected={key:value for key,value in r.get('protection',{}).items() if key.endswith('after') or key.startswith('final') or key=='status'}
++    audit={**r.get('final_readonly_audits',{}),**protected}
++    add(_table(['最终只读/保护审计','状态','检查数量'],[[key,value.get('status') if isinstance(value,dict) else value,
++        value.get('checked',value.get('files')) if isinstance(value,dict) else None] for key,value in audit.items()]))
++    add('执行门禁状态：'+_fmt({key:(value.get('status') if isinstance(value,dict) else value) for key,value in r.get('gates',{}).items()}))
++    next_step=interpretation.get('next_step')
++    if next_step:add('后续建议：'+_fmt(next_step)+'。本轮没有执行。')
++    add('训练固定预算结束后停止；不按结果追加训练、更换损失、重抽噪声或添加组合臂。')
++    return '\n\n'.join(pieces)+'\n'
++
++
++def deliver_report(r,out,bank=None):
++    started=time.perf_counter();out=Path(out).resolve();allowed=Path(__file__).resolve().parent/'outputs'
++    if not out.is_dir() or allowed not in out.parents:raise ValueError('Require isolated experiment output directory')
++    destination=out/'TIME_GATE_RELATION_REPORT.md'
++    if destination.exists():raise FileExistsError(destination)
++    figure=fixed_figure(r,out,bank);text=render_report(r,figure)
++    if '\ufffd' in text:raise ValueError('Invalid replacement character in report')
++    destination.write_text(text,encoding='utf-8')
++    return dict(report=dict(path=str(destination),sha256=hashlib.sha256(destination.read_bytes()).hexdigest()),
++        figure=figure,report_and_figure_seconds=time.perf_counter()-started,
++        model_calls=0,scoring_calls=0,new_geometry_scores=0,training_updates=0)
+\ No newline at end of file
+diff --git a/experiments/mf_h1_local0/t1_time_gate_run.py b/experiments/mf_h1_local0/t1_time_gate_run.py
+new file mode 100755
+index 0000000..2daf6d9
+--- /dev/null
++++ b/experiments/mf_h1_local0/t1_time_gate_run.py
+@@ -0,0 +1,236 @@
++"""One fixed time-gated relation-loss experiment, exactly500 updates and16 rollouts."""
++from native_t1.runtime import configure_stable_runtime
++from pathlib import Path
++import argparse,copy,gc,hashlib,json,platform,subprocess,time,traceback
++import numpy as np
++import torch
++from native_t1.artifacts import atomic_json,file_sha256,state_sha256,array_hash
++from native_t1.checkpoint import load_t1,T1_FILE_SHA256,T1_STATE_SHA256,DEFAULT_CHECKPOINT,DEFAULT_CONFIG
++from native_t1.data import load_archive
++from native_t1.sampling import clamped_sample,new_counts
++from .guided_native_geometry_run import prepare_assets,record,verify_records
++from .c_relation_run import discover_source
++from .t1_interface_run import cpu
++
++PROJECT=Path(__file__).resolve().parent
++REPO=PROJECT.parents[1]
++SEEDS=tuple(range(9501,9509));DIAGNOSTIC_STEPS=(1,100,250,500)
++
++def seal(v):return hashlib.sha256(json.dumps(v,sort_keys=True,separators=(',',':')).encode()).hexdigest()
++def write(r,out):atomic_json(out/'results.json',r)
++def event(name,**kw):print(json.dumps(dict(event=name,**kw),allow_nan=False),flush=True)
++def release():gc.collect();torch.cuda.empty_cache()
++def metadata(out):
++    files=[p for p in (PROJECT/'outputs').rglob('*') if p.is_file() and not p.is_relative_to(out)]
++    files += [p for p in PROJECT.glob('*.py') if not p.name.startswith('t1_time_gate_')]
++    files += list((REPO/'native_t1').glob('*.py'))+list((REPO/'models').glob('*.py'))+[REPO/'utils/ot_utils.py',DEFAULT_CONFIG,Path('/mnt/c/Users/warpwang/Downloads/last.pt')]
++    files += list((PROJECT/'assets').rglob('*.npz'))
++    return {str(p):dict(bytes=p.stat().st_size,mtime_ns=p.stat().st_mtime_ns) for p in sorted(set(files))}
++
++class Ledger:
++    def __init__(self,r):self.r=r
++    def attach(self,model):
++        def before(module,args):
++            c=self.r['counts']
++            if c['model_forward_attempts']>=4800:raise RuntimeError('Hard4800 forward budget')
++            c['model_forward_attempts']+=1
++            stage=self.r['active_stage'];c['forward_by_stage'][stage]=c['forward_by_stage'].get(stage,0)+1
++        def after(module,args,output):self.r['counts']['model_forward_returns']+=1
++        model.register_forward_pre_hook(before);model.register_forward_hook(after)
++
++def initialize(out):
++    if out.exists():raise FileExistsError(out)
++    source,saved=discover_source();out.mkdir(parents=True);(out/'raw').mkdir()
++    initial=copy.deepcopy(saved['protocol']['initial'])
++    if initial['file_sha256']!=T1_FILE_SHA256 or initial['state_sha256']!=T1_STATE_SHA256 or Path(initial['path']).resolve()!=DEFAULT_CHECKPOINT.resolve():raise RuntimeError('Wrong common step500 identity')
++    training=copy.deepcopy(saved['protocol']['training'])
++    training.update(total_update_cap=500,additional_updates_each=500,gate='stored FP32 sampled t >=0.5',arms=['C_gate'])
++    protocol=dict(schema='t1_time_gate_v1',initial=initial,training=training,gate_threshold=.5,
++        full_effective_group_denominators=True,auxiliary_formula='FM + I[t>=.5]*(.1 FC + .1 FF); original full effective8 group denominators; no active-fraction compensation',
++        seeds=list(SEEDS),seed_status='previously_used_paired_followup',new_seeds=False,
++        runtime=copy.deepcopy(saved['protocol']['runtime']),
++        budget=dict(optimizer_updates=500,model_forwards=4800,model_backwards=4000,complete_rollouts=16,Euler_updates=800,training_OT_calls=4000),
++        evaluation=dict(models=['A','C','C_gate'],new_model='C_gate',saved_baseline_outputs=32,new_outputs=16,N=112,K=12,free=100,steps=50,
++            fixed_checkpoint_additional_step=500,postprocessing=False,guidance=False,noise='Existing seed9501..9508 freeGaussian; no GT matching',same_noise_two_contexts=True),
++        interpretation='Exploratory paired followup on known seeds and two training objects; gating changes temporal support and total auxiliary exposure. No equal-dose control or generalization claim.',
++        stop='500 updates then16 complete generations; no retries, new arms, new gates, modules, or Phase3')
++    r=dict(status='INITIALIZING',started_utc=time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),protocol=protocol,protocol_sha256=seal(protocol),source_run=str(source),
++        active_stage='assets',counts=dict(model_forward_attempts=0,model_forward_returns=0,forward_by_stage={},backward_attempts=0,backward_completed=0,
++            optimizer_step_attempts=0,optimizer_updates=0,training_OT_calls=0,training_OT_attempts=0,rollout_attempts=0,complete_rollouts=0,euler_updates=0,
++            geometry_guidance_calls=0,geometry_repairs=0,formula_autograd_calls=0,formula_autograd_returns=0),
++        arms={},generated=[],scores=[],gates={},assets={},timing={},evaluation_ledger={},protection=dict(before=metadata(out)),
++        AGENTS='No applicable AGENTS.md found by repository and ancestor searches',
++        environment=dict(python=platform.python_version(),torch=torch.__version__,cuda=torch.version.cuda,numpy=np.__version__),
++        git_status_before=subprocess.run(['git','status','--short'],cwd=REPO,capture_output=True,text=True).stdout)
++    write(r,out);tick=time.perf_counter()
++    from .t1_time_gate_evaluation import load_saved_baselines
++    baseline=load_saved_baselines(source,SEEDS)
++    r['scores']=baseline['scores'];r['generated']=baseline['generated'];r['assets']['saved_baseline_identity']=baseline['source_identity']
++    r['assets']['inputs']=record(saved['relations']['inputs']['path'])
++    if r['assets']['inputs']['sha256']!=saved['relations']['inputs']['sha256']:raise RuntimeError('Source input differs')
++    r['assets']['parent_ids']=saved['assets']['parent_ids'];r['input_topology']=saved['input_topology'];r['assets']['context_audits']=saved['assets']['context_audits']
++    r['assets']['source_report']=record(source/'THREE_ARM_INTERFACE_REPORT.md');r['assets']['source_results']=record(source/'results.json')
++    r['assets']['noise_file']=record(source/'fixed_noise.npz')
++    r['assets']['initial_file']=record(DEFAULT_CHECKPOINT)
++    if r['assets']['initial_file']['sha256']!=T1_FILE_SHA256:raise RuntimeError('Initial weight hash differs')
++    critical={str(p):record(p) for p in list((REPO/'native_t1').glob('*.py'))+list((REPO/'models').glob('*.py'))+
++        [REPO/'utils/ot_utils.py',DEFAULT_CONFIG,PROJECT/'t1_interface_relations.py',PROJECT/'t1_interface_train.py',PROJECT/'t1_native_confirmation_evaluation.py',PROJECT/'t1_native_confirmation_topology.py',Path('/mnt/c/Users/warpwang/Downloads/last.pt')]}
++    for item in ('inputs','source_report','source_results','noise_file','initial_file'):
++        rec=r['assets'][item];critical[rec['path']]=rec
++    for arm in ('A','C'):
++        cp=saved['arms'][arm]['checkpoints']['500'];rec=record(cp['path'])
++        if rec['sha256']!=cp['sha256']:raise RuntimeError('Baseline checkpoint hash differs')
++        critical[rec['path']]=rec
++    for row in r['generated']:
++        rec=record(row['raw_path'])
++        if rec['sha256']!=row['raw_sha256']:raise RuntimeError('Saved baseline raw hash differs')
++        critical[rec['path']]=rec
++    r['assets']['critical_files']=critical
++    r['reference_stream_sha256']=seal(saved['arms']['A']['stream_audits'])
++    if any(saved['arms'][a]['stream_audits']!=saved['arms']['A']['stream_audits'] for a in ('B','C')):raise RuntimeError('Reference stream mismatch')
++    audits=saved['arms']['A']['stream_audits']
++    r['preregistered_gate_exposure']=dict(samples=4000,active_samples=sum(t>=.5 for x in audits for t in x['times']),
++        active_FC_groups=sum(n for x in audits for t,n in zip(x['times'],x['FC_counts']) if t>=.5),
++        active_FF_groups=sum(n for x in audits for t,n in zip(x['times'],x['FF_counts']) if t>=.5),
++        total_FC_groups=sum(sum(x['FC_counts']) for x in audits),total_FF_groups=sum(sum(x['FF_counts']) for x in audits),
++        inactive_only_steps=[x['step'] for x in audits if not any(t>=.5 for t in x['times'])])
++    r['environment']['GPU']=subprocess.run(['nvidia-smi','--query-gpu=name,driver_version,memory.total,memory.used','--format=csv,noheader'],capture_output=True,text=True).stdout.strip()
++    r['timing']['assets_seconds']=time.perf_counter()-tick;r.update(status='ASSETS_PASS',active_stage='assets_complete');write(r,out);event('assets_pass',out=str(out))
++
++def preflight(r,out):
++    from .t1_time_gate_loss import run_cpu_tests
++    from .t1_time_gate_evaluation import run_cpu_tests as evaluate_tests
++    if not r['gates'].get('math'):
++        r['active_stage']='CPU_math_gates';original=torch.autograd.grad
++        def counted(*args,**kw):
++            r['counts']['formula_autograd_calls']+=1;write(r,out)
++            result=original(*args,**kw);r['counts']['formula_autograd_returns']+=1
++            return result
++        torch.autograd.grad=counted
++        try:r['gates']['math']=run_cpu_tests()
++        finally:torch.autograd.grad=original;write(r,out)
++    r['gates']['evaluation_arithmetic']=evaluate_tests()
++    r['counts']['evaluation_synthetic_fixture_attempts']=3 if r.get('implementation_fixture_failures') else 1
++    r['counts']['evaluation_synthetic_fixture_passes']=2 if r.get('implementation_fixture_failures') else 1
++    if r['gates']['math']['status']!='PASS' or r['counts']['formula_autograd_calls']!=r['gates']['math']['CPU_autograd_grad_calls']:raise RuntimeError('Math gate mismatch')
++    r['new_execution_sources']={str(p):record(p) for p in sorted(PROJECT.glob('t1_time_gate_*.py')) if p.name!='t1_time_gate_report.py'}
++    r.update(status='PREFLIGHT_PASS',active_stage='preflight_complete');write(r,out);event('preflight_pass',counts=r['counts'])
++
++def load_model(r,name='C_gate',checkpoint=None,trainable=False):
++    if name!='C_gate':raise RuntimeError('Only new C_gate model permitted')
++    model,audit=load_t1()
++    if checkpoint is not None:
++        if file_sha256(checkpoint['path'])!=checkpoint['sha256']:raise RuntimeError('New checkpoint bytes differ')
++        payload=torch.load(checkpoint['path'],map_location='cpu',weights_only=True,mmap=True)
++        if payload['schema']!='t1_time_gate_branch_v1' or payload['arm']!='C_gate' or payload['additional_updates']!=500 or payload['cumulative_updates']!=1000:raise RuntimeError('Wrong branch endpoint')
++        keys=model.load_state_dict(payload['model'],strict=True);del payload
++        if keys.missing_keys or keys.unexpected_keys or state_sha256(model)!=checkpoint['state_sha256']:raise RuntimeError('Strict load differs')
++    model.set_trainable(trainable).eval();Ledger(r).attach(model)
++    return model,audit
++
++def sample_all(r,out):
++    arm=r['arms']['C_gate']
++    if arm['completed_updates']!=500 or arm['status']!='PASS':raise RuntimeError('Fixed endpoint required')
++    archive=load_archive(r['assets']['inputs']['path'],r['assets']['inputs']['sha256'])
++    with np.load(r['assets']['noise_file']['path']) as f:noises={s:f[f'noise_seed{s}'].copy() for s in SEEDS}
++    r['active_stage']='C_gate_sampling';model,loaded=load_model(r,checkpoint=arm['checkpoints']['500'])
++    before=state_sha256(model);tick=time.perf_counter()
++    try:
++        for parent in (0,1):
++            C=archive.cases[parent,12].constraints.copy()
++            for seed in SEEDS:
++                if r['counts']['rollout_attempts']>=16:raise RuntimeError('Hard16rollout budget')
++                r['counts']['rollout_attempts']+=1;write(r,out);start=time.perf_counter();nf=r['counts']['model_forward_attempts'];sc=new_counts()
++                try:raw,path,stats=clamped_sample(model,torch.from_numpy(noises[seed]).cuda(),torch.from_numpy(C).cuda(),sc)
++                finally:
++                    r['counts']['euler_updates']+=sc['euler_updates'];r['counts']['complete_rollouts']+=sc['complete_rollouts']
++                    r.setdefault('sampling_attempts',[]).append(dict(model='C_gate',parent=parent,seed=seed,local_counts=dict(sc),returned=sc['complete_rollouts']==1));write(r,out)
++                if r['counts']['model_forward_attempts']-nf!=50:raise RuntimeError('NFE differs')
++                expected=np.broadcast_to(C.reshape(1,12,9),(51,12,9)).copy()
++                if not np.array_equal(path[:,:12].view(np.uint32),expected.view(np.uint32)) or not np.isfinite(path).all():raise RuntimeError('C altered or nonfinite path')
++                if not np.array_equal(path[0,12:].view(np.uint32),noises[seed][0,12:].view(np.uint32)):raise RuntimeError('Noise changed')
++                target=out/'raw'/f'C_gate_P{parent}_K12_seed{seed}.npz'
++                if target.exists():raise FileExistsError(target)
++                export=time.perf_counter();np.savez_compressed(target,output=raw,path=path);export=time.perf_counter()-export
++                r['generated'].append(dict(phase='confirmation',model='C_gate',parent=parent,K=12,seed=seed,variant='Raw',raw_path=str(target),raw_sha256=file_sha256(target),
++                    output_sha256=array_hash(raw),sampling=stats,C_all51_FP32_bits_exact=True,all_states_finite=True,initial_free_Gaussian_exact=True,
++                    costs=dict(complete_generation_wall_seconds=time.perf_counter()-start,NPZ_export_seconds=export,peak_cuda_allocated=stats['peak_cuda_allocated'])))
++                write(r,out);event('sample',parent=parent,seed=seed,completed=r['counts']['complete_rollouts'])
++        r['sampling_models']={'C_gate':dict(initial_state=before,final_state=state_sha256(model),seconds=time.perf_counter()-tick,strict_load=loaded)}
++        if r['sampling_models']['C_gate']['final_state']!=before:raise RuntimeError('Frozen sampling changed')
++        r['timing']['sampling_seconds']=time.perf_counter()-tick
++    finally:del model;release()
++    r.update(status='RAW_COMPLETE',active_stage='sampling_complete');write(r,out)
++
++def score_all(r,out):
++    from .t1_time_gate_evaluation import score_output,aggregate_results
++    tick=time.perf_counter();bank,_=prepare_assets();bank['input_topology']=r['input_topology'];bank['context_audits']={int(k):v for k,v in r['assets']['context_audits'].items()}
++    for row in [x for x in r['generated'] if x['model']=='C_gate']:
++        with np.load(row['raw_path']) as f:raw=f['output'].copy()
++        start=time.perf_counter();metric=score_output(raw,bank,row['parent'],ledger=r['evaluation_ledger'])
++        r['scores'].append(dict(phase='confirmation',model='C_gate',parent=row['parent'],K=12,seed=row['seed'],variant='Raw',raw_path=row['raw_path'],metrics=metric,offline_scoring_seconds=time.perf_counter()-start))
++        write(r,out);event('scored',parent=row['parent'],seed=row['seed'],new_scores=len(r['scores'])-32)
++    r['summary']=aggregate_results(r['scores'],SEEDS);r['bindings']=r['summary']['bindings'];r['timing']['offline_audit_seconds']=time.perf_counter()-tick
++    after=metadata(out);changed=[p for p,v in r['protection']['before'].items() if after.get(p)!=v]
++    r['protection']['after']=dict(status='PASS' if not changed else 'FAIL',files=len(r['protection']['before']),changed=changed)
++    r['protection']['critical_files_after']=verify_records(r['assets']['critical_files']);r['protection']['execution_after']=verify_records(r['new_execution_sources'])
++    if changed or r['protection']['critical_files_after']['status']!='PASS' or r['protection']['execution_after']['status']!='PASS':raise RuntimeError('Protected assets or execution changed')
++    c=r['counts'];expected=dict(optimizer_updates=500,optimizer_step_attempts=500,complete_rollouts=16,rollout_attempts=16,euler_updates=800,
++        model_forward_attempts=4800,model_forward_returns=4800,backward_attempts=4000,backward_completed=4000,training_OT_calls=4000)
++    if any(c[k]!=v for k,v in expected.items()):raise RuntimeError('Final fixed budget differs')
++    g=r['arms']['C_gate']['gate_audits'];actual=dict(samples=4000,active_samples=sum(x['active_samples'] for x in g),active_FC_groups=sum(x['active_FC_groups'] for x in g),
++        active_FF_groups=sum(x['active_FF_groups'] for x in g),total_FC_groups=sum(x['FC_group_denominator'] for x in g),total_FF_groups=sum(x['FF_group_denominator'] for x in g),inactive_only_steps=[x['step'] for x in g if not x['active_samples']])
++    if actual!=r['preregistered_gate_exposure']:raise RuntimeError('Gate exposure mismatch')
++    r['gates']['stream_identity']=dict(status='PASS',steps=500,samples=4000,reference='Full old A/B/C per-step audit dictionaries',sha256=seal(r['arms']['C_gate']['stream_audits']))
++    if r['gates']['stream_identity']['sha256']!=r['reference_stream_sha256']:raise RuntimeError('Final stream differs')
++    r['gates']['gate_exposure']=dict(status='PASS',actual=actual)
++    r['timing']['training_seconds']=r['arms']['C_gate']['training_seconds']
++    r.update(status='PASS_EXECUTION',active_stage='FINISHED',finished_utc=time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()));write(r,out);event('complete',counts=c)
++
++def execute(out,stage):
++    if stage=='init':return initialize(out)
++    r=json.loads((out/'results.json').read_text())
++    try:
++        if seal(r['protocol'])!=r['protocol_sha256']:raise RuntimeError('Protocol changed')
++        configure_stable_runtime()
++        if stage=='preflight':
++            if r['status']!='ASSETS_PASS':
++                if r['status']!='STOPPED' or r['counts']['model_forward_attempts']!=0 or r['counts']['optimizer_updates']!=0 or r['gates'].get('math',{}).get('status')!='PASS' or 't1_time_gate_evaluation.py' not in r.get('failure',{}).get('traceback',''):
++                    raise RuntimeError('No automatic model/numerical retry')
++                r.setdefault('implementation_fixture_failures',[]).append(r.pop('failure'))
++                r['implementation_fixture_resolution']='Synthetic scalar expected -2 differed by FP64 roundoff; evaluation arithmetic assertion only. No model, optimizer, noise, hyperparameter, or geometry change; passed12 math-gradient checks reused, not repeated.'
++            preflight(r,out)
++        elif stage=='train':
++            if r['status']!='PREFLIGHT_PASS':raise RuntimeError('No training retry')
++            from .t1_interface_relations import load_source_relations
++            from .t1_time_gate_train import train_arm
++            relations=load_source_relations(r['assets']['inputs']['path'],expected_sha256=r['assets']['inputs']['sha256']);r['relations']=relations.audit
++            saved=json.loads((Path(r['source_run'])/'results.json').read_text());reference=saved['arms']['A']['stream_audits']
++            if seal(reference)!=r['reference_stream_sha256']:raise RuntimeError('Reference changed')
++            import utils.ot_utils as data_module
++            original_ot=data_module.optimal_sum_numpy
++            def counted_ot(*args,**kwargs):
++                r['counts']['training_OT_attempts']+=1
++                answer=original_ot(*args,**kwargs)
++                r['counts']['training_OT_calls']+=1
++                return answer
++            data_module.optimal_sum_numpy=counted_ot
++            try:train_arm(r,out,relations,reference)
++            finally:data_module.optimal_sum_numpy=original_ot;write(r,out)
++            r['status']='TRAINING_COMPLETE';write(r,out)
++        elif stage=='sample':
++            if r['status']!='TRAINING_COMPLETE':raise RuntimeError('Training incomplete')
++            if verify_records(r['new_execution_sources'])['status']!='PASS':raise RuntimeError('Execution changed')
++            sample_all(r,out)
++        elif stage=='score':
++            if r['status']!='RAW_COMPLETE':raise RuntimeError('Raw incomplete')
++            score_all(r,out)
++        elif stage=='report':
++            if r['status']!='PASS_EXECUTION':raise RuntimeError('Not complete')
++            from .t1_time_gate_report import deliver_report
++            r['delivery']=deliver_report(r,out);write(r,out)
++    except BaseException as error:
++        r.update(status='STOPPED',failure=dict(stage=stage,error=repr(error),traceback=traceback.format_exc(),automatic_retry=False));write(r,out);event('stopped',error=repr(error),counts=r['counts']);raise
++
++if __name__=='__main__':
++    p=argparse.ArgumentParser();p.add_argument('--out',required=True,type=Path);p.add_argument('--stage',required=True,choices=['init','preflight','train','sample','score','report']);a=p.parse_args();execute(a.out.resolve(),a.stage)
+diff --git a/experiments/mf_h1_local0/t1_time_gate_train.py b/experiments/mf_h1_local0/t1_time_gate_train.py
+new file mode 100755
+index 0000000..27b1c14
+--- /dev/null
++++ b/experiments/mf_h1_local0/t1_time_gate_train.py
+@@ -0,0 +1,115 @@
++"""One bounded C_gate branch; original training stream, gated relation terms only."""
++from native_t1.runtime import configure_stable_runtime
++import copy,random,time,traceback
++import numpy as np
++import torch
++from native_t1.artifacts import state_sha256,array_hash
++from native_t1.data import load_archive,NativeTrainingStream,native_collate,model_inputs
++from native_t1.model import native_execution
++from native_t1.training import masked_fm_loss,make_optimizer
++from .t1_interface_relations import prepare_relations
++from .t1_time_gate_loss import gated_relation_loss
++from .t1_time_gate_run import (T1_STATE_SHA256,DIAGNOSTIC_STEPS,write,event,release,load_model,record,cpu,verify_records)
++
++def magnitude(x):
++    if x is None:return dict(present=False)
++    x=x.detach().float();return dict(present=True,finite=bool(torch.isfinite(x).all()),RMS=float(x.square().mean().sqrt()),max_abs=float(x.abs().max()),nonzero=int(torch.count_nonzero(x)))
++
++
++def selected(model):
++    names=['role_embedding','backbone.x_embedder.mlp.0.weight','backbone.t_embedder.mlp.0.weight','backbone.layers.0.attn.qkv_proj.weight','backbone.final_layer.linear.weight','boundary_proj.weight']
++    return {n:p for n,p in model.named_parameters() if n in names}
++
++
++def save_checkpoint(model,optimizer,stream,r,out,arm,result,step,stopped=False):
++    folder=out/arm;folder.mkdir(exist_ok=True)
++    suffix='interrupted' if stopped else f'additional_step{step}_cumulative_step{500+step}'
++    path=folder/(suffix+'.pt')
++    if path.exists():raise FileExistsError(path)
++    tick=time.perf_counter()
++    payload=dict(schema='t1_time_gate_branch_v1',arm=arm,model=cpu(model.state_dict()),optimizer=cpu(optimizer.state_dict()),
++        initial_checkpoint=r['protocol']['initial'],additional_updates=result['completed_updates'],cumulative_updates=500+result['completed_updates'],
++        optimizer_step_attempts=result['optimizer_step_attempts'],optimizer_step_in_progress=result['optimizer_step_in_progress'],
++        batch_in_progress=result['batch_in_progress'],recoverable=not result['optimizer_step_in_progress'] and not result['batch_in_progress'],
++        protocol_sha256=r['protocol_sha256'],stream_state=stream.state_dict(),torch_cpu_rng=torch.get_rng_state(),torch_cuda_rng=torch.cuda.get_rng_state_all(),
++        note='C_gate uses fresh AdamW from old T1 step500; no old optimizer recovery')
++    torch.save(payload,path);del payload
++    info=dict(**record(path),state_sha256=state_sha256(model),backbone_state_sha256=state_sha256(model.backbone),additional_updates=result['completed_updates'],cumulative_updates=500+result['completed_updates'],
++        optimizer_saved=True,save_and_hash_seconds=time.perf_counter()-tick)
++    result['checkpoints']['interrupted' if stopped else str(step)]=info;write(r,out)
++
++
++def train_arm(r,out,relations,reference):
++    arm='C_gate'
++    if arm in r['arms']:raise RuntimeError('No automatic arm restart')
++    if verify_records(r['new_execution_sources'])['status']!='PASS':raise RuntimeError('Execution source changed after gates')
++    model,load=load_model(r,arm,trainable=True)
++    if state_sha256(model)!=T1_STATE_SHA256:raise RuntimeError('Branch common initialization differs')
++    torch.manual_seed(10);np.random.seed(10);random.seed(10)
++    archive=load_archive(r['assets']['inputs']['path'],r['assets']['inputs']['sha256']);stream=NativeTrainingStream(archive,'Native_correct',seed=10)
++    optimizer=make_optimizer(model);parameters=list(model.parameters());picked=selected(model)
++    result=dict(status='RUNNING',completed_updates=0,optimizer_step_attempts=0,optimizer_step_in_progress=False,batch_in_progress=False,
++        load=load,initial_state_sha256=state_sha256(model),common_initial_state_sha256=state_sha256(model),parameters=sum(p.numel() for p in parameters),
++        trainable_parameters=sum(p.numel() for p in parameters if p.requires_grad),stream_audits=[],gate_audits=[],diagnostics=[],checkpoints={},training_seconds=0.,peak_cuda_allocated=0)
++    r['arms'][arm]=result;r['active_stage']=arm+'_training';write(r,out)
++    try:
++        for step in range(1,501):
++            if r['counts']['optimizer_step_attempts']>=500 or result['optimizer_step_attempts']>=500:raise RuntimeError('Hard500 total update cap')
++            tick=time.perf_counter();torch.cuda.reset_peak_memory_stats();result['batch_in_progress']=True
++            samples=stream.next_effective_batch()
++            labels=[relations.prepare_sample_labels(s) for s in samples]
++            audit=copy.deepcopy(stream.last_audit)
++            audit.update(step=step,context_hashes=[s['context_sha256'] for s in samples],
++                raw_Gaussian_hashes=[array_hash(s['free_gaussian_before_OT']) for s in samples],OT_hashes=[array_hash(s['free_noise_after_OT']) for s in samples],
++                source_label_hashes=[x['source_mapping_audit']['actual_source_ids_sha256'] for x in labels],phi_hashes=[x['source_mapping_audit']['phi_sha256'] for x in labels],
++                FC_counts=[x['FC_count'] for x in labels],FF_counts=[x['FF_count'] for x in labels])
++            if audit!=reference[step-1]:raise RuntimeError('Three-arm target/C/Gaussian/OT/t/mask/permutation flow differs')
++            denominator=audit['effective_free_coordinates'];fc_den=sum(x['FC_count'] for x in labels);ff_den=sum(x['FF_count'] for x in labels)
++            sparse=step in DIAGNOSTIC_STEPS;optimizer.zero_grad(set_to_none=True)
++            sums=dict(fm=0.,fc=0.,ff=0.,total=0.);runtimes=[];gate_rows=[]
++            for sample,label in zip(samples,labels):
++                batch=native_collate([sample],'cuda');prepared=prepare_relations(label,'cuda')
++                with native_execution(model,coordinates=batch['xt']) as facts:
++                    velocity=model(*model_inputs(batch)).float()
++                    fm=masked_fm_loss(velocity,batch['u'],batch['valid_mask'],batch['known_mask'],denominator=denominator)
++                    loss,components,gate=gated_relation_loss(fm,batch,velocity,prepared,fc_den,ff_den)
++                    fc,ff=components['FC'],components['FF']
++                    if gate['active_samples']==0 and (float(fc.detach())!=0 or float(ff.detach())!=0):raise RuntimeError('Inactive auxiliary nonzero')
++                    if not bool(torch.isfinite(loss)):raise RuntimeError('Nonfinite loss; no numerical fallback')
++                    r['counts']['backward_attempts']+=1
++                    loss.backward()
++                    r['counts']['backward_completed']+=1
++                gate_rows.append(gate)
++                if sparse:
++                    sums['fm']+=float(fm.detach());sums['fc']+=float(fc.detach());sums['ff']+=float(ff.detach());sums['total']+=float(loss.detach())
++                    runtimes.append(facts)
++            gate_audit=dict(step=step,FC_group_denominator=fc_den,FF_group_denominator=ff_den,
++                active_samples=sum(g['active_samples'] for g in gate_rows),
++                active_FC_groups=sum(g['active_FC_groups'] for g in gate_rows),
++                active_FF_groups=sum(g['active_FF_groups'] for g in gate_rows),samples=gate_rows)
++            if sparse:
++                before={n:p.detach().clone() for n,p in picked.items()};grads={n:magnitude(p.grad) for n,p in picked.items()}
++            norm=float(torch.nn.utils.clip_grad_norm_(parameters,1.,error_if_nonfinite=True))
++            result['optimizer_step_in_progress']=True;result['optimizer_step_attempts']+=1;r['counts']['optimizer_step_attempts']+=1
++            optimizer.step();torch.cuda.synchronize()
++            result['completed_updates']+=1;r['counts']['optimizer_updates']+=1;result['optimizer_step_in_progress']=False
++            if not bool(torch.stack([torch.isfinite(p).all() for p in parameters]).all()):raise RuntimeError('Nonfinite model state after update')
++            result['batch_in_progress']=False;result['stream_audits'].append(audit);result['gate_audits'].append(gate_audit)
++            if sparse:
++                updates={n:magnitude(p.detach()-before[n]) for n,p in picked.items()}
++                diagnostic=dict(step=step,additional_updates=step,cumulative_updates=500+step,fm_loss=sums['fm'],fc_loss=sums['fc'],ff_loss=sums['ff'],total_loss=sums['total'],
++                    auxiliary_weighted=.1*(sums['fc']+sums['ff']),FC_group_denominator=fc_den,FF_group_denominator=ff_den,FM_coordinate_denominator=denominator,
++                    gradients=grads,parameter_updates=updates,grad_norm_before_clip=norm,runtime=runtimes[0],gate=gate_audit,auxiliary_note='t>=.5 only; original all8 group denominators retained')
++                result['diagnostics'].append(diagnostic);del before
++            result['training_seconds']+=time.perf_counter()-tick
++            result['peak_cuda_allocated']=max(result['peak_cuda_allocated'],torch.cuda.max_memory_allocated())
++            if step in (250,500):save_checkpoint(model,optimizer,stream,r,out,arm,result,step)
++            if step%10==0 or sparse:write(r,out);event('training',arm=arm,additional_step=step,total_updates=r['counts']['optimizer_updates'],seconds=result['training_seconds'])
++        result.update(status='PASS',final_state_sha256=state_sha256(model),final_common_state_sha256=state_sha256(model));write(r,out)
++    except BaseException as error:
++        result.update(status='STOPPED',error=repr(error),traceback=traceback.format_exc())
++        try:save_checkpoint(model,optimizer,stream,r,out,arm,result,result['completed_updates'],stopped=True)
++        except BaseException as save_error:result['checkpoint_failure']=repr(save_error)
++        write(r,out);raise
++    finally:
++        optimizer.zero_grad(set_to_none=True);del optimizer,model;release()

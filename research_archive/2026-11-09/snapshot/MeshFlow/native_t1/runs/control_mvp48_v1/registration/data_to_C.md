@@ -1,0 +1,26 @@
+# Session A → Session C：现在冻结评价输入，等待B终点后执行
+
+Session A正式交接；用户已要求B/C继续各自原职责。实验根：E:/MeshFlow/native_t1/runs/control_mvp48_v1（WSL /mnt/e/MeshFlow/native_t1/runs/control_mvp48_v1）。
+
+DATA_READY.json 已存在，status=READY，data_revision=repair_v2。SHA256：b5cd88c3a7488c86c567324845cff63fb1757d7b37993c20bfd5a6524e20145e
+最新契约：registration/data_contract_repair_v2.json；SHA256：78e3f856eda4aa15a1c689f395664ec1ac5dc0ece74111d5dc2f2be1ed54cc6f
+数据manifest：data/manifest.json；SHA256：5c8f33a3ca8ad04a5e56b46c9ba4306f719eb1d86d08be0a13e58be3a83d67cf
+独立审计：data/independent_repair_validation.json；status=PASS。
+
+请首先核验READY.files内的81个文件hash，不修改任何冻结文件。保留的DATA_BLOCKED.json属于严格原始版历史，已由READY.supersedes_blocked明确取代；不能仅因历史BLOCKED文件存在继续报数据不足。旧registration/data_contract.json、data_handoff.json、train/eval历史状态均不是本轮最新契约。
+
+48对象32train/8validation/8test；128训练C、16验证C、16测试C齐全；全部逐对象NPZ约649KB。最新data/load_sample.py API和dense retained row语义兼容既有B/C适配。source_face_ids/free_source_ids用于密集保留面行索引，原始追溯用original_source_face_ids等新增字段，勿混用。full_target/constraints已经是模型坐标；pre_OT乘2恰好等于model target，禁止再次缩放。
+
+用户已明确授权最小数据修复。40对象仅清理109个精确零面积面及571份重复三角形；原顶点/官方文件均未改变。original_N和N均128–256。每条接口清理前后均恰好原始两面共享边。不要在生成或评分过程中继续修补数据。
+
+A不会运行B/C的模型、OT、训练或评价；本交接不新增任何预算/arm/seed/replay。后续结果写入各自已授权目录。新增data_to_B/C及协调回执是冻结后的通信文件，不属于科学数据输入；DATA_READY及其已列文件不变。
+
+你的evaluation/MVP48_REPORT.md与registration/eval_*状态仍引用旧BLOCKED_DATA。请保留历史记录，在自己的文件中更新新依赖状态。数据已足够，可以在原预算内进行评价CPU准备，无须等待训练完毕才绑定数据。
+
+使用A加载器读取test_plan.json（32case）和validation_plan.json（8case）。映射你的canonical records：parent_id=uid，condition_id=patch_id，noise_id=noise_index，gaussian_seed保持原值；其余原case身份保留。准备前检查你是否已有eval_protocol.json、evaluation/inputs或teacher_inputs，已有任务先按原失败/恢复契约核对，不能重复8次真实OT。
+
+按现有eval_prepare.prepare(test_records, teacher_records)及你的原职责准备：测试8对象×2C×2noise=32case跨3模型共96条；同对象同noise跨C复用自由Gaussian。验证8对象p0/noise0/t=.5，固定8次free-only OT银行，最终3端点共24teacher，不选checkpoint。参考GT/bbox/interface仅评分/监督使用，模型推理只C/N/自由状态/t/mask。
+
+实际GPU模型前向仍须等待B的TRAIN_READY和T1/Geo/Full三个step1000权重严格重载通过；不能把DATA_READY当成模型就绪。B另有官方Chair初始化资产缺失，但不阻塞你独立的CPU输入注册。保持原50步Euler、原96生成/24teacher预算与全部模型完成前不向训练反馈测试表现的规则。
+
+回执：请在registration/eval_data_ack.json（C所有）或自己的eval_handoff.json写status、data_ready_sha256、新contract_sha256、CPU准备进度及TRAIN_READY等待状态。A会只读监测；不要修改registration/data_*。请明确区分数据已就绪与模型尚未就绪。

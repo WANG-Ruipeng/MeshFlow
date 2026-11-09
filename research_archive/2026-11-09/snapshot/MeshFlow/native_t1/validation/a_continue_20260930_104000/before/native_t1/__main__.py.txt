@@ -1,0 +1,67 @@
+"""Explicit sample/verify commands; importing this module does not run a model."""
+from .runtime import configure_stable_runtime
+import argparse
+from pathlib import Path
+import numpy as np
+from .artifacts import atomic_json, file_sha256, state_sha256
+from .checkpoint import DEFAULT_CHECKPOINT, DEFAULT_CONFIG, load_t1
+from .sampling import make_noise, clamped_sample, new_counts
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Pure Native T1, fixed N112 and 50 Euler steps")
+    commands = parser.add_subparsers(dest="command", required=True)
+    sample = commands.add_parser("sample", help="Generate from FP32 known faces only")
+    sample.add_argument("--condition", type=Path, required=True, help="NPY C or NPZ containing C; no target needed")
+    sample.add_argument("--condition-key", help="Required when condition is NPZ")
+    sample.add_argument("--seed", type=int, required=True)
+    sample.add_argument("--out", type=Path, required=True, help="New output directory; never overwritten")
+    sample.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
+    sample.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    verify = commands.add_parser("verify", help="Exactly two archived T1 replay checks; no training")
+    verify.add_argument("--out", type=Path, required=True)
+    args = parser.parse_args()
+    if args.command == "verify":
+        from .verify import run_regression
+        return run_regression(args.out)
+    if args.out.exists():
+        raise FileExistsError(args.out)
+    value = np.load(args.condition, allow_pickle=False)
+    if isinstance(value, np.lib.npyio.NpzFile):
+        try:
+            if not args.condition_key:
+                raise ValueError("NPZ condition requires an explicit --condition-key")
+            C = value[args.condition_key].copy()
+        finally:
+            value.close()
+    else:
+        C = value
+    if C.dtype != np.float32 or C.ndim not in (2, 3) or C.shape[1:] not in ((9,), (3, 3)):
+        raise ValueError("Condition must be FP32[K,9] or FP32[K,3,3]; no implicit coordinate transform")
+    if len(C) not in (2, 4, 8, 12) or not np.isfinite(C).all():
+        raise ValueError("Finite K2/4/8/12 conditions required")
+    args.out.mkdir(parents=True)
+    report = dict(status="RUNNING", seed=args.seed, condition_file=str(args.condition.resolve()),
+                  condition_file_sha256=file_sha256(args.condition), counts=new_counts())
+    atomic_json(args.out / "run.json", report)
+    try:
+        import torch
+        configure_stable_runtime()
+        model, report["load"] = load_t1(args.checkpoint, args.config)
+        z = make_noise(args.seed)
+        raw, path, report["sampling"] = clamped_sample(model, z.cuda(), torch.from_numpy(C).cuda(), report["counts"])
+        report["state_after"] = state_sha256(model)
+        if report["state_after"] != report["load"]["state_sha256"]:
+            raise RuntimeError("Frozen T1 changed")
+        np.savez_compressed(args.out / "raw.npz", output=raw, path=path, initial_gaussian=z.numpy())
+        report.update(status="PASS", raw_sha256=file_sha256(args.out / "raw.npz"))
+    except BaseException as error:
+        report.update(status="STOPPED", error=repr(error))
+        raise
+    finally:
+        atomic_json(args.out / "run.json", report)
+    print("PASS: " + str(args.out.resolve()))
+
+
+if __name__ == "__main__":
+    main()

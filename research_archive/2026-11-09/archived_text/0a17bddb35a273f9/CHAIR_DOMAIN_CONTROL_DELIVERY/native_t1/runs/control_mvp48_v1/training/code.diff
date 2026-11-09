@@ -1,0 +1,1572 @@
+--- /dev/null
++++ b/experiments/mf_h1_local0/control_mvp48/model_mvp.py
+@@ -0,0 +1,197 @@
++"""Single Control MVP48 train/inference model; no historical endpoint fallback."""
++from native_t1 import runtime as _runtime  # CUBLAS policy before torch
++from pathlib import Path
++import hashlib
++import json
++
++import torch
++from models.equidit import DiT
++from models.utils import get_embedder
++from native_t1.model import (NativeInpaintingModel, assert_native_runtime,
++    native_block_forward, native_final_forward, native_execution, _corners)
++from native_t1.context_geometry import attach_context_encoder, inject_context
++from native_t1.portable_checkpoint import (_read_config, load_official_initialization,
++    config_sha256, OFFICIAL_FILE_SHA256, OFFICIAL_BACKBONE_SHA256)
++from native_t1.checkpoint import DEFAULT_CONFIG
++from native_t1.artifacts import file_sha256, state_sha256
++
++SCHEMA = 'control_mvp48_checkpoint_v1'
++
++
++def json_hash(value):
++    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':'),
++                                    allow_nan=False).encode()).hexdigest()
++
++
++class MVPModel(NativeInpaintingModel):
++    """Original Native arithmetic, total N128..256 and independent valid mask."""
++    def forward(self, x, t, y, valid_mask=None, known_mask=None, *, observer=None):
++        assert_native_runtime(self, coordinates=(x, t))
++        if x.ndim != 3 or x.shape[-1] != 9:
++            raise ValueError('Expected FP32 x[B,padded_N,9]')
++        batch, faces, _ = x.shape
++        if t.shape != (batch,) or y.shape != (batch,) or y.dtype != torch.int64:
++            raise ValueError('Expected free t[B] and integer total N[B]')
++        if not bool(torch.isfinite(x).all() and torch.isfinite(t).all()):
++            raise ValueError('Nonfinite coordinates/time')
++        if bool(((t < 0) | (t > 1)).any()):
++            raise ValueError('Free time outside [0,1]')
++        for mask in (valid_mask, known_mask):
++            if mask is None or mask.dtype != torch.bool or mask.shape != (batch, faces) or mask.device != x.device:
++                raise ValueError('Colocated separate bool[B,padded_N] masks required')
++        if bool((known_mask & ~valid_mask).any()):
++            raise ValueError('Known faces must be valid')
++        if not torch.equal(valid_mask.sum(1), y) or bool(((y < 128) | (y > 256)).any()):
++            raise ValueError('y must count real faces only, N128..256')
++        if bool((known_mask.sum(1) == 0).any()) or bool(((valid_mask & ~known_mask).sum(1) == 0).any()):
++            raise ValueError('Each sample requires known and free faces')
++        _, hidden = self.backbone.x_embedder(x)
++        hidden = hidden.view(batch, faces * 3, -1)
++        role = self.role_embedding[known_mask.long()].to(hidden.dtype)
++        hidden = hidden + _corners(role)
++        if self.context_encoder is not None:
++            delta = self.context_encoder(x, known_mask, valid_mask, observer=self.context_observer)
++            hidden = inject_context(hidden, delta, known_mask, observer=self.context_observer)
++        c_free = self.backbone.t_embedder(t)
++        c_known = self.backbone.t_embedder(torch.ones_like(t))
++        count = self.backbone.y_embedder(y // self.backbone.face_bin, False)
++        c_free, c_known = c_free + count, c_known + count
++        face_time = torch.where(known_mask, torch.ones_like(t[:, None]), t[:, None])
++        if observer is not None:
++            observer(dict(site='embedding', hidden=hidden, role=role,
++                known_mask=known_mask, valid_mask=valid_mask, face_time=face_time,
++                c_free=c_free, c_known=c_known))
++        for index, block in enumerate(self.backbone.layers, 1):
++            hidden = native_block_forward(block, hidden, c_free, c_known, known_mask,
++                valid_mask, observer=observer, layer_index=index, face_time=face_time)
++        output = native_final_forward(self.backbone.final_layer, hidden, c_free,
++            c_known, known_mask, observer=observer, face_time=face_time)
++        # Raw known velocity is intentionally unconstrained. Integration owns C.
++        return output.view(batch, faces, 9)
++
++
++def initialize_mvp(official_path, *, geo, device='cpu'):
++    """Verified official EMA, zero role, independently seeded zero-exit Geo."""
++    original, identity = load_official_initialization(official_path, device='cpu')
++    model = MVPModel(original.backbone, trainable=True)
++    del original
++    if geo:
++        attach_context_encoder(model, 'geo', seed=1010)
++    model.to(device).eval()
++    identity.update(context_encoder='geo' if geo else None, feature_statistics_fitted=False,
++                    initialization_state_sha256=state_sha256(model), device=str(device),
++                    parameters=sum(p.numel() for p in model.parameters()),
++                    trainable_parameters=sum(p.numel() for p in model.parameters() if p.requires_grad))
++    return model, identity
++
++
++def validate_metadata(payload):
++    if payload.get('schema') != SCHEMA:
++        raise ValueError('Expected Control MVP48 checkpoint schema')
++    meta = payload['metadata']
++    variant = meta['variant']
++    if variant not in ('T1', 'Geo_shared', 'Geo', 'Full'):
++        raise ValueError('Invalid variant')
++    step = meta['logical_step']
++    allowed_steps = {'T1': (500, 1000), 'Geo_shared': (500,), 'Geo': (1000,), 'Full': (1000,)}
++    if type(step) is not int or step not in allowed_steps[variant]:
++        raise ValueError('Invalid logical endpoint')
++    if meta['context_encoder'] != (None if variant == 'T1' else 'geo'):
++        raise ValueError('Variant/network identity mismatch')
++    if meta['official_file_sha256'] != OFFICIAL_FILE_SHA256 or meta['official_backbone_sha256'] != OFFICIAL_BACKBONE_SHA256:
++        raise ValueError('Unapproved initialization lineage')
++    if meta['protocol_sha256'] != json_hash(payload['protocol']):
++        raise ValueError('Protocol hash mismatch')
++    from .train_contract import validate_protocol
++    validate_protocol(payload['protocol'])
++    if meta['config_sha256'] != config_sha256(DEFAULT_CONFIG):
++        raise ValueError('Architecture config mismatch')
++    if payload['stream_state']['batch_index'] != step:
++        raise ValueError('Data cursor mismatch')
++    if payload.get('update_in_progress') is not False:
++        raise ValueError('Not a completed update boundary')
++    if not all(key in payload for key in ('optimizer', 'rng', 'model')):
++        raise ValueError('Incomplete training checkpoint')
++    if variant in ('Geo', 'Full') and not meta.get('fork_checkpoint_sha256'):
++        raise ValueError('Branch missing exact shared checkpoint identity')
++    from .train_io import tree_hash
++    if tree_hash(payload['optimizer']) != meta['optimizer_state_sha256']:
++        raise ValueError('Optimizer state hash mismatch')
++    if tree_hash(payload['rng']) != meta['rng_sha256'] or json_hash(payload['stream_state']) != meta['stream_state_sha256']:
++        raise ValueError('Model/data RNG or cursor hash mismatch')
++    phases = {'T1': 0, 'Geo_shared': 0, 'Geo': 0, 'Full': 0}
++    if variant == 'T1':
++        phases['T1'] = step
++    else:
++        phases.update(T1=1000, Geo_shared=500)
++        if variant in ('Geo', 'Full'): phases['Geo'] = 500
++        if variant == 'Full': phases['Full'] = 500
++    if meta['executed_phase_updates'] != phases or meta['actual_updates_at_save'] != sum(phases.values()):
++        raise ValueError('Actual optimizer update accounting differs')
++    if meta['loss_recipe'] != ('edge5' if variant == 'Full' else 'fm'):
++        raise ValueError('Checkpoint objective identity differs')
++    if meta['optimizer_reset_at_phase_start'] != (variant in ('T1', 'Geo_shared')):
++        raise ValueError('AdamW reset/restore history differs')
++    if not payload['optimizer']['state'] or not payload['optimizer']['param_groups']:
++        raise ValueError('Empty trained AdamW state')
++    for group in payload['optimizer']['param_groups']:
++        if (group['lr'], tuple(group['betas']), group['weight_decay']) != (1e-5, (.9, .95), 0.):
++            raise ValueError('Saved optimizer settings differ')
++    if any(int(s['step']) != step for s in payload['optimizer']['state'].values()):
++        raise ValueError('AdamW update cursor differs from logical step')
++    return meta
++
++
++def load_mvp_checkpoint(path, device):
++    """Return (model, actual_metadata, hashes); the only inference model loader.
++
++    Callers must hold the shared GPU lock before requesting a CUDA device.
++    Loading on CPU never initializes CUDA. No optimizer or RNG is restored here.
++    """
++    path = Path(path)
++    payload = torch.load(path, map_location='cpu', weights_only=True, mmap=True)
++    meta = validate_metadata(payload)
++    config = _read_config(Path(DEFAULT_CONFIG))
++    _runtime.configure_stable_runtime()
++    with torch.device('meta'):
++        model = MVPModel(DiT(**config), trainable=False)
++    model.backbone.x_embedder.embed_fn, _ = get_embedder(config['pe_freq'], input_dims=3)
++    if meta['context_encoder'] == 'geo':
++        # Explicit CPU construction; assign subsequently replaces every tensor.
++        from native_t1.context_geometry import ContextGeometryEncoder
++        model.context_encoder = ContextGeometryEncoder('geo', seed=1010)
++    state = payload['model']
++    if any(v.dtype != torch.float32 or v.device.type != 'cpu' or not bool(torch.isfinite(v).all()) for v in state.values()):
++        raise ValueError('Checkpoint must contain finite CPU FP32 model tensors')
++    model.load_state_dict(state, strict=True, assign=True)
++    actual = state_sha256(model)
++    if actual != meta['model_state_sha256']:
++        raise ValueError('Model tensor hash mismatch')
++    digest = file_sha256(path)
++    sidecar = path.with_suffix('.json')
++    if sidecar.exists():
++        recorded = json.loads(sidecar.read_text())
++        if recorded['checkpoint_sha256'] != digest or recorded['metadata'] != meta:
++            raise ValueError('Checkpoint sidecar identity mismatch')
++    actual_meta = dict(meta, strict_load=True, checkpoint=str(path.resolve()),
++                       protocol=payload['protocol'], inference_trainable=False)
++    del payload
++    model.set_trainable(False).eval().to(device)
++    return model, actual_meta, dict(checkpoint_sha256=digest, model_state_sha256=actual,
++                                   protocol_sha256=meta['protocol_sha256'])
++
++
++def velocity_mvp(model, x, t, N, valid_mask, known_mask):
++    """Unified BF16 production forward; grad mode belongs to caller."""
++    with native_execution(model, coordinates=(x, t), autocast=x.device.type == 'cuda'):
++        return model(x, t, N, valid_mask, known_mask).float()
++
++
++def integrate_mvp_step(model, x, t, dt, N, valid_mask, known_mask, context):
++    """FP32 Euler step with exact C preservation; no GT labels or repairs."""
++    if x.dtype != torch.float32 or context.dtype != torch.float32:
++        raise ValueError('FP32 integration and C required')
++    x = torch.where(known_mask[..., None], context, x)
++    velocity = velocity_mvp(model, x, t, N, valid_mask, known_mask)
++    free = valid_mask & ~known_mask
++    return torch.where(free[..., None], x + float(dt) * velocity, x)
+--- /dev/null
++++ b/experiments/mf_h1_local0/control_mvp48/train_accept_data.py
+@@ -0,0 +1,98 @@
++"""Session B CPU-only receipt of the frozen repair_v2 data; zero OT/model calls."""
++import os
++for name in ('OMP_NUM_THREADS','MKL_NUM_THREADS','OPENBLAS_NUM_THREADS','NUMEXPR_NUM_THREADS'):
++    os.environ[name]='2'
++import json
++import time
++from collections import Counter
++from pathlib import Path
++from native_t1 import runtime
++import torch
++from native_t1.artifacts import atomic_json,file_sha256
++from .train_contract import ROOT,read_binding
++from .train_stream import FrozenStream
++from .train_io import resource_snapshot
++from .model_mvp import json_hash
++
++def main():
++    torch.set_num_threads(2);torch.set_num_interop_threads(2)
++    if torch.cuda.is_initialized(): raise RuntimeError('Data receipt must not initialize CUDA')
++    root=ROOT
++    before=resource_snapshot()
++    atomic_json(root/'registration/train_data_resources.json',before)
++    tick=time.perf_counter()
++    binding,protocol,plan_path,data_root=read_binding(root)
++    ready=json.loads((root/'DATA_READY.json').read_text())
++    if ready.get('data_revision')!='repair_v2':
++        raise ValueError('This receipt explicitly acknowledges repair_v2')
++    stream=FrozenStream(binding,plan_path,data_root)
++    counts=Counter((r['uid'],r['patch_id']) for r in stream.records)
++    assert len(stream.objects)==32 and len(stream.cases)==128 and len(stream.records)==8000
++    assert all(n in (62,63) for n in counts.values())
++    assert stream.counts==dict(actual_OT_attempts=0,actual_OT_returns=0,OT_cache_hits=0)
++    assert not torch.cuda.is_initialized()
++    receipt=dict(schema='control_mvp48_train_data_ack_v1',owner='Session B',
++        status='DATA_BOUND_CPU_CONSUMER_PASS',data_revision=ready['data_revision'],
++        data_ready_sha256=binding['data_ready_sha256'],contract_sha256=binding['accepted_contract_sha256'],
++        manifest_sha256=protocol['manifest_sha256'],train_plan_sha256=protocol['plan_sha256'],
++        binding_path='registration/train_data_binding.json',binding_sha256=protocol['binding_sha256'],
++        files_verified=len(binding['files']),splits=ready['splits'],
++        loaded_training_objects=len(stream.objects),loaded_training_patches=len(stream.cases),
++        effective_batches=1000,effective_batch_size=8,sample_records=8000,
++        plan_N_range=[min(r['N'] for r in stream.records),max(r['N'] for r in stream.records)],
++        plan_K_range=[min(r['K'] for r in stream.records),max(r['K'] for r in stream.records)],
++        pair_usage_range=[min(counts.values()),max(counts.values())],
++        all_record_order_N_K_checked=True,training_evaluation_disjoint=True,
++        coordinate_contract='pre_ot_full * 2 == model target; C/full_target not rescaled',
++        label_contract='source_face_ids use retained dense rows; original_* are provenance only',
++        feature_statistics_fitted=False,actual_OT_calls=0,model_forwards=0,optimizer_updates=0,
++        CUDA_initialized=False,seconds=time.perf_counter()-tick,
++        supersedes_data_blocked=ready.get('supersedes_blocked'),
++        remaining_blockers=['OFFICIAL_CHAIR_ASSET_MISSING'],
++        next_action='Resolve and SHA256-verify official Chair; then original bounded precheck and single-worker 2500-update tree.')
++    atomic_json(root/'registration/train_data_ack.json',receipt)
++    atomic_json(root/'registration/train_protocol.json',dict(protocol=protocol,protocol_sha256=json_hash(protocol),
++        status='DATA_BOUND_AWAITING_OFFICIAL_CHAIR'))
++    handoff_path=root/'registration/train_handoff.json'
++    previous=json.loads(handoff_path.read_text())
++    history=root/'registration/train_handoff_before_repair_v2.json'
++    if not history.exists(): atomic_json(history,previous)
++    previous.update(status='WAITING_OFFICIAL_CHAIR',data_revision='repair_v2',DATA_READY_exists=True,
++        accepted_data_contract=dict(path=ready['contract']['path'],sha256=ready['contract']['sha256']),
++        data_ready_sha256=binding['data_ready_sha256'],data_binding='registration/train_data_binding.json',
++        data_ack='registration/train_data_ack.json',remaining_blockers=receipt['remaining_blockers'])
++    atomic_json(handoff_path,previous)
++    missing=json.loads((root/'registration/train_dependency_audit.json').read_text())
++    history=root/'registration/train_dependency_before_repair_v2.json'
++    if not history.exists(): atomic_json(history,missing)
++    missing.update(status='WAITING_OFFICIAL_CHAIR',data_status='BOUND_REPAIR_V2',
++        data_ready_sha256=binding['data_ready_sha256'],data_ack='registration/train_data_ack.json')
++    if 'data_blocked' in missing: missing['historical_data_blocked_superseded']=missing.pop('data_blocked')
++    missing['action']=receipt['next_action']
++    atomic_json(root/'registration/train_dependency_audit.json',missing)
++    lines=['# Session B data requirements and receipt','',
++        'Current data: repair_v2, all '+str(len(binding['files']))+' frozen file hashes and sizes verified.',
++        'B consumed 32 training objects, 128 training patches and 8000 fixed records using FrozenStream.',
++        'No OT, model forward, optimizer update or CUDA initialization occurred in this receipt.','',
++        '| Input | Required role | Current status |','|---|---|---|',
++        '| DATA_READY.json | Freeze identity and hash inventory | Bound |',
++        '| registration/data_contract_repair_v2.json | Data API and retained/source index semantics | Bound |',
++        '| data/manifest.json, splits.json, patches.json | Object identity, 32/8/8 split, patch membership/interfaces | Verified |',
++        '| data/meshes/<uid>.npz | Original provenance, retained topology, FP32 target/C/pre-OT coordinates | 48 frozen, train32 consumed |',
++        '| data/train_plan.json | 1000 batches x8; UID/patch/Gaussian/t/permutation seeds | 8000 records validated |',
++        '| data/load_sample.py | Shared exact loaders and stateless RNG recipes | Hash pinned and consumed |',
++        '| data/independent_repair_validation.json | Independent audit | PASS |',
++        '| Official Chair last.pt | Official EMA backbone only | Missing |','',
++        'Per-record plan fields: sample_index, effective_batch_index, slot_index, uid, patch_id, N, K, gaussian_seed, t_seed, permutation_seed.',
++        'Mesh/patch fields consumed: model_vertices, source_face_vertex_ids, pre_ot_full, full_target, constraints, source_face_ids, free_source_ids, bbox_diagonal, interface.',
++        'N counts retained genuine faces. source_face_ids/free_source_ids index retained dense rows; original_* fields are traceability only.',
++        'pre_ot_full is captured before official final x2. full_target and C already include x2; they are never rescaled.',
++        'Validation/test files are hash-verified but never used to fit statistics, select training batches, or train. Geo fits no statistics.','',
++        'Remaining asset: 2,084,287,208 bytes; SHA256 bda891a0f046ca6015f70f745fa24a8036c64dda12175b246d853c957f63b92d.',
++        'Historical registered location: /mnt/c/Users/warpwang/Downloads/last.pt. Bench/old tuned models cannot substitute.',
++        'After this exact asset is restored, the registered real-data prechecks and 2500 updates can run; no extra arm or retry was added.','',
++        'Receipt: registration/train_data_ack.json. Binding: registration/train_data_binding.json.']
++    (root/'training/TRAIN_DATA_REQUIREMENTS.md').write_text('\n'.join(lines)+'\n')
++    print(json.dumps(receipt,indent=2))
++
++if __name__=='__main__':main()
+--- /dev/null
++++ b/experiments/mf_h1_local0/control_mvp48/train_binding.py
+@@ -0,0 +1,68 @@
++"""Session A readiness verification; no speculative schema or data selection."""
++from pathlib import Path
++import importlib.util
++import json
++from native_t1.artifacts import atomic_json, file_sha256
++from .model_mvp import json_hash
++from .train_contract import PROTOCOL, WaitingDependency, checked_file
++
++def data_api(path):
++    spec = importlib.util.spec_from_file_location('control_mvp48_frozen_data', path)
++    module = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(module)
++    return module
++
++def bind_data(root):
++    root = Path(root)
++    ready_path = root / 'DATA_READY.json'
++    if not ready_path.is_file():
++        blocked=root/'DATA_BLOCKED.json'
++        if blocked.is_file():
++            reason=json.loads(blocked.read_text()).get('reason', 'See Session A report')
++            raise WaitingDependency('BLOCKED_DATA: '+reason+' [DATA_BLOCKED sha256='+file_sha256(blocked)+']')
++        raise WaitingDependency('Session A DATA_READY.json is absent')
++    ready = json.loads(ready_path.read_text())
++    if ready.get('schema') != 'control_mvp48_data_ready_v1' or ready.get('status') != 'READY':
++        raise WaitingDependency('Session A has not published the expected READY contract')
++    if ready['splits'] != dict(train=32, validation=8, test=8):
++        raise ValueError('Frozen split counts changed')
++    verified = {}
++    for name, record in ready['files'].items():
++        path = checked_file(root, dict(path=name, sha256=record['sha256']))
++        if path.stat().st_size != record['bytes']:
++            raise ValueError('Frozen artifact size mismatch: ' + name)
++        verified[name] = record['sha256']
++    for name in ('manifest', 'split', 'contract', 'independent_audit'):
++        record = ready[name]
++        if verified.get(record['path']) != record['sha256']:
++            raise ValueError('Readiness references an unhashed/different artifact')
++    audit = json.loads((root / ready['independent_audit']['path']).read_text())
++    if audit['status'] != 'PASS':
++        raise ValueError('Independent data audit did not pass')
++    splits = json.loads((root / ready['split']['path']).read_text())
++    sets = [set(splits[k]) for k in ('train', 'validation', 'test')]
++    if [len(s) for s in sets] != [32, 8, 8] or any(sets[i] & sets[j] for i,j in ((0,1),(0,2),(1,2))):
++        raise ValueError('Split overlap/count error')
++    for record in ready['task_plans'].values():
++        if verified.get(record['path']) != record['sha256']:
++            raise ValueError('Unbound task plan')
++    loader_path = root / 'data/load_sample.py'
++    if 'data/load_sample.py' not in verified:
++        raise ValueError('Data loader is not frozen')
++    binding = dict(schema='control_mvp48_train_binding_v1', status='FROZEN',
++        data_ready_sha256=file_sha256(ready_path), accepted_contract_sha256=ready['contract']['sha256'],
++        train_object_ids=sorted(sets[0]), evaluation_object_ids=sorted(sets[1] | sets[2]),
++        files=verified, loader_path=str(loader_path), data_root=str(root / 'data'),
++        manifest=ready['manifest'], plan=ready['task_plans']['train'])
++    path = root / 'registration/train_data_binding.json'
++    if path.exists():
++        if json.loads(path.read_text()) != binding:
++            raise ValueError('Existing train binding differs; refusing overwrite')
++    else:
++        atomic_json(path, binding)
++    protocol = dict(PROTOCOL, data_ready_sha256=binding['data_ready_sha256'],
++        binding_sha256=file_sha256(path), manifest_sha256=ready['manifest']['sha256'],
++        plan_sha256=ready['task_plans']['train']['sha256'],
++        data_contract_sha256=ready['contract']['sha256'],
++        data_rng='Frozen per-sample Session A Gaussian/time/permutation seeds; no worker-derived seeds')
++    return binding, protocol, root / ready['task_plans']['train']['path'], root / 'data'
+--- /dev/null
++++ b/experiments/mf_h1_local0/control_mvp48/train_contract.py
+@@ -0,0 +1,45 @@
++"""Immutable update budget and fail-closed frozen-data binding contract."""
++from pathlib import Path
++import json
++from native_t1.artifacts import file_sha256
++from native_t1.objectives import objective_spec
++
++ROOT = Path(__file__).resolve().parents[3] / 'native_t1/runs/control_mvp48_v1'
++PROTOCOL = dict(schema='control_mvp48_training_protocol_v1', training_seed=10,
++    model_initialization_seed=1010, total_actual_optimizer_updates=2500,
++    phases=[['T1', 0, 1000], ['Geo_shared', 0, 500], ['Geo', 500, 1000], ['Full', 500, 1000]],
++    effective_batch=8, microbatch=1, N_range=[128, 256],
++    optimizer=dict(name='AdamW', lr=1e-5, betas=[.9, .95], weight_decay=0., clip=1.),
++    scheduler=None, ema=None, precision='BF16_forward_FP32_parameters_coordinates_geometry',
++    determinism='strict_TF32_off_SDPA_math', loss=objective_spec('edge5'),
++    full_ramp_index='logical_step_minus_500', shared_optimizer_copied=True,
++    FM_denominator='all_valid_free_scalar_coordinates_in_effective_batch',
++    feature_statistics_fitted=False, gpu_workers=1,
++    gpu_lock='/tmp/wrp_meshflow_jedge5_diag_gpu0.lock')
++
++
++def validate_protocol(protocol):
++    if {k: protocol.get(k) for k in PROTOCOL} != PROTOCOL:
++        raise ValueError('Fixed Control MVP48 protocol changed')
++    if not all(protocol.get(k) for k in ('data_ready_sha256', 'binding_sha256', 'plan_sha256')):
++        raise ValueError('Protocol lacks frozen data identities')
++
++
++class WaitingDependency(RuntimeError):
++    pass
++
++
++def checked_file(root, record):
++    path = (root / record['path']).resolve()
++    if not path.is_relative_to(root.resolve()):
++        raise ValueError('Frozen data path escapes run root')
++    if not path.is_file():
++        raise WaitingDependency('Missing frozen dependency: ' + str(path))
++    if file_sha256(path) != record['sha256']:
++        raise ValueError('Frozen dependency hash mismatch: ' + str(path))
++    return path
++
++
++def read_binding(root=ROOT):
++    from .train_binding import bind_data
++    return bind_data(root)
+--- /dev/null
++++ b/experiments/mf_h1_local0/control_mvp48/train_core.py
+@@ -0,0 +1,73 @@
++"""One training implementation for all four phases; precheck never steps AdamW."""
++import time
++import torch
++from native_t1.model import native_execution
++from native_t1.data import model_inputs
++from native_t1.training import masked_fm_loss
++from .train_stream import collate
++
++
++def backward_batch(model, samples, *, objective=None, additional_step=None, counts=None):
++    if len(samples) != 8:
++        raise ValueError('Effective batch8/microbatch1 is fixed')
++    device = next(model.parameters()).device
++    counts = {} if counts is None else counts
++    def inc(key): counts[key] = counts.get(key, 0) + 1
++    denominator = 9 * sum(int((s['valid_mask'] & ~s['known_mask']).sum()) for s in samples)
++    prepared = objective.prepare(samples) if objective is not None else None
++    report = dict(FM=0., geometry=0., loss=0., free_coordinate_denominator=denominator,
++                  active_samples=0, geometry_diagnostics=[])
++    for index, sample in enumerate(samples):
++        batch = collate([sample], device)
++        with native_execution(model, coordinates=(batch['xt'], batch['t']), autocast=device.type == 'cuda') as runtime:
++            inc('forward_attempts')
++            velocity = model(*model_inputs(batch)).float()
++            inc('forward_returns')
++            loss = masked_fm_loss(velocity, batch['u'], batch['valid_mask'],
++                                 batch['known_mask'], denominator=denominator)
++            report['FM'] += float(loss.detach())
++            if objective is not None:
++                aux, diagnostic = objective.auxiliary(velocity, batch, prepared[index], additional_step=additional_step)
++                report['geometry'] += float(aux.detach())
++                report['active_samples'] += int(diagnostic['active'])
++                report['geometry_diagnostics'].append(diagnostic)
++                loss = loss + aux
++            if not bool(torch.isfinite(loss)):
++                raise FloatingPointError('Nonfinite actual loss')
++            report['loss'] += float(loss.detach())
++            inc('backward_attempts'); loss.backward(); inc('backward_returns')
++    report['runtime'] = runtime
++    return report
++
++
++def optimizer_update(model, optimizer, samples, *, objective=None, additional_step=None, counts=None):
++    counts = {} if counts is None else counts
++    if not isinstance(optimizer, torch.optim.AdamW):
++        raise ValueError('AdamW required')
++    params = list(model.parameters())
++    if model.training or not all(p.requires_grad and p.dtype == torch.float32 for p in params):
++        raise ValueError('All model parameters must remain trainable FP32 in eval mode')
++    opt_params = [p for group in optimizer.param_groups for p in group['params']]
++    if len(opt_params) != len(params) or {id(p) for p in opt_params} != {id(p) for p in params}:
++        raise ValueError('Optimizer must own all parameters exactly once')
++    for group in optimizer.param_groups:
++        if (group['lr'], tuple(group['betas']), group['weight_decay']) != (1e-5, (.9, .95), 0.):
++            raise ValueError('Optimizer configuration differs')
++    tick = time.perf_counter()
++    optimizer.zero_grad(set_to_none=True)
++    report = backward_batch(model, samples, objective=objective, additional_step=additional_step, counts=counts)
++    report['grad_norm_before_clip'] = float(torch.nn.utils.clip_grad_norm_(params, 1., error_if_nonfinite=True))
++    counts['optimizer_step_attempts'] = counts.get('optimizer_step_attempts', 0) + 1
++    counts['optimizer_step_in_progress'] = True
++    counts['update_validated'] = False
++    optimizer.step()
++    counts['optimizer_step_in_progress'] = False
++    counts['optimizer_updates'] = counts.get('optimizer_updates', 0) + 1
++    if params[0].is_cuda:
++        torch.cuda.synchronize()
++    if not all(bool(torch.isfinite(p).all()) for p in params):
++        raise FloatingPointError('Nonfinite parameter after optimizer update; no retry')
++    counts['update_validated'] = True
++    report['train_seconds'] = time.perf_counter() - tick
++    report['counts'] = dict(counts)
++    return report
+--- /dev/null
++++ b/experiments/mf_h1_local0/control_mvp48/train_io.py
+@@ -0,0 +1,163 @@
++"""Atomic checkpoints, full branch state, resource observations and GPU lock."""
++from native_t1 import runtime as _runtime
++import contextlib
++import copy
++import fcntl
++import hashlib
++import json
++import os
++from pathlib import Path
++import random
++import shutil
++import subprocess
++import time
++import numpy as np
++import torch
++from native_t1.artifacts import atomic_json, file_sha256, state_sha256
++from native_t1.portable_checkpoint import (OFFICIAL_FILE_SHA256,
++    OFFICIAL_BACKBONE_SHA256, config_sha256)
++from native_t1.checkpoint import DEFAULT_CONFIG
++from .model_mvp import SCHEMA, json_hash, load_mvp_checkpoint
++from .train_contract import PROTOCOL
++
++
++def resource_snapshot():
++    """nvidia-smi only; does not initialize the calling process's CUDA context."""
++    def command(args):
++        value = subprocess.run(args, text=True, capture_output=True, timeout=15)
++        return dict(returncode=value.returncode, stdout=value.stdout.strip(), stderr=value.stderr.strip())
++    memory = {}
++    for line in Path('/proc/meminfo').read_text().splitlines():
++        key, val = line.split(':', 1)
++        if key in ('MemTotal', 'MemAvailable', 'SwapFree'):
++            memory[key + '_kib'] = int(val.split()[0])
++    return dict(time_unix=time.time(), pid=os.getpid(), cpu_cores=os.cpu_count(),
++        cpu_affinity_cores=len(os.sched_getaffinity(0)), load_average=list(os.getloadavg()),
++        memory=memory,
++        gpu=command(['nvidia-smi', '--query-gpu=name,memory.total,memory.used,memory.free,utilization.gpu', '--format=csv,noheader,nounits']),
++        gpu_processes=command(['nvidia-smi', '--query-compute-apps=pid,process_name,used_gpu_memory', '--format=csv,noheader,nounits']),
++        cpu_processes=command(['ps', '-eo', 'pid,pcpu,pmem,rss,nlwp,comm', '--sort=-pcpu']))
++
++
++@contextlib.contextmanager
++def gpu_lock(root):
++    if torch.cuda.is_initialized():
++        raise RuntimeError('CUDA was initialized before obtaining shared GPU lock')
++    tick = time.perf_counter()
++    with open(PROTOCOL['gpu_lock'], 'a+') as handle:
++        while True:
++            try:
++                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
++                break
++            except BlockingIOError:
++                atomic_json(root / 'training/status.json', dict(status='WAITING_GPU_LOCK',
++                    actual_optimizer_updates=0, lock=PROTOCOL['gpu_lock'], wait_seconds=time.perf_counter()-tick))
++                time.sleep(5)
++        try:
++            yield time.perf_counter() - tick
++        finally:
++            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
++
++
++def capture_rng():
++    s = np.random.get_state()
++    return dict(python=random.getstate(), numpy=[s[0], s[1].tolist(), int(s[2]), int(s[3]), float(s[4])],
++        torch_cpu=torch.random.get_rng_state(),
++        torch_cuda=torch.cuda.get_rng_state_all() if torch.cuda.is_initialized() else [])
++
++
++def restore_rng(state):
++    random.setstate(state['python'])
++    s = state['numpy']; np.random.set_state((s[0], np.asarray(s[1], np.uint32), s[2], s[3], s[4]))
++    torch.random.set_rng_state(state['torch_cpu'])
++    if state['torch_cuda']:
++        torch.cuda.set_rng_state_all(state['torch_cuda'])
++
++
++def tree_cpu(value):
++    if torch.is_tensor(value):
++        return value.detach().cpu().clone()
++    if isinstance(value, dict):
++        return {k: tree_cpu(v) for k, v in value.items()}
++    if isinstance(value, list):
++        return [tree_cpu(v) for v in value]
++    if isinstance(value, tuple):
++        return tuple(tree_cpu(v) for v in value)
++    return copy.deepcopy(value)
++
++
++def tree_hash(value):
++    """Hash optimizer/RNG content, including scalar tensor state and layout."""
++    digest = hashlib.sha256()
++    def visit(v):
++        if torch.is_tensor(v):
++            t = v.detach().cpu().contiguous()
++            digest.update(str((str(t.dtype), tuple(t.shape))).encode())
++            digest.update(t.reshape(-1).view(torch.uint8).numpy().tobytes())
++        elif isinstance(v, dict):
++            for key in sorted(v, key=lambda k: str(k)):
++                digest.update(repr(key).encode()); visit(v[key])
++        elif isinstance(v, (list, tuple)):
++            digest.update(type(v).__name__.encode())
++            for x in v: visit(x)
++        else:
++            digest.update(repr(v).encode())
++    visit(value)
++    return digest.hexdigest()
++
++
++def save_checkpoint(root, model, optimizer, stream, protocol, *, variant, step,
++                    actual_updates, phase_updates, fork_sha=None):
++    tick = time.perf_counter()
++    name = f'{variant}_step{step}'
++    path = root / 'checkpoints' / (name + '.pt')
++    if path.exists() or path.with_suffix('.json').exists():
++        raise FileExistsError('Refusing to overwrite checkpoint ' + str(path))
++    state = tree_cpu(model.state_dict())
++    opt = tree_cpu(optimizer.state_dict())
++    rng = capture_rng()
++    meta = dict(variant=variant, logical_step=step, context_encoder=None if variant == 'T1' else 'geo',
++        model_state_sha256=state_sha256(model), optimizer_state_sha256=tree_hash(opt),
++        rng_sha256=tree_hash(rng), stream_state_sha256=json_hash(stream.state_dict()),
++        protocol_sha256=json_hash(protocol), config_sha256=config_sha256(DEFAULT_CONFIG),
++        official_file_sha256=OFFICIAL_FILE_SHA256, official_backbone_sha256=OFFICIAL_BACKBONE_SHA256,
++        actual_updates_at_save=actual_updates, executed_phase_updates=dict(phase_updates),
++        fork_checkpoint_sha256=fork_sha, official_pretraining_steps_in_logical_count=False,
++        optimizer_reset_at_phase_start=variant in ('T1', 'Geo_shared'),
++        loss_recipe='edge5' if variant == 'Full' else 'fm')
++    payload = dict(schema=SCHEMA, metadata=meta, protocol=protocol, model=state, optimizer=opt,
++                   rng=rng, stream_state=stream.state_dict(), update_in_progress=False)
++    temporary = path.with_suffix('.pt.tmp')
++    torch.save(payload, temporary)
++    with temporary.open('rb') as handle: os.fsync(handle.fileno())
++    temporary.replace(path)
++    digest = file_sha256(path)
++    record = dict(path=str(path), checkpoint_sha256=digest, metadata=meta)
++    atomic_json(path.with_suffix('.json'), record)
++    del payload, state, opt
++    loaded, actual, hashes = load_mvp_checkpoint(path, 'cpu')
++    if hashes['model_state_sha256'] != meta['model_state_sha256']:
++        raise RuntimeError('Strict checkpoint reload mismatch')
++    del loaded
++    record.update(strict_reload='PASS', save_and_verify_seconds=time.perf_counter()-tick)
++    return record
++
++
++def restore_branch(path, stream, *, device='cuda'):
++    model, meta, hashes = load_mvp_checkpoint(path, device)
++    if meta['variant'] != 'Geo_shared' or meta['logical_step'] != 500:
++        raise ValueError('Branch requires exact Geo_shared_step500')
++    payload = torch.load(path, map_location='cpu', weights_only=True, mmap=True)
++    from native_t1.training import make_optimizer
++    model.set_trainable(True)
++    optimizer = make_optimizer(model)
++    optimizer.load_state_dict(payload['optimizer'])
++    if tree_hash(optimizer.state_dict()) != meta['optimizer_state_sha256']:
++        raise ValueError('Restored AdamW momentum/state differs')
++    stream.load_state_dict(payload['stream_state'])
++    if json_hash(stream.state_dict()) != meta['stream_state_sha256']:
++        raise ValueError('Restored data cursor/RNG differs')
++    restore_rng(payload['rng'])
++    if tree_hash(capture_rng()) != meta['rng_sha256']:
++        raise ValueError('Restored model RNG differs')
++    return model, optimizer, hashes['checkpoint_sha256']
+--- /dev/null
++++ b/experiments/mf_h1_local0/control_mvp48/train_precheck.py
+@@ -0,0 +1,110 @@
++"""Bounded real-training-data gates; zero optimizer updates and no evaluation data."""
++import copy
++import gc
++import time
++import torch
++from native_t1.artifacts import atomic_json, state_sha256
++from native_t1.data import model_inputs
++from native_t1.model import native_execution
++from native_t1.losses import prepare_targets, evaluate
++from native_t1.training import masked_fm_loss
++from native_t1.context_geometry import attach_context_encoder
++from .model_mvp import initialize_mvp, integrate_mvp_step, velocity_mvp
++from .train_stream import FrozenStream, collate, MVPObjective
++from .train_core import backward_batch
++
++
++def run_precheck(root, official_path, binding, plan_path, archive_path):
++    tick = time.perf_counter()
++    stream = FrozenStream(binding, plan_path, archive_path)
++    samples = stream.next_effective_batch()
++    if len({int(s['y']) for s in samples}) < 2 or len({s['K'] for s in samples}) < 2:
++        raise ValueError('First frozen batch lacks variable N/K coverage; inspect plan, do not substitute objects')
++    model, identity = initialize_mvp(official_path, geo=False, device='cuda')
++    before = state_sha256(model)
++    counts = {}
++    model.zero_grad(set_to_none=True)
++    fm = backward_batch(model, samples, counts=counts)
++    grad_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), float('inf'), error_if_nonfinite=True))
++    if grad_norm <= 0 or state_sha256(model) != before:
++        raise RuntimeError('FM gradient absent or precheck changed parameters')
++    model.zero_grad(set_to_none=True)
++    batch = collate([samples[0]], 'cuda')
++    observed = []
++    def observer(record):
++        if record['site'] == 'final':
++            ft = record['face_time']; known = batch['known_mask']
++            assert torch.equal(ft[known], torch.ones_like(ft[known]))
++            assert torch.equal(ft[~known], batch['t'][:, None].expand_as(ft)[~known])
++            observed.append('final_time_correct')
++    with torch.no_grad(), native_execution(model, coordinates=batch['xt']):
++        original = model(*model_inputs(batch), observer=observer).float()
++    if observed != ['final_time_correct']:
++        raise RuntimeError('Final head time was not observed')
++    attach_context_encoder(model, 'geo', seed=1010)
++    with torch.no_grad():
++        zero = velocity_mvp(model, *model_inputs(batch))
++    if not torch.equal(original, zero):
++        raise RuntimeError('Zero-exit Geo fails exact initial regression')
++    with torch.no_grad():
++        after = integrate_mvp_step(model, batch['xt'], batch['t'], .02,
++            batch['y'], batch['valid_mask'], batch['known_mask'], batch['context'])
++    assert torch.equal(after[batch['known_mask']], batch['context'][batch['known_mask']])
++    # Exercise a real dynamic padded batch without treating padding as N.
++    other = next(s for s in samples if int(s['y']) != int(samples[0]['y']))
++    padded = collate([samples[0], other], 'cuda', pad_to=max(int(samples[0]['y']), int(other['y'])) + 3)
++    with torch.no_grad():
++        padded_velocity = velocity_mvp(model, *model_inputs(padded))
++    assert bool(torch.isfinite(padded_velocity).all())
++    del padded_velocity, padded, after, zero, original
++    active = next((s for s in samples if float(s['t']) >= .5), None)
++    if active is None:
++        raise ValueError('First frozen batch has no active auxiliary sample; no time override')
++    batch = collate([active], 'cuda')
++    target = prepare_targets(stream.label(active))
++    term_gradients = {}
++    with native_execution(model, coordinates=batch['xt']):
++        velocity = model(*model_inputs(batch)).float()
++        prediction = (batch['xt'] + (1-batch['t'][:, None, None])*velocity)[batch['loss_mask']].reshape(-1, 3, 3)
++        terms = dict(FM=masked_fm_loss(velocity, batch['u'], batch['valid_mask'], batch['known_mask']))
++        terms.update({name: evaluate(name, prediction, target[name])['loss'] for name in ('D_edge', 'L5')})
++        for name, term in terms.items():
++            g = torch.autograd.grad(term, velocity, retain_graph=True)[0]
++            if not bool(torch.isfinite(term)) or not bool(torch.isfinite(g).all()):
++                raise FloatingPointError('Nonfinite actual-model-output gradient: ' + name)
++            term_gradients[name] = dict(loss=float(term.detach()), output_gradient_norm=float(g.norm()))
++        sum(terms.values()).backward()
++    torch.nn.utils.clip_grad_norm_(model.parameters(), float('inf'), error_if_nonfinite=True)
++    del terms, velocity, prediction, target, g
++    model.zero_grad(set_to_none=True)
++    geometry_counts = {}
++    joint = backward_batch(model, samples, objective=MVPObjective(stream), additional_step=1, counts=geometry_counts)
++    joint_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), float('inf'), error_if_nonfinite=True))
++    model.zero_grad(set_to_none=True)
++    digest = state_sha256(model)
++    temporary = root / 'training/precheck_serialization.pt'
++    if temporary.exists():
++        raise FileExistsError('Precheck serialization already exists; do not silently repeat gates')
++    torch.save(dict(schema='control_mvp48_precheck_only', optimizer_updates=0,
++                    model={k: v.detach().cpu() for k, v in model.state_dict().items()}), temporary)
++    payload = torch.load(temporary, map_location='cpu', weights_only=True, mmap=True)
++    model.load_state_dict(payload['model'], strict=True)
++    if state_sha256(model) != digest:
++        raise RuntimeError('Precheck serialization changed tensors')
++    del payload
++    # The small diagnostic copy is not an endpoint and need not retain 0.5 GB.
++    temporary.unlink()
++    result = dict(status='PASS', optimizer_updates=0, FM=fm['FM'], FM_gradient_norm=grad_norm,
++        joint_loss=joint['loss'], joint_gradient_norm=joint_norm, term_output_gradients=term_gradients,
++        known_coordinate_bitwise_preserved=True, raw_known_velocity_zero_asserted=False,
++        final_head_time='PASS', zero_exit_geo_bitwise_regression=True, strict_serialization='PASS',
++        N=[int(s['y']) for s in samples], K=[s['K'] for s in samples],
++        counts=counts, geometry_counts=geometry_counts, OT=dict(stream.counts), official_identity=identity,
++        old_BF16_permutation=dict(status='HISTORICAL_FAIL_UNCHANGED', atol=.015625, rtol=.03125,
++            failed_coordinates=10, total_coordinates=1008, max_abs=.064453125,
++            source='native_t1/runs/geometry_context_revised_20260930_153000/gates.json'),
++        seconds=time.perf_counter()-tick, formal_initialization='Reload official EMA after all prechecks')
++    atomic_json(root / 'training/precheck.json', result)
++    del model, batch, samples, stream, joint, fm
++    gc.collect(); torch.cuda.empty_cache()
++    return result
+--- /dev/null
++++ b/experiments/mf_h1_local0/control_mvp48/train_restore_official.py
+@@ -0,0 +1,68 @@
++"""Restore the exact registered official Chair asset; no model/GPU operation."""
++import hashlib
++import json
++import os
++from pathlib import Path
++import shutil
++import time
++import urllib.request
++
++ROOT=Path(__file__).resolve().parents[3]/'native_t1/runs/control_mvp48_v1'
++SHA='bda891a0f046ca6015f70f745fa24a8036c64dda12175b246d853c957f63b92d'
++SIZE=2084287208
++BASE='https://huggingface.co/datasets/qsun2001/meshflow'
++POINTER=BASE+'/raw/main/v1/120m-ot-v-chair/checkpoints/last.pt'
++DOWNLOAD=BASE+'/resolve/main/v1/120m-ot-v-chair/checkpoints/last.pt'
++DEST=ROOT/'checkpoints/official_chair_last.pt'
++
++def write(value):
++    path=ROOT/'registration/train_official_asset.json'
++    temp=path.with_suffix('.tmp');temp.write_text(json.dumps(value,indent=2)+'\n');temp.replace(path)
++
++def file_hash(path):
++    digest=hashlib.sha256()
++    with path.open('rb') as f:
++        for chunk in iter(lambda:f.read(8*1024*1024),b''):digest.update(chunk)
++    return digest.hexdigest()
++
++def main():
++    tick=time.perf_counter()
++    record=dict(status='VERIFYING_SOURCE',source=DOWNLOAD,pointer_source=POINTER,
++        expected_bytes=SIZE,expected_sha256=SHA,path=str(DEST),downloaded_bytes=0,
++        model_forwards=0,optimizer_updates=0,CUDA_initialized=False)
++    DEST.parent.mkdir(parents=True,exist_ok=True)
++    if DEST.exists():
++        if DEST.stat().st_size!=SIZE or file_hash(DEST)!=SHA:raise ValueError('Existing destination identity mismatch; no overwrite')
++        record.update(status='VERIFIED',existing=True,actual_sha256=SHA,bytes=SIZE)
++        write(record);print(json.dumps(record));return
++    partial=DEST.with_suffix('.pt.partial')
++    if partial.exists():raise FileExistsError('Preserving previous partial download; no automatic restart')
++    if shutil.disk_usage(DEST.parent).free < SIZE+12*1024**3:raise RuntimeError('Insufficient disk for asset plus training checkpoints')
++    try:
++        with urllib.request.urlopen(POINTER,timeout=20) as response: pointer=response.read(4096).decode()
++        if ('oid sha256:'+SHA) not in pointer.splitlines() or ('size '+str(SIZE)) not in pointer.splitlines():
++            raise ValueError('Official LFS pointer differs from pinned Chair identity')
++        record.update(status='DOWNLOADING',pointer=pointer);write(record)
++        digest=hashlib.sha256();total=0;last=time.perf_counter()
++        with urllib.request.urlopen(DOWNLOAD,timeout=60) as response,partial.open('xb') as output:
++            while True:
++                block=response.read(8*1024*1024)
++                if not block:break
++                output.write(block);digest.update(block);total+=len(block)
++                if total>SIZE:raise ValueError('Official payload larger than pinned size')
++                if time.perf_counter()-last>=10:
++                    record.update(downloaded_bytes=total,seconds=time.perf_counter()-tick)
++                    write(record);print(json.dumps(dict(status='DOWNLOADING',bytes=total,total=SIZE)),flush=True)
++                    last=time.perf_counter()
++            output.flush();os.fsync(output.fileno())
++        actual=digest.hexdigest()
++        if total!=SIZE or actual!=SHA:raise ValueError('Downloaded official Chair content identity mismatch')
++        partial.replace(DEST)
++        record.update(status='VERIFIED',downloaded_bytes=total,bytes=total,actual_sha256=actual,seconds=time.perf_counter()-tick)
++        write(record);print(json.dumps(record),flush=True)
++    except Exception as exc:
++        record.update(status='BLOCKED_OFFICIAL_DOWNLOAD',error=type(exc).__name__+': '+str(exc),
++            partial_bytes=partial.stat().st_size if partial.exists() else 0,seconds=time.perf_counter()-tick)
++        write(record);raise
++
++if __name__=='__main__':main()
+--- /dev/null
++++ b/experiments/mf_h1_local0/control_mvp48/train_run.py
+@@ -0,0 +1,354 @@
++"""Single-worker Control MVP48 training tree. No automatic replay or extra arms."""
++import os
++for _thread_variable in ('OMP_NUM_THREADS','MKL_NUM_THREADS','OPENBLAS_NUM_THREADS','NUMEXPR_NUM_THREADS'):
++    os.environ[_thread_variable]='2'
++from native_t1 import runtime as _runtime
++import argparse
++import csv
++import difflib
++import gc
++import hashlib
++import json
++import os
++from pathlib import Path
++import random
++import shutil
++import subprocess
++import threading
++import time
++import traceback
++import numpy as np
++import torch
++from native_t1.artifacts import atomic_json, file_sha256
++from native_t1.portable_checkpoint import OFFICIAL_FILE_SHA256
++from native_t1.training import make_optimizer
++from .train_contract import ROOT, PROTOCOL, WaitingDependency, read_binding
++from .train_core import optimizer_update
++from .train_stream import FrozenStream, MVPObjective
++from .model_mvp import initialize_mvp, json_hash, load_mvp_checkpoint
++from .train_io import gpu_lock, resource_snapshot, save_checkpoint, restore_branch
++from .train_precheck import run_precheck
++
++REPO = Path(__file__).resolve().parents[3]
++COLUMNS=['phase','logical_step','branch_step','actual_optimizer_updates','batch_sha256','FM','geometry','loss',
++    'grad_norm_before_clip','free_coordinate_denominator','active_samples','mean_active_D_edge','mean_active_L5',
++    'OT_seconds','train_seconds','cuda_peak_allocated_bytes','cuda_peak_reserved_bytes','actual_OT_returns','OT_cache_hits']
++RECOVERY = ('cd /mnt/e/MeshFlow && OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 '
++    '/home/warpwang/miniforge3/envs/meshflow/bin/python -B -m '
++    'experiments.mf_h1_local0.control_mvp48.train_run --official-checkpoint /ABSOLUTE/PATH/TO/CHAIR/last.pt')
++
++def append_json(path, value):
++    with path.open('a') as f:
++        f.write(json.dumps(value, sort_keys=True, allow_nan=False)+'\n')
++        f.flush(); os.fsync(f.fileno())
++
++def source_files():
++    own = Path(__file__).parent
++    files = list(own.glob('train_*.py')) + list(own.glob('model_*.py'))
++    files += list((REPO/'native_t1').glob('*.py')) + list((REPO/'native_t1/losses').glob('*.py'))
++    files += list((REPO/'models').glob('*.py'))
++    files += [REPO/'utils/ot_utils.py', REPO/'configs/snet/base-120m-ot-v-chair.yaml']
++    return sorted(set(files))
++
++def code_snapshot(root):
++    values = {str(p.relative_to(REPO)):file_sha256(p) for p in source_files()}
++    atomic_json(root/'registration/train_code_hashes.json', values)
++    chunks=[]
++    for path in sorted(Path(__file__).parent.glob('*.py')):
++        if path.name.startswith(('train_', 'model_')):
++            relative=str(path.relative_to(REPO))
++            chunks.extend(difflib.unified_diff([], path.read_text().splitlines(keepends=True),
++                fromfile='/dev/null', tofile='b/'+relative))
++    (root/'training/code.diff').write_text(''.join(chunks))
++    return values
++
++def report(root, status):
++    log=root/'training/training_log.csv'
++    if not log.exists():
++        with log.open('x',newline='') as f: csv.writer(f).writerow(COLUMNS)
++    index=root/'checkpoints/checkpoints.json'
++    index.parent.mkdir(parents=True,exist_ok=True)
++    if not index.exists(): atomic_json(index,dict(status='NOT_RUN',checkpoints=[],actual_optimizer_updates=0))
++    lines = ['# Control MVP48 — Session B', '', 'Status: '+status['status'], '',
++        'Actual optimizer updates: '+str(status.get('actual_optimizer_updates',0))+' / 2500.',
++        'Executed phases: '+json.dumps(status.get('phase_updates',{})), '',
++        'Implementation: one variable-N Native model, original Geo/Edge/L5 functions, effective batch8/microbatch1.',
++        'Official Chair EMA only. Geo/Full restore the same complete shared step500 model, AdamW, RNG and data cursor.',
++        'Formal GPU concurrency is one under /tmp/wrp_meshflow_jedge5_diag_gpu0.lock; CPU numerical threads are capped at two.',
++        'Timing and GPU allocated/reserved peaks are phase scoped; nvidia-smi global/process observations are separate.',
++        'Concurrent observations are not isolated compute benchmarks.',
++        '',
++        'Historical BF16 permutation boundary remains FAIL: atol=.015625, rtol=.03125; 10/1008 coordinates; max_abs=.064453125.',
++        'Evidence: native_t1/runs/geometry_context_revised_20260930_153000/gates.json. No threshold changed or repair claimed.',
++        '',
++        'CPU checks: training/cpu_tests.json (synthetic fixtures only, zero optimizer steps).',
++        'Real-data/official-weight prechecks: '+('PASS' if (root/'training/precheck.json').exists() else 'NOT_RUN')+'.',
++        'Training/checkpoint implementation has not been end-to-end exercised when dependencies are blocked.',
++        'Checkpoints and sidecars: checkpoints/. Ledger: training/training_log.csv and training/update_events.jsonl.',
++        'Unified API: experiments.mf_h1_local0.control_mvp48.model_mvp.load_mvp_checkpoint(path, device)',
++        'Returns (model, actual_metadata, hashes). Model construction/inference must not be reimplemented by Session C.',
++        'Inference helpers: velocity_mvp and integrate_mvp_step. The caller owns its registered sampling budget and GPU lock.',
++        '', 'No TRAIN_READY is published unless all three final endpoints and strict reloading succeed.']
++    if status.get('dependencies'): lines += ['', 'Dependencies: '+json.dumps(status['dependencies'], ensure_ascii=False)]
++    if status.get('error'): lines += ['', 'Failure: '+status['error']]
++    lines += ['', 'Recovery before any attempted GPU precheck/training:', '', '```bash', RECOVERY, '```',
++        '', 'After any numerical failure or optimizer attempt, inspect status.json and update_events.jsonl first.',
++        'This runner refuses automatic restarts; no failure replay budget was granted. Completed checkpoints remain preserved.']
++    (root/'training/TRAIN_REPORT.md').write_text('\n'.join(lines)+'\n')
++
++class GPUMonitor:
++    def __init__(self, root):
++        self.root=root; self.stop_event=threading.Event()
++        self.peak_global_used_mib=0.; self.peak_process_used_mib=None
++        self.thread=threading.Thread(target=self.run, daemon=True)
++    def run(self):
++        while not self.stop_event.is_set():
++            try:
++                result=subprocess.run(['nvidia-smi','--query-gpu=memory.used,memory.free,utilization.gpu',
++                    '--format=csv,noheader,nounits'],capture_output=True,text=True,timeout=10)
++                processes=subprocess.run(['nvidia-smi','--query-compute-apps=pid,process_name,used_gpu_memory',
++                    '--format=csv,noheader,nounits'],capture_output=True,text=True,timeout=10)
++                if result.returncode==0:
++                    self.peak_global_used_mib=max(self.peak_global_used_mib,float(result.stdout.split(',')[0]))
++                for line in processes.stdout.splitlines():
++                    parts=[p.strip() for p in line.split(',')]
++                    if len(parts)>=3 and parts[0]==str(os.getpid()):
++                        try: value=float(parts[-1])
++                        except ValueError: continue
++                        self.peak_process_used_mib=max(self.peak_process_used_mib or 0.,value)
++                append_json(self.root/'training/gpu_samples.jsonl',dict(time_unix=time.time(),
++                    pid=os.getpid(),gpu=result.stdout.strip(),gpu_returncode=result.returncode,
++                    processes=processes.stdout.strip(),process_returncode=processes.returncode))
++            except Exception as exc:
++                append_json(self.root/'training/gpu_samples.jsonl',dict(monitor_error=str(exc)))
++            self.stop_event.wait(2)
++    def start(self): self.thread.start()
++    def stop(self):
++        self.stop_event.set(); self.thread.join(timeout=25)
++
++def dispatch_check(snapshot):
++    if snapshot['gpu']['returncode']:
++        raise RuntimeError('nvidia-smi failed before dispatch')
++    first=snapshot['gpu']['stdout'].splitlines()[0].split(',')
++    total, used, free, utilization=map(float,first[-4:])
++    headroom=max(2048., .10*total)
++    if free <= headroom:
++        raise WaitingDependency('GPU free memory does not preserve required headroom')
++    if snapshot['memory']['MemAvailable_kib'] < 5*1024*1024:
++        raise WaitingDependency('Less than 5 GiB available RAM for single training worker')
++    return dict(gpu_workers=1, free_mib=free, total_mib=total, headroom_mib=headroom,
++        utilization_percent=utilization, comparable_training_process_peak=None,
++        rationale='Explicit experiment cap=1; first authorized precheck/training observes representative peak. No probe job.',
++        numerical_threads=2, OT_cache=False, source='Actual nvidia-smi and /proc snapshot')
++
++def main():
++    parser=argparse.ArgumentParser()
++    parser.add_argument('--official-checkpoint',type=Path,default=Path('/mnt/c/Users/warpwang/Downloads/last.pt'))
++    parser.add_argument('--status',action='store_true')
++    args=parser.parse_args()
++    root=ROOT
++    for name in ('training','checkpoints','registration'): (root/name).mkdir(parents=True,exist_ok=True)
++    status_path=root/'training/status.json'
++    if args.status:
++        print(status_path.read_text() if status_path.exists() else 'No Session B status yet')
++        return
++    if (root/'TRAIN_READY.json').exists():
++        print('Already complete; no further work authorized.')
++        return
++    attempt_marker=root/'training/gpu_attempt_started.json'
++    if attempt_marker.exists():
++        raise RuntimeError('An earlier GPU attempt exists. Refusing automatic precheck/training replay; inspect status and ledger.')
++    for variable in ('OMP_NUM_THREADS','MKL_NUM_THREADS','OPENBLAS_NUM_THREADS','NUMEXPR_NUM_THREADS'):
++        os.environ[variable]='2'
++    torch.set_num_threads(2); torch.set_num_interop_threads(2)
++    _runtime.configure_stable_runtime()
++    status=dict(status='PREPARING', actual_optimizer_updates=0,
++        phase_updates={name:0 for name in ('T1','Geo_shared','Geo','Full')},
++        optimizer_step_attempts=0, completed_checkpoints=[], recovery_command=RECOVERY,
++        cuda_initialized=torch.cuda.is_initialized())
++    resources=resource_snapshot()
++    atomic_json(root/'registration/train_resources_before.json',resources)
++    sources=code_snapshot(root)
++    dependencies=[]
++    try:
++        binding, protocol, plan_path, data_root=read_binding(root)
++    except WaitingDependency as exc:
++        dependencies.append(str(exc))
++    if not args.official_checkpoint.is_file():
++        dependencies.append('BLOCKED_OFFICIAL_CHAIR_ASSET_MISSING: '+str(args.official_checkpoint))
++    elif file_sha256(args.official_checkpoint)!=OFFICIAL_FILE_SHA256:
++        dependencies.append('BLOCKED_OFFICIAL_CHAIR_IDENTITY_MISMATCH: '+str(args.official_checkpoint))
++    if dependencies:
++        status.update(status='WAITING_DEPENDENCY', dependencies=dependencies, cuda_initialized=torch.cuda.is_initialized())
++        atomic_json(status_path,status); report(root,status)
++        print(json.dumps(status,indent=2)); return
++    if shutil.disk_usage(root).free < 12*1024**3:
++        raise RuntimeError('Need at least 12 GiB free space for the five full-state checkpoints and staging')
++    atomic_json(root/'registration/train_protocol.json',dict(protocol=protocol,protocol_sha256=json_hash(protocol)))
++    cpu_checks=json.loads((root/'training/cpu_tests.json').read_text())
++    if cpu_checks['status']!='PASS' or cpu_checks.get('source_hashes')!=sources:
++        raise RuntimeError('Current-code CPU implementation checks must pass before GPU work')
++    dispatch=dispatch_check(resources)
++    atomic_json(root/'registration/train_dispatch.json',dispatch)
++    phase_updates=status['phase_updates']
++    batches={}
++    checkpoint_records=[]
++    log_path=root/'training/training_log.csv'
++    monitor=None; current_counts={}; current_phase=None; stream=None
++    total_tick=time.perf_counter()
++    try:
++        with gpu_lock(root) as lock_seconds:
++            dispatch_check(resource_snapshot())
++            atomic_json(attempt_marker,dict(start_time_unix=time.time(),protocol_sha256=json_hash(protocol),
++                official_checkpoint=str(args.official_checkpoint),optimizer_updates=0))
++            status.update(status='REAL_DATA_PRECHECK',lock_wait_seconds=lock_seconds)
++            atomic_json(status_path,status)
++            monitor=GPUMonitor(root);monitor.start()
++            # All actual CUDA initialization happens after the shared lock.
++            torch.cuda.reset_peak_memory_stats()
++            precheck=run_precheck(root,args.official_checkpoint,binding,plan_path,data_root)
++            status['precheck_seconds']=precheck['seconds']
++            # Never train a precheck-mutated object. Reconstruct original initialization.
++            random.seed(10);np.random.seed(10);torch.manual_seed(10);torch.cuda.manual_seed_all(10)
++            if log_path.exists():
++                old_rows=list(csv.reader(log_path.open(newline='')))
++                if old_rows != [COLUMNS]: raise RuntimeError('Existing training log contains results; no replay allowed')
++            with log_path.open('a',newline='') as csv_file:
++                writer=csv.DictWriter(csv_file,fieldnames=COLUMNS)
++                if log_path.stat().st_size==0: writer.writeheader()
++                csv_file.flush()
++                for phase,start,end in PROTOCOL['phases']:
++                    current_phase=phase; current_counts={}
++                    phase_tick=time.perf_counter()
++                    observation=resource_snapshot()
++                    atomic_json(root/f'training/{phase}_resources_before.json',observation)
++                    dispatch_check(observation)
++                    for relative,digest in sources.items():
++                        if file_sha256(REPO/relative)!=digest: raise RuntimeError('Code changed during fixed run: '+relative)
++                    fresh_binding,fresh_protocol,_,_=read_binding(root)
++                    if fresh_protocol!=protocol: raise RuntimeError('Frozen input identities changed')
++                    stream=FrozenStream(binding,plan_path,data_root)
++                    load_tick=time.perf_counter();fork_sha=None
++                    if start==0:
++                        random.seed(10);np.random.seed(10);torch.manual_seed(10);torch.cuda.manual_seed_all(10)
++                        model,identity=initialize_mvp(args.official_checkpoint,geo=phase!='T1',device='cuda')
++                        optimizer=make_optimizer(model)
++                        atomic_json(root/f'training/{phase}_initialization.json',identity)
++                    else:
++                        model,optimizer,fork_sha=restore_branch(root/'checkpoints/Geo_shared_step500.pt',stream)
++                        atomic_json(root/f'training/{phase}_fork_restore.json',dict(status='PASS',fork_checkpoint_sha256=fork_sha,
++                            model_optimizer_rng_stream_restored=True))
++                    load_seconds=time.perf_counter()-load_tick
++                    torch.cuda.reset_peak_memory_stats()
++                    objective=MVPObjective(stream) if phase=='Full' else None
++                    ot_seconds=train_seconds=save_seconds=0.
++                    status.update(status='TRAINING',phase=phase)
++                    for step in range(start+1,end+1):
++                        ot_tick=time.perf_counter();samples=stream.next_effective_batch();elapsed=time.perf_counter()-ot_tick
++                        ot_seconds+=elapsed
++                        sample_hashes=[s['shared_input_sha256'] for s in samples]
++                        bh=hashlib.sha256(''.join(sample_hashes).encode()).hexdigest()
++                        if phase=='T1':
++                            batches[str(step)]=dict(batch_sha256=bh,sample_hashes=sample_hashes)
++                        elif batches[str(step)]['batch_sha256']!=bh:
++                            raise RuntimeError('Shared data/Gaussian/OT/time/permutation bytes differ at '+str(step))
++                        append_json(root/'training/update_events.jsonl',dict(event='UPDATE_BEGIN',phase=phase,logical_step=step,
++                            actual_completed_before=status['actual_optimizer_updates'],batch_sha256=bh))
++                        result=optimizer_update(model,optimizer,samples,objective=objective,
++                            additional_step=step-500 if phase=='Full' else None,counts=current_counts)
++                        phase_updates[phase]=current_counts['optimizer_updates']
++                        status['actual_optimizer_updates']=sum(phase_updates.values())
++                        status['optimizer_step_attempts']=sum(phase_updates.values())
++                        train_seconds+=result['train_seconds']
++                        diagnostic=result['geometry_diagnostics']
++                        def mean_term(name):
++                            values=[d['raw_losses'][name] for d in diagnostic if name in d['raw_losses']]
++                            return sum(values)/len(values) if values else 0.
++                        row=dict(phase=phase,logical_step=step,branch_step=step-start,
++                            actual_optimizer_updates=status['actual_optimizer_updates'],batch_sha256=bh,
++                            **{k:result[k] for k in ('FM','geometry','loss','grad_norm_before_clip','free_coordinate_denominator','active_samples')},
++                            mean_active_D_edge=mean_term('D_edge'),mean_active_L5=mean_term('L5'),
++                            OT_seconds=elapsed,train_seconds=result['train_seconds'],
++                            cuda_peak_allocated_bytes=torch.cuda.max_memory_allocated(),
++                            cuda_peak_reserved_bytes=torch.cuda.max_memory_reserved(),
++                            actual_OT_returns=stream.counts['actual_OT_returns'],OT_cache_hits=stream.counts['OT_cache_hits'])
++                        writer.writerow(row);csv_file.flush()
++                        append_json(root/'training/update_events.jsonl',dict(event='UPDATE_VALIDATED',**row))
++                        status.update(logical_step=step,current_counts=dict(current_counts),current_OT_counts=dict(stream.counts))
++                        atomic_json(status_path,status)
++                        if step in (1,100,500,1000) or step-start in (1,100,500):
++                            atomic_json(root/f'training/{phase}_step{step}.json',dict(row=row,result=result))
++                            print(json.dumps(row),flush=True)
++                        if step in (500,1000):
++                            checkpoint=save_checkpoint(root,model,optimizer,stream,protocol,variant=phase,step=step,
++                                actual_updates=status['actual_optimizer_updates'],phase_updates=phase_updates,fork_sha=fork_sha)
++                            checkpoint_records.append(checkpoint);save_seconds+=checkpoint['save_and_verify_seconds']
++                            status['completed_checkpoints']=[r['path'] for r in checkpoint_records]
++                            atomic_json(root/'checkpoints/checkpoints.json',dict(checkpoints=checkpoint_records))
++                    atomic_json(root/'training/batch_hashes.json',batches)
++                    phase_report=dict(phase=phase,load_seconds=load_seconds,OT_seconds=ot_seconds,
++                        train_seconds=train_seconds,save_seconds=save_seconds,wall_seconds=time.perf_counter()-phase_tick,
++                        actual_updates=current_counts['optimizer_updates'],updates_per_training_second=current_counts['optimizer_updates']/train_seconds,
++                        counts=current_counts,OT_counts=stream.counts,scope='one phase; reset after model/optimizer load',
++                        cuda_peak_allocated_bytes=torch.cuda.max_memory_allocated(),cuda_peak_reserved_bytes=torch.cuda.max_memory_reserved())
++                    atomic_json(root/f'training/{phase}_summary.json',phase_report)
++                    del model,optimizer,objective,samples,result,stream;stream=None
++                    gc.collect();torch.cuda.empty_cache()
++                    atomic_json(root/f'training/{phase}_resources_after.json',resource_snapshot())
++            if status['actual_optimizer_updates']!=2500 or phase_updates!={'T1':1000,'Geo_shared':500,'Geo':500,'Full':500}:
++                raise RuntimeError('Update budget/accounting mismatch')
++            final={}
++            for variant in ('T1','Geo','Full'):
++                path=root/f'checkpoints/{variant}_step1000.pt'
++                model,meta,hashes=load_mvp_checkpoint(path,'cpu')
++                final[variant]=dict(path=str(path),metadata=meta,hashes=hashes,strict_reload='PASS')
++                del model;gc.collect()
++            if file_sha256(args.official_checkpoint)!=OFFICIAL_FILE_SHA256:
++                raise RuntimeError('Official source file changed')
++            if read_binding(root)[1]!=protocol: raise RuntimeError('Final data verification changed')
++            for relative,digest in sources.items():
++                if file_sha256(REPO/relative)!=digest: raise RuntimeError('Final code verification changed: '+relative)
++            status.update(status='COMPLETE',wall_seconds=time.perf_counter()-total_tick,
++                global_gpu_used_peak_mib=monitor.peak_global_used_mib,
++                process_gpu_used_peak_mib=monitor.peak_process_used_mib,
++                process_peak_note='nvidia-smi matched PID only; null if WSL reports N/A. Global used includes unrelated processes.')
++            atomic_json(status_path,status);report(root,status)
++            ready=dict(schema='control_mvp48_train_ready_v1',status='READY',owner='Session B',
++                actual_optimizer_updates=2500,phase_updates=phase_updates,protocol_sha256=json_hash(protocol),
++                data_ready_sha256=protocol['data_ready_sha256'],final_checkpoints=final,
++                loader_module='experiments.mf_h1_local0.control_mvp48.model_mvp',
++                loader_function='load_mvp_checkpoint',loader_returns=['model','actual_metadata','hashes'],
++                loader_sha256=file_sha256(Path(__file__).parent/'model_mvp.py'),
++                checkpoints_json=dict(path='checkpoints/checkpoints.json',sha256=file_sha256(root/'checkpoints/checkpoints.json')),
++                report=dict(path='training/TRAIN_REPORT.md',sha256=file_sha256(root/'training/TRAIN_REPORT.md')),
++                training_log=dict(path='training/training_log.csv',sha256=file_sha256(log_path)),
++                code_diff=dict(path='training/code.diff',sha256=file_sha256(root/'training/code.diff')),
++                source_hashes=sources,default_model_changed=False)
++            atomic_json(root/'TRAIN_READY.json',ready)
++    except Exception as exc:
++        if current_phase:
++            phase_updates[current_phase]=current_counts.get('optimizer_updates',0)
++            status['actual_optimizer_updates']=sum(phase_updates.values())
++            status['optimizer_step_attempts']=sum(phase_updates.values())-current_counts.get('optimizer_updates',0)+current_counts.get('optimizer_step_attempts',0)
++        status.update(status='BLOCKED',error=type(exc).__name__+': '+str(exc),current_counts=current_counts,
++            current_OT_counts=dict(stream.counts) if stream is not None else None,
++            traceback=traceback.format_exc(),wall_seconds=time.perf_counter()-total_tick)
++        atomic_json(status_path,status);report(root,status)
++        raise
++    finally:
++        if monitor: monitor.stop()
++
++def entry():
++    try:
++        main()
++    except Exception as exc:
++        (ROOT/'training').mkdir(parents=True,exist_ok=True)
++        path=ROOT/'training/status.json'
++        state=json.loads(path.read_text()) if path.exists() else dict(actual_optimizer_updates=0,phase_updates={})
++        state.update(status='WAITING_DEPENDENCY' if isinstance(exc,WaitingDependency) else 'BLOCKED',
++            error=type(exc).__name__+': '+str(exc),traceback=traceback.format_exc(),recovery_command=RECOVERY)
++        atomic_json(path,state);report(ROOT,state)
++        raise
++
++if __name__=='__main__':
++    entry()
+--- /dev/null
++++ b/experiments/mf_h1_local0/control_mvp48/train_stream.py
+@@ -0,0 +1,176 @@
++"""Replayable CPU-only stream. Requires explicit binding to frozen Session A data."""
++import copy
++import hashlib
++import json
++import numpy as np
++import torch
++from native_t1.artifacts import array_hash
++from native_t1.data import CYCLIC
++from native_t1.losses import prepare_targets
++from native_t1.objectives import GeometryObjective, objective_spec
++from utils.ot_utils import optimal_sum_numpy
++
++
++def equal_bits(a, b):
++    return a.dtype == b.dtype and a.shape == b.shape and a.tobytes() == b.tobytes()
++
++
++def sample_hash(sample):
++    keys = ('x0', 'x1', 'u', 'xt', 'context', 't', 'y', 'known_mask', 'valid_mask',
++            'source_face_ids', 'corner_permutations', 'face_permutation',
++            'free_gaussian_before_OT', 'free_noise_after_OT', 'free_target_before_OT')
++    digest = hashlib.sha256()
++    digest.update(json.dumps([sample['object_id'], sample['patch_id']]).encode())
++    for key in keys:
++        digest.update(key.encode()); digest.update(array_hash(np.asarray(sample[key])).encode())
++    return digest.hexdigest()
++
++
++class FrozenStream:
++    def __init__(self, binding, plan_path, archive_path, *, seed=10):
++        from .train_binding import data_api
++        self.binding = binding
++        self.api = data_api(binding['loader_path'])
++        self.data_root = archive_path
++        from native_t1.artifacts import file_sha256
++        from pathlib import Path
++        if Path(plan_path).resolve() != (Path(self.data_root)/'train_plan.json').resolve() or file_sha256(plan_path) != binding['plan']['sha256']:
++            raise ValueError('Actual consumed plan differs from frozen binding')
++        plan = self.api.load_plan('train', self.data_root)
++        if plan['schema'] != 'control_mvp48_train_plan_v1':
++            raise ValueError('Session A train plan schema changed')
++        self.records = plan['records']
++        if len(self.records) != 8000 or plan['effective_batch_count'] != 1000 or plan['batch_size'] != 8:
++            raise ValueError('Require exactly 1000 batches of eight')
++        train_ids = set(binding['train_object_ids'])
++        used = set()
++        self.objects, self.cases = {}, {}
++        for index, record in enumerate(self.records):
++            uid, patch = record['uid'], record['patch_id']
++            if (record['sample_index'], record['effective_batch_index'], record['slot_index']) != (index, index//8, index%8):
++                raise ValueError('Frozen sample order differs')
++            if uid not in train_ids:
++                raise ValueError('Nontraining object entered task plan')
++            used.add(uid)
++            cid = (uid, patch)
++            if cid not in self.cases:
++                case = self.api.load_sample(uid, patch, self.data_root)
++                self.cases[cid] = dict(object_id=uid, patch_id=patch, known_ids=case['source_face_ids'], N=case['N'], K=case['K'])
++                if uid not in self.objects:
++                    self.objects[uid] = dict(V=case['model_vertices'], F=case['source_face_vertex_ids'],
++                        pre=case['pre_ot_full'], Y=case['full_target'].reshape(-1,3,3), bbox_L=case['bbox_diagonal'])
++                self.cases[cid]['interface_edges'] = case['interface']['edge_source_vertex_ids']
++            if (record['N'], record['K']) != (self.cases[cid]['N'], self.cases[cid]['K']):
++                raise ValueError('Plan and loaded patch N/K differ')
++        if used != train_ids:
++            raise ValueError('Task plan does not cover exactly 32 train objects')
++        self.seed = seed
++        self.batch_index = 0
++        self.counts = dict(actual_OT_attempts=0, actual_OT_returns=0, OT_cache_hits=0)
++
++    def state_dict(self):
++        return dict(seed=self.seed, batch_index=self.batch_index, sample_index=8*self.batch_index,
++            RNG_mode='stateless_per_sample_frozen_seeds', plan_sha256=self.binding['plan']['sha256'])
++
++    def load_state_dict(self, state):
++        if (state['seed'] != self.seed or not 0 <= state['batch_index'] <= 1000 or
++            state['sample_index'] != 8*state['batch_index'] or
++            state['plan_sha256'] != self.binding['plan']['sha256'] or
++            state['RNG_mode'] != 'stateless_per_sample_frozen_seeds'):
++            raise ValueError('Invalid stream restore')
++        self.batch_index = state['batch_index']
++
++    def _sample(self, record):
++        cid = (record['uid'], record['patch_id'])
++        case = self.cases[cid]; uid = case['object_id']; obj = self.objects[uid]
++        known_ids = case['known_ids']; n = len(obj['Y']); k = len(known_ids)
++        free_ids = np.asarray([i for i in range(n) if i not in set(known_ids.tolist())], np.int64)
++        free_order, corners, order = self.api.permutations(record['permutation_seed'], n, k)
++        pre = obj['pre'][free_ids[free_order]][np.arange(n-k)[:, None], corners[k:]]
++        noise = self.api.gaussian(record['gaussian_seed'], n-k)
++        self.counts['actual_OT_attempts'] += 1
++        paired = optimal_sum_numpy(pre, noise, optimal=True)
++        self.counts['actual_OT_returns'] += 1
++        x0 = np.zeros((n, 3, 3), np.float32); x1 = np.zeros_like(x0)
++        x0[k:] = paired.astype(np.float32); x1[k:] = (pre * 2).astype(np.float32)
++        context = np.zeros_like(x0)
++        context[:k] = obj['Y'][known_ids][np.arange(k)[:, None], corners[:k]]
++        ids = np.concatenate((known_ids, free_ids[free_order]))
++        known = np.arange(n) < k
++        x0, x1, context = [a[order].reshape(n, 9) for a in (x0, x1, context)]
++        known, ids, corners = known[order], ids[order], corners[order]
++        t = np.asarray(self.api.training_time(record['t_seed']), np.float32)
++        u = x1 - x0
++        xt = (np.float32(1) - t) * x0 + t * x1
++        xt[known] = context[known]
++        sample = dict(x0=x0, x1=x1, u=u, xt=xt, context=context, t=t,
++            y=np.asarray(n, np.int64), known_mask=known, valid_mask=np.ones(n, bool),
++            source_face_ids=ids, corner_permutations=corners, face_permutation=order,
++            object_id=uid, patch_id=case['patch_id'], K=k,
++            free_gaussian_before_OT=noise, free_noise_after_OT=paired,
++            free_target_before_OT=pre)
++        sample['shared_input_sha256'] = sample_hash(sample)
++        self.label(sample)  # Validate real source/GT correspondence before any forward.
++        return sample
++
++    def next_effective_batch(self):
++        if self.batch_index >= 1000:
++            raise RuntimeError('Frozen plan exhausted')
++        samples = [self._sample(record) for record in self.records[8*self.batch_index:8*(self.batch_index+1)]]
++        self.batch_index += 1
++        return samples
++
++    def label(self, sample):
++        obj = self.objects[sample['object_id']]
++        valid, known = sample['valid_mask'], sample['known_mask']
++        ids, corners = sample['source_face_ids'][valid], sample['corner_permutations'][valid]
++        n = len(obj['F'])
++        if sorted(ids.tolist()) != list(range(n)) or not np.array_equal(np.sort(corners, 1), np.tile(np.arange(3), (n, 1))):
++            raise ValueError('Invalid source face/corner permutation')
++        vids = np.take_along_axis(obj['F'][ids], corners, axis=1)
++        xyz = obj['V'][vids]
++        km = known[valid]
++        Y = sample['x1'][valid].reshape(n, 3, 3)
++        C = sample['context'][valid].reshape(n, 3, 3)
++        if not equal_bits(xyz[~km], Y[~km]) or not equal_bits(xyz[km], C[km]):
++            raise ValueError('GT/interface mapping does not reconstruct actual coordinates')
++        return dict(free_gt=Y[~km].copy(), known=C[km].copy(), free_ids=vids[~km].copy(),
++                    known_ids=vids[km].copy(), bbox_L=obj['bbox_L'])
++
++
++class MVPObjective(GeometryObjective):
++    """Only replaces the old N112 target bank; exact original auxiliary method."""
++    def __init__(self, stream):
++        self.bank = stream
++        self.spec = objective_spec('edge5')
++
++    def prepare(self, samples):
++        return [prepare_targets(self.bank.label(sample)) for sample in samples]
++
++
++def collate(samples, device='cpu', *, pad_to=None):
++    """Pad without truncation; padded coordinates/IDs never enter N or losses."""
++    if not samples:
++        raise ValueError('Empty batch')
++    width = max(len(s['valid_mask']) for s in samples)
++    if pad_to is not None:
++        if pad_to < width:
++            raise ValueError('Refusing to truncate real faces')
++        width = pad_to
++    batch = {}
++    for key in ('x0', 'x1', 'u', 'context', 'valid_mask', 'known_mask'):
++        rows = []
++        for s in samples:
++            a = np.asarray(s[key])
++            out = np.zeros((width,) + a.shape[1:], dtype=a.dtype)
++            out[:len(a)] = a
++            rows.append(out)
++        batch[key] = torch.from_numpy(np.stack(rows)).to(device)
++    for key in ('t', 'y'):
++        batch[key] = torch.from_numpy(np.stack([np.asarray(s[key]) for s in samples])).to(device)
++    if not torch.equal(batch['valid_mask'].sum(1), batch['y']):
++        raise ValueError('Total N includes padding or truncates real faces')
++    batch['xt'] = (1-batch['t'][:, None, None])*batch['x0'] + batch['t'][:, None, None]*batch['x1']
++    batch['xt'] = torch.where(batch['known_mask'][..., None], batch['context'], batch['xt'])
++    batch['loss_mask'] = batch['valid_mask'] & ~batch['known_mask']
++    return batch
+--- /dev/null
++++ b/experiments/mf_h1_local0/control_mvp48/train_tests.py
+@@ -0,0 +1,187 @@
++"""Bounded CPU implementation tests, explicitly synthetic; zero optimizer updates."""
++import ast
++import copy
++import json
++from pathlib import Path
++import unittest
++import numpy as np
++from native_t1 import runtime
++import torch
++from models.equidit import DiT
++from native_t1.artifacts import atomic_json
++from native_t1.model import native_execution
++from native_t1.data import model_inputs
++from native_t1.training import masked_fm_loss
++from native_t1.context_geometry import attach_context_encoder
++from native_t1.losses import prepare_targets
++from native_t1.objectives import GeometryObjective, objective_spec
++from .model_mvp import MVPModel, velocity_mvp, integrate_mvp_step, json_hash
++from .train_stream import collate, FrozenStream, equal_bits
++from .train_binding import data_api
++from .train_contract import ROOT
++from .train_io import tree_hash, capture_rng, restore_rng
++
++def fixture(n,k):
++    generator=np.random.RandomState(n+k)
++    x0=generator.randn(n,9).astype(np.float32)
++    x1=generator.randn(n,9).astype(np.float32)
++    context=np.zeros_like(x0);context[:k]=x1[:k]
++    return dict(x0=x0,x1=x1,u=x1-x0,context=context,t=np.asarray(.6,np.float32),
++        y=np.asarray(n,np.int64),known_mask=np.arange(n)<k,valid_mask=np.ones(n,bool))
++
++class Units(unittest.TestCase):
++    def test_sources_parse(self):
++        for path in Path(__file__).parent.glob('*.py'):
++            if path.name.startswith(('train_','model_')): ast.parse(path.read_text())
++
++    def test_variable_fm_denominator_and_gradient(self):
++        samples=[fixture(128,26),fixture(256,51)]
++        batch=collate(samples,pad_to=259)
++        self.assertEqual(batch['y'].tolist(),[128,256])
++        denominator=9*((128-26)+(256-51))
++        velocity=torch.zeros_like(batch['u'],requires_grad=True)
++        joint=masked_fm_loss(velocity,batch['u'],batch['valid_mask'],batch['known_mask'])
++        pieces=[]
++        for s in samples:
++            b=collate([s])
++            pieces.append(masked_fm_loss(torch.zeros_like(b['u']),b['u'],b['valid_mask'],b['known_mask'],denominator=denominator))
++        torch.testing.assert_close(joint,sum(pieces),atol=1e-6,rtol=1e-6)
++        joint.backward()
++        expected=(torch.ones_like(velocity)/denominator)*2*(velocity.detach()-batch['u'])
++        expected[~batch['loss_mask']]=0
++        torch.testing.assert_close(velocity.grad,expected,atol=0,rtol=0)
++        self.assertTrue(torch.equal(batch['xt'][batch['known_mask']],batch['context'][batch['known_mask']]))
++        with self.assertRaises(ValueError): collate(samples,pad_to=128)
++
++    def test_original_auxiliary_gate_and_output_gradient(self):
++        gt=torch.tensor([[[1.,0,0],[1,1,0],[0,1,0]]])
++        known=torch.tensor([[[0.,0,0],[1,0,0],[0,1,0]]])
++        target=prepare_targets(dict(free_gt=gt,known=known,free_ids=np.array([[1,3,2]]),
++            known_ids=np.array([[0,1,2]]),bbox_L=2**.5))
++        obj=GeometryObjective.__new__(GeometryObjective);obj.spec=objective_spec('edge5')
++        velocity=torch.full((1,2,9),.1,requires_grad=True)
++        batch=dict(t=torch.tensor([.5]),xt=torch.cat((known,gt)).reshape(1,2,9),
++            valid_mask=torch.ones(1,2,dtype=torch.bool),known_mask=torch.tensor([[True,False]]))
++        loss,diagnostic=obj.auxiliary(velocity,batch,target,additional_step=1)
++        self.assertTrue(diagnostic['active'])
++        self.assertEqual(diagnostic['ramp'],.02)
++        raw=diagnostic['raw_losses']
++        expected=.02/8*(4.071385484299878*raw['D_edge']+.3266104383520167*raw['L5'])
++        self.assertAlmostEqual(float(loss),expected,places=8)
++        loss.backward()
++        self.assertTrue(torch.isfinite(velocity.grad).all())
++        self.assertGreater(float(velocity.grad.norm()),0)
++        self.assertTrue(torch.equal(velocity.grad[:,:1],torch.zeros_like(velocity.grad[:,:1])))
++        batch['t']=torch.tensor([.499])
++        inactive,diag=obj.auxiliary(velocity,batch,target,additional_step=50)
++        self.assertFalse(diag['active']);self.assertEqual(float(inactive),0.)
++
++    def test_cpu_variable_model_masks_final_time_zero_geo(self):
++        runtime.configure_stable_runtime()
++        with torch.random.fork_rng(devices=[]):
++            torch.manual_seed(713)
++            # Explicit unit fixture only: one layer, random weights; never a formal initialization.
++            backbone=DiT(hidden_dim=768,num_layers=1,num_heads=12,max_length=800,
++                version=3,gradient_checkpointing=False,face_cond=True,face_bin=20,
++                use_dit_like_pe=False,use_qknorm=True,use_rmsnorm=True,pe_freq=20)
++            with torch.no_grad():
++                backbone.final_layer.linear.weight.normal_(0,.01)
++                backbone.layers[0].adaLN_modulation[-1].weight.normal_(0,.005)
++            model=MVPModel(backbone,trainable=True)
++            samples=[fixture(128,26),fixture(144,29)]
++            b=collate(samples,pad_to=147)
++            final=[]
++            def observe(record):
++                if record['site']=='final':
++                    known=b['known_mask'];times=record['face_time']
++                    self.assertTrue(torch.equal(times[known],torch.ones_like(times[known])))
++                    self.assertTrue(torch.equal(times[~known],b['t'][:,None].expand_as(times)[~known]))
++                    final.append(True)
++            with torch.no_grad(),native_execution(model,coordinates=b['xt'],autocast=False):
++                result=model(*model_inputs(b),observer=observe)
++            self.assertEqual(final,[True]);self.assertTrue(torch.isfinite(result).all())
++            self.assertGreater(float(result[b['known_mask']].abs().max()),0)
++            rng=torch.random.get_rng_state().clone()
++            attach_context_encoder(model,'geo',seed=1010)
++            self.assertTrue(torch.equal(rng,torch.random.get_rng_state()))
++            with torch.no_grad(): zero=velocity_mvp(model,*model_inputs(b))
++            self.assertTrue(torch.equal(result,zero))
++            altered=copy.deepcopy(b);altered['xt'][~b['valid_mask']]=127.
++            with torch.no_grad(): masked=velocity_mvp(model,*model_inputs(altered))
++            torch.testing.assert_close(zero[b['valid_mask']],masked[b['valid_mask']],atol=0,rtol=0)
++            with torch.no_grad():
++                integrated=integrate_mvp_step(model,b['xt'],b['t'],.02,b['y'],b['valid_mask'],b['known_mask'],b['context'])
++            self.assertTrue(torch.equal(integrated[b['known_mask']],b['context'][b['known_mask']]))
++            self.assertTrue(torch.equal(integrated[~b['valid_mask']],b['xt'][~b['valid_mask']]))
++
++    def test_stateless_ot_replay_and_source_corner_labels(self):
++        api=data_api(ROOT/'data/load_sample.py')
++        stream=FrozenStream.__new__(FrozenStream)
++        stream.api=api;stream.seed=10;stream.batch_index=0
++        stream.binding=dict(plan=dict(sha256='a'*64))
++        stream.counts=dict(actual_OT_attempts=0,actual_OT_returns=0,OT_cache_hits=0)
++        n=128;k=26;gen=np.random.RandomState(71)
++        V=gen.randn(n*3,3).astype(np.float32);F=np.arange(n*3).reshape(n,3)
++        pre=(V[F]*np.float32(.5));Y=(pre*np.float32(2)).astype(np.float32)
++        stream.objects={'fixture':dict(V=V,F=F,pre=pre,Y=Y,bbox_L=float(np.linalg.norm(np.ptp(V,axis=0))))}
++        stream.cases={('fixture','p0'):dict(object_id='fixture',patch_id='p0',known_ids=np.arange(k))}
++        rec=dict(uid='fixture',patch_id='p0',gaussian_seed=803,t_seed=904,permutation_seed=1001)
++        before=capture_rng()
++        first=stream._sample(rec);state=stream.state_dict();second=stream._sample(rec)
++        self.assertEqual(first['shared_input_sha256'],second['shared_input_sha256'])
++        self.assertEqual(tree_hash(before),tree_hash(capture_rng()))
++        stream.batch_index=200;stream.load_state_dict(state)
++        self.assertEqual(stream.batch_index,0)
++        label=stream.label(first)
++        ids=np.take_along_axis(F[first['source_face_ids']],first['corner_permutations'],axis=1)
++        self.assertTrue(equal_bits(V[ids][~first['known_mask']],label['free_gt']))
++        self.assertEqual(stream.counts['actual_OT_returns'],2)
++        self.assertEqual(stream.counts['OT_cache_hits'],0)
++
++    def test_checkpoint_metadata_rejects_state_tampering(self):
++        from .model_mvp import validate_metadata,SCHEMA
++        from .train_contract import PROTOCOL
++        from native_t1.portable_checkpoint import OFFICIAL_FILE_SHA256,OFFICIAL_BACKBONE_SHA256,config_sha256
++        from native_t1.checkpoint import DEFAULT_CONFIG
++        protocol=dict(PROTOCOL,data_ready_sha256='a'*64,binding_sha256='b'*64,plan_sha256='c'*64)
++        opt=dict(param_groups=[dict(lr=1e-5,betas=(.9,.95),weight_decay=0)],state={0:dict(step=torch.tensor(500.),exp_avg=torch.zeros(2))})
++        rng=capture_rng();stream=dict(batch_index=500)
++        meta=dict(variant='Geo_shared',logical_step=500,context_encoder='geo',
++            official_file_sha256=OFFICIAL_FILE_SHA256,official_backbone_sha256=OFFICIAL_BACKBONE_SHA256,
++            protocol_sha256=json_hash(protocol),config_sha256=config_sha256(DEFAULT_CONFIG),
++            optimizer_state_sha256=tree_hash(opt),rng_sha256=tree_hash(rng),stream_state_sha256=json_hash(stream),
++            executed_phase_updates=dict(T1=1000,Geo_shared=500,Geo=0,Full=0),actual_updates_at_save=1500,
++            loss_recipe='fm',optimizer_reset_at_phase_start=True)
++        payload=dict(schema=SCHEMA,metadata=meta,protocol=protocol,model={},optimizer=opt,rng=rng,stream_state=stream,update_in_progress=False)
++        self.assertEqual(validate_metadata(payload),meta)
++        corrupt=copy.deepcopy(payload);corrupt['optimizer']['state'][0]['exp_avg'][0]=1
++        with self.assertRaises(ValueError):validate_metadata(corrupt)
++        corrupt=copy.deepcopy(payload);corrupt['metadata']['actual_updates_at_save']=2000
++        with self.assertRaises(ValueError):validate_metadata(corrupt)
++        corrupt=copy.deepcopy(payload);corrupt['metadata']['variant']='Full'
++        with self.assertRaises(ValueError):validate_metadata(corrupt)
++
++    def test_rng_roundtrip_no_cuda(self):
++        before=capture_rng()
++        torch.rand(3);np.random.randn(3)
++        restore_rng(before)
++        self.assertEqual(tree_hash(before),tree_hash(capture_rng()))
++        self.assertFalse(torch.cuda.is_initialized())
++
++def main():
++    torch.set_num_threads(2);torch.set_num_interop_threads(2)
++    ROOT.joinpath('training').mkdir(parents=True,exist_ok=True)
++    suite=unittest.defaultTestLoader.loadTestsFromTestCase(Units)
++    result=unittest.TextTestRunner(verbosity=2).run(suite)
++    from .train_run import source_files
++    from native_t1.artifacts import file_sha256
++    from .train_run import REPO
++    summary=dict(source_hashes={str(p.relative_to(REPO)):file_sha256(p) for p in source_files()},status='PASS' if result.wasSuccessful() else 'FAIL',tests=result.testsRun,
++        failures=[dict(test=str(test),traceback=text) for test,text in result.failures+result.errors],
++        scope='CPU synthetic implementation fixtures only; no real-data or official-weight gate claimed',
++        optimizer_updates=0,CUDA_initialized=torch.cuda.is_initialized(),
++        actual_CPU_OT_calls=2,no_GPU_model_calls=True)
++    atomic_json(ROOT/'training/cpu_tests.json',summary)
++    if not result.wasSuccessful(): raise SystemExit(1)
++
++if __name__=='__main__': main()

@@ -1,0 +1,1010 @@
+--- /dev/null
++++ b/experiments/mf_h1_local0/chair_control_attribution_v1/core.py
+@@ -0,0 +1,123 @@
++"""Isolated CPU attribution infrastructure. No torch/model/OT imports."""
++from pathlib import Path
++import os,sys,json,csv,hashlib,time,subprocess,collections,traceback
++os.environ['CUDA_VISIBLE_DEVICES']=''
++os.environ['OMP_NUM_THREADS']='1'
++os.environ['MKL_NUM_THREADS']='1'
++os.environ['OPENBLAS_NUM_THREADS']='1'
++os.environ['NUMEXPR_NUM_THREADS']='1'
++os.environ['PYTHONDONTWRITEBYTECODE']='1'
++import numpy as np
++import psutil
++ROOT=Path(__file__).resolve().parents[3]
++CODE=Path(__file__).resolve().parent
++SRC=ROOT/'native_t1/runs/chair_domain_control_v1'
++OUT=ROOT/'native_t1/runs/chair_control_attribution_v1'
++ARMS=('T1','Geo','Full')
++NAMES={'T1':'Native','Geo':'Native+Geo','Full':'Native+Geo+Joint'}
++ALPHAS=(.9,1.,1.1)
++TOL=dict(atol=1e-8,rtol=1e-6)
++
++def js(p): return json.loads(Path(p).read_text(encoding='utf-8-sig'))
++def clean(o):
++ if isinstance(o,dict): return {str(k):clean(v) for k,v in o.items()}
++ if isinstance(o,(tuple,list)): return [clean(x) for x in o]
++ if isinstance(o,np.ndarray): return clean(o.tolist())
++ if isinstance(o,np.generic): return clean(o.item())
++ if isinstance(o,float) and not np.isfinite(o): return None
++ if isinstance(o,Path): return str(o)
++ return o
++def savej(p,o):
++ p=Path(p);p.parent.mkdir(parents=True,exist_ok=True)
++ tmp=p.with_name(p.name+'.tmp')
++ tmp.write_text(json.dumps(clean(o),ensure_ascii=False,indent=2,allow_nan=False)+'\n',encoding='utf8');os.replace(tmp,p)
++def digest(p):
++ h=hashlib.sha256()
++ with Path(p).open('rb') as f:
++  for b in iter(lambda:f.read(8*1024*1024),b''):h.update(b)
++ return h.hexdigest()
++def ah(a):
++ a=np.ascontiguousarray(a)
++ h=hashlib.sha256();h.update(str(a.dtype).encode());h.update(str(a.shape).encode());h.update(a.tobytes());return h.hexdigest()
++def legacy_ah(a):
++ # Original native_inpainting_metrics.array_sha definition is verified separately.
++ return hashlib.sha256(np.ascontiguousarray(a).tobytes()).hexdigest()
++def resolve(p):
++ p=Path(p);return p if p.is_absolute() else SRC/p
++def arrays(p):
++ with np.load(resolve(p),allow_pickle=False) as z:return {k:z[k].copy() for k in z.files}
++def conv(x):
++ if x in ('','NA','None'):return None
++ if x=='True':return True
++ if x=='False':return False
++ try:return float(x) if any(y in x for y in '.eE') else int(x)
++ except (ValueError,TypeError):return x
++def readcsv(p):
++ with Path(p).open(encoding='utf-8-sig',newline='') as f:return [{k:conv(v) for k,v in r.items()} for r in csv.DictReader(f)]
++def writecsv(name,rows,fields=None):
++ p=OUT/name;p.parent.mkdir(parents=True,exist_ok=True)
++ if fields is None:fields=list(dict.fromkeys(k for r in rows for k in r))
++ if not fields:fields=['status','reason']
++ with p.open('w',encoding='utf8',newline='') as f:
++  w=csv.DictWriter(f,fieldnames=fields,extrasaction='ignore');w.writeheader()
++  for r in rows:w.writerow({k:('NA' if clean(v) is None else clean(v)) for k,v in r.items()})
++ return str(p.relative_to(OUT))
++def groups(rows,keys):
++ d=collections.defaultdict(list)
++ for r in rows:d[tuple(r.get(k) for k in keys)].append(r)
++ return dict(sorted(d.items(),key=lambda t:str(t[0])))
++def mean(xs):
++ xs=[float(x) for x in xs if x is not None and np.isfinite(x)]
++ return float(np.mean(xs)) if xs else None
++def aggregate(rows,keys,metrics):
++ return [dict(zip(keys,key),n_rows=len(rs),**{m:mean(r.get(m) for r in rs) for m in metrics}) for key,rs in groups(rows,keys).items()]
++def parent_summary(rows,keys,metrics):
++ parents=aggregate(rows,list(keys)+['uid'],metrics)
++ sums=aggregate(parents,keys,metrics)
++ for r in sums:r['n_parents']=r.pop('n_rows')
++ return parents,sums
++def event(kind,**kw):
++ OUT.mkdir(parents=True,exist_ok=True)
++ with (OUT/'execution_ledger.jsonl').open('a',encoding='utf8') as f:
++  f.write(json.dumps(clean(dict(time_utc=time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),pid=os.getpid(),kind=kind,**kw)),ensure_ascii=False)+'\n')
++def resources(tag):
++ def cmd(args):
++  try:return subprocess.run(args,text=True,capture_output=True,timeout=12).stdout.strip()
++  except Exception as e:return repr(e)
++ v=psutil.virtual_memory()
++ procs=[]
++ for p in psutil.process_iter(['pid','name','memory_info','cpu_times']):
++  if any(s in (p.info['name'] or '').lower() for s in ('python','ot','audit')):
++   procs.append(dict(pid=p.pid,name=p.info['name'],rss=p.info['memory_info'].rss if p.info['memory_info'] else None))
++ r=dict(tag=tag,cpu_count=psutil.cpu_count(),cpu_percent=psutil.cpu_percent(interval=.2),load=os.getloadavg(),ram_total=v.total,ram_available=v.available,processes=procs,
++        gpu=cmd(['nvidia-smi','--query-gpu=name,memory.total,memory.used,memory.free,utilization.gpu','--format=csv,noheader']),gpu_processes=cmd(['nvidia-smi','--query-compute-apps=pid,process_name,used_memory','--format=csv,noheader']))
++ event('resource_snapshot',**r);return r
++def recs():
++ p=js(SRC/'panels.json');return {r['case_id']:r for k in ('A','B','C') for r in p[k]}
++def generated():
++ result=[]
++ for p in sorted((SRC/'evaluation').glob('phase*/*/ledger.json')):
++  v=js(p)
++  for r in v['rows']:result.append(dict(r,checkpoint_sha256=v['identity']['checkpoint_sha256'],ledger_path=str(p.relative_to(ROOT))))
++ return result
++def raw_for(row):
++ r=recs()[row['case_id']];bank=arrays(r['input_path']);raw=arrays(row['raw_path'])
++ return raw['raw'][int(bank['K']):].reshape(-1,3,3),bank,raw
++def close(a,b,**kw):return bool(np.isclose(a,b,**(kw or TOL)))
++def stage(name,fn):
++ path=OUT/'stages'/f'{name}.json'
++ if path.exists():
++  s=js(path)
++  if s['status']=='COMPLETE':
++   for f,h in s['outputs'].items():
++    if digest(OUT/f)!=h:raise RuntimeError('Completed stage output changed: '+f)
++   event('stage_reused',stage=name);return s['result']
++  event('stage_resume',stage=name,previous=s['status'])
++ start=time.monotonic();event('stage_start',stage=name,code_hashes={p.name:digest(p) for p in CODE.glob('*.py')})
++ savej(path,dict(status='RUNNING',name=name))
++ try:
++  result,outputs=fn()
++  s=dict(status='COMPLETE',name=name,seconds=time.monotonic()-start,result=result,outputs={str(x):digest(OUT/x) for x in outputs})
++  savej(path,s);event('stage_complete',stage=name,seconds=s['seconds'],result=result);return result
++ except BaseException as e:
++  savej(path,dict(status='FAIL',name=name,error=repr(e),traceback=traceback.format_exc(),seconds=time.monotonic()-start));event('stage_fail',stage=name,error=repr(e));raise
+--- /dev/null
++++ b/experiments/mf_h1_local0/chair_control_attribution_v1/coverage_teacher.py
+@@ -0,0 +1,120 @@
++from core import *
++
++QUALITY=['remainder_symmetric_RMS_bbox_pct','R12_to_free_RMS_bbox_pct','free_to_R12_RMS_bbox_pct','Gamma_to_free_edges_RMS_bbox_pct','Gamma_to_free_edges_p95_bbox_pct','boundary_RMS_bbox_pct','boundary_p95_bbox_pct','CF_proper_pair_count','FF_proper_pair_count','FF_illegal_pair_count','CF_proper_affected_free_fraction','FF_proper_affected_free_fraction','FF_illegal_affected_free_fraction','free_minimum_angle_lt5_fraction','free_angle_p05_degrees','free_area_over_GT_free_area','free_q_gt10_fraction']
++
++def coverage():
++ records=recs();rr=[r for r in generated() if r['table']=='A'];scores={};vectors={};per=[];missing=[];recon=[];points={}
++ for r in rr:
++  rec=records[r['case_id']];key=(r['arm'],r['phase_step'],r['case_id'])
++  if r['status']!='PASS':missing.append(dict(arm=r['arm'],phase_step=r['phase_step'],case_id=r['case_id'],uid=r['uid'],split=r['split'],ratio=rec['ratio'],status='NA',reason=r.get('reason')));continue
++  try:
++   sp=resolve(r['score_path']);s=js(sp);assert digest(sp)==r['score_sha256']
++   bank=arrays(rec['input_path']);ref=arrays(rec['ref_npz']);refj=js(resolve(rec['ref_json']));L=float(bank['L'])
++   q=ref['coverage_points'];d=np.array(s['detail']['fixed_GT_coverage']['per_point_distances'],np.float64)/L
++   assert len(q)==len(d)==512 and np.isfinite(d).all()
++   assert ah(q)==s['detail']['fixed_GT_coverage']['points_sha256']==refj['array_sha256']['coverage_points']
++   assert s['detail']['reference']['GT_free_sha256']==ah(bank['gt_free'].reshape(-1,3,3))
++   assert ah(ref['pairwise_target_points'])==s['detail']['remainder']['target_sample_sha256']
++   assert ah(q)!=ah(ref['pairwise_target_points'])
++   cov=float(np.mean(d<=.01));mse=float(np.mean(d*d));m=s['metrics']
++   assert close(cov,m['fixed_R12_coverage_within_1pct_fraction']) and close(np.sqrt(mse),m['fixed_R12_coverage_RMS_bbox_pct']/100)
++   row=dict(arm=r['arm'],phase_step=r['phase_step'],case_id=r['case_id'],uid=r['uid'],split=r['split'],ratio=rec['ratio'],noise_index=r['noise_index'],task_id=rec['task_id'],L=L,N=int(bank['N']),K=int(bank['K']),Q=len(d),query_sha256=ah(q),GT_sha256=ah(bank['gt_free']),noise_sha256=ah(bank['z']),input_sha256=rec['input_sha256'],source_score_sha256=r['score_sha256'],fixed_query_MSE=mse,fixed_query_RMS_L=np.sqrt(mse),coverage_fraction=cov,d_p50_L=np.quantile(d,.5),d_p90_L=np.quantile(d,.9),d_p95_L=np.quantile(d,.95),d_max_L=d.max(),evidence='REUSED_ORIGINAL_DISTANCE_VECTOR',pairwise_and_coverage_queries_identical=False,**{k:m.get(k) for k in QUALITY})
++   per.append(row);scores[key]=row;vectors[key]=d
++   pkey=rec['task_id'];points[pkey]=q
++   vpath=OUT/'coverage_vectors'/f"{r['arm']}_phase{r['phase_step']}_{r['case_id']}.npz";vpath.parent.mkdir(parents=True,exist_ok=True)
++   np.savez_compressed(vpath,points=q,distances_L=d,L=np.array(L),query_sha256=np.array(ah(q)))
++   recon.append(dict(arm=r['arm'],phase_step=r['phase_step'],case_id=r['case_id'],coverage_diff=cov-m['fixed_R12_coverage_within_1pct_fraction'],fixed_RMS_L_diff=np.sqrt(mse)-m['fixed_R12_coverage_RMS_bbox_pct']/100,status='MATCH',coverage_query_sha256=ah(q),pairwise_query_sha256=ah(ref['pairwise_target_points'])))
++  except FileNotFoundError as e:missing.append(dict(arm=r['arm'],phase_step=r['phase_step'],case_id=r['case_id'],status='BLOCKED',reason=str(e)))
++ assert len(per)<=270
++ pairs=[];parts=[];pairplan=[]
++ for r in per:
++  if r['phase_step']==3000:
++   if r['arm']=='Geo':pairplan.append((('T1',3000,r['case_id']),('Geo',3000,r['case_id']),'Geo-Native'))
++   if r['arm']=='Full':pairplan.append((('Geo',3000,r['case_id']),('Full',3000,r['case_id']),'Joint-Geo'))
++   if r['noise_index']==0 and (r['arm'],0,r['case_id']) in scores:pairplan.append(((r['arm'],0,r['case_id']),(r['arm'],3000,r['case_id']),r['arm']+'_phase3000-phase0'))
++ for ka,kb,name in pairplan:
++  if ka not in scores or kb not in scores:continue
++  a,b=scores[ka],scores[kb];x,y=vectors[ka],vectors[kb]
++  for f in ('query_sha256','GT_sha256','noise_sha256','input_sha256','Q','L','N','K'):assert a[f]==b[f],(f,ka,kb)
++  withinx=x<=.01;withiny=y<=.01;delta=y*y-x*x;Q=len(x)
++  row=dict(comparison=name,old_arm=ka[0],new_arm=kb[0],old_phase=ka[1],new_phase=kb[1],case_id=b['case_id'],uid=b['uid'],split=b['split'],ratio=b['ratio'],noise_index=b['noise_index'],query_sha256=b['query_sha256'],noise_sha256=b['noise_sha256'],Q=Q)
++  for m in ['coverage_fraction','fixed_query_MSE','fixed_query_RMS_L','d_p50_L','d_p90_L','d_p95_L','d_max_L']+QUALITY:
++   row[m+'_old']=a[m];row[m+'_new']=b[m];row[m+'_delta']=b[m]-a[m] if a[m] is not None and b[m] is not None else None
++  row['coverage_up_fixed_MSE_worse']=bool(row['coverage_fraction_delta']>0 and row['fixed_query_MSE_delta']>0)
++  row['coverage_up_R12_RMS_worse']=bool(row['coverage_fraction_delta']>0 and row['R12_to_free_RMS_bbox_pct_delta']>0)
++  maskgroups={'both_in':withinx&withiny,'enter':~withinx&withiny,'leave':withinx&~withiny,'both_out':~withinx&~withiny}
++  total=0
++  labels=np.zeros(Q,np.int8)
++  for i,(group,mask) in enumerate(maskgroups.items()):
++   contribution=float(delta[mask].sum()/Q);total+=contribution;labels[mask]=i
++   part=dict(comparison=name,case_id=b['case_id'],uid=b['uid'],split=b['split'],ratio=b['ratio'],noise_index=b['noise_index'],group=group,count=int(mask.sum()),fraction=float(mask.mean()),Q=Q,old_mean_distance_L=mean(x[mask]),new_mean_distance_L=mean(y[mask]),fixed_query_MSE_contribution=contribution,total_MSE_delta=float(delta.mean()),evidence='ORIGINAL_FIXED_QUERY_VECTORS',query_sha256=b['query_sha256'])
++   parts.append(part);row[group+'_fraction']=part['fraction'];row[group+'_MSE_contribution']=contribution
++  row['partition_sum_residual']=total-float(delta.mean());assert abs(row['partition_sum_residual'])<1e-14
++  row['entered_minus_left_residual']=row['enter_fraction']-row['leave_fraction']-row['coverage_fraction_delta'];assert abs(row['entered_minus_left_residual'])<1e-14
++  pairs.append(row)
++  target=OUT/'coverage_pair_vectors'/f'{name}_{b["case_id"]}.npz';target.parent.mkdir(parents=True,exist_ok=True)
++  np.savez_compressed(target,points=points[b['task_id']],old_distance_L=x,new_distance_L=y,partition=labels,squared_delta=delta)
++ metrics=[k for k in pairs[0] if k.endswith('_delta') or k.endswith('_contribution') or k.endswith('_fraction')]+['coverage_up_fixed_MSE_worse','coverage_up_R12_RMS_worse']
++ pp,summary=parent_summary(pairs,['comparison','split','ratio'],metrics)
++ # Parent descriptive direction counts use average within each parent's noise first.
++ for s in summary:
++  ps=[r for r in pp if all(r[k]==s[k] for k in ('comparison','split','ratio'))]
++  for m in ('coverage_fraction_delta','fixed_query_MSE_delta','R12_to_free_RMS_bbox_pct_delta','Gamma_to_free_edges_RMS_bbox_pct_delta','FF_illegal_affected_free_fraction_delta'):
++   s[m+'_positive_parents']=sum(r[m]>0 for r in ps);s[m+'_negative_parents']=sum(r[m]<0 for r in ps)
++  s['coverage_up_MSE_worse_parents']=sum(r['coverage_fraction_delta']>0 and r['fixed_query_MSE_delta']>0 for r in ps)
++  s['coverage_up_R12_worse_parents']=sum(r['coverage_fraction_delta']>0 and r['R12_to_free_RMS_bbox_pct_delta']>0 for r in ps)
++ ppar,partsum=parent_summary(parts,['comparison','split','ratio','group'],['count','fraction','old_mean_distance_L','new_mean_distance_L','fixed_query_MSE_contribution','total_MSE_delta'])
++ # Intersect parent sets only for availability table, never interpret across ratios causally.
++ availability=[]
++ for split in ('train','validation'):
++  a20={r['uid'] for r in per if r['phase_step']==3000 and r['split']==split and r['ratio']==.2}
++  a40={r['uid'] for r in per if r['phase_step']==3000 and r['split']==split and r['ratio']==.4}
++  for u in sorted(a20|a40):availability.append(dict(uid=u,split=split,A20=u in a20,A40=u in a40,common=u in a20&a40,causal_information_effect='NOT_IDENTIFIED; C/free complement differs'))
++ outs=[]
++ for n,r in [('A_distance_per_output.csv',per),('A_distance_reconciliation.csv',recon),('coverage_partition.csv',parts),('coverage_partition_per_parent.csv',ppar),('coverage_partition_summary.csv',partsum),('coverage_paired.csv',pairs),('coverage_per_parent.csv',pp),('coverage_summary.csv',summary),('A_availability.csv',availability),('A_missing_NA.csv',missing)]:outs.append(writecsv(n,r))
++ return dict(original_A_vectors_reused=len(per),new_A_distance_evaluations=0,new_pair_intersection_scans=0,paired_cases=len(pairs),partition_rows=len(parts),NA=sum(r['status']=='NA' for r in missing),blocked=sum(r['status']=='BLOCKED' for r in missing),max_partition_residual=max(abs(r['partition_sum_residual']) for r in pairs)),outs
++
++def teacher():
++ rows=readcsv(SRC/'teacher_per_case.csv');assert len(rows)<=288
++ metrics=['FM_error','D_edge','L5','Yhat_free_area']
++ summaries=aggregate(rows,['arm','phase_step','split','t'],metrics)
++ original=readcsv(SRC/'teacher_summary.csv');check=[]
++ oi={tuple(r[k] for k in ('arm','phase_step','split','t')):r for r in original}
++ for s in summaries:
++  o=oi[tuple(s[k] for k in ('arm','phase_step','split','t'))]
++  for m in metrics:
++   check.append(dict(arm=s['arm'],phase_step=s['phase_step'],split=s['split'],t=s['t'],metric=m,recomputed=s[m],original=o[m],difference=s[m]-o[m],match=close(s[m],o[m])))
++ assert all(r['match'] for r in check)
++ pairs=[];trajectories=[]
++ for key,rs in groups(rows,['case_id','input_sha256'] ).items():
++  ix={(r['arm'],r['phase_step']):r for r in rs}
++  assert len(rs)==12
++  for phase in (0,1000,2500,3000):
++   for a,b in (('T1','Geo'),('Geo','Full')):
++    aa,bb=ix[(a,phase)],ix[(b,phase)]
++    pairs.append(dict(comparison=b+'-'+a,phase_step=phase,case_id=key[0],input_sha256=key[1],uid=bb['uid'],split=bb['split'],t=bb['t'],**{m+'_delta':bb[m]-aa[m] for m in metrics}))
++  for arm in ARMS:
++   a,b=ix[(arm,0)],ix[(arm,3000)]
++   tr=dict(arm=arm,case_id=key[0],input_sha256=key[1],uid=b['uid'],split=b['split'],t=b['t'])
++   for m in metrics:
++    vals=[ix[(arm,p)][m] for p in (0,1000,2500,3000)]
++    for p,v in zip((0,1000,2500,3000),vals):tr[m+'_phase'+str(p)]=v
++    tr[m+'_delta']=b[m]-a[m];tr[m+'_relative_change_pct']=100*(b[m]/a[m]-1) if a[m] else None
++    tr[m+'_monotonic']=bool(np.all(np.diff(vals)>=0) or np.all(np.diff(vals)<=0))
++   trajectories.append(tr)
++ # Generation curve reproduction from real A20 noise0 records, preserving NA train middle phases.
++ A=readcsv(OUT/'A_distance_per_output.csv');gr=[r for r in A if r['ratio']==.2 and r['noise_index']==0]
++ gm=['remainder_symmetric_RMS_bbox_pct','R12_to_free_RMS_bbox_pct','Gamma_to_free_edges_RMS_bbox_pct','FF_illegal_affected_free_fraction','coverage_fraction']
++ gps,gs=parent_summary(gr,['arm','phase_step','split'],gm)
++ gcheck=[];og=readcsv(SRC/'shared_input_generation_curves.csv')
++ for r in og:
++  s=next(x for x in gs if all(x[k]==r[k] for k in ('arm','phase_step','split')))
++  for m in gm:
++   om='fixed_R12_coverage_within_1pct_fraction' if m=='coverage_fraction' else m
++   gcheck.append(dict(arm=r['arm'],phase_step=r['phase_step'],split=r['split'],metric=m,old=r[om],recomputed=s[m],match=close(r[om],s[m])))
++ assert all(r['match'] for r in gcheck)
++ for arm in ARMS:
++  for phase in (1000,2500):gs.append(dict(arm=arm,phase_step=phase,split='train',n_parents=0,status='NA',reason='No original intermediate train generation'))
++ outs=[]
++ for n,r in [('teacher_readonly_per_case.csv',rows),('teacher_recomputed_summary.csv',summaries),('teacher_reconciliation.csv',check),('teacher_input_paired.csv',pairs),('teacher_per_input_curves.csv',trajectories),('generation_readonly_curves.csv',gs),('generation_curve_reconciliation.csv',gcheck)]:outs.append(writecsv(n,r))
++ return dict(original_teacher_rows=len(rows),input_trajectories=len(trajectories),teacher_summary_checks=len(check),generation_curve_checks=len(gcheck),new_model_calls=0),outs
+--- /dev/null
++++ b/experiments/mf_h1_local0/chair_control_attribution_v1/delivery.py
+@@ -0,0 +1,201 @@
++from core import *
++import shutil,difflib,zipfile,platform
++
++def fmt(x,d=6):
++ if x is None:return 'NA'
++ if isinstance(x,bool):return str(x)
++ if isinstance(x,(int,np.integer)):return str(x)
++ if isinstance(x,(float,np.floating)):return f'{x:.{d}g}'
++ return str(x)
++def table(headers,rows):
++ return '\n|'+'|'.join(headers)+'|\n|'+'|'.join('---' for _ in headers)+'|\n'+''.join('|'+'|'.join(fmt(x).replace('|','/') for x in r)+'|\n' for r in rows)+'\n'
++
++def supplemental_checks():
++ records=recs();w=readcsv(OUT/'width_per_output.csv');crossledger=js(SRC/'analysis_ledger.json');checks=[];exported=[]
++ # Bank query identities and correspondence: actual transformed frozen points, not new draws.
++ for key,rs in groups(w,['arm','phase_step','uid','noise_index']).items():
++  ix={r['alpha']:r for r in rs};r1=records[ix[1.]['case_id']];b1=arrays(r1['input_path']);q1=arrays(r1['control_points_path'])['points'];cid=rs[0]['curve_id']
++  op=crossledger['operations'][cid+'_cross'];oldidentity=op['identity']
++  for a in ALPHAS:
++   r=ix[a];record=records[r['case_id']];cp=resolve(record['control_points_path']);bank=arrays(record['input_path']);query=arrays(cp)['points'];expected=q1.copy();expected[:,0]*=np.float32(a)
++   assert np.array_equal(query,expected) and digest(cp)==record['control_points_sha256']
++   assert oldidentity[str(a)]==r['raw_sha256']
++   checks.append(dict(curve_id=cid,alpha=a,point_hash=ah(query),Q1_hash=ah(q1),exact_transported_query=True,query_file_hash_match=True,old_cross_ledger_raw_identity_match=True,C_ids_same=ah(bank['source_face_ids'])==ah(b1['source_face_ids']),free_slots_same=ah(bank['free_source_ids'])==ah(b1['free_source_ids'])))
++   if key[1]==3000:
++    raw=arrays(r['raw_path']);K=int(bank['K']);path=OUT/'evidence_arrays'/f'{cid}_a{int(round(a*100))}.npz';path.parent.mkdir(exist_ok=True)
++    np.savez_compressed(path,free=raw['raw'][K:].reshape(-1,3,3),C=bank['C'],GT_free=bank['gt_free'].reshape(-1,3,3),Q=query,L0=bank['L0'],L_alpha=bank['L'],source_face_ids=bank['source_face_ids'],free_source_ids=bank['free_source_ids'],noise_sha256=np.array(ah(raw['noise'])),alpha=np.array(a))
++    exported.append(dict(file=str(path.relative_to(OUT)),sha256=digest(path),bytes=path.stat().st_size,source_raw=r['raw_path'],source_raw_sha256=r['raw_sha256'],scope='copied existing endpoint arrays, no generated candidate'))
++ # Reconcile exact original alpha-wise summary rather than treating brief as source truth.
++ os=readcsv(SRC/'B_width_summary.csv');old=readcsv(SRC/'B_width_response.csv');summarychecks=[]
++ metricmap={'slope':'b_self','slope_abs_error':None,'X_span_abs_error_L0':'actual_GT_abs_error_L0','response_abs_residual':None}
++ for r in os:
++  sub=[x for x in w if all(x[k]==r[k] for k in ('arm','phase_step','split','alpha'))]
++  for m,newkey in metricmap.items():
++   if newkey:val=mean(x[newkey] for x in sub)
++   elif m=='slope_abs_error':val=mean(abs(x['b_self']-1) for x in sub)
++   else:val=mean(abs(x['r_alpha']) for x in sub)
++   assert close(val,r[m]);summarychecks.append(dict(arm=r['arm'],phase_step=r['phase_step'],split=r['split'],alpha=r['alpha'],metric=m,original=r[m],raw_derived=val,difference=val-r[m],match=True))
++ savej(OUT/'evidence_arrays/manifest.json',exported)
++ arraysreadme='这些是原B终点144个输出的free/C/GT/Q小型副本；L0、源面ID及噪声字节hash一并保留。没有保存新的Gaussian，没有模型调用。完整原raw含状态轨迹仍只读留在源目录。manifest记录原raw及导出副本SHA256。\n'
++ (OUT/'evidence_arrays/README.md').write_text(arraysreadme,encoding='utf8')
++ # Missing means missing: expected applicability gaps and unmeasured phases have explicit NA.
++ missing=readcsv(OUT/'A_missing_NA.csv')+readcsv(OUT/'width_missing.csv')
++ for arm in ARMS:
++  for phase in (1000,2500):
++   missing.append(dict(module='A_train_generation',arm=arm,phase_step=phase,status='NA',reason='Original protocol did not measure train intermediate generation; no interpolation'))
++   missing.append(dict(module='B_intermediate_generation',arm=arm,phase_step=phase,status='NA',reason='No original intermediate B generation; no replacement outputs'))
++ missing.append(dict(module='auxiliary_independent_audit',status='NA_OPTIONAL',reason='Exact CHAIR_BRIEF_INDEPENDENT_AUDIT_20261003.md not found; local followup report exists and is only secondary corroboration'))
++ for c in readcsv(OUT/'width_per_curve.csv'):
++  if c['phase_step']==3000 and c['noise_index']==1:missing.append(dict(module='B_phase0_noise1',arm=c['arm'],uid=c['uid'],status='NA',reason='Only first-noise phase0 was registered; no paired phase0 noise1'))
++ outs=[writecsv('query_and_curve_identity_audit.csv',checks),writecsv('original_B_summary_reconciliation.csv',summarychecks),writecsv('missing_and_NA.csv',missing),'evidence_arrays/manifest.json','evidence_arrays/README.md']
++ return dict(query_identity_checks=len(checks),original_B_summary_checks=len(summarychecks),endpoint_small_arrays=len(exported),blocked=sum(r['status']=='BLOCKED' for r in missing)),outs
++
++def write_report():
++ get=lambda n:readcsv(OUT/n)
++ widths=get('width_summary.csv');curves=get('width_per_curve.csv');noise=get('noise_paired.csv');seed=get('width_by_noise.csv');ph=get('width_phase_paired.csv');cross=get('cross_summary.csv');ca=get('cross_all_targets_summary.csv');cp=get('cross_model_paired.csv');coverage=get('coverage_summary.csv');covpar=get('coverage_per_parent.csv');covpair=get('coverage_paired.csv');part=get('coverage_partition_summary.csv');pull=get('pullback_summary.csv');pc=get('pullback_per_case.csv');tea=get('teacher_recomputed_summary.csv');dec=get('error_decomposition_macro.csv');ana=get('analytic_curve_comparison.csv');dispatch=js(OUT/'CPU_dispatch.json')
++ ep=[r for r in widths if r['phase_step']==3000];geo_train=[r for r in noise if r['arm']=='Geo' and r['split']=='train']
++ checks=js(OUT/'stages/02_width.json')['result'];endv=[r for r in curves if r['phase_step']==3000 and r['split']=='validation']
++ report=['# Chair 条件控制逐例归因报告\n',
++ '**本轮已实际完成固定离线任务。** 216 个 B 原输出、72 条真实响应曲线、648 个原矩阵单元、270 条 A 固定查询点距离向量和288行 teacher 原表全部可读。新增几何计算只有96个终点逆仿射候选（每个两类距离）及一个小型点到三角面 fixture；模型加载、前向、反向、训练更新、OT、新Gaussian、新模型生成、CUDA初始化均为0。核心分析没有 BLOCKED；18个A40几何不适用请求及未测中间/第二噪声起点保留NA。\n',
++ '**能确定的结论：** 旧3×3单元分数无误，但旧“correct-column”解释用了固定输出行；应更新按目标的条件优势结论。Geo训练均值确实混合了明显不同的两噪声响应。验证组基准自由宽度偏窄的证据由raw直接支持；撤销X变换后，完整自由几何到GT的距离仍高。Geo覆盖收益有明确适用范围；Joint在本面板没有同时保住覆盖、条件优势与相交质量，局部接口改善仍成立。\n',
++ '所有汇总先在曲线/case计算，再父内平均噪声或alpha，最后父等权。Native=T1+FM；Native+Geo=T1+Geo+FM；Native+Geo+Joint=T1+Geo+JEdge5。三臂各自从MVP48累计1000分叉，本阶段新增3000、终点4000；不是旧双对象JEdge5_3000、MVP48_5000或fit2。旧账本确认9000次历史更新、582条历史生成、288次teacher；本轮只读这些记录。\n',
++ '## Q1：3×3到底测了什么，哪些旧结论需要更新？\n',
++ '`E[alpha_in,beta_target]` 的行是生成条件，列是目标。原 `width_analytics.py` 在 `matching = [r for r in cross if r["alpha"]==alpha]` 固定输出行，再取非对角目标均值。因此旧 `wrong_mean_minus_diagonal_RMS_L0`、两个diagonal-win字段均为行口径。648格CSV与原评分JSON完全一致，原代码与冻结code.diff一致，原几何评分器hash与protocol一致：**单元分数及行统计计算核对通过；将其称为固定目标列的条件利用是解释/汇总轴错误。** 原文件不变，本目录新增列统计。\n',
++ '`A_column(b)=mean_{a!=b}E[a,b]-E[b,b]` 回答同一目标下正确C是否有益。`A_row(a)=mean_{b!=a}E[a,b]-E[a,a]` 只回答同一输出偏好哪个目标。216项旧值均逐项吻合行公式；改用列公式后，117项优势符号、117项严格胜负改变。单元分数、宽度和teacher结论不因此失效；旧按alpha的“正确条件赢/输”及由此推出普遍向心收缩的论证需撤回。\n',
++ '终点列优势（%L0，正数为正确输入较好）及严格同时胜过两个错误输入的比例如下。每格仅4父×2噪声。\n']
++ report.append(table(['模型','划分','目标beta','列优势 %L0','严格列胜率','旧行优势 %L0'],[[NAMES[r['arm']],r['split'],r['alpha_beta'],100*r['A_column'],r['column_strict_win'],100*r['A_row']] for r in cross if r['phase_step']==3000]))
++ report += ['训练组 beta=1.1 的三臂列优势均为正，原行优势却均为负，不能把旧现象直接解释为扩张条件普遍无效。验证组 beta=1.1 的平均列优势仍为负，但每臂有4/8条曲线严格列胜；存在逐父/噪声异质性。三目标的平均行优势与平均列优势相等是代数恒等式，不是新增独立证据。\n',
++ 'No-response正控复用每组真实F1的三个原距离，重复成三行，并核对原No-response解析候选raw及对应评分：72组每列优势全部为0、无严格列胜。相同行[1,2,3] fixture的行优势为[1.5,0,-1.5]，列优势为[0,0,0]；全等、零对角、行列标签置换等8类fixture均通过。正控是解析解释，不能算模型性能。原点集是Q1运输后的固定点，属于单向诊断，并非三个形变表面各自均匀的双向RMS。\n',
++ '证据：[完整矩阵](cross_matrix.csv)、[逐项方向审计](cross_direction_audit.csv)、[真实No-response审计](no_response_direction_audit.csv)、[源码行定位](metric_source_locations.csv)、[8类CPU测试](cpu_fixture_results.json)。\n',
++ '## Q2：真实父/噪声曲线是否支持此前均值推导？\n',
++ '支持，但只支持这组登记数据：Geo训练 b_self 的noise0父均值为0.431636，noise1为1.244131，两者均值0.837884。3/4训练父从欠响应跨到过响应；第一个父两噪声都欠响应。不是所有父统一变好。下表来自真实曲线，不从宏平均反推。\n']
++ report.append(table(['Geo训练父UID','p/g n0','p/g n1','b_self n0','b_self n1','b_GT n0','b_GT n1','b1−b0'],[[r['uid'],r['p_over_g_noise0'],r['p_over_g_noise1'],r['b_self_noise0'],r['b_self_noise1'],r['b_GT_noise0'],r['b_GT_noise1'],r['b_noise1_minus_noise0']] for r in geo_train]))
++ report.append(table(['模型','划分','p/g','b_self均值','b_GT均值','abs(mean(b)−1)','mean(abs(b−1))'],[[NAMES[r['arm']],r['split'],r['p_over_g'],r['b_self'],r['b_GT'],r['abs_mean_b_minus_one'],r['b_self_abs_error']] for r in ep]))
++ report += ['Geo训练平均斜率比Native更接近1，但逐曲线平均|b−1|约0.56677，大于Native的0.54334，不能据平均斜率宣布控制更稳。验证三臂各有2/4父的斜率在两噪声间变号。两份噪声不是两次独立训练复现，不能推断总体噪声分布或seed因果效应。\n',
++ '216行raw的宽度/中位数与斜率共2808项核对无差异；72条曲线均检查N/K、源面集合、free槽位、实际Gaussian字节hash。所有单侧斜率、逆向、平局、单调及绝对变化保存在[逐曲线表](width_per_curve.csv)；[逐父噪声配对](noise_paired.csv)和[按噪声汇总](width_by_noise.csv)完整保留两组结果。相同斜率在三个alpha行只计一次。\n',
++ '## Q3：基准偏差与相对响应怎样共同决定绝对误差？\n',
++ '`e=(p_a-a*g)/L0 = a*(p-g)/L0 + (p_a-a*p)/L0 = base+response`；平方保留 `2*base*response`，不把两个平方项称为不重叠因果贡献。量纲为L0归一化；原绝对误差用实际存档GT宽度g_a，另外列 `GT_affine_roundoff=(a*g-g_a)/L0`，因此实际带符号误差为e+roundoff。原FP32目标变换造成的最大修正为'+fmt(checks['max_target_FP32_affine_residual_L0'])+' L0，预登记容差内；分解恒等式最大残差'+fmt(checks['max_exact_residual'])+'。未放宽对账容差。\n',
++ '宽度严格沿用有效free面角等角权q95−q05，raw先转FP64，再NumPy linear quantile；不改成bbox，不按面积加权。L0来自未变形完整父bbox对角线；原重建分数仍用L_alpha，新诊断统一L0。alpha=1的相对残差恒为0只是定义。\n',
++ f'验证终点三臂共{len(endv)}条曲线中，{sum(r["p_over_g"]<.9 for r in endv)}条均有p/g<0.9。这是已观察基准偏窄，不是从矩阵方向推断。Geo验证均值p/g=0.650821；基准项绝对值均值0.169173 L0，相对响应项绝对值均值0.018562 L0，但两者可抵消，不能相加解释最终绝对误差。\n',
++ 'Geo真正共有第一噪声的起终点比较，每划分4父，跨三个alpha平均：\n']
++ pr=[]
++ for split in ('train','validation'):
++  rs=[r for r in ph if r['arm']=='Geo' and r['split']==split]
++  for label,m in [('基准|p−g|/L0','base_abs_L0'),('相对残差平均绝对值','mean_abs_r'),('响应项平均绝对值/L0','mean_abs_response'),('最终原GT绝对宽度误差/L0','mean_actual_GT_abs_error_L0'),('抵消量 |base|+|response|−|e|','mean_cancellation'),('平方展开交叉项均值','mean_cross_term')]:
++   pr.append([split,label,mean(r[m+'_phase0'] for r in rs),mean(r[m+'_phase3000'] for r in rs),mean(r[m+'_delta'] for r in rs)])
++ report.append(table(['划分','量','phase0','phase3000','变化'],pr))
++ report += ['Geo验证响应残差减小，同时基准宽度变差、项间抵消减少，最终绝对宽度误差从0.139460升到0.156422 L0。验证父341bcae1…和534b0e6e…、训练父12c2b708…呈现“响应改善、基准与最终误差恶化”；训练父2ce61518…两项绝对量都减小但抵消也减少，最终误差可略升。这里是代数和配对描述，不是训练因果链。\n',
++ '新增b_GT满足b_GT=b_self*(p/g)，所以基准偏窄时self斜率看似合理也不能保证实际GT尺度响应。X/Y/Z位置及Y/Z跨度误差均在[216行逐输出表](width_per_output.csv)；[平方/符号分解逐父表](error_decomposition_summary.csv)保留交叉项；[24组起终点配对](width_phase_paired.csv)只用同一Gaussian字节。\n',
++ '## Q4：No-response与Post-scale平均误差相同，是否意味代码错？\n',
++ '不意味着。对p<0.9g、对称alpha取值0.9/1/1.1，No-response的平均|p−a*g|和Post-scale的平均|a*p−a*g|都等于g−p，而两者响应斜率分别为0和1。验证终点24条曲线都属于这一偏窄情形，存档解析参照均值近似相同；实际Post-scale系数来自C1与C_alpha的点积拟合，不由GT free估计。\n']
++ va=[r for r in ana if r['phase_step']==3000 and r['split']=='validation']
++ report += ['这24条实际曲线中两解析方法平均绝对误差差值的最大绝对值为 '+fmt(max(abs(r['post_minus_no_mean_error_L0']) for r in va))+' L0。432个原解析候选的坐标使用原存档hat逐一核对；重新CPU点积的末位舍入另列，不替换原hat。解析方法使用编辑前C、编辑前输出与当前C，信息合同比只读当前C的生成器更丰富，不能作为GT驱动部署校正。\n',
++ '证据：[解析坐标与hat审计](analytic_source_audit.csv)、[每曲线解析比较](analytic_curve_comparison.csv)。\n',
++ '## 新几何诊断：撤销已知仿射后，剩下多少偏差？\n',
++ '终点48曲线的两侧alpha共96候选。按真实存档变换系数float32(alpha)的倒数，仅离线撤销X缩放。每候选两类评价：与F1的对称表面RMS（两方向各512个固定协议面积样本）；统一Q1到pullback的单向固定点RMS/覆盖。原点到三角面实现、chunk=32；没有ICP、刚体对齐或GT槽位匹配。同预测槽坐标RMS仅作辅助。每候选的两种评价、两个方向及分母均入表。\n']
++ report.append(table(['模型','划分','pullback↔F1 %L0','Q1→F1 %L0','Q1→pullback %L0','pullback覆盖','覆盖−F1 pp'],[[NAMES[r['arm']],r['split'],100*r['symmetric_RMS_L0'],100*r['F1_fixed_GT_RMS_L0'],100*r['fixed_GT_RMS_L0'],r['fixed_GT_coverage_fraction'],100*r['fixed_GT_coverage_minus_F1']] for r in pull]))
++ report += ['验证三臂pullback到GT约7.62–7.67%L0，F1本身约7.42–7.56%L0；pullback与F1约1.01–1.16%L0。距离定义不同，不能相减做因果分摊，但这些数值与“共同基准形状偏差仍大”相容。它们并非精确仿射复现：表面差非零；不能称撤销后已正确。\n',
++ '训练组Geo的pullback↔F1约1.92%L0，为三臂中较大；pullback固定点RMS比F1增加约0.120%L0、覆盖下降4.785个百分点。Joint训练pullback到GT的平均RMS比F1反而低约0.302%L0，同时覆盖下降6.030个百分点。这一局部收益应保留，也再次说明RMS与coverage不可互换。未经阈值定义不把“近/远”转成成功率。\n',
++ '证据：[96个逐候选结果](pullback_per_case.csv)、[逐父结果](pullback_per_parent.csv)、`pullback_cache/`中的真实距离/采样点、`figures/geometry_*`固定相机图。图的对象按每划分UID字典序第一父、noise0预登记，非按结果挑图。\n',
++ '## Q5：Geo覆盖增加具体来自哪些查询点，距离尾部怎样变化？\n',
++ 'A的270条原评分JSON已保存每个固定查询点到free的距离，本轮全部复用且核对查询点hash、GT补集与原分数；新增A距离计算为0。coverage用独立seed=9973的512点，原R12→free RMS用seed=9911的另一组点，二者hash不同。本节明确命名fixed_query_MSE，不能冒充原R12 RMS。\n',
++ '同GT、同Q、同输入噪声的每对分为both_in/enter/leave/both_out，阈值沿用d≤0.01L。每组MSE贡献为sum((d_new/L)^2−(d_old/L)^2)/512。656组分区贡献与164对总差的最大闭合残差为1.735e−18；每对enter−leave也精确等于覆盖差。下表为Geo−Native父等权增量，MSE列乘10,000方便阅读。\n']
++ gc=[r for r in coverage if r['comparison']=='Geo-Native']
++ report.append(table(['划分','K比例','父数','覆盖 pp','fixed MSEΔ×1e4','enter贡献×1e4','both_out贡献×1e4','p95距离Δ %L','覆盖↑且MSE差父数'],[[r['split'],r['ratio'],r['n_parents'],100*r['coverage_fraction_delta'],1e4*r['fixed_query_MSE_delta'],1e4*r['enter_MSE_contribution'],1e4*r['both_out_MSE_contribution'],100*r['d_p95_L_delta'],r['coverage_up_MSE_worse_parents']] for r in gc]))
++ report += ['训练40%是明确的局部正结果：进入阈值的点和仍在阈值外的点都降低MSE，覆盖+6.138个百分点、p95尾部下降1.229%L。其余三组里，新进入点带来负MSE贡献，但both_out的正贡献更大或伴随leave代价，覆盖上升与平均MSE恶化可以同时发生。\n',
++ '这不只是父对象平均造成的表象：Geo−Native在训练20%、验证20%、验证40%分别有2/8、4/8、3/6父同时覆盖上升而fixed MSE变差；对应原R12指标为3/8、4/8、3/6。两个计数的差别正是点集不同，不能混用。验证20%的父33ec1e64…覆盖+0.977个百分点，却有MSEΔ=0.00109417，其中both_out贡献0.00108435；341bcae1…的MSEΔ=0.000757824，both_out贡献0.000765573。完整逐case/逐父和坐标向量保留，可定位哪些固定点付出代价，而非仅按宏平均推测。没有剔除这些父。\n',
++ '证据：[逐点分区表](coverage_partition.csv)、[逐case联表](coverage_paired.csv)、[逐父联表](coverage_per_parent.csv)、`coverage_vectors/`与`coverage_pair_vectors/`（含Q坐标、距离、分区标签及逐点平方差）。四组比例、均值、MSE贡献均保留；空组均值为NA，不写0。\n',
++ '## Q6：Joint是否同时保住覆盖、条件优势、接口与相交？\n',
++ '终点Joint−Geo四组的覆盖均值均下降，fixed-query MSE均值均上升；但验证两组的p95尾部下降，验证接口有收益，不能概括成所有量都变差。以下距离为原评分%L，fraction差只乘一次100换成百分点。CF/FF数目与受影响面比例同时保留在逐case表，未重跑相交扫描。\n']
++ jc=[r for r in coverage if r['comparison']=='Joint-Geo']
++ report.append(table(['划分','K比例','覆盖 pp','原双向RMSΔ %L','Gamma边RMSΔ %L','Gamma边p95Δ %L','CF受影响 pp','FF受影响 pp','小角面 pp'],[[r['split'],r['ratio'],100*r['coverage_fraction_delta'],r['remainder_symmetric_RMS_bbox_pct_delta'],r['Gamma_to_free_edges_RMS_bbox_pct_delta'],r['Gamma_to_free_edges_p95_bbox_pct_delta'],100*r['CF_proper_affected_free_fraction_delta'],100*r['FF_illegal_affected_free_fraction_delta'],100*r['free_minimum_angle_lt5_fraction_delta']] for r in jc]))
++ report += ['验证40%：Joint接口边RMS改善0.157536%L、CF受影响比例下降0.941097个百分点、小角面比例下降0.938436个百分点，同时FF受影响比例增加1.22395个百分点，覆盖下降0.667318个百分点。收益和代价同时存在。三目标合并的验证严格列胜率，Native/Geo/Joint为41.67%/37.50%/41.67%；训练为50.00%/45.83%/50.00%。Joint不是所有条件优势都下降，但没有保住整套几何指标。\n',
++ 'A20是两划分各8父；A40为训练7父、验证6父。源面集合、free补集和适用父不同，因此20%与40%的差不是纯信息量因果效果。共有父表单独列出。起终点A比较只用真正共有48条A20第一噪声；48条中间生成仅验证A20，未补造训练或B中间观测。C原留出只作为背景复用原配对表：历史终点相交代价仍需保留，本轮没有重生成或重评分C。\n',
++ '## Teacher与已有曲线：原始数值核验\n',
++ '原teacher 288行对应72条(臂×父×t)输入轨迹。按相同case_id与input SHA在phase0/1000/2500/3000配对，t=.2/.5/.8分开；288项原汇总与独立复算吻合。共享生成曲线90项也与真实A20 noise0数值吻合。下面的相对变化为“各格均值之比−1”，不混作每父相对变化均值。\n']
++ trows=[]
++ for split in ('train','validation'):
++  for t in (.2,.5,.8):
++   rs=[r for r in tea if r['arm']=='Geo' and r['split']==split and r['t']==t];ix={r['phase_step']:r for r in rs}
++   trows.append([split,t,*[ix[p]['FM_error'] for p in (0,1000,2500,3000)],100*(ix[3000]['FM_error']/ix[0]['FM_error']-1),100*(ix[3000]['D_edge']/ix[0]['D_edge']-1),100*(ix[3000]['L5']/ix[0]['L5']-1)])
++ report.append(table(['Geo划分','t','FM phase0','1000','2500','3000','FM变化 %','D_edge变化 %','L5变化 %'],trows))
++ report += ['FM的t=.2训练下降/验证上升、t=.8训练上升/验证下降在三臂均值上成立，t=.5曲线非单调；不能把FM走势套到全部loss或全部父。teacher的GT状态输入、t、patch与生成面板不同，没有相同完整输入hash可作跨任务逐例因果关联。未重新执行teacher，未据曲线调整门控。详见[原数值重汇总](teacher_recomputed_summary.csv)、[每输入轨迹](teacher_per_input_curves.csv)、[同输入跨臂配对](teacher_input_paired.csv)。\n',
++ '## Q7：唯一优先下一步及检验假说\n',
++ '**优先做“基准自由形状学习”的受控修复验证。** 本轮已在独立结果中纠正评分解释；接下来的科学优先级应放在alpha=1时自由部分的尺度/位置与完整形状，而不是只把平均self斜率推向1。依据是：验证全部24条曲线基准偏窄，Geo第一噪声响应改善未抵消基准恶化，撤销仿射后到GT的距离仍约7.7%L0。噪声不一致和接口/相交代价应保留为约束指标，不自动等同于同一训练病因。\n',
++ '**检验假说：** 如果基准形状偏差是当前验证绝对控制误差的主要可修复瓶颈，那么下一次另行批准、固定父/噪声/预算的单一受控修复中，alpha=1的|p−g|/L0、位置误差与统一Q1到自由面的距离应共同降低；其绝对宽度收益应主要体现在base项减小，同时列条件优势、response项、噪声差及CF/FF质量不出现对应退化。若只改善宽度标量而表面距离不降，或收益依赖更强抵消，则该假说不获支持。这里没有提出GT部署校正，也没有将分解项自动改成新loss。\n',
++ '本轮不启动该验证，不训练、不改loss、不扫描求解器/NFE/alpha、不追加seed、不换默认模型。单训练seed、B每划分4父和2噪声只支持描述性归因，不支持普遍性、显著性或唯一病因；四个训练父的新C不是未见物体。\n',
++ '## 执行、可恢复性与交付\n',
++ f'CPU按观测递增至{dispatch["actual_parallel_workers"]}个进程。首个已授权候选观测峰值RSS={dispatch["first_actual_candidate_peak_RSS"]/1024**2:.1f} MiB；逆仿射阶段并发墙钟{dispatch["seconds"]:.3f}秒（包含IO/import，不能与隔离算时直接比较）。资源快照记录RTX5080的总/用/空闲显存、利用率和进程，以及24核CPU与RAM；本轮GPU工作进程0。每个worker独立输出、固定surface RNG，按注册候选ID排序聚合。\n',
++ '入口为 `experiments/mf_h1_local0/chair_control_attribution_v1/run_all.py`。所有新结果仅在 `native_t1/runs/chair_control_attribution_v1/`；旧源码、CSV、raw、报告保持只读。`source_manifest.json`登记所有读取来源与hash/schema；结束前逐项重新核对，结果见`source_hash_verification.json`。权重仅查原manifest/metadata身份，未反序列化。\n',
++ '实现期间两次标量预检中断已记账：旧code.diff使用普通unified diff而非git diff头；原Post-scale重新点积与存档hat存在约1e−16级CPU舍入。只修正新目录中的解析与对账方式，未重试模型/生成/评分，未提高科学预算或放宽容差。恢复入口按源hash和完成阶段hash跳过已完成阶段；pullback按候选、距离类型保存完成标记，已完成评分不重复执行。失败/未提交的几何类型禁止静默重放。\n',
++ '必要文件均已包含：216行逐输出、72行逐曲线、24行逐父噪声配对、648格原矩阵与216项方向审计、平方/符号分解、96行pullback、656行覆盖分区、teacher逐行表、原B三份CSV、实际评分源码小文件、源码hash、新增code.diff、8类CPU测试、执行账本、缺失/NA清单和恢复命令。另附原B终点144份小数组、固定查询点/距离向量及全部固定图，无大权重或训练轨迹。\n',
++ '关键入口：[指标合同](metric_contract.json)、[来源清单](source_manifest.json)、[源码hash](source_code_hashes.json)、[缺失/NA](missing_and_NA.csv)、[账本](execution_ledger.jsonl)、[完整预算](execution_accounting.json)、[恢复命令](restart.txt)、[图件清单](figures/manifest.json)。评分/测试PASS只表示流程与数值核验通过，不代表模型质量通过。\n']
++ (OUT/'ATTRIBUTION_REPORT.md').write_text('\n'.join(report),encoding='utf8')
++ return dict(report='ATTRIBUTION_REPORT.md',language='zh',recommendation='baseline free-shape learning controlled repair verification; not started'),['ATTRIBUTION_REPORT.md']
++
++def finalize():
++ # Before/after of all frozen input evidence and public source, no checkpoint tensor reads.
++ changed=[];verified=[]
++ for r in js(OUT/'source_manifest.json')['sources']:
++  h=digest(r['path']);ok=h==r['sha256'];verified.append(dict(path=r['path'],before=r['sha256'],after=h,unchanged=ok))
++  if not ok:changed.append(r['path'])
++ savej(OUT/'source_hash_verification.json',dict(status='UNCHANGED' if not changed else 'FAIL',files=len(verified),changed=changed,entries=verified))
++ if changed:raise RuntimeError('Protected source changed')
++ assert 'torch' not in sys.modules
++ stages={p.stem:js(p) for p in sorted((OUT/'stages').glob('*.json'))}
++ counts=dict(model_loads=0,model_forwards=0,model_backwards=0,optimizer_updates=0,OT_calls=0,new_Gaussians=0,new_generated_outputs=0,CUDA_initializations=0,GPU_workers=0,
++  B_raw_outputs_recomputed=216,B_curves=72,original_cross_cells_reused=648,new_original_cross_geometry_cells=0,no_response_analytic_groups_reused=72,original_analytic_candidates_verified=432,
++  A_fixed_distance_vectors_reused=270,A_new_vectors_computed=0,A_new_pair_intersection_scans=0,A_pairs=164,coverage_partition_rows=656,
++  teacher_rows_read=288,new_teacher_calls=0,pullback_candidates=96,pullback_distance_types_per_candidate=2,pullback_point_triangle_calls=288,fixture_families=8,fixture_point_triangle_calls=1,
++  core_blocked_modules=0,original_A_geometry_NA_requests=18,stages={k:dict(seconds=v.get('seconds'),status=v['status'],result=v.get('result')) for k,v in stages.items()})
++ savej(OUT/'execution_accounting.json',counts)
++ restart='wsl -e /home/warpwang/miniforge3/envs/meshflow/bin/python -B /mnt/e/MeshFlow/experiments/mf_h1_local0/chair_control_attribution_v1/run_all.py\n'
++ (OUT/'restart.txt').write_text(restart,encoding='utf8')
++ versions=dict(python=sys.version,platform=platform.platform(),numpy=np.__version__)
++ for name in ('trimesh','matplotlib','scipy','psutil'):
++  mod=__import__(name);versions[name]=getattr(mod,'__version__','NA')
++ savej(OUT/'runtime_versions.json',versions)
++ sourcefiles=sorted(CODE.glob('*.py'));diff=''
++ for p in sourcefiles:
++  rel=str(p.relative_to(ROOT));diff+=''.join(difflib.unified_diff([],p.read_text().splitlines(keepends=True),fromfile='/dev/null',tofile='b/'+rel))
++ (OUT/'code.diff').write_text(diff,encoding='utf8')
++ codedest=OUT/'analysis_code';codedest.mkdir(exist_ok=True)
++ for p in sourcefiles:shutil.copyfile(p,codedest/p.name)
++ savej(OUT/'analysis_code_hashes.json',[dict(path=str(p.relative_to(ROOT)),sha256=digest(p)) for p in sourcefiles])
++ (OUT/'README.md').write_text('''# CHAIR_CONTROL_ATTRIBUTION_REVIEW
++
++先读 ATTRIBUTION_REPORT.md；全部数字从原chair_domain_control_v1逐例raw/CSV/评分JSON导出。
++
++- width_per_output.csv=216行；width_per_curve.csv=72；noise_paired.csv=24。
++- cross_matrix.csv=648个原单元；cross_direction_audit.csv保留旧行解释和正确列比较；no_response_matrix.csv只是原F1三行重复的解析正控，不是新评分。
++- coverage_partition.csv=656行（164配对×4组）；coverage_paired.csv/coverage_per_parent.csv保留接口、角质量、pair数和受影响面比例。coverage_vectors和coverage_pair_vectors含实际固定Q坐标和逐点数值。标签0/1/2/3=both_in/enter/leave/both_out。
++- pullback_per_case.csv=96个离线候选；pullback_cache每候选仅两类距离，包含真实采样点和平方距离。原模型输出未改写。
++- evidence_arrays含144份原B终点free/C/GT/Q及hash。original_tables保存原B逐例三表、teacher、A、原协议和清单。
++- original_scoring_code为实际相关评分源码全文及trimesh最近点依赖源码，不是伪代码；source_code_hashes.json提供来源和hash。analysis_code与code.diff仅为独立新增代码。
++- source_manifest.json与source_hash_verification.json记录源前后hash；每个打包文件另列package_manifest.json。
++- 恢复命令见restart.txt；源数据在本机原位置。完成阶段和候选会校验hash后复用，不重复冒充新证据。
++
++CSV中的距离/L是fraction；原bbox_pct是%L；coverage fraction乘一次100才是百分点。NA不等于0。教师与生成输入不同，不能当逐状态因果配对。所有模型/训练/OT/CUDA调用为0。
++''',encoding='utf8')
++ resources('final_completion');event('fixed_task_complete',counts={k:v for k,v in counts.items() if k!='stages'},protected_source_files=len(verified))
++ savej(OUT/'RUN_COMPLETE.json',dict(status='COMPLETE',protected_source_files=len(verified),all_source_hashes_unchanged=True,model_calls=0,core_blocked=0,complete_stages=list(stages),stop_reason='fixed authorized offline task finished; no next experiment launched'))
++ # Archives exclude only their own bytes, mutable local lock, and transient helper files.
++ include=[p for p in sorted(OUT.rglob('*')) if p.is_file() and p.name not in ('CHAIR_CONTROL_ATTRIBUTION_REVIEW.zip','CHAIR_CONTROL_ATTRIBUTION_REVIEW.zip.sha256','package_manifest.json','archive_verification.json','attribution_cpu.lock') and '.tmp' not in p.name]
++ pm=[dict(path=str(p.relative_to(OUT)),bytes=p.stat().st_size,sha256=digest(p)) for p in include]
++ savej(OUT/'package_manifest.json',pm);include.append(OUT/'package_manifest.json')
++ zpath=OUT/'CHAIR_CONTROL_ATTRIBUTION_REVIEW.zip'
++ with zipfile.ZipFile(zpath,'w',compression=zipfile.ZIP_DEFLATED,compresslevel=6) as z:
++  for p in include:z.write(p,str(p.relative_to(OUT)))
++ with zipfile.ZipFile(zpath) as z:
++  assert z.testzip() is None
++  for r in pm:assert hashlib.sha256(z.read(r['path'])).hexdigest()==r['sha256']
++  must=['ATTRIBUTION_REPORT.md','width_per_output.csv','width_per_curve.csv','noise_paired.csv','cross_matrix.csv','cross_direction_audit.csv','error_decomposition_summary.csv','pullback_per_case.csv','coverage_partition.csv','original_tables/B_cross_condition_scores.csv','code.diff','source_code_hashes.json']
++  assert all(n in z.namelist() for n in must)
++ h=digest(zpath);(OUT/'CHAIR_CONTROL_ATTRIBUTION_REVIEW.zip.sha256').write_text(h+'  '+zpath.name+'\n',encoding='ascii')
++ savej(OUT/'archive_verification.json',dict(status='PASS',zip_sha256=h,zip_bytes=zpath.stat().st_size,files=len(include),CRC='PASS',all_member_SHA256='PASS',required_members='PASS'))
++ print(json.dumps(dict(status='COMPLETE',zip=str(zpath),bytes=zpath.stat().st_size,sha256=h,source_files=len(verified)),ensure_ascii=False),flush=True)
++
++def deliver():
++ stage('09_supplemental',supplemental_checks)
++ stage('10_report',write_report)
++ finalize()
+--- /dev/null
++++ b/experiments/mf_h1_local0/chair_control_attribution_v1/figures.py
+@@ -0,0 +1,108 @@
++from core import *
++import matplotlib
++matplotlib.use('Agg')
++import matplotlib.pyplot as plt
++from mpl_toolkits.mplot3d.art3d import Poly3DCollection
++
++def make_figures():
++ D=OUT/'figures';D.mkdir(exist_ok=True);manifest=[]
++ plt.rcParams.update({'font.size':9,'axes.titlesize':10,'figure.dpi':120,'savefig.dpi':150})
++ def save(fig,name,definition,sources):
++  fig.savefig(D/name,bbox_inches='tight');plt.close(fig)
++  manifest.append(dict(file='figures/'+name,definition=definition,source_tables=sources,sha256=digest(D/name)))
++ w=readcsv(OUT/'width_per_output.csv');c=readcsv(OUT/'width_per_curve.csv');ana=readcsv(OUT/'analytic_source_audit.csv')
++ colors=['#1679b7','#d95821']
++ # Six figures, every registered endpoint curve shown, never select by observed score.
++ wr=[r for r in w if r['phase_step']==3000]
++ ymax=max(max(r['p_alpha'],r['g_alpha'])/r['L0'] for r in wr)*1.05
++ for arm in ARMS:
++  for split in ('train','validation'):
++   rs=[r for r in wr if r['arm']==arm and r['split']==split];uids=sorted({r['uid'] for r in rs})
++   fig,axes=plt.subplots(2,2,figsize=(11,8),sharex=True,sharey=True)
++   for ax,u in zip(axes.flat,uids):
++    gt=sorted([r for r in rs if r['uid']==u and r['noise_index']==0],key=lambda r:r['alpha'])
++    ax.plot(ALPHAS,[r['g_alpha']/r['L0'] for r in gt],color='black',marker='s',label='GT')
++    for noise in (0,1):
++     sub=sorted([r for r in rs if r['uid']==u and r['noise_index']==noise],key=lambda r:r['alpha'])
++     ax.plot(ALPHAS,[r['p_alpha']/r['L0'] for r in sub],color=colors[noise],marker='o',label=f'model noise{noise}')
++     for candidate,style in [('No-response',':'),('Post-scale','--')]:
++      aa=sorted([r for r in ana if r['phase_step']==3000 and r['arm']==arm and r['uid']==u and r['noise_index']==noise and r['candidate']==candidate],key=lambda r:r['alpha'])
++      ax.plot(ALPHAS,[r['width']/r['L0'] for r in aa],color=colors[noise],linestyle=style,alpha=.7,label=f'{candidate} n{noise}')
++    ax.set(title=u[:10],ylim=(0,ymax),xticks=ALPHAS,xlabel='input alpha',ylabel='free q95-q05 width / L0');ax.grid(alpha=.2)
++   axes[0,0].legend(fontsize=7,ncol=2);fig.suptitle(f'{NAMES[arm]} | {split} | phase3000 | four parents, two saved noises',y=1.01);fig.tight_layout()
++   save(fig,f'width_{arm}_{split}.png','All actual raw widths; fixed y axis across six figures; analytic lines use saved candidates',['width_per_output.csv','analytic_source_audit.csv'])
++ fig,axes=plt.subplots(2,3,figsize=(16,9),sharex=True,sharey=True)
++ for ax,(split,arm) in zip(axes.flat,[(s,a) for s in ('train','validation') for a in ARMS]):
++  for r in wr:
++   if r['arm']!=arm or r['split']!=split or r['alpha']==1:continue
++   ax.scatter(r['base'],r['response'],color=colors[r['noise_index']],marker='<' if r['alpha']==.9 else '>',s=32)
++   ax.annotate(r['uid'][:4]+'n'+str(r['noise_index']), (r['base'],r['response']),fontsize=5,xytext=(2,2),textcoords='offset points')
++  ax.axhline(0,color='gray',lw=.7);ax.axvline(0,color='gray',lw=.7);ax.set(title=f'{NAMES[arm]} / {split}',xlabel='alpha*(p-g)/L0',ylabel='(p_alpha-alpha*p)/L0');ax.grid(alpha=.15)
++ fig.suptitle('Signed base and response terms | < alpha=.9, > alpha=1.1 | color = saved noise');fig.tight_layout()
++ save(fig,'base_response_scatter.png','Every endpoint off-center request, labeled parent/noise; no absolute-value additivity',['width_per_output.csv'])
++ cross=readcsv(OUT/'cross_matrix.csv');cg=groups(cross,['curve_id']);vmax=max(r['E_RMS_L0']*100 for r in cross)
++ for page,start in enumerate(range(0,len(cg),12),1):
++  fig,axes=plt.subplots(3,4,figsize=(13,10));items=list(cg.items())[start:start+12]
++  for ax,((cid,),rs) in zip(axes.flat,items):
++   M=np.zeros((3,3))
++   for r in rs:M[ALPHAS.index(r['alpha_in']),ALPHAS.index(r['beta_target'])]=r['E_RMS_L0']*100
++   im=ax.imshow(M,vmin=0,vmax=vmax,cmap='viridis',aspect='equal')
++   for i in range(3):
++    for j in range(3):ax.text(j,i,f'{M[i,j]:.2f}',ha='center',va='center',fontsize=8,color='white' if M[i,j]<vmax*.6 else 'black')
++   r=rs[0];ax.set(title=f"{r['arm']} p{r['phase_step']} {r['uid'][:7]} n{r['noise_index']}",xticks=range(3),xticklabels=ALPHAS,yticks=range(3),yticklabels=ALPHAS,xlabel='target beta (column)',ylabel='input alpha (row)')
++  fig.subplots_adjust(hspace=.65,wspace=.5,right=.9,top=.92);cb=fig.add_axes([.93,.2,.015,.6]);fig.colorbar(im,cax=cb,label='one-way RMS (% L0)')
++  fig.suptitle(f'All saved 3 x 3 matrices | page {page}/6 | common color scale')
++  save(fig,f'cross_matrices_{page:02}.png','All 72 groups paginated, labels map explicit row/column; common color range',['cross_matrix.csv'])
++ parts=readcsv(OUT/'coverage_partition_summary.csv');paired=readcsv(OUT/'coverage_paired.csv');parent=readcsv(OUT/'coverage_per_parent.csv')
++ fig,axes=plt.subplots(2,4,figsize=(17,8),sharex=False,sharey=True)
++ for i,comp in enumerate(('Geo-Native','Joint-Geo')):
++  for j,(split,ratio) in enumerate((('train',.2),('train',.4),('validation',.2),('validation',.4))):
++   ax=axes[i,j];rs=[r for r in parts if r['comparison']==comp and r['split']==split and r['ratio']==ratio]
++   order=['both_in','enter','leave','both_out'];idx={r['group']:r for r in rs}
++   ax.bar(range(4),[idx[k]['fixed_query_MSE_contribution']*1e4 for k in order],color=['#6699aa','#3ca868','#dd874a','#a56699'])
++   ax.axhline(0,color='black',lw=.7);ax.set(xticks=range(4),xticklabels=['both in','enter','leave','both out'],title=f'{comp} {split} {ratio:.0%}',ylabel='MSE contribution x 10,000');ax.tick_params(axis='x',rotation=25)
++ fig.suptitle('Coverage partitions: signed contribution to fixed-query MSE | parent equal weight');fig.tight_layout()
++ save(fig,'coverage_partition_cost.png','Distance vector partitions at unchanged 1%L threshold, positive means higher squared distance',['coverage_partition_summary.csv'])
++ fig,axes=plt.subplots(2,4,figsize=(17,8))
++ for i,comp in enumerate(('Geo-Native','Joint-Geo')):
++  for j,(split,ratio) in enumerate((('train',.2),('train',.4),('validation',.2),('validation',.4))):
++   ax=axes[i,j];rs=[r for r in paired if r['comparison']==comp and r['split']==split and r['ratio']==ratio]
++   for r in rs:ax.scatter(100*r['coverage_fraction_delta'],100*r['d_p95_L_delta'],color=colors[r['noise_index']],s=15,alpha=.5)
++   ps=[r for r in parent if r['comparison']==comp and r['split']==split and r['ratio']==ratio]
++   for r in ps:
++    ax.scatter(100*r['coverage_fraction_delta'],100*r['d_p95_L_delta'],color='black',marker='x',s=32);ax.annotate(r['uid'][:4],(100*r['coverage_fraction_delta'],100*r['d_p95_L_delta']),fontsize=6)
++   ax.axhline(0,color='gray',lw=.6);ax.axvline(0,color='gray',lw=.6);ax.set(title=f'{comp} {split} {ratio:.0%}',xlabel='coverage change (pp)',ylabel='p95 distance change (%L)')
++ endpoint_pairs=[r for r in paired if r['comparison'] in ('Geo-Native','Joint-Geo')]
++ for ax in axes.flat:
++  ax.set_xlim(min(100*r['coverage_fraction_delta'] for r in endpoint_pairs)-2,max(100*r['coverage_fraction_delta'] for r in endpoint_pairs)+2)
++  ax.set_ylim(min(100*r['d_p95_L_delta'] for r in endpoint_pairs)-.2,max(100*r['d_p95_L_delta'] for r in endpoint_pairs)+.2)
++ fig.suptitle('Coverage gains and distance tails | colored dots: saved noise; black x: parent mean');fig.tight_layout()
++ save(fig,'coverage_tail_cost.png','Per-case and per-parent actual fixed-query p95, not original R12 quantile',['coverage_paired.csv','coverage_per_parent.csv'])
++ # Fixed examples registered by lexicographic UID before scores: first train and first validation, n0.
++ gen=[r for r in generated() if r['table']=='B' and r['phase_step']==3000 and r['noise_index']==0]
++ for split in ('train','validation'):
++  uid=min(r['uid'] for r in gen if r['split']==split)
++  plate_points=[]
++  for rr in [r for r in gen if r['uid']==uid]:
++   ff,bb,_=raw_for(rr);LL=float(bb['L0']);pp=ff.astype(float).copy();pp[...,0]/=float(np.float32(rr['alpha']))
++   plate_points.extend([ff.reshape(-1,3)/LL,pp.reshape(-1,3)/LL,bb['C'].reshape(-1,3)/LL,bb['gt_free'].reshape(-1,3)/LL])
++  fixed_points=np.concatenate(plate_points);fixed_mid=(fixed_points.min(0)+fixed_points.max(0))/2;fixed_half=max(fixed_points.max(0)-fixed_points.min(0))*.55
++  for arm in ARMS:
++   ix={r['alpha']:r for r in gen if r['uid']==uid and r['arm']==arm};f1,b1,_=raw_for(ix[1.]);L=float(b1['L0']);C1=b1['C'];gt=b1['gt_free'].reshape(-1,3,3)
++   geoms=[]
++   for a in (.9,1.1):
++    f,b,_=raw_for(ix[a]);pull=f.astype(float).copy();pull[...,0]/=float(np.float32(a));geoms.append([(f,b['C']), (pull,C1),(f1,C1),(gt,C1)])
++   pointsall=np.concatenate([x.reshape(-1,3)/L for row in geoms for f,cc in row for x in (f,cc)])
++   mid=fixed_mid;half=fixed_half
++   fig=plt.figure(figsize=(16,11))
++   for i,a in enumerate((.9,1.1)):
++    for j,title in enumerate(('raw F_alpha','offline pullback','saved F_1','GT Y_1')):
++     ax=fig.add_subplot(2,4,4*i+j+1,projection='3d');f,cc=geoms[i][j]
++     ax.add_collection3d(Poly3DCollection(f/L,facecolors='#7ba3be',edgecolors='#355970',linewidths=.18,alpha=.55))
++     ax.add_collection3d(Poly3DCollection(cc/L,facecolors='#e8a147',edgecolors='#765925',linewidths=.2,alpha=.8))
++     ax.set(xlim=(mid[0]-half,mid[0]+half),ylim=(mid[1]-half,mid[1]+half),zlim=(mid[2]-half,mid[2]+half),title=f'a={a}: {title}',xlabel='X/L0',ylabel='Y/L0',zlabel='Z/L0');ax.set_box_aspect((1,1,1));ax.view_init(elev=20,azim=-60);ax.tick_params(labelsize=6)
++   fig.suptitle(f'{NAMES[arm]} | {split} {uid[:10]} noise0 | offline geometry diagnostic',y=.97)
++   fig.subplots_adjust(left=.02,right=.98,bottom=.06,top=.89,wspace=.12,hspace=.32)
++   save(fig,f'geometry_{arm}_{split}.png','Preregistered UID/noise; fixed camera and shared limits across all three arms for same parent; no ICP/slot match; actual arrays only',['pullback_per_case.csv','source_manifest.json'])
++ savej(OUT/'figures/manifest.json',manifest)
++ return dict(figures=len(manifest)),['figures/manifest.json']+[r['file'] for r in manifest]
+--- /dev/null
++++ b/experiments/mf_h1_local0/chair_control_attribution_v1/geometry.py
+@@ -0,0 +1,129 @@
++from core import *
++from scalars import advantages
++import importlib.util,resource,concurrent.futures,multiprocessing
++
++def scorer():
++ p=ROOT/'experiments/mf_h1_local0/evaluate.py'
++ spec=importlib.util.spec_from_file_location('original_cpu_surface',p);m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
++ assert 'torch' not in sys.modules
++ return m
++
++def fixtures():
++ results=[]
++ def done(name,**kw):results.append(dict(family=name,status='PASS',**kw))
++ M=np.tile([1.,2.,3.],(3,1));c,r=advantages(M);assert np.array_equal(c,[0,0,0]) and np.array_equal(r,[1.5,0,-1.5]);done('identical_rows',column=c,row=r)
++ M=np.ones((3,3))-np.eye(3);c,r=advantages(M);assert np.all(c>0);done('diagonal_zero',column=c)
++ M=np.array([[0.,3,7],[2,0,8],[4,6,0]]);rp=[2,0,1];cp=[1,2,0];permuted=M[np.ix_(rp,cp)]
++ tagged={(ALPHAS[rp[i]],ALPHAS[cp[j]]):permuted[i,j] for i in range(3) for j in range(3)}
++ restored=np.array([[tagged[(a,b)] for b in ALPHAS] for a in ALPHAS]);assert np.array_equal(restored,M);assert not np.array_equal(M,M.T);done('label_permutation',restored=restored)
++ c,r=advantages(np.ones((3,3)));assert np.all(c==0) and np.all(r==0);done('all_equal_ties',strict_wins=0)
++ actual=readcsv(OUT/'no_response_direction_audit.csv');assert len(actual)==216 and all(x['A_column']==0 and not x['column_strict_win'] for x in actual);done('actual_F1_no_response',groups=len(actual)//3,geometry_calls=0)
++ p,g,pa,a,L=2.,4.,2.3,1.1,5.;e=(pa-a*g)/L;base=a*(p-g)/L;resp=(pa-a*p)/L
++ assert abs(e-base-resp)<1e-15 and abs(e*e-base*base-resp*resp-2*base*resp)<1e-15;done('decomposition_cancellation',e=e,base=base,response=resp)
++ m=scorer();tri=np.array([[[0.,0,0],[1.,0,0],[0,1.,0]]]);q=np.array([[.2,.2,1],[.2,.2,0],[2.,0,0]])
++ d=m.surface_distance_squared(q,tri);assert np.allclose(d,[1,0,1],atol=1e-14,rtol=0);done('known_point_triangle_distance',squared_distances=d,geometry_calls=1)
++ transformed=tri.copy();transformed[...,0]*=1.1;pulled=transformed.copy();pulled[...,0]/=1.1;assert np.array_equal(pulled,tri);done('affine_pullback_identity',coordinate_residual=float(abs(pulled-tri).max()))
++ savej(OUT/'cpu_fixture_results.json',dict(families=results,new_geometry_calls=1,random_scans=0,model_calls=0,torch_imported='torch' in sys.modules))
++ return dict(fixture_families=len(results),status='PASS',new_point_triangle_calls=1),['cpu_fixture_results.json']
++
++def evaluate_pullback(job):
++ # Each candidate owns durable result and distance buffers. No shared mutable RNG.
++ name=job['candidate_id'];dest=OUT/'pullback_cache'/name;dest.mkdir(parents=True,exist_ok=True)
++ report=dest/'result.json'
++ if report.exists():
++  r=js(report)
++  for p,h in r['cache_hashes'].items():assert digest(dest/p)==h
++  return r
++ start=time.monotonic();attempt=dest/'attempt.json'
++ if attempt.exists():
++  a=js(attempt)
++  # A finished distance type is reused. An interrupted uncommitted score never silently replays.
++  for typ in ('symmetric','fixed_GT'):
++   if a.get(typ)=='RUNNING' and not (dest/(typ+'.npz')).exists():raise RuntimeError('Interrupted distance type requires explicit audit: '+name+'/'+typ)
++ else:a=dict(candidate_id=name,status='RUNNING',model_calls=0,new_Gaussian=0)
++ savej(attempt,a)
++ f,b,raw=raw_for(job['row']);f1,b1,raw1=raw_for(job['base_row']);L=float(b1['L0']);alpha=job['alpha'];factor=float(np.float32(alpha))
++ pulled=f.astype(np.float64).copy();pulled[...,0]/=factor
++ q=arrays(recs()[job['base_row']['case_id']]['control_points_path'])['points']
++ m=scorer()
++ cache={}
++ sym=dest/'symmetric.npz'
++ if not sym.exists():
++  a['symmetric']='RUNNING';savej(attempt,a)
++  # Independent identical registered RNG stream for the two area measures.
++  p1=m.sample_mesh_surface(f1,512,np.random.RandomState(9911));pp=m.sample_mesh_surface(pulled,512,np.random.RandomState(9911))
++  d1=m.surface_distance_squared(p1,pulled);d2=m.surface_distance_squared(pp,f1)
++  assert np.isfinite(d1).all() and np.isfinite(d2).all()
++  tmp=dest/'symmetric.tmp.npz';np.savez_compressed(tmp,F1_samples=p1,pullback_samples=pp,F1_to_pullback_d2=d1,pullback_to_F1_d2=d2);os.replace(tmp,sym)
++  a['symmetric']='COMPLETE';savej(attempt,a)
++ else:
++  with np.load(sym) as z:d1=z['F1_to_pullback_d2'];d2=z['pullback_to_F1_d2']
++ gp=dest/'fixed_GT.npz'
++ if not gp.exists():
++  a['fixed_GT']='RUNNING';savej(attempt,a)
++  dg=m.surface_distance_squared(q,pulled);assert np.isfinite(dg).all()
++  tmp=dest/'fixed_GT.tmp.npz'
++  np.savez_compressed(tmp,GT_Q1=q,GT_to_pullback_d2=dg);os.replace(tmp,gp)
++  a['fixed_GT']='COMPLETE';savej(attempt,a)
++ else:
++  with np.load(gp) as z:dg=z['GT_to_pullback_d2']
++ result=dict(candidate_id=name,curve_id=job['curve_id'],arm=job['row']['arm'],phase_step=3000,uid=job['row']['uid'],noise_index=job['row']['noise_index'],split=job['row']['split'],alpha=alpha,inverse_factor=factor,L0=L,
++  raw_sha256=job['row']['raw_sha256'],F1_raw_sha256=job['base_row']['raw_sha256'],query_sha256=ah(q),raw_free_sha256=ah(f),pullback_sha256=ah(pulled),
++  symmetric_RMS_L0=float(np.sqrt((d1.mean()+d2.mean())/2)/L),F1_to_pullback_RMS_L0=float(np.sqrt(d1.mean())/L),pullback_to_F1_RMS_L0=float(np.sqrt(d2.mean())/L),
++  fixed_GT_RMS_L0=float(np.sqrt(dg.mean())/L),fixed_GT_coverage_fraction=float(np.mean(dg<=(.01*L)**2)),fixed_GT_p50_L0=float(np.quantile(np.sqrt(dg),.5)/L),fixed_GT_p90_L0=float(np.quantile(np.sqrt(dg),.9)/L),fixed_GT_p95_L0=float(np.quantile(np.sqrt(dg),.95)/L),
++  F1_fixed_GT_RMS_L0=job['F1_E'],F1_fixed_GT_coverage_fraction=job['F1_cov'],fixed_GT_RMS_minus_F1=float(np.sqrt(dg.mean())/L-job['F1_E']),fixed_GT_coverage_minus_F1=float(np.mean(dg<=(.01*L)**2)-job['F1_cov']),
++  same_slot_coordinate_RMS_L0_AUX=float(np.sqrt(np.mean((pulled-f1)**2))/L),same_slot_scope='predicted slot only, no GT assignment; not a surface metric',
++  sample_points_each_direction=512,fixed_GT_points=len(q),geometry_types=2,point_triangle_calls=3,geometry_scope='OFFLINE_DIAGNOSTIC_NOT_NEW_GENERATION',seconds=time.monotonic()-start,
++  peak_process_RSS_bytes=int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss*1024),peak_scope='whole CPU worker process lifetime, includes imports and geometry buffers',pid=os.getpid(),torch_imported='torch' in sys.modules,
++  cache_hashes={p.name:digest(p) for p in (sym,gp)})
++ assert not result['torch_imported']
++ savej(report,result);a['status']='COMPLETE';savej(attempt,a)
++ return result
++
++def pullback():
++ gen=[r for r in generated() if r['table']=='B' and r['phase_step']==3000 and r['status']=='PASS'];cx=readcsv(OUT/'cross_matrix.csv');ix={(r['arm'],r['uid'],r['noise_index']):r for r in cx if r['phase_step']==3000 and r['alpha_in']==1 and r['beta_target']==1}
++ jobs=[]
++ for key,rs in groups(gen,['arm','uid','noise_index'] ).items():
++  aa={r['alpha']:r for r in rs};cid=f'{key[0]}_phase3000_{key[1]}_n{key[2]}';c=ix[key]
++  for alpha in (.9,1.1):jobs.append(dict(candidate_id=cid+'_a'+str(int(round(alpha*100))),curve_id=cid,alpha=alpha,row=aa[alpha],base_row=aa[1.],F1_E=c['E_RMS_L0'],F1_cov=c['coverage_fraction']))
++ assert len(jobs)<=96
++ pending=[j for j in jobs if not (OUT/'pullback_cache'/j['candidate_id']/'result.json').exists()];completed=[]
++ resources('before_authorized_first_pullback')
++ started=time.monotonic();workers=1;observed=None;dispatch=[]
++ if pending:
++  first=pending.pop(0);r=evaluate_pullback(first);completed.append(r);observed=r['peak_process_RSS_bytes']
++  snap=resources('after_first_actual_candidate');free_cpu=max(1,int(snap['cpu_count']*(1-snap['cpu_percent']/100)))
++  # CPU workers cap at four for this bounded audit, further reduced from measured RSS and current CPU/RAM.
++  allowed=min(4,max(1,free_cpu//2),max(1,int((snap['ram_available']-2*1024**3)/(1.5*max(observed,128*1024**2)))),len(pending))
++  pools=[];running={};idx=0
++  try:
++   for slot in range(allowed):
++    s=resources('before_CPU_worker_'+str(slot+1))
++    if s['ram_available']<2*1024**3+1.5*max(observed,128*1024**2) or s['cpu_percent']>90:break
++    pool=concurrent.futures.ProcessPoolExecutor(max_workers=1,mp_context=multiprocessing.get_context('spawn'));pools.append(pool)
++    job=pending[idx];idx+=1;f=pool.submit(evaluate_pullback,job);running[f]=(pool,job)
++    # Incremental startup: observe representative candidate before adding another worker.
++    rr=f.result();completed.append(rr);running.pop(f)
++    dispatch.append(dict(slot=slot+1,first_candidate=job['candidate_id'],seconds=rr['seconds'],observed_RSS=rr['peak_process_RSS_bytes'],resource=s))
++    if idx<len(pending):
++     job=pending[idx];idx+=1;running[pool.submit(evaluate_pullback,job)]=(pool,job)
++   workers=max(1,len(pools))
++   if not pools:
++    for j in pending:completed.append(evaluate_pullback(j))
++   while running:
++    done,_=concurrent.futures.wait(running,timeout=20,return_when=concurrent.futures.FIRST_COMPLETED)
++    for f in done:
++     pool,job=running.pop(f);rr=f.result();completed.append(rr)
++     if len(completed)%16==0:print('pullback complete',len(completed),'of',len(jobs),flush=True)
++     if idx<len(pending):
++      job=pending[idx];idx+=1;running[pool.submit(evaluate_pullback,job)]=(pool,job)
++  finally:
++   for p in pools:p.shutdown(wait=True)
++ resources('pullback_finished')
++ result=[evaluate_pullback(j) for j in jobs] # cache reads only, verified hashes
++ metrics=['symmetric_RMS_L0','fixed_GT_RMS_L0','fixed_GT_coverage_fraction','F1_fixed_GT_RMS_L0','fixed_GT_RMS_minus_F1','fixed_GT_coverage_minus_F1','fixed_GT_p95_L0','same_slot_coordinate_RMS_L0_AUX']
++ per,summ=parent_summary(result,['arm','split'],metrics)
++ outs=[writecsv('pullback_per_case.csv',result),writecsv('pullback_per_parent.csv',per),writecsv('pullback_summary.csv',summ)]
++ savej(OUT/'CPU_dispatch.json',dict(actual_parallel_workers=workers,first_actual_candidate_peak_RSS=observed,incremental_dispatch=dispatch,seconds=time.monotonic()-started,candidates=len(jobs),new_candidates_this_entry=len(completed),reused_candidates_this_entry=len(jobs)-len(completed),throughput_candidates_per_second=len(completed)/(time.monotonic()-started),phase_timing_scope='concurrent CPU wall time including imports and IO, not isolated compute benchmark',GPU_workers=0))
++ outs.append('CPU_dispatch.json')
++ return dict(candidates=len(result),geometry_types_per_candidate=2,new_candidates_this_entry=len(completed),point_triangle_calls_total=sum(r['point_triangle_calls'] for r in result),workers=workers),outs
+--- /dev/null
++++ b/experiments/mf_h1_local0/chair_control_attribution_v1/inspect_sources.py
+@@ -0,0 +1,26 @@
++from pathlib import Path
++import json,csv,sys,importlib.util
++R=Path('/mnt/e/MeshFlow') if Path('/mnt/e/MeshFlow').exists() else Path('E:/MeshFlow')
++O=R/'native_t1/runs/chair_domain_control_v1'
++print('PYTHON',sys.executable)
++for m in ('numpy','scipy','matplotlib','pandas','trimesh','numba','psutil'):
++ print(m,importlib.util.find_spec(m))
++p=json.loads((O/'panels.json').read_text())
++for tab in ('A','B','teacher'):
++ r=next(x for x in p[tab] if x.get('status')=='READY')
++ print('RECORD',tab,json.dumps(r))
++try:
++ import numpy as np
++ for tab in ('A','B'):
++  r=next(x for x in p[tab] if x.get('status')=='READY')
++  for k in ('input_path','ref_npz','target_path','control_points_path'):
++   if k in r:
++    loc=Path(r[k]);loc=loc if loc.is_absolute() else O/loc
++    with np.load(loc,allow_pickle=False) as z: print('ARRAYS',tab,k,{k:(z[k].shape,str(z[k].dtype)) for k in z.files})
++except ImportError: pass
++for name in ('protocol.json','checkpoint_manifest.json','execution_accounting.json'):
++ obj=json.loads((O/name).read_text());print(name,json.dumps(obj)[:7500])
++for path in sorted(O.glob('*.csv')):
++ with path.open() as f:
++  reader=csv.DictReader(f);rows=list(reader)
++ print('CSV',path.name,len(rows))
+--- /dev/null
++++ b/experiments/mf_h1_local0/chair_control_attribution_v1/registration.py
+@@ -0,0 +1,85 @@
++from core import *
++import shutil,ast
++
++def register():
++ OUT.mkdir(parents=True,exist_ok=True)
++ resources('registration')
++ paths=set()
++ # All original run evidence except large weights, images, model/teacher tensor payloads.
++ for p in SRC.rglob('*'):
++  if p.is_file() and p.suffix in ('.json','.csv','.md','.py','.diff','.npz') and 'teacher_raw' not in p.parts:
++   paths.add(p)
++ for p in (ROOT/'experiments/mf_h1_local0/chair_domain_control_v1').glob('*.py'):paths.add(p)
++ protocol=js(SRC/'protocol.json')
++ for p in protocol['source_scorer_identity']:paths.add(ROOT/p)
++ for name in ('AGENTS.md','WORKSPACE.md'):paths.add(ROOT/name)
++ for base in ('native_t1','models'):
++  for p in (ROOT/base).glob('*.py'):paths.add(p)
++ prompt=Path('/mnt/c/Users/warpwang/Downloads/Chair_Control_Attribution_Codex_Prompt.md')
++ if prompt.exists():paths.add(prompt)
++ old_followup=ROOT/'native_t1/analysis/chair_control_followup_v1'
++ for p in old_followup.rglob('*.md'):paths.add(p)
++ # Historical frozen code.diff is retained and compared to current scoring file contents.
++ entries=[];schemas=[]
++ for p in sorted(paths):
++  item=dict(path=str(p),relative_path=str(p.relative_to(ROOT)) if p.is_relative_to(ROOT) else None,bytes=p.stat().st_size,sha256=digest(p),status='PRESENT')
++  if p.suffix=='.csv':
++   with p.open(encoding='utf-8-sig') as f:
++    rr=csv.reader(f);fields=next(rr);n=sum(1 for _ in rr)
++   item.update(rows=n,fields=fields);schemas.append(item)
++  entries.append(item)
++ current=dict(schema='chair_control_attribution_source_manifest_v1',sources=entries,excluded=['checkpoint tensors: metadata only, never deserialized','teacher_raw arrays: teacher CSV only','old figures: not numeric truth'])
++ path=OUT/'source_manifest.json'
++ if path.exists():
++  before={x['path']:x['sha256'] for x in js(path)['sources']}
++  if before!={x['path']:x['sha256'] for x in entries}:raise RuntimeError('Source manifest changed; refuse silent reentry')
++ else:savej(path,current)
++ savej(OUT/'source_schema.json',schemas)
++ checks=[]
++ for p,h in protocol['source_scorer_identity'].items():checks.append(dict(path=p,recorded=h,actual=digest(ROOT/p),match=h==digest(ROOT/p)))
++ if not all(x['match'] for x in checks):raise RuntimeError('Original scorer mismatch')
++ diff=(SRC/'code.diff').read_text()
++ original=ROOT/'experiments/mf_h1_local0/chair_domain_control_v1/width_analytics.py'
++ rel=str(original.relative_to(ROOT));needle='+++ b/'+rel
++ block=diff.split(needle,1)[1].split('\n--- /dev/null',1)[0]
++ extracted='\n'.join(s[1:] for s in block.splitlines() if s.startswith('+') and not s.startswith('+++'))+'\n'
++ checks.append(dict(path=rel,frozen_source='original code.diff added file',match=extracted==original.read_text()))
++ if not checks[-1]['match']:raise RuntimeError('Frozen width scorer differs')
++ savej(OUT/'original_source_identity_check.json',checks)
++ srcsmall=OUT/'original_scoring_code';srcsmall.mkdir(exist_ok=True)
++ srcpaths=set(ROOT/p for p in protocol['source_scorer_identity'])
++ srcpaths.update(ROOT/'experiments/mf_h1_local0/chair_domain_control_v1'/n for n in ('width_analytics.py','reporting.py','evaluation.py','prepare.py','conclusions.py'))
++ srcpaths.add(Path(__import__('trimesh').triangles.__file__))
++ sourcehash=[]
++ for p in sorted(srcpaths):
++  rel=p.relative_to(ROOT) if p.is_relative_to(ROOT) else Path('dependency')/p.name
++  dest=srcsmall/rel;dest.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(p,dest)
++  sourcehash.append(dict(source=str(p),packaged=str(dest.relative_to(OUT)),sha256=digest(p),bytes=p.stat().st_size))
++ savej(OUT/'source_code_hashes.json',sourcehash)
++ od=OUT/'original_tables';od.mkdir(exist_ok=True)
++ names=['B_width_response.csv','B_cross_condition_scores.csv','B_analytic_baselines.csv','A_context_per_case.csv','teacher_per_case.csv','shared_input_generation_curves.csv','B_width_summary.csv','teacher_summary.csv','C_holdout_paired_summary.csv','C_holdout_paired_per_parent.csv','failure_classification.csv','task_manifest.json','protocol.json','checkpoint_manifest.json','panels.json']
++ for n in names:shutil.copyfile(SRC/n,od/n)
++ shutil.copyfile(prompt,OUT/'REQUEST.md')
++ contract=dict(schema='metric_contract_v1',units={'coordinates':'original model coordinates','e_base_response':'fraction of L0','squared_terms':'L0 squared normalized','legacy_bbox_pct':'100*distance/L_alpha','coverage':'fraction; multiply once by 100 for percentage points'},
++ width=dict(formula='q95(X)-q05(X)',population='all finite free triangle corners, equal corner weight; copied C excluded',dtype='raw float32 converted to float64 BEFORE np.quantile',method='numpy linear',source='width_analytics.py:extent',small_p='p<=1e-8*L0 -> relative response undefined'),
++ decomposition=dict(e='(p_a-alpha*g)/L0',base='alpha*(p-g)/L0',response='(p_a-alpha*p)/L0',cross='2*base*response',actual_GT_error='(p_a-g_alpha)/L0=e+(alpha*g-g_alpha)/L0; preserve float32 target transform residual',slope_self='(p_1.1-p_.9)/(.2*p)',slope_GT='(p_1.1-p_.9)/(.2*g)'),
++ transform=dict(origin='original fixed origin, X only',source='prepare.py:load_task_sample',source_dtype='float32 multiply by np.float32(alpha)',pullback='float64(F_alpha); X /= float(np.float32(alpha)); invert actual saved transform factor; nominal alpha separately recorded',no_alignment=True),
++ cross=dict(formula='E[alpha_in,beta_target]=sqrt(mean(distance(Q_beta,F_alpha)^2))/L0',queries='frozen Q1 points transported by float32(alpha) factor in float64',direction='rows=input condition, columns=target',column_advantage='mean(E[wrong,b])-E[b,b]',row_preference='mean(E[a,wrong])-E[a,a]',old_field='wrong_mean_minus_diagonal_RMS_L0 is ROW; old diagonal wins also ROW',rank_ties='raw sign strict retained; tolerance ties atol=1e-8+1e-6*abs(diagonal) separately',reuse='648 original cells + original JSON independent mapping; no rerun when agree'),
++ coverage=dict(points='original reference coverage_points; uniform per sampled point, Q=512',threshold='d<=.01*L for original A case',partition='both_in,enter,leave,both_out',contribution='sum_group((d_new/L)^2-(d_old/L)^2)/Q',original_R12='uses DIFFERENT pairwise_target_points; fixed_query_MSE never relabeled original R12 RMS',source='eval_scoring.py:score_free'),
++ pullback=dict(candidates=96,types=2,symmetric='512 area samples independently on each surface via original sampler RandomState(9911); sum of two directional means /2, sqrt /L0',GT='frozen B Q1 -> canonical pulled free, coverage<=.01 L0',sampling='finite offline surface uniform draws only, NO Gaussian; not generated meshes',auxiliary='same-slot coordinate RMS is auxiliary, no GT slot matching',chunk=32),
++ aggregation='curve first; within parent average noise/alpha; parents equal weight. Phase comparison common n0 only. A20/A40 separate complements.',
++ reconciliation=TOL,fixture_families=8,budgets=dict(B_outputs=216,curves=72,cross_cells=648,pullback_candidates=96,A_vectors=270,teacher_rows=288),
++ forbidden=dict(model_loads=0,forwards=0,backwards=0,optimizer_updates=0,OT=0,new_Gaussians=0,new_generations=0,CUDA_initializations=0),
++ visual_registration=dict(raw_examples='lexicographically first UID in each B split; noise0; all three arms; raw/pullback/GT; fixed view elev20 azim-60',fixed_global_heatmap=True),
++ source_code_hashes=sourcehash)
++ savej(OUT/'metric_contract.json',contract)
++ line_locations=[]
++ for p in srcpaths:
++  for i,line in enumerate(p.read_text().splitlines(),1):
++   if any(s in line for s in ('def extent','def response_metrics','matching =','off =','wrong_mean_minus_diagonal','def point_diagnostic','def score_free','def surface_distance_squared','def sample_mesh_surface','coverage_points','pairwise_target_points','def load_task_sample')):
++    line_locations.append(dict(file=str(p),line=i,source=line))
++ writecsv('metric_source_locations.csv',line_locations)
++ acc=js(SRC/'execution_accounting.json');gen=generated()
++ identity=dict(complete_generations=acc['complete_generations'],phase_table_counts={str(k):len(v) for k,v in groups([r for r in gen if r['status']=='PASS'],['phase_step','table']).items()},checkpoint_identity_source='metadata/manifest only',protocol_NFE=protocol['NFE'],precision=protocol['precision'],main_updates_per_arm=protocol['main_updates_per_arm'])
++ savej(OUT/'source_identity.json',identity)
++ return dict(files=len(entries),source_scorer_matches=all(x['match'] for x in checks),identity=identity),['source_manifest.json','source_schema.json','original_source_identity_check.json','source_code_hashes.json','metric_contract.json','metric_source_locations.csv','source_identity.json']
+--- /dev/null
++++ b/experiments/mf_h1_local0/chair_control_attribution_v1/run_all.py
+@@ -0,0 +1,33 @@
++"""Recoverable CPU-only entry. Run with the existing meshflow Python environment."""
++from core import *
++import argparse,fcntl
++from registration import register
++from scalars import width,cross
++from coverage_teacher import coverage,teacher
++
++def main():
++ ap=argparse.ArgumentParser();ap.add_argument('--through',default='all',choices=['register','scalar','geometry','figures','all']);args=ap.parse_args()
++ OUT.mkdir(parents=True,exist_ok=True)
++ # Local attribution controller lock only; never touches the GPU or old controller locks.
++ with (OUT/'attribution_cpu.lock').open('a') as lock:
++  fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
++  event('entry',argv=sys.argv,model_loads=0,forwards=0,backwards=0,OT=0,new_Gaussians=0,CUDA_initializations=0)
++  stage('01_registration',register)
++  # Verify immutable source identity on every reentry, even when completed stages are skipped.
++  for r in js(OUT/'source_manifest.json')['sources']:
++   if digest(r['path'])!=r['sha256']:raise RuntimeError('Source changed: '+r['path'])
++  if args.through=='register':return
++  for n,fn in [('02_width',width),('03_cross',cross),('04_coverage',coverage),('05_teacher',teacher)]:
++   print(n,flush=True);print(stage(n,fn),flush=True)
++  if args.through=='scalar':return
++  from geometry import fixtures,pullback
++  stage('06_cpu_fixtures',fixtures)
++  stage('07_pullback',pullback)
++  if args.through=='geometry':return
++  from figures import make_figures
++  stage('08_figures',make_figures)
++  if args.through=='figures':return
++  from delivery import deliver
++  deliver()
++
++if __name__=='__main__':main()
+--- /dev/null
++++ b/experiments/mf_h1_local0/chair_control_attribution_v1/scalars.py
+@@ -0,0 +1,158 @@
++from core import *
++CK=['arm','phase_step','uid','noise_index']
++def ext(a):
++ p=np.asarray(a,dtype=np.float64).reshape(-1,3)
++ return np.quantile(p,.95,axis=0,method='linear')-np.quantile(p,.05,axis=0,method='linear'),np.median(p,axis=0)
++
++def width():
++ original=readcsv(SRC/'B_width_response.csv');gen={(r['arm'],r['phase_step'],r['case_id']):r for r in generated() if r['table']=='B'}
++ panels=recs();out=[];curves=[];audit=[];missing=[];analytic_audit=[]
++ analytic=readcsv(SRC/'B_analytic_baselines.csv')
++ ai={(r['arm'],r['phase_step'],r['uid'],r['noise_index'],r['alpha'],r['candidate']):r for r in analytic}
++ for key,rs in groups(original,CK).items():
++  base=dict(zip(CK,key));base['split']=rs[0]['split'];base['display_model']=NAMES[base['arm']]
++  state={};complete=True
++  for r in rs:
++   gr=gen[(*key[:2],r['case_id'])];rec=panels[r['case_id']]
++   try:
++    f,b,raw=raw_for(gr)
++    assert digest(resolve(gr['raw_path']))==gr['raw_sha256']
++    assert digest(resolve(rec['input_path']))==rec['input_sha256']
++    assert np.array_equal(raw['noise'],b['z'])
++    assert np.array_equal(raw['raw'][:int(b['K'])].reshape(-1,3,3),b['C'])
++    assert np.all(b['valid_mask']) and np.array_equal(raw['known_mask'],b['known_mask'])
++    s,m=ext(f);gs,gm=ext(b['gt_free'])
++    state[r['alpha']]=dict(r=r,gr=gr,rec=rec,free=f,bank=b,raw=raw,span=s,median=m,gspan=gs,gmedian=gm)
++   except FileNotFoundError as e:
++    complete=False;missing.append(dict(module='width_raw',key=str(key),status='BLOCKED',reason=str(e)))
++  if not complete or set(state)!=set(ALPHAS):continue
++  z=state[1.];p=z['span'][0];g=z['gspan'][0];L=float(z['bank']['L0']);N=int(z['bank']['N']);K=int(z['bank']['K'])
++  noise=ah(z['raw']['noise']);ids=ah(z['bank']['source_face_ids']);slots=ah(z['bank']['free_source_ids'])
++  cid=f'{key[0]}_phase{key[1]}_{key[2]}_n{key[3]}'
++  base.update(curve_id=cid,task_id=z['rec']['task_id'],noise_sha256=noise,C_source_ids_sha256=ids,free_slot_ids_sha256=slots,checkpoint_sha256=z['gr']['checkpoint_sha256'],N=N,K=K,gaussian_seed=z['rec']['gaussian_seed'],L0=L)
++  goodp=p>1e-8*L;goodg=g>1e-8*L
++  lo,hi=state[.9]['span'][0],state[1.1]['span'][0]
++  bself=(hi-lo)/(.2*p) if goodp else None;bgt=(hi-lo)/(.2*g) if goodg else None
++  sm=(p-lo)/(.1*p) if goodp else None;sp=(hi-p)/(.1*p) if goodp else None
++  c=dict(base,p=p,g=g,p_over_g=p/g if goodg else None,base_signed_L0=(p-g)/L,base_abs_L0=abs(p-g)/L,b_self=bself,b_GT=bgt,
++   b_self_abs_error=abs(bself-1) if goodp else None,b_GT_abs_error=abs(bgt-1) if goodg else None,slope_narrow=sm,slope_widen=sp,
++   one_sided_difference=sp-sm if goodp else None,change_narrow=p-lo,change_widen=hi-p,change_total=hi-lo,
++   monotonic=bool(lo<=p<=hi),strict_monotonic=bool(lo<p<hi),reverse_narrow=bool(p<lo),reverse_widen=bool(hi<p),net_reverse=bool(hi<lo),tie_narrow=bool(p==lo),tie_widen=bool(hi==p),
++   under_response=bool(bself<1) if goodp else None,over_response=bool(bself>1) if goodp else None,response_status='DEFINED' if goodp else 'UNDEFINED_SMALL_BASE_WIDTH',
++   slope_identity_residual=bgt-bself*p/g if goodp and goodg else None)
++  curve_rows=[]
++  for a,v in sorted(state.items()):
++   b=v['bank'];gr=v['gr'];r=v['r'];pa=v['span'][0];ga=v['gspan'][0]
++   assert noise==ah(v['raw']['noise']) and ids==ah(b['source_face_ids']) and slots==ah(b['free_source_ids'])
++   assert N==int(b['N']) and K==int(b['K'])
++   expect=z['bank']['full_target'].copy().reshape(-1,3);expect[:,0]*=np.float32(a)
++   assert np.array_equal(expect,b['full_target'].reshape(-1,3))
++   assert np.array_equal(b['gt_free'].reshape(-1,3)[:,1:],z['bank']['gt_free'].reshape(-1,3)[:,1:])
++   assert close(float(np.linalg.norm(np.ptp(z['bank']['full_target'].reshape(-1,3),axis=0))),L)
++   bt=a*(p-g)/L;resp=(pa-a*p)/L;e=(pa-a*g)/L;gtcorr=(a*g-ga)/L
++   row=dict(base,case_id=r['case_id'],alpha=a,alpha_float32=float(np.float32(a)),raw_path=gr['raw_path'],raw_sha256=gr['raw_sha256'],input_path=v['rec']['input_path'],raw_dtype=str(v['free'].dtype),statistic_dtype='float64',evidence='RAW_RECOMPUTED',L_alpha=float(b['L']),p=p,g=g,p_alpha=pa,g_alpha=ga,
++     p_over_g=c['p_over_g'],e=e,base=bt,response=resp,exact_residual=e-bt-resp,e2=e*e,base2=bt*bt,response2=resp*resp,cross_term=2*bt*resp,square_residual=e*e-bt*bt-resp*resp-2*bt*resp,
++     abs_e=abs(e),abs_base=abs(bt),abs_response=abs(resp),cancellation=abs(bt)+abs(resp)-abs(e),opposing_terms=bool(bt*resp<0),
++     actual_GT_signed_error_L0=(pa-ga)/L,actual_GT_abs_error_L0=abs(pa-ga)/L,GT_affine_roundoff_L0=gtcorr,GT_affine_identity_within_tolerance=close(ga/L,a*g/L),
++     r_alpha=pa/p-a if goodp else None,response_via_relative=p*(pa/p-a)/L if goodp else None,b_self=bself,b_GT=bgt,
++     old_X_span_abs_error_L0=r['X_span_abs_error_L0'],old_slope=r['slope'])
++   for j,ax in enumerate('XYZ'):
++    for field,new in ((ax+'_span',v['span'][j]),(ax+'_GT_span',v['gspan'][j]),(ax+'_median',v['median'][j]),(ax+'_GT_median',v['gmedian'][j])):
++     row[field]=new;audit.append(dict(curve_id=cid,alpha=a,field=field,old=r[field],recomputed=new,difference=new-r[field],match=close(new/L,r[field]/L)))
++    row[ax+'_span_signed_error_L0']=(v['span'][j]-v['gspan'][j])/L
++    row[ax+'_median_signed_error_L0']=(v['median'][j]-v['gmedian'][j])/L
++   audit.append(dict(curve_id=cid,alpha=a,field='slope',old=r['slope'],recomputed=bself,difference=bself-r['slope'],match=close(bself,r['slope'])))
++   assert abs(row['exact_residual'])<1e-12 and abs(row['square_residual'])<1e-12
++   curve_rows.append(row);out.append(row)
++   for name in ('No-response','Post-scale'):
++    ar=ai[(*key,a,name)];craw=arrays(ar['candidate_raw_path'])['raw'];cf=craw[K:].reshape(-1,3,3)
++    x=z['bank']['C'][...,0].astype(np.float64).ravel();xx=b['C'][...,0].astype(np.float64).ravel();hat=float(x@xx/(x@x))
++    expected=z['free'].astype(np.float64).copy()
++    if name=='Post-scale':expected[...,0]*=ar['alpha_hat']
++    assert np.array_equal(cf,expected) and digest(resolve(ar['candidate_raw_path']))==ar['candidate_raw_sha256']
++    assert close(hat,ar['alpha_hat']) and ar['source_alpha1_raw_sha256']==z['gr']['raw_sha256']
++    analytic_audit.append(dict(base,alpha=a,candidate=name,alpha_hat=ar['alpha_hat'],hat_recomputed=hat,hat_roundoff=hat-ar['alpha_hat'],hat_source='only C1 and Calpha dot fit; no GT free',source_F1_sha256=z['gr']['raw_sha256'],coordinate_exact=True,width=ext(cf)[0][0],absolute_error_L0=ar['X_span_abs_error_L0'],response_residual=ar['response_residual'],slope=ar['slope']))
++  for m in ('e','base','response','e2','base2','response2','cross_term','abs_e','abs_base','abs_response','cancellation','actual_GT_abs_error_L0'):
++   c['mean_'+m]=mean(r[m] for r in curve_rows)
++  c['mean_abs_r']=mean(abs(r['r_alpha']) for r in curve_rows)
++  curves.append(c)
++ if not all(r['match'] for r in audit):raise RuntimeError('Width reconciliation failed')
++ phasepairs=[]
++ for key,rs in groups([r for r in curves if r['noise_index']==0],['arm','uid','task_id','noise_sha256']).items():
++  ix={r['phase_step']:r for r in rs}
++  if set(ix)!={0,3000}:continue
++  row=dict(zip(['arm','uid','task_id','noise_sha256'],key),split=rs[0]['split'],noise_index=0)
++  for m in ('p_over_g','base_signed_L0','base_abs_L0','b_self','b_GT','b_self_abs_error','b_GT_abs_error','mean_abs_r','mean_e','mean_base','mean_response','mean_e2','mean_base2','mean_response2','mean_cross_term','mean_abs_e','mean_abs_base','mean_abs_response','mean_cancellation','mean_actual_GT_abs_error_L0'):
++   row[m+'_phase0']=ix[0][m];row[m+'_phase3000']=ix[3000][m];row[m+'_delta']=ix[3000][m]-ix[0][m]
++  phasepairs.append(row)
++ noisepairs=[]
++ for key,rs in groups([r for r in curves if r['phase_step']==3000],['arm','uid']).items():
++  ix={r['noise_index']:r for r in rs}
++  if set(ix)!={0,1}:continue
++  row=dict(arm=key[0],uid=key[1],split=rs[0]['split'],noise0_sha256=ix[0]['noise_sha256'],noise1_sha256=ix[1]['noise_sha256'],distinct_gaussian_bytes=ix[0]['noise_sha256']!=ix[1]['noise_sha256'])
++  for m in ('p_over_g','b_self','b_GT','b_self_abs_error','b_GT_abs_error','slope_narrow','slope_widen','one_sided_difference','strict_monotonic','net_reverse','under_response','over_response'):
++   row[m+'_noise0']=ix[0][m];row[m+'_noise1']=ix[1][m]
++  row['b_noise1_minus_noise0']=ix[1]['b_self']-ix[0]['b_self'];row['abs_b_noise_difference']=abs(row['b_noise1_minus_noise0'])
++  row['crosses_ideal_one']=bool((ix[0]['b_self']-1)*(ix[1]['b_self']-1)<0);row['slope_changes_sign']=bool(ix[0]['b_self']*ix[1]['b_self']<0)
++  noisepairs.append(row)
++ metrics=['p_over_g','base_signed_L0','base_abs_L0','b_self','b_GT','b_self_abs_error','b_GT_abs_error','slope_narrow','slope_widen','strict_monotonic','monotonic','under_response','over_response','net_reverse','mean_abs_e','mean_abs_base','mean_abs_response','mean_cross_term','mean_cancellation','mean_abs_r']
++ parents,summary=parent_summary(curves,['arm','phase_step','split'],metrics)
++ for r in summary:r['abs_mean_b_minus_one']=abs(r['b_self']-1)
++ seed_summary=aggregate(curves,['arm','phase_step','split','noise_index'],metrics)
++ decomp_m=['e','base','response','e2','base2','response2','cross_term','abs_e','abs_base','abs_response','cancellation','actual_GT_abs_error_L0','GT_affine_roundoff_L0']
++ dp,ds=parent_summary(out,['arm','phase_step','split'],decomp_m)
++ ac=[]
++ for key,rs in groups(analytic_audit,CK).items():
++  i=groups(rs,['candidate']);row=dict(zip(CK,key),split=rs[0]['split'])
++  for (name,),v in i.items():
++   row[name+'_mean_absolute_error_L0']=mean(x['absolute_error_L0'] for x in v)
++   row[name+'_slope']=mean(x['slope'] for x in v)
++  row['post_minus_no_mean_error_L0']=row['Post-scale_mean_absolute_error_L0']-row['No-response_mean_absolute_error_L0'];ac.append(row)
++ outs=[]
++ for n,r in [('width_per_output.csv',out),('width_per_curve.csv',curves),('width_raw_reconciliation.csv',audit),('width_phase_paired.csv',phasepairs),('noise_paired.csv',noisepairs),('width_per_parent.csv',parents),('width_summary.csv',summary),('width_by_noise.csv',seed_summary),('error_decomposition_summary.csv',dp),('error_decomposition_macro.csv',ds),('analytic_source_audit.csv',analytic_audit),('analytic_curve_comparison.csv',ac),('width_missing.csv',missing)]:outs.append(writecsv(n,r))
++ return dict(outputs=len(out),curves=len(curves),raw_numeric_checks=len(audit),max_width_difference=max(abs(r['difference']) for r in audit),max_exact_residual=max(abs(r['exact_residual']) for r in out),max_target_FP32_affine_residual_L0=max(abs(r['GT_affine_roundoff_L0']) for r in out),missing=len(missing)),outs
++
++def advantages(M):
++ return np.array([np.mean(np.delete(M[:,j],j))-M[j,j] for j in range(3)]),np.array([np.mean(np.delete(M[i,:],i))-M[i,i] for i in range(3)])
++
++def cross():
++ rows=readcsv(SRC/'B_cross_condition_scores.csv');wr=readcsv(SRC/'B_width_response.csv');original={(r['arm'],r['phase_step'],r['uid'],r['noise_index'],r['alpha']):r for r in wr}
++ aa=readcsv(SRC/'B_analytic_baselines.csv');ar={(r['arm'],r['phase_step'],r['uid'],r['noise_index'],r['alpha']):r for r in aa if r['candidate']=='No-response'}
++ out=[];audit=[];no=[];noaudit=[];reconcile=[]
++ for key,rs in groups(rows,CK).items():
++  cid=f'{key[0]}_phase{key[1]}_{key[2]}_n{key[3]}'
++  saved=js(SRC/'analysis/cross_condition_group'/f'{cid}_cross.json')['rows'];saved={(r['alpha'],r['target_beta']):r for r in saved}
++  M=np.full((3,3),np.nan)
++  for r in rs:
++   a,b=r['alpha'],r['target_beta'];val=r['corresponding_GT_to_free_RMS_L0'];s=saved[(a,b)]
++   assert close(val,s['corresponding_GT_to_free_RMS_L0'])
++   M[ALPHAS.index(a),ALPHAS.index(b)]=val
++   out.append(dict(zip(CK,key),curve_id=cid,split=r['split'],alpha_in=a,beta_target=b,E_RMS_L0=val,coverage_fraction=r['corresponding_GT_coverage_1pct_L0_fraction'],L0=r['L0'],evidence='ORIGINAL_CSV_AND_SCORE_JSON',source_json=f'analysis/cross_condition_group/{cid}_cross.json'))
++   reconcile.append(dict(curve_id=cid,alpha_in=a,beta_target=b,CSV_minus_JSON=val-s['corresponding_GT_to_free_RMS_L0'],match=True))
++  assert np.isfinite(M).all()
++  cols,rr=advantages(M);N=np.tile(M[1,:],(3,1));ncols,nrows=advantages(N)
++  assert np.max(abs(ncols))<1e-14
++  for j,a in enumerate(ALPHAS):
++   old=original[(*key,a)];wrongc=np.delete(M[:,j],j);wrongr=np.delete(M[j,:],j);tol=TOL['atol']+TOL['rtol']*abs(M[j,j])
++   assert close(rr[j],old['wrong_mean_minus_diagonal_RMS_L0'])
++   assert bool(M[j,j]<wrongr.min())==old['diagonal_strictly_better_than_both_wrong']
++   assert bool(M[j,j]<=wrongr.min())==old['diagonal_no_worse_than_both_wrong']
++   wa=[x for x in ALPHAS if x!=a]
++   audit.append(dict(zip(CK,key),curve_id=cid,split=rs[0]['split'],alpha_beta=a,old_field='wrong_mean_minus_diagonal_RMS_L0',old_formula='mean E[a,b!=a]-E[a,a]',old_actual_axis='ROW_FIXED_OUTPUT',old_value=old['wrong_mean_minus_diagonal_RMS_L0'],A_row=rr[j],A_column=cols[j],
++    wrong_input_1=wa[0],wrong_input_2=wa[1],wrong1_minus_diagonal=wrongc[0]-M[j,j],wrong2_minus_diagonal=wrongc[1]-M[j,j],
++    old_row_strict_win=old['diagonal_strictly_better_than_both_wrong'],column_strict_win=bool(M[j,j]<wrongc.min()),column_no_worse=bool(M[j,j]<=wrongc.min()),column_strict_win_beyond_tolerance=bool(np.all(wrongc-M[j,j]>tol)),column_ties_within_tolerance=int(np.sum(abs(wrongc-M[j,j])<=tol)),diagonal_rank=1+int(np.sum(wrongc<M[j,j])),
++    advantage_sign_changed=bool(np.sign(rr[j])!=np.sign(cols[j])),strict_win_changed=bool((M[j,j]<wrongr.min())!=(M[j,j]<wrongc.min())),audit_result='OLD_VALUES_MATCH_ROW; COLUMN_ADDED',source='width_analytics.py:matching selects alpha, off selects target_beta'))
++   nar=ar[(*key,a)];assert close(nar['corresponding_GT_to_free_RMS_L0'],M[1,j])
++   noaudit.append(dict(zip(CK,key),curve_id=cid,split=rs[0]['split'],beta_target=a,A_column=ncols[j],A_row=nrows[j],column_strict_win=False,column_ties=2,source_F1_sha256=nar['source_alpha1_raw_sha256'],actual_analytic_score_minus_F1_matrix=nar['corresponding_GT_to_free_RMS_L0']-M[1,j],evidence='original No-response candidate raw verified in width stage + original scores reused'))
++   for i,ain in enumerate(ALPHAS):no.append(dict(zip(CK,key),curve_id=cid,alpha_in=ain,beta_target=a,E_RMS_L0=N[i,j],evidence='ANALYTIC_F1_REPEATED_EXISTING_DISTANCES'))
++  assert close(cols.mean(),rr.mean())
++ par,summ=parent_summary(audit,['arm','phase_step','split','alpha_beta'],['A_column','A_row','column_strict_win','old_row_strict_win','column_ties_within_tolerance','diagonal_rank'])
++ allpar,allsumm=parent_summary(audit,['arm','phase_step','split'],['A_column','A_row','column_strict_win','old_row_strict_win'])
++ pairs=[]
++ for key,rs in groups([r for r in audit if r['phase_step']==3000],['uid','noise_index','alpha_beta']).items():
++  ix={r['arm']:r for r in rs}
++  for old,new in (('T1','Geo'),('Geo','Full')):
++   pairs.append(dict(uid=key[0],noise_index=key[1],alpha_beta=key[2],split=rs[0]['split'],comparison=new+'-'+old,column_advantage_delta=ix[new]['A_column']-ix[old]['A_column'],column_win_delta=int(ix[new]['column_strict_win'])-int(ix[old]['column_strict_win'])))
++ outs=[]
++ for n,r in [('cross_matrix.csv',out),('cross_direction_audit.csv',audit),('cross_original_reconciliation.csv',reconcile),('no_response_matrix.csv',no),('no_response_direction_audit.csv',noaudit),('cross_per_parent.csv',par),('cross_summary.csv',summ),('cross_all_targets_summary.csv',allsumm),('cross_model_paired.csv',pairs)]:outs.append(writecsv(n,r))
++ return dict(original_cells_reused=len(out),new_geometry_cells=0,direction_rows=len(audit),changed_signs=sum(r['advantage_sign_changed'] for r in audit),changed_strict_wins=sum(r['strict_win_changed'] for r in audit),no_response_groups=len(noaudit)//3),outs

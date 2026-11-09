@@ -1,0 +1,132 @@
+"""Write the fixed-endpoint report from completed evidence, without new scoring."""
+from pathlib import Path
+import csv, json
+
+ROOT=Path(__file__).resolve().parents[3]
+OUT=ROOT/'experiments/r2_bench_seat_coverage_v1'
+T=OUT/'results/report_tables_v1'
+def read(p): return json.loads(p.read_text('utf-8-sig'))
+def rows(p):
+    with p.open(encoding='utf-8-sig',newline='') as f: return list(csv.DictReader(f))
+def number(x): return None if x in ('',None,'NA') else float(x)
+
+def run():
+    assert read(T/'completion.json')['status']=='COMPLETE'
+    audits=[(p,read(p)) for p in sorted((OUT/'audits').glob('closeout_check_*.json'))]
+    audit_path,audit=next((p,r) for p,r in reversed(audits) if r['status']=='AUDIT_PASS')
+    core={(r['label'],r['stage'],r['report_group'],r['metric']):r for r in rows(T/'core_parent_macro.csv')}
+    visual={(r['label'],r['stage'],r['report_group'],r['axis'],r['category']):r for r in rows(T/'visual_axis_and_strict_counts.csv')}
+    labels=('NATIVE_S6000','COVERAGE_FINAL','SEAM_S3000')
+    groups=('OLD_TRAIN','NEW_TRAIN','NEW_PARENT_HOLDOUT','DEV')
+    names={'NATIVE_S6000':'Native6000','COVERAGE_FINAL':'新候选1500','SEAM_S3000':'保留SEAM3000'}
+    gnames={'OLD_TRAIN':'旧训练8父/16请求','NEW_TRAIN':'新增训练2父/4请求','NEW_PARENT_HOLDOUT':'留出1父/2请求','DEV':'旧DEV4父/8请求'}
+    def val(label,stage,g,m,pct=False):
+        n=number(core[label,stage,g,m]['mean'])
+        return 'NA' if n is None else (f'{n*100:.2f}%' if pct else f'{n:.2f}')
+    def vc(label,stage,g,axis,cat):
+        r=visual[label,stage,g,axis,cat]
+        return f"{r['count']}/{r['requests']}" if int(r['requests']) else 'NA'
+    text=['# Bench 完整座面扩覆盖：1500步实际实验报告','',
+          '实验：`R2_BENCH_SEAT_COVERAGE_V1`；日期：2026-10-23。固定训练、全部配对评价、90页实际图审和执行账本已完成。','',
+          '**保留原完整座面 Native6000→SEAM3000 作为当前 Bench 研究参考。本轮新增数据候选不替换它。** 两个新增训练条件的 RAW 已出现较明确的细腿、座面和靠背组织，但当前处理链没有保住这些细支撑；低最终 FF 同时伴随大幅删面。旧 DEV 没有形成整体采用与主体质量升级，新留出父也没有显示清楚的迁移收益。','',
+          '这不是“新增数据无用”的定论：本轮仅加入两个父，并各密集曝光3000次；它检验的是追加训练和新曝光配方的整体版本，没有等预算 OLD-only 对照。结果不能证明新增独立父的单因素因果，也不能据此宣布经典过拟合或整个数据方向失败。','',
+          '## 1. 实际做了什么','',
+          '- 保留原22父22条完整座面任务；制作并实际查看5个候选，接纳a8木条座面与27弧形座碗两个新训练父，df6双向座面作为单父留出。另两条因完整座面语义不符保留为HOLD，未为凑数量纳入。',
+          '- 每条C使用同一完整目标的真实原三角面，Y是精确补集；没有移动顶点、重三角化、修目标、补桥面作为训练答案。来源目标与原实验资产只读。',
+          '- 从保留的Native6000/global18000完整权重、匹配AdamW和RNG接出，固定新增1500更新，终点global19500。原Native/T1+role+Geo、free-only FM、先OT后HYBRID0.25；没有SEAM头调用或新loss。',
+          '- batch8/micro1，每步OLD两父+NEW两父，每父identity及x-width U[0.9,1.1]两例；lr1e-5、AdamW(0.9,0.95)、wd0、clip1。BF16前向，FP32参数/积分，严格确定性、math SDPA、TF32关闭。',
+          '- OLD总曝光6000，原22父各272–274次；NEW总曝光6000，a8/27各3000次。50%指实例曝光，不是恰好50%的FM坐标权重。',
+          '- 最终权重预先指定，没有挑best、追加SEAM训练、恢复重算、清理旧权重、切默认或commit/push。','',
+          '| 数据身份 | 父数 / 条件数 | 本轮评价 | 边界 |','|---|---:|---:|---|',
+          '| 原完整座面池 | 22 / 22 | 其中8父×2噪声=16 | 全池回放；不是只挑旧好例训练 |',
+          '| 新增a8 / 27 | 2 / 2 | 4请求 | 新于当前COMMON→Native谱系；在项目别的历史分支出现过 |',
+          '| df6留出 | 1 / 1 | 2请求 | 未加入本轮训练；不是2个独立父 |',
+          '| 旧DEV | 4 / 4 | 8请求 | 反复使用的开发回归，不改称独立测试 |','',
+          '三个新面板父均来自官方train来源划分；没有官方逐父曝光日志，不能宣称预训练未见。a8/df6保留来源T-junction，分别2/1个非流形顶点链接；有限面检查未见非法相交、正面积重叠或退化，但**不认证共形流形或未来SEAM兼容**。旧QUARANTINE记录未改。见[数据制作与准入报告](DATA_REPORT.md)。','',
+          '## 2. 评价合同与完整证据','',
+          'Native6000与新候选各30请求，保留SEAM3000仅旧24请求，共84逻辑输出。实际新增36份RAW、1800次Euler生成器前向、36次官方Bench D0；48份旧输出只读复用。全部新增RAW先完成，再进入D0。三个阶段共252行评分（新108、旧144），保留177个数值字段、状态、分母与NA。','',
+          '统一流程：Euler50 → 单次官方Bench D0 → 恢复C/GEO_C/来源定向（BASE_POST）→ HINGE_OPP015 → ALPHA → HOLE（CLEAN_FINAL_POST）。原评分器、噪声、C/N和查询不改。Native没有SEAM分区，其SEAM专属指标是NA，不能与SEAM的bulk可达量当作同定义比较。','',
+          'CF/FF是非法面对涉及的实际free面比例；I是固定C支持域的冲突覆盖，**不是整个物体自交率**。以下按噪声→条件→父平均。每组恰好每父一C、两噪声；I主表只取原PASS状态，支持分母见完整表。','',
+          '图审实际打开90页、252模型单元，每页两固定视角和两原位截面。为非盲AI_PROXY，三位代理按父分工，不能当独立人类认证。蓝C存在不自动算采用，支撑和整体合理性分开；不按唯一来源款式排名。','',
+          '## 3. 实际图审：采用、主体和支撑必须在同一输出成立','',
+          '下面的“同输出三项”仅指 PLAUSIBLE + REASONABLE + PRESENT 的交集；不是合法接续/水密或几何质量达标。全部不确定标签均保留在分母。','',
+          '| 集合 / 阶段 | 模型 | C合理采用 | 整体合理 | 主要支撑存在 | 同输出三项 |','|---|---|---:|---:|---:|---:|']
+    for g in groups:
+        for stage in ('RAW','CLEAN_FINAL_POST'):
+            for label in labels:
+                if g in ('NEW_TRAIN','NEW_PARENT_HOLDOUT') and label==labels[2]: continue
+                vals=[vc(label,stage,g,a,c) for a,c in [('C_use','PLAUSIBLE'),('overall_shape','REASONABLE'),('support_retention','PRESENT'),('strict_visual_three_axis','YES')]]
+                text.append('| '+gnames[g]+' / '+('RAW' if stage=='RAW' else 'FINAL')+' | '+names[label]+' | '+' | '.join(vals)+' |')
+    text += ['', '新增训练的同输出三项在RAW为2/4→4/4，新增两份都来自a8；27两份原本就成立。FINAL则3/4→0/4，候选四份主要支撑均被评为受损。旧训练RAW为14/16→13/16，损失为4cd/n1；FINAL仍8/16。DEV为0/8→1/8，只新增fd355/n0，同一个请求在保留SEAM3000已经成立；留出df6仍0/2。这些变化不支持跨父整体升级，但不能抹去a8的RAW局部学习和fd355/n0的采用变化。','',
+             '完整五轴、每个类别和不确定项：[VISUAL_TABLES.md](results/report_tables_v1/VISUAL_TABLES.md)；逐请求及逐父增减均在同目录CSV。','',
+             '## 4. 全组几何代价：不能只报告新增训练池的低FF','',
+             '| FINAL集合 | 模型 | CF↓ | FF↓ | I↓ | <5°小角↓ | 删除原free/请求 | 保留原free/请求 | free面积 |',
+             '|---|---|---:|---:|---:|---:|---:|---:|---:|']
+    metric_specs=[('CF_illegal_affected_free_fraction',True),('FF_illegal_affected_free_fraction',True),('ConflictCov_C',True),('free_minimum_angle_lt5_fraction',True),('deleted_free_faces',False),('actual_free_faces',False),('free_total_surface_area',False)]
+    for g in groups:
+        for label in labels:
+            if g in ('NEW_TRAIN','NEW_PARENT_HOLDOUT') and label==labels[2]: continue
+            text.append('| '+gnames[g]+' | '+names[label]+' | '+' | '.join(val(label,'CLEAN_FINAL_POST',g,m,p) for m,p in metric_specs)+' |')
+    text += ['', '“保留原free”不含后来新增BRIDGE；free面积是实际三角形面积和，可能包括BRIDGE，不是真实表面并集保留率。新版与旧版不能仅凭删面后分母变小来评优。','',
+             '| RAW集合 | 模型 | CF↓ | FF↓ | I↓ | <5°小角↓ |','|---|---|---:|---:|---:|---:|']
+    for g in groups:
+        for label in labels[:2]:
+            text.append('| '+gnames[g]+' | '+names[label]+' | '+' | '.join(val(label,'RAW',g,m,p) for m,p in metric_specs[:4])+' |')
+    text += ['', '旧训练FINAL的FF从14.57%升至15.80%，I从1.87%升至5.07%；旧DEV的FF从24.05%降至22.26%、I从12.85%降至11.42%，但小角从58.01%升至65.32%。新留出df6的CF/FF/I均未改善。新增训练RAW的CF也由7.16%升至15.04%、I由6.85%升至10.02%，所以RAW视觉采用收益并非没有几何代价。必须保留这些取舍，不能用新增训练池的低最终FF抵消。','',
+             '| FINAL集合 | 模型 | 有合法CF边的请求比例 | 合法CF边数/请求 | 合法CF边长 | 方向合法图可达free面积比例 |',
+             '|---|---|---:|---:|---:|---:|']
+    for g in groups:
+        for label in labels:
+            if g in ('NEW_TRAIN','NEW_PARENT_HOLDOUT') and label==labels[2]: continue
+            metrics=[('C_F_has_valid_edge',True),('C_F_valid_edge_count',False),('C_F_valid_edge_total_length',False),('hinge_diag_legal_opposed_edge_C_reached_free_area_fraction',True)]
+            text.append('| '+gnames[g]+' | '+names[label]+' | '+' | '.join(val(label,'CLEAN_FINAL_POST',g,m,p) for m,p in metrics)+' |')
+    text += ['', '以上是所有表示都适用的free图统计，不是SEAM专属bulk可达。少量剩余面上的高可达比例不表示支撑保留或整条边界封好。','',
+             '逐父坏尾也保留：旧训练6b的FINAL I从0.66%升至27.59%、FF从36.75%升至54.92%；DEV459f的I下降至0，同时free面积23.17→3.14、小角61.25%→94.26%。因此DEV均值冲突降低，也不能直接解释成保住主体的表面改善。完整独立复算见[数值复核](audits/numeric_crosscheck_v1/READOUT.md)。','',
+             '## 5. 新增训练条件：RAW有可见组织，BASE已丢细支撑','',
+             'a8的两份候选RAW都形成围绕蓝色木条座面的细腿长椅，灰色下表面更贴合条状结构；27的两份候选RAW形成弧形蓝座碗、灰靠背及端部细支撑。两种样式都能作为合理完成，不能因为更像来源就额外加分。','',
+             '但这些支撑在BASE_POST中已经大幅减少，FINAL没有恢复。它们不是“生成器从未画出腿”的例子。当前三阶段证据只定位到RAW→BASE，不能单独指定D0还是GEO为全部根因。','',
+             '| NEW_TRAIN均值 | 原Native RAW | 原Native BASE | 原Native FINAL | 候选RAW | 候选BASE | 候选FINAL |',
+             '|---|---:|---:|---:|---:|---:|---:|']
+    for m,p in metric_specs:
+        text.append('| '+m+' | '+' | '.join(val(l,s,'NEW_TRAIN',m,p) for l in labels[:2] for s in ('RAW','BASE_POST','CLEAN_FINAL_POST'))+' |')
+    geo=rows(OUT/'results/existing_geo_deletion_ledger/per_output.csv')
+    new=[r for r in geo if r['eval_group']=='NEW_TRAIN' and r['label']=='COVERAGE_FINAL']
+    collapse=sum(int(r.get('deleted_exact_repeated_vertex') or 0) for r in new)
+    deleted=sum(int(r['deleted_free_faces']) for r in new)
+    text += ['', f'四份新增候选共删除{deleted}张原free，其中{collapse}张记录为合并后重复顶点坍缩，余下{deleted-collapse}张为重复free面。该原因直接读取原GEO_C逐面账本，未重新评分。它说明实际删除操作，不证明每张被删面都是必要结构，也不证明原始细化完全由某个单一模块造成。', '',
+             '候选新训练池最终FF从20.87%降到1.79%，同时平均原free留存57.75→30.75、删除130.25→157.25、面积20.52→3.80。较大的方向可达面积比例也可能建立在少量剩余面之上；不能替代完整支撑。','',
+             '| 请求 | RAW | BASE_POST | FINAL |','|---|---|---|---|']
+    for parent in ('a8e987a6a6486b962d6c8e51365a5a87','27eb79ddf26fd7ac7898580cb9d16864','df6fd36040a5719662701a18243b45d3'):
+        for noise in (0,1):
+            req=parent+'__COMPLETE_SEAT_CANDIDATE__COVERAGE_V1__n'+str(noise)
+            text.append('| '+parent[:8]+f'/n{noise} | '+' | '.join(f'[{s}](gallery/{s}__{req}.png)' for s in ('RAW','BASE_POST','CLEAN_FINAL_POST'))+' |')
+    text += ['', '上表完整列出新增面板全部六请求，不仅展示正例。df6两噪声仍有中间灰色结构与蓝色双向座面未协调、破片/折层迹象，不能称跨父迁移成功。根代理另外实际查看14页的[补充观察](visual_review/root_supplementary_notes.json)不进入正式252单元计数。','',
+             '## 6. 学习曲线、执行与可恢复性','',
+             '实际1500更新、12000训练前向、12000反向，0头前向、0探针、0失败/未完成调用、0重放。前100步FM均值0.09136，末100步0.08681；50步区间仍有波动。训练插值状态上的误差不等于自由生成质量或充分收敛证明。','',
+             '![完整学习曲线](results/learning_curve.png)','',
+             '训练内部计时2691.02秒；进程派发至退出2714.41秒（45.24分钟）。自动pipeline为3194.12秒（53.24分钟，不含数据准备和实际图审）。训练期间与已授权的6份冻结参考采样部分重叠；不能当独占硬件benchmark。资源为RTX5080/16303MiB、24 CPU逻辑核、开工可用内存约61GiB。先启动一条训练，在正式更新显存观察后，用已有采样整机峰值的保守上界及当时空闲量放行一个参考采样worker。CPU评分4worker，图库按实测2worker。','',
+             '训练框架allocated峰值约2.73GiB、reserved约3.09GiB；整机显存观察峰值6735MiB含并行采样及其他进程，不能冒充训练进程峰值。WDDM进程显存不可得，保留NA。未停止用户其他GPU进程。完整逐阶段耗时、资源与保留资产校验见最终审计。','',
+             '准备阶段存在数据清单API字段适配、启动器与只读shell引号修正，均有独立工程记录；没有改变冻结数据/噪声/步数或重算模型调用。原评分代码与旧结果保留。恢复入口核验PID、完整checkpoint、输入游标和调用账本，不静默重试。','',
+             '## 7. 解释边界与保留决定','',
+             '- 本轮有新增完整输入上的RAW组织能力证据，但当前整条生成流程没有形成值得替换保留SEAM3000的总体升级。新候选及其数据、完整恢复状态和全部正负产物保留，不自动晋级。',
+             '- 两个新父各占3000曝光，约为单个旧父的11倍；不是“从22扩到24就证明更多数据有效/无效”。没有OLD-only等预算臂，也没有同父预留条件组。',
+             '- 新留出只一个父，旧DEV重复使用，所有图审非盲AI_PROXY；不宣称广泛泛化、独立人类认证或严格多样性坍缩。',
+             '- 过去Bench后处理诊断已记录D0压细与GEO合并坍缩，见[历史报告](../r2_bench_post_rescue_diagnostic_v1/REPORT.md)；这不是新发现“只要缩半径就能解决”。本轮在更明确完整输入上的再现，为阶段相容性提供新增证据。',
+             '- 若继续，仅优先检验一个问题：能否保住这些RAW中已存在的细支撑，同时保留单次D0的去噪收益与CF/FF/I代价边界。应先复用已有逐阶段缓存及历史护栏证据定义实质不同的有限干预，不再把低FF或少碎片单独当成功，也不直接扩大当前密集曝光。此次到固定任务终点停止。','',
+             '## 8. 产物与复查入口','',
+             '- [完整90页图集（含两视角、两截面）](gallery/index.html)',
+             '- [全177数值字段逐输出表](results/report_tables_v1/all_177_per_output.csv)；[全部字段父等权表](results/report_tables_v1/ALL_177_PARENT_TABLES.md)；[核心表](results/report_tables_v1/CORE_PARENT_TABLES.md)',
+             '- [逐请求配对](results/paired_per_output.csv)；[逐父配对](results/paired_per_parent.csv)；[GEO删面原因账本](results/existing_geo_deletion_ledger/per_output.csv)',
+             '- [252条实际图审](visual_review/summary_v1/actual_observations.csv)；[原几何历史标签变化](visual_review/summary_v1/historical_label_changes.csv)',
+             '- [最终推理权重](training/NATIVE/generator_step1500.pt)；[含AdamW/RNG完整恢复权重](training/NATIVE/checkpoint_step1500.pt)',
+             '- [数据清单](data/manifest.json)；[训练注册](training_registration.json)；[固定评测](eval_manifest.json)；[恢复说明](RUNBOOK.md)',
+             f'- [实际执行终态审计]({audit_path.relative_to(OUT).as_posix()})；[源码与差异归档](source_archive/receipt.json)；最终完成身份见`COMPLETE.json`。','']
+    hist=rows(OUT/'visual_review/summary_v1/historical_label_changes.csv')
+    changed=sum(r['change_status']=='CHANGED' for r in hist)
+    text.insert(text.index('## 4. 全组几何代价：不能只报告新增训练池的低FF'),
+        f'旧Native/SEAM几何没有变化，但本轮并排重审的720个轴标签中有{changed}个与旧记录不同。例如旧Native的TRAIN RAW采用在原报告为14/16，本轮为16/16；旧SEAM对应15/16→14/16。原标签不覆盖、不择优合并；上表使用本轮统一并排图审，不能把评级漂移当成模型改善。\n')
+    p=OUT/'REPORT.md'
+    if p.exists(): raise RuntimeError('Report exists; use explicit revision rather than overwrite')
+    p.write_text('\n'.join(text),encoding='utf-8')
+    return {'status':'REPORT_WRITTEN','path':str(p),'model_calls':0,'scoring_calls':0}
+if __name__=='__main__': print(run())

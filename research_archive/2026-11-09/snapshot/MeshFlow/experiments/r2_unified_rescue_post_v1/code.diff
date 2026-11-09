@@ -1,0 +1,915 @@
+--- read_only/r2/src/meshflow_control/geo_c.py
++++ new/unified_rescue_post_v1/guard_geo.py
+@@ -1,3 +1,5 @@
++# Derived from original GEO_C; only same-protected-face cluster guard added.
++# Original representative ordering, radius, cleanup and source maps retained.
+ """Optional CPU-only GEO_C cleanup of a saved FP32 triangle soup.
+ 
+ The radius is an engineering convention, not an exact reproduction of the
+@@ -70,7 +72,7 @@
+     return None
+ 
+ 
+-def process(raw, K, radius=RADIUS):
++def process(raw, K, radius=RADIUS, protected_faces=None):
+     """Return corrected triangle soup, real indexed topology, and source maps.
+ 
+     Only FP32 raw[N,3,3], known-face count and the frozen radius are accepted.
+@@ -89,9 +91,28 @@
+     if not np.isscalar(radius) or not np.isfinite(radius) or float(radius) != RADIUS:
+         raise ValueError("Only the preregistered engineering radius is allowed")
+     radius = float(radius)
++    protected_faces = np.zeros(len(raw), bool) if protected_faces is None else np.asarray(protected_faces, bool)
++    if protected_faces.shape != (len(raw),) or protected_faces[:K].any():
++        raise ValueError('Only valid free faces may be protected')
++    cluster_corners = {}
++    corner_key = {}
++    guard_records = []
++    def conflict(i, j):
++        return bool(protected_faces[i//3] and any(z!=i and z//3==i//3 for z in cluster_corners.get(_bits(points[j]), set())))
++    def claim(i, j):
++        if protected_faces[i//3]:
++            old = corner_key.get(i)
++            if old is not None: cluster_corners[old].discard(i)
++            key = _bits(points[j]); corner_key[i] = key
++            cluster_corners.setdefault(key, set()).add(i)
+     original_hash = _hash(raw)
+     original = np.ascontiguousarray(raw).copy()
+     points = original.reshape(-1, 3)
++    # Reserve every current protected corner, including not-yet-visited ones.
++    # Otherwise an earlier merge can occupy a later corner's exact coordinate;
++    # rejecting the later merge would leave the collision in place.
++    for i in range(3*K, len(points)):
++        if protected_faces[i//3]: claim(i, i)
+     corrected = points.copy()
+     known_count = 3 * K
+     n_corners = len(points)
+@@ -120,12 +141,19 @@
+         anchor_candidates[i] = len(hits)
+         if len(hits) == 1:
+             j = int(anchor_rows[hits[0]])
+-            corrected[i] = points[j]
+-            target[i] = j
+-            kind[i] = "unique_C_anchor"
++            if conflict(i, j):
++                guard_records.append(dict(corner=i, target=j, kind="C_anchor_same_face_rejected"))
++                kind[i] = "guard_C_unchanged"
++                claim(i, i)
++            else:
++                corrected[i] = points[j]
++                target[i] = j
++                kind[i] = "unique_C_anchor"
++                claim(i, j)
+         elif len(hits) > 1:
+             # This fixed corner cannot later be moved by the free/free stage.
+             kind[i] = "ambiguous_C_unchanged"
++            claim(i, i)
+         else:
+             free_for_clustering.append(i)
+ 
+@@ -140,14 +168,28 @@
+             hits = []
+         if len(hits):
+             # Representatives already have the fixed lexicographic ordering.
+-            position = min(hits, key=lambda h: (float(distances[h]), int(h)))
+-            j = representatives[int(position)]
+-            corrected[i] = points[j]
+-            target[i] = j
+-            kind[i] = "free_to_representative"
++            ordered = sorted(hits, key=lambda h: (float(distances[h]), int(h)))
++            valid = []
++            for h in ordered:
++                j = representatives[int(h)]
++                if conflict(i, j):
++                    guard_records.append(dict(corner=i, target=j, kind="free_cluster_same_face_rejected"))
++                else:
++                    valid.append(h)
++            if valid:
++                j = representatives[int(valid[0])]
++                corrected[i] = points[j]
++                target[i] = j
++                kind[i] = "free_to_representative"
++                claim(i, j)
++            else:
++                representatives.append(i)
++                kind[i] = "guard_free_representative"
++                claim(i, i)
+         else:
+             representatives.append(i)
+             kind[i] = "free_representative"
++            claim(i, i)
+ 
+     corrected = corrected.reshape(original.shape)
+     displacement_vector = corrected.astype(np.float64) - original.astype(np.float64)
+@@ -222,7 +264,11 @@
+         geometry_repair_guarantees="No manifold, orientation, self-intersection, or watertightness guarantee",
+         seconds=time.perf_counter() - started, model_calls=0,
+     )
+-    return dict(output=output, vertices=vertices, faces=faces,
++    stats.update(anti_collapse_protected_faces=int(protected_faces.sum()),
++        anti_collapse_rejections=len(guard_records),
++        protected_deleted_faces=int((protected_faces & ~keep).sum()),
++        guard_version="raw_extent_protected_deterministic_geo_v1")
++    return dict(guard_records=guard_records, output=output, vertices=vertices, faces=faces,
+                 source_face_ids=source_faces, source_corner_ids=np.tile(np.arange(3), (len(output), 1)),
+                 vertex_source_input_corner_ids=np.asarray(vertex_sources, dtype=np.int64),
+                 corner_displacement=np.sqrt(displacement2), corner_displacement_vector=displacement_vector,
+--- /dev/null
++++ r2/pilots/unified_rescue_post_v1/__init__.py
+@@ -0,0 +1 @@
++"""Frozen CPU-only residual edge floor and protected GEO experiment."""
+--- /dev/null
++++ r2/pilots/unified_rescue_post_v1/build_guard_copy.py
+@@ -0,0 +1,86 @@
++"""One-time source derivation, kept for review; never edits original GEO_C."""
++from pathlib import Path
++def build():
++    root=Path(__file__).resolve().parents[2]
++    source=root/'src/meshflow_control/geo_c.py'
++    text=source.read_text(encoding='utf-8')
++    text=text.replace('def process(raw, K, radius=RADIUS):','def process(raw, K, radius=RADIUS, protected_faces=None):')
++    text=text.replace('    radius = float(radius)\n','''    radius = float(radius)
++    protected_faces = np.zeros(len(raw), bool) if protected_faces is None else np.asarray(protected_faces, bool)
++    if protected_faces.shape != (len(raw),) or protected_faces[:K].any():
++        raise ValueError('Only valid free faces may be protected')
++    cluster_corners = {}
++    corner_key = {}
++    guard_records = []
++    def conflict(i, j):
++        return bool(protected_faces[i//3] and any(z!=i and z//3==i//3 for z in cluster_corners.get(_bits(points[j]), set())))
++    def claim(i, j):
++        if protected_faces[i//3]:
++            old = corner_key.get(i)
++            if old is not None: cluster_corners[old].discard(i)
++            key = _bits(points[j]); corner_key[i] = key
++            cluster_corners.setdefault(key, set()).add(i)
++''')
++    text=text.replace('    points = original.reshape(-1, 3)\n','''    points = original.reshape(-1, 3)
++    # Reserve every current protected corner, including not-yet-visited ones.
++    # Otherwise an earlier merge can occupy a later corner's exact coordinate;
++    # rejecting the later merge would leave the collision in place.
++    for i in range(3*K, len(points)):
++        if protected_faces[i//3]: claim(i, i)
++''')
++    text=text.replace('''            corrected[i] = points[j]
++            target[i] = j
++            kind[i] = "unique_C_anchor"''','''            if conflict(i, j):
++                guard_records.append(dict(corner=i, target=j, kind="C_anchor_same_face_rejected"))
++                kind[i] = "guard_C_unchanged"
++                claim(i, i)
++            else:
++                corrected[i] = points[j]
++                target[i] = j
++                kind[i] = "unique_C_anchor"
++                claim(i, j)''')
++    text=text.replace('''            kind[i] = "ambiguous_C_unchanged"
++        else:''','''            kind[i] = "ambiguous_C_unchanged"
++            claim(i, i)
++        else:''')
++    text=text.replace('''            position = min(hits, key=lambda h: (float(distances[h]), int(h)))
++            j = representatives[int(position)]
++            corrected[i] = points[j]
++            target[i] = j
++            kind[i] = "free_to_representative"
++        else:
++            representatives.append(i)
++            kind[i] = "free_representative"''','''            ordered = sorted(hits, key=lambda h: (float(distances[h]), int(h)))
++            valid = []
++            for h in ordered:
++                j = representatives[int(h)]
++                if conflict(i, j):
++                    guard_records.append(dict(corner=i, target=j, kind="free_cluster_same_face_rejected"))
++                else:
++                    valid.append(h)
++            if valid:
++                j = representatives[int(valid[0])]
++                corrected[i] = points[j]
++                target[i] = j
++                kind[i] = "free_to_representative"
++                claim(i, j)
++            else:
++                representatives.append(i)
++                kind[i] = "guard_free_representative"
++                claim(i, i)
++        else:
++            representatives.append(i)
++            kind[i] = "free_representative"
++            claim(i, i)''')
++    text=text.replace('''    return dict(output=output, vertices=vertices, faces=faces,''','''    stats.update(anti_collapse_protected_faces=int(protected_faces.sum()),
++        anti_collapse_rejections=len(guard_records),
++        protected_deleted_faces=int((protected_faces & ~keep).sum()),
++        guard_version="raw_extent_protected_deterministic_geo_v1")
++    return dict(guard_records=guard_records, output=output, vertices=vertices, faces=faces,''')
++    text='''# Derived from original GEO_C; only same-protected-face cluster guard added.
++# Original representative ordering, radius, cleanup and source maps retained.
++'''+text
++    target=Path(__file__).with_name('guard_geo.py')
++    if target.exists():raise FileExistsError(target)
++    target.write_text(text,encoding='utf-8')
++if __name__=='__main__':build()
+--- /dev/null
++++ r2/pilots/unified_rescue_post_v1/displacement.py
+@@ -0,0 +1,43 @@
++"""Post-hoc coordinate accounting from stored arrays only; no score rerun."""
++from __future__ import annotations
++import collections,json
++import numpy as np
++from . import run as R
++C=R.C
++
++def run():
++    reg=C.read(R.ROOT/'registration.json');rows=[];faces=[];hashes={}
++    for job in reg['jobs']:
++        q=job['q'];rawpath=C.resolve(job['base_dir'])/'raw/raw.npz';prepath=C.resolve(job['base_dir'])/'post/pre_geo.npz'
++        raw=C.arrays(rawpath);pre=C.arrays(prepath)['output'];hashes[str(rawpath)]=C.sha(rawpath);hashes[str(prepath)]=C.sha(prepath)
++        rt=raw['raw'].astype(float)
++        raw_area=.5*np.linalg.norm(np.cross(rt[:,1]-rt[:,0],rt[:,2]-rt[:,0]),axis=1)
++        for stage,path in [('OLD_BASE',job['old_base']),('OLD_FINAL',job['old_final']),('GUARD_GEO',R.cell(job)/'GUARD_GEO/post.npz'),('FINAL',R.cell(job)/'FINAL/post.npz')]:
++            path=C.resolve(path);a=C.arrays(path);hashes[str(path)]=C.sha(path)
++            sf=a.get('source_face_ids',a.get('base_source_face_ids'));sc=a.get('source_corner_ids',a.get('base_source_corner_ids'))
++            tri=a['output'][:len(sf)];original=raw['raw'][sf[:,None],sc];proposal=pre[sf[:,None],sc]
++            isfree=sf>=q['K'];ids=raw['raw_anchor_ids'][sf[:,None],sc];fixed=ids>=0
++            if tri[fixed].tobytes()!=raw['C_vertices'][ids[fixed]].tobytes():raise AssertionError('Retained anchor moved '+str(path))
++            delta_raw=np.linalg.norm(tri.astype(float)-original,axis=2);delta_d0=np.linalg.norm(tri.astype(float)-proposal,axis=2)
++            row=dict(panel=job['panel'],request_id=q['request_id'],parent_id=q['parent_id'],split=q['split'],stage=stage,
++                retained_original_free_faces=int(isfree.sum()),extra_bridge_faces=len(a['output'])-len(sf),
++                original_free_corner_denominator=int(isfree.sum())*3,retained_hard_anchor_corners=int(fixed.sum()),hard_anchors_bitwise_exact=True,
++                reference='Source model corner permutation restored; BRIDGE excluded from absent RAW lineage')
++            den=float(raw_area[q['K']:].sum());kept=float(raw_area[sf[isfree]].sum())
++            row.update(RAW_free_area_denominator=den,retained_RAW_free_area=kept,
++                deleted_RAW_free_area_fraction=(den-kept)/den if den else None)
++            for name,d in (('RAW',delta_raw),('D0_RESTORED',delta_d0)):
++                v=d[isfree].reshape(-1)
++                row.update({f'max_distance_from_{name}_model':float(v.max()) if len(v) else None,
++                    f'mean_distance_from_{name}_model':float(v.mean()) if len(v) else None,
++                    f'p95_distance_from_{name}_model':float(np.quantile(v,.95)) if len(v) else None})
++            rows.append(row)
++            for i in np.flatnonzero(isfree):faces.append(dict(panel=job['panel'],request_id=q['request_id'],stage=stage,raw_slot=int(sf[i]),
++                max_from_RAW_model=float(delta_raw[i].max()),max_from_D0_restored_model=float(delta_d0[i].max())))
++    out=R.ROOT/'displacement';C.csvwrite(out/'per_output.csv',rows);C.csvwrite(out/'per_original_face.csv',faces)
++    r=dict(status='COMPLETE',rows=len(rows),faces=len(faces),source_hashes=hashes,
++        model_calls=0,scoring_calls=0,decoder_calls=0,code_sha256=C.sha(__file__),
++        budget_note='HINGE/ALPHA 1.5%L is measured from new guarded PRE_GEO, whereas total displacement from original D0 and RAW is separately recorded here',
++        files={str(p):C.sha(p) for p in (out/'per_output.csv',out/'per_original_face.csv')})
++    C.write(out/'completion.json',r);print(json.dumps({k:v for k,v in r.items() if k not in ('source_hashes','files')}));return r
++if __name__=='__main__':run()
+--- /dev/null
++++ r2/pilots/unified_rescue_post_v1/finalize.py
+@@ -0,0 +1,127 @@
++"""Package executed CPU evidence and report; never calls a model or scorer."""
++from __future__ import annotations
++import collections,csv,difflib,json,shutil
++from pathlib import Path
++import numpy as np
++from . import run as R
++C=R.C
++
++def rows(path):
++    with C.resolve(path).open(encoding='utf-8-sig',newline='') as f:return list(csv.DictReader(f))
++def number(x):
++    if x in ('',None):return None
++    if x in ('True','False'):return int(x=='True')
++    return float(x)
++
++def finish():
++    root=R.ROOT;reg=C.read(root/'registration.json');completed=C.read(root/'completion.json')
++    table=C.read(root/'tables/completion.json');R.E.verify(completed['files']);R.E.verify(table['files']);R.E.verify(reg['protected']);contract=R.verify_code(reg)
++    out=rows(root/'tables/per_output.csv');sums=rows(root/'tables/summary_parent_equal.csv');edges=rows(root/'tables/connectivity_ledger.csv');guard=rows(root/'tables/request_guard_counts.csv')
++    by={(r['panel'],r['request_id'],r['stage']):r for r in out};summary=[];positives=[]
++    for panel in sorted({j['panel'] for j in reg['jobs']}):
++        jobs=[j for j in reg['jobs'] if j['panel']==panel]
++        row=dict(panel=panel,requests=len(jobs),open_C=sum(j['q']['boundary_edges']>0 for j in jobs),
++            closed_C=sum(j['q']['boundary_edges']==0 for j in jobs),old_final_chain=jobs[0]['old_final_chain'])
++        for stage in ('GUARD_GEO','FINAL'):
++            ee=[x for x in edges if x['panel']==panel and x['stage']==stage]
++            for field in ('CF_baseline_legal_edges','CF_lost_legal_edges','CF_new_legal_edges','FF_baseline_legal_edges','FF_lost_legal_edges','FF_new_legal_edges',
++                'CF_new_illegal_pairs','FF_new_illegal_pairs','CF_illegal_pairs_removed','FF_illegal_pairs_removed','deleted_source_faces'):
++                row[stage+'_'+field]=sum(int(number(x[field])) for x in ee)
++        gg=[x for x in guard if x['panel']==panel]
++        for field in ('floor_triggered_faces','anti_protected_faces','anti_rejected_assignments','protected_deleted_faces'):
++            row[field]=sum(int(number(x[field])) for x in gg)
++        for stage in ('OLD_BASE','OLD_FINAL','GUARD_GEO','FINAL'):
++            rr=[x for x in out if x['panel']==panel and x['stage']==stage]
++            valid=[x for x in rr if number(x.get('bulk_reach_ge_0_30_descriptive')) is not None]
++            row[stage+'_bulk_ge30']=sum(number(x['bulk_reach_ge_0_30_descriptive'])==1 for x in valid);row[stage+'_bulk_denominator']=len(valid)
++        oldpos=keep=newpos=lost=0
++        for j in jobs:
++            rid=j['q']['request_id'];a,b=by[panel,rid,'OLD_FINAL'],by[panel,rid,'FINAL']
++            x,y=number(a.get('bulk_reach_ge_0_30_descriptive')),number(b.get('bulk_reach_ge_0_30_descriptive'))
++            status='NA' if x is None or y is None else 'RETAINED' if x and y else 'LOST' if x and not y else 'NEW' if not x and y else 'REMAINS_BELOW'
++            oldpos+=x==1;keep+=status=='RETAINED';lost+=status=='LOST';newpos+=status=='NEW'
++            positives.append(dict(panel=panel,request_id=rid,parent_id=j['q']['parent_id'],split=j['q']['split'],status=status,
++                old_FINAL_bulk_ge30=x,new_FINAL_bulk_ge30=y,old_FINAL_bulk_area_fraction=number(a.get('free_only_reached_bulk_area_fraction')),
++                new_FINAL_bulk_area_fraction=number(b.get('free_only_reached_bulk_area_fraction')),
++                old_FINAL_legal_CF=number(a['C_F_valid_edge_count']),new_FINAL_legal_CF=number(b['C_F_valid_edge_count']),
++                claim='STRUCTURAL_DESCRIPTOR_ONLY; new visual joint review separate'))
++        row.update(old_FINAL_positive_count=oldpos,retained_old_FINAL_positives=keep,lost_old_FINAL_positives=lost,new_FINAL_positives=newpos);summary.append(row)
++    C.csvwrite(root/'panel_outcomes.csv',summary);C.csvwrite(root/'strong_positive_pairing.csv',positives)
++    fields={'FF':'FF_illegal_affected_free_fraction','CF':'CF_illegal_affected_free_fraction','I':'ConflictCov_C','小角':'free_minimum_angle_lt5_fraction',
++        '删面':'deleted_free_faces','非流形边':'nonmanifold_edges','bulk可达':'free_only_reached_bulk_area_fraction'}
++    slookup={(r['panel'],r['stage'],r['group'],r['metric']):number(r['mean_parent_equal']) for r in sums if r['grouping']=='split'}
++    def fmt(v,pct=False):return 'NA' if v is None else f'{v*(100 if pct else 1):.3f}'
++    lines=['# 统一CPU保护后处理：140份冻结缓存实测','',
++        '**状态：固定140份现成RAW/D0缓存已处理与评分完成；本阶段零模型、零新增D0、零噪声。** 两个保护不是无损修复；以下同时保留恢复面、接续及新增冲突/旧边损失。','',
++        '## 范围与因果口径','',
++        'Bench两个终点各48份，Chair BACK16份，Chair SEAT28份。`OLD_BASE→GUARD_GEO`隔离两个保护的组合；`OLD_FINAL→FINAL`比较实际旧新终态。Chair旧终态已有HINGE+ALPHA+HOLE；Bench旧终态只有HINGE，所以Bench终态增量还包含ALPHA/HOLE，不能全部归功于两个保护。',
++        '闭合C不需要开放接口，边界/SEAM接续列为NA。所有旧评分、面板、阈值、查询点及来源几何保持只读。I仍是C查询冲突覆盖，并非新增非法面对计数。无唯一来源GT款式排名。','',
++        '## 完整父等权质量比较','',
++        '表内FF/CF/I/小角/bulk可达为百分比；删面、非流形边为数量均值。先噪声、再条件、再父等权；各面板分别汇总。','',
++        '| 面板 / 子集 | 阶段 | FF% | CF% | I% | 小角% | 删面 | 非流形边 | bulk可达% |',
++        '|---|---|---:|---:|---:|---:|---:|---:|---:|']
++    for panel in sorted({j['panel'] for j in reg['jobs']}):
++        for split in ['ALL',*sorted({j['q']['split'] for j in reg['jobs'] if j['panel']==panel})]:
++            for stage in ('OLD_BASE','OLD_FINAL','GUARD_GEO','FINAL'):
++                vals=[fmt(slookup.get((panel,stage,split,v)),k not in ('删面','非流形边')) for k,v in fields.items()]
++                lines.append('| '+panel+'/'+split+' | '+stage+' | '+' | '.join(vals)+' |')
++    lines+=['','## 真实旧连接保留与新增冲突','',
++        '以下均对原OLD_BASE、按RAW来源面/角身份配对。它们是总条数/总面对数，不是父等权比例。guard本身引入的损失没有被后续HINGE零新增护栏掩盖，也没有触发静默整例回滚。','',
++        '| 面板 | 阶段 | 丢旧CF边 | 丢旧FF边 | 新合法CF边 | 新合法FF边 | 新非法CF对 | 新非法FF对 |',
++        '|---|---|---:|---:|---:|---:|---:|---:|']
++    for r in summary:
++        for stage in ('GUARD_GEO','FINAL'):
++            keys=('CF_lost_legal_edges','FF_lost_legal_edges','CF_new_legal_edges','FF_new_legal_edges','CF_new_illegal_pairs','FF_new_illegal_pairs')
++            lines.append('| '+r['panel']+' | '+stage+' | '+' | '.join(str(r[stage+'_'+k]) for k in keys)+' |')
++    lines+=['','## 旧结构正例的保留','',
++        '这里只把“合法C种子沿free合法共边达到至少30%原BULK面积”作为既有描述标记；不能代替新的视觉质量/用途联合成功。原RAW没有变化，但新的后处理仍可能损坏原有形状。','',
++        '| 面板 | 适用请求 | 旧FINAL≥30% | 保留 | 丢失 | 新增 | 新FINAL≥30% |',
++        '|---|---:|---:|---:|---:|---:|---:|']
++    for r in summary:lines.append('| '+r['panel']+' | '+' | '.join(str(r[k]) for k in ('FINAL_bulk_denominator','old_FINAL_positive_count','retained_old_FINAL_positives','lost_old_FINAL_positives','new_FINAL_positives','FINAL_bulk_ge30'))+' |')
++    lost=[r for r in positives if r['status']=='LOST']
++    lines+=['','丢失身份：'+('；'.join(r['panel']+'/'+r['request_id'] for r in lost) if lost else '无（按本结构描述标记）。'),'',
++        '## 保护、位移与执行账本','',
++        '逐面alpha由三条边二次约束首次进入禁区决定，允许切触、禁止跳过中间不安全区；最终FP32写回必要时向RAW方向退alpha ULP，超过原257步时按坐标舍入区间端点解析退步，不假定边长单调。ANTI_SELF_COLLAPSE保留原GEO顺序并预约未处理角点位置。它不拆开进入GEO前已经重合的角点，也不禁止精确重复面清理。','',
++        'Hinge/Alpha的1.5%L预算从新的guarded PRE_GEO计算；相对原RAW和原D0提议的总位移另见`displacement/per_output.csv`与逐面表。C及所有留存SEAM硬锚逐字节和索引合同均检查，BRIDGE没有RAW来源身份。','',
++        f'修订正式执行：{completed["requests"]}请求，最多{completed["workers"]}个单线程CPU worker，最后一次恢复控制器墙钟{completed["seconds"]:.2f}秒，140个完整格墙钟之和{completed["sum_completed_cell_seconds"]:.2f}秒（并发相加，并非总历时）；280份新完整评分，旧BASE/FINAL不重评分。线程竞争下墙钟不可当孤立算法基准。',
++        '初始工程尝试单独保留：6请求启动，4完整、2部分，10份完整评分；修复的是后来角点已经占据精确目标坐标的边界情形。全部旧尝试、源码及注册保留于`engineering_attempt_00`，没有模型/D0/噪声重试。','',
++        '第二次数值边界：Chair SEAT `73b369b9_n1/slot179` 在原257次alpha ULP退步后，写入最短边比固定下限少1.56296764e-8模型单位；按一次坐标舍入事件继续至总261 ULP后通过。113个完成格的保护数组逐字节不变且不重算；失败格在GEO/评分之前停止，保留于`engineering_attempt_01`。27格采用显式V2执行注册，科学门槛不变，原V1与V2源码均验hash。','',
++        '## 交付与恢复','',
++        '- `tables/per_output.csv`：四阶段完整逐例数值，全部原135字段保留，已有179扩展不覆盖旧定义。',
++        '- `tables/paired_per_output.csv`、`summary_parent_equal.csv`、`per_parent.csv`：完整配对与分母。',
++        '- `tables/connectivity_ledger.csv`及每格JSON：丢失/新增原边与非法面对、删面和面积。',
++        '- `tables/floor_per_face.csv`：每个RAW槽的门槛、alpha、位移与保护资格。',
++        '- `strong_positive_pairing.csv`：旧结构描述正例保留/丢失身份；图审另列。',
++        '- `cells/`：guarded PRE、GEO、HINGE、ALPHA、FINAL及全部候选/拒绝/评分。',
++        '- `source_snapshot/`、`source_hashes.json`、`code.diff`：实际CPU实现及原依赖hash。',
++        '- 恢复：`python -B -m r2.pilots.unified_rescue_post_v1.resume --workers 4`；已完成阶段校验后跳过，未完成异常目录不静默覆盖。','',
++        '本报告不自动晋级后处理、切换模型、训练或提交Git。是否值得保留必须同时考虑完整表、旧结构正例和实际图审，不能从删面数下降单独判断。']
++    text='\n'.join(lines)+'\n';report=root/'REPORT.md'
++    if report.exists() and report.read_text(encoding='utf-8')!=text:raise FileExistsError('Refusing report overwrite')
++    report.write_text(text,encoding='utf-8')
++    code=dict(contract['code']);code.update({str(p):C.sha(p) for p in Path(__file__).parent.glob('*.py')})
++    for rel in ('r2/pilots/chair_back_transfer_v1/post_cpu.py','r2/pilots/chair_back_transfer_v1/evaluate.py',
++        'r2/pilots/seam_slot_c200_v1/postprocess.py','r2/pilots/seam_slot_c200_v1/generate.py',
++        'r2/pilots/seam_pool47_couple_v1/endpoint_scoring.py'):
++        p=C.ROOT/rel;code[str(p)]=C.sha(p)
++    for path,digest in code.items():
++        p=C.resolve(path)
++        try:rel=p.relative_to(C.ROOT)
++        except ValueError:rel=Path('external')/p.name
++        dest=root/'source_snapshot'/rel;dest.parent.mkdir(parents=True,exist_ok=True)
++        if dest.exists():assert C.sha(dest)==digest
++        else:shutil.copy2(p,dest)
++    C.write(root/'source_hashes.json',dict(code=code,protected_inputs=reg['protected'],model_calls=0,
++        execution_revisions=completed['execution_revisions'],prior_code_snapshots=contract.get('prior_code_snapshots',{})))
++    original=(C.ROOT/'r2/src/meshflow_control/geo_c.py').read_text(encoding='utf-8').splitlines(True)
++    guardtext=Path(R.guard_geo.__file__).read_text(encoding='utf-8').splitlines(True)
++    diff=''.join(difflib.unified_diff(original,guardtext,fromfile='read_only/r2/src/meshflow_control/geo_c.py',tofile='new/unified_rescue_post_v1/guard_geo.py'))
++    for p in sorted(Path(__file__).parent.glob('*.py')):
++        if p.name!='guard_geo.py':diff+=''.join(difflib.unified_diff([],p.read_text(encoding='utf-8').splitlines(True),fromfile='/dev/null',tofile=str(p.relative_to(C.ROOT))))
++    (root/'code.diff').write_text(diff,encoding='utf-8')
++    if not (root/'resources_after.json').exists():C.write(root/'resources_after.json',C.resources())
++    C.write(root/'report_ready.json',dict(status='CPU140_COMPLETE',requests=140,model_calls=0,new_D0=0,new_noise=0,
++        report_sha256=C.sha(report),tables_sha256=C.sha(root/'tables/completion.json'),code_diff_sha256=C.sha(root/'code.diff'),
++        positive_pairing_sha256=C.sha(root/'strong_positive_pairing.csv'),old_assets_hash_verified=len(reg['protected'])))
++    print(json.dumps(summary,indent=2));return summary
++if __name__=='__main__':finish()
+--- /dev/null
++++ r2/pilots/unified_rescue_post_v1/floor.py
+@@ -0,0 +1,105 @@
++"""Exact safe-prefix quadratic edge floor; no monotonicity assumption."""
++from __future__ import annotations
++import numpy as np
++
++EDGES=((0,1),(1,2),(2,0))
++
++def quantized_prefix(x,d,cap,floor,fixed,anchor_values):
++    """Largest visited FP32 safe endpoint, with exact rounding-event fallback.
++
++    The historical 257 endpoint checks stay byte-identical. If they are
++    exhausted, skip constant-coordinate intervals using FP32 bin midpoints.
++    This walks backward within the analytic safe prefix, never bisects a
++    presumed monotone predicate and never changes the edge threshold.
++    """
++    aa=np.float32(cap)
++    if float(aa)>cap:aa=np.nextafter(aa,np.float32(0))
++    initial=aa
++    def trial_at(a):
++        t=(x+float(a)*d).astype(np.float32);t[fixed]=anchor_values
++        return t
++    for roundoff in range(257):
++        trial=trial_at(aa)
++        if float(lengths(trial).min())>=floor:return aa,trial,roundoff,None
++        aa=np.nextafter(aa,np.float32(0))
++    failed_alpha=float(aa);failed_min=float(lengths(trial_at(aa)).min());events=0
++    movable=np.broadcast_to(~fixed[:,None],d.shape)&(d!=0)
++    while events<100000:
++        trial=trial_at(aa)
++        if float(lengths(trial).min())>=floor:
++            total=int(initial.view(np.uint32))-int(aa.view(np.uint32))
++            return aa,trial,total,dict(method='FP32_coordinate_rounding_events',
++                initial_alpha=float(initial),alpha_after_257_ulp_retreat=failed_alpha,
++                min_edge_after_257_ulp_retreat=failed_min,floor=floor,
++                below_floor_difference=failed_min-floor,coordinate_events=events,
++                total_alpha_ULPs=total,final_alpha=float(aa),final_min_edge=float(lengths(trial).min()))
++        # Moving alpha toward zero crosses the next lower/upper FP32 bin
++        # boundary according to the sign of d. All intervening alpha values
++        # have the identical written triangle and can be skipped exactly.
++        direction=np.where(d>0,-np.inf,np.inf).astype(np.float32)
++        neighbor=np.nextafter(trial,direction)
++        midpoint=(trial.astype(np.float64)+neighbor.astype(np.float64))*.5
++        critical=np.full(d.shape,-np.inf,np.float64)
++        np.divide(midpoint-x,d,out=critical,where=movable)
++        valid=movable&(critical>=0)&(critical<=float(aa)+8*np.spacing(float(aa)))
++        if valid.any():
++            boundary=min(float(aa),float(critical[valid].max()))
++            next_a=np.float32(boundary)
++            if float(next_a)>boundary:next_a=np.nextafter(next_a,np.float32(0))
++            if next_a>=aa:next_a=np.nextafter(aa,np.float32(0))
++        else:next_a=np.float32(0)
++        # A tie-to-even midpoint or float64 cancellation can retain the old
++        # coordinate at the event itself. The next alpha float leaves it.
++        aa=next_a;events+=1
++        if aa==0:
++            trial=trial_at(aa)
++            if float(lengths(trial).min())<floor:raise ArithmeticError('RAW endpoint violates protected floor')
++    raise ArithmeticError('FP32 coordinate-event walk exceeded explicit safety bound')
++
++def lengths(tri):
++    x=np.asarray(tri,np.float64)
++    return np.stack([np.linalg.norm(x[...,a,:]-x[...,b,:],axis=-1) for a,b in EDGES],axis=-1)
++
++def first_entry(e0,de,threshold):
++    """First alpha where norm(e0+alpha*de) enters the open forbidden ball.
++
++    A double root merely touches the sphere and imposes no restriction.
++    The returned cap defines the whole safe prefix [0,cap], not just its end.
++    """
++    e0,de=np.asarray(e0,np.float64),np.asarray(de,np.float64)
++    a=float(de@de);b=float(2*(e0@de));c=float(e0@e0-threshold*threshold)
++    if c < 0:raise ValueError('Path begins below the protected edge floor')
++    if a==0:return 1.0,dict(a=a,b=b,c=c,kind='constant',roots=[])
++    disc=b*b-4*a*c
++    if disc<=0:return 1.0,dict(a=a,b=b,c=c,kind='no_open_negative_interval',roots=[])
++    s=float(np.sqrt(disc));q=-.5*(b+np.copysign(s,b))
++    roots=sorted((q/a,c/q)) if q else [(-b-s)/(2*a),(-b+s)/(2*a)]
++    lo,hi=roots
++    cap=max(0.,lo) if hi>0 and lo<1 and hi>max(0.,lo) else 1.
++    return min(1.,cap),dict(a=a,b=b,c=c,kind='quadratic',roots=roots)
++
++def protect(raw,proposal,anchors,C_vertices,K,radius):
++    if raw.dtype!=np.float32 or proposal.dtype!=np.float32 or raw.shape!=proposal.shape:
++        raise ValueError('Existing same-domain FP32 RAW and D0 proposal required')
++    fixed=anchors>=0;pre=proposal.copy();pre[fixed]=C_vertices[anchors[fixed]]
++    if pre[:K].tobytes()!=raw[:K].tobytes():raise ValueError('Hard restored C differs from RAW')
++    rawlen=lengths(raw);proplen=lengths(pre);floor=1.25*radius
++    trigger=(rawlen.min(1)>=1.5*radius)&(proplen.min(1)<floor);trigger[:K]=False
++    protected=(rawlen.max(1)>3*radius)&(rawlen.min(1)>radius);protected[:K]=False
++    guarded=pre.copy();records=[]
++    for i in range(len(raw)):
++        alpha=1.;cap=1.;roots=[];roundoff=0;fallback=None
++        if trigger[i]:
++            x=raw[i].astype(float);d=pre[i].astype(float)-x
++            for a,b in EDGES:
++                edgecap,rr=first_entry(x[a]-x[b],d[a]-d[b],floor);roots.append(rr);cap=min(cap,edgecap)
++            aa,trial,roundoff,fallback=quantized_prefix(x,d,cap,floor,fixed[i],C_vertices[anchors[i][fixed[i]]])
++            alpha=float(aa);guarded[i]=trial
++        records.append(dict(raw_slot=i,known=i<K,floor_triggered=bool(trigger[i]),anti_collapse_protected=bool(protected[i]),
++            raw_min_edge=float(rawlen[i].min()),raw_max_edge=float(rawlen[i].max()),proposal_min_edge=float(proplen[i].min()),
++            guarded_min_edge=float(lengths(guarded[i]).min()),alpha_exact_prefix=cap,alpha_written=alpha,
++            quantization_inward_steps=roundoff,quantization_event_fallback=fallback,quadratics=roots,
++            max_guard_minus_raw=float(np.linalg.norm(guarded[i].astype(float)-raw[i],axis=1).max()),
++            max_guard_minus_proposal=float(np.linalg.norm(guarded[i].astype(float)-pre[i],axis=1).max())))
++    if guarded[fixed].tobytes()!=pre[fixed].tobytes():raise AssertionError('Hard anchors moved')
++    return guarded,protected,records,pre
+--- /dev/null
++++ r2/pilots/unified_rescue_post_v1/pipeline.py
+@@ -0,0 +1,42 @@
++"""Frozen CPU adapter; reusable on existing or independently authorized D0 caches."""
++from __future__ import annotations
++import os
++os.environ['CUDA_VISIBLE_DEVICES']=''
++for key in ('OMP_NUM_THREADS','MKL_NUM_THREADS','OPENBLAS_NUM_THREADS','NUMEXPR_NUM_THREADS'):os.environ[key]='1'
++from pathlib import Path
++import sys
++import numpy as np
++sys.path.insert(0,str(Path(__file__).resolve().parents[2]/'src'))
++from meshflow_control import geo_io
++from meshflow_control.source_winding import export_source_winding
++from r2.pilots.seam_slot_c200_v1.postprocess import validate_anchor_indices
++from r2.tools.hinge_opposite_v1 import engine as H
++from r2.tools.hinge_v2_cpu_v1 import alpha,holes
++from . import floor,guard_geo
++
++VERSION='D0_EDGE_FLOOR_1p5R_1p25R_ANTI_SELF_COLLAPSE_3R_1R_v1'
++
++def geometry_from_cached(raw,proposal,source):
++    """No model/GT reads. RAW, restored proposal and all maps use canonical slots."""
++    original=raw['raw'];K=int(raw['known_faces'])
++    pre,protected,records,restored=floor.protect(original,proposal,raw['raw_anchor_ids'],raw['C_vertices'],K,guard_geo.RADIUS)
++    geo=guard_geo.process(pre,K,protected_faces=protected)
++    canonical=geo_io._validate_result(pre,K,geo)
++    oriented=export_source_winding(canonical,source);post=oriented['oriented_arrays']
++    extra,anchors=validate_anchor_indices(post,raw);final=dict(post,**extra)
++    final.update(identity_domain=np.asarray('generated_RAW_slot_not_GT'),occupied=raw['occupied'],
++        occupancy_logits=raw['occupancy_logits'],edge_records=raw['edge_records'],C_vertices=raw['C_vertices'],
++        C_faces_original=raw['C_faces_original'],C_faces_model=raw['C_faces_model'])
++    assert final['vertices'][final['faces']].tobytes()==final['output'].tobytes()
++    assert final['C'].tobytes()==source['C_original'].tobytes()
++    if 'torch' in sys.modules:raise RuntimeError('CPU adapter imported torch')
++    return pre,canonical,final,geo,oriented,anchors,records
++
++def finish_stage(stage,current,pre,raw,pairs):
++    """Exactly one frozen pass per stage, no threshold scan or extra replays."""
++    if stage=='HINGE_OPP015':return H.decode(current,pre,raw,pairs,.015,require_opposite_winding=True)
++    if stage=='ALPHA':return alpha.decode(current,pre,raw,pairs,.015,alphas=True)
++    if stage=='FINAL':
++        out,npairs,edges,records,summary=holes.decode(current,pairs)
++        return out,records,summary,None,None,npairs
++    raise ValueError(stage)
+--- /dev/null
++++ r2/pilots/unified_rescue_post_v1/resume.py
+@@ -0,0 +1,6 @@
++"""Finite CPU140 entry; skips completed cells, refuses unexplained partials."""
++import argparse
++from . import run,summarize,displacement,finalize
++if __name__=='__main__':
++    p=argparse.ArgumentParser();p.add_argument('--workers',type=int,choices=(1,2,3,4,5,6),default=4);a=p.parse_args()
++    run.run(a.workers);summarize.aggregate();displacement.run();finalize.finish()
+--- /dev/null
++++ r2/pilots/unified_rescue_post_v1/run.py
+@@ -0,0 +1,230 @@
++"""Resumable 140-cell frozen cache replay; no neural framework or new randomness."""
++from __future__ import annotations
++import os
++os.environ['CUDA_VISIBLE_DEVICES']=''
++for key in ('OMP_NUM_THREADS','MKL_NUM_THREADS','OPENBLAS_NUM_THREADS','NUMEXPR_NUM_THREADS'):os.environ[key]='1'
++import argparse,collections,concurrent.futures,inspect,json,multiprocessing,resource,sys,time,traceback,types
++from pathlib import Path
++import numpy as np
++from . import pipeline as P,floor,guard_geo,test_geometry
++from r2.pilots.seam_abc_v1 import evaluate as E,eval_common as C
++from r2.pilots.chair_back_transfer_v1.post_cpu import save_npz
++from r2.pilots.chair_back_transfer_v1.evaluate import worker_count
++from r2.pilots.seam_pool47_couple_v1.endpoint_scoring import metric_row
++from r2.pilots.seam_hinge_quality_v1 import topology as T
++from r2.tools.hinge_v2_cpu_v1 import scoring as M
++H=P.H
++ROOT=C.ROOT/'experiments/r2_unified_rescue_post_v1'
++STAGES=('GUARD_GEO','HINGE_OPP015','ALPHA','FINAL')
++
++def active_contract(reg=None):
++    reg=C.read(ROOT/'registration.json') if reg is None else reg
++    path=ROOT/'execution_revision_02.json'
++    if not path.exists():return dict(revision='CORRECTED_GEO_V1',path=str(ROOT/'registration.json'),sha256=C.sha(ROOT/'registration.json'),code=reg['code'])
++    amendment=C.read(path)
++    if amendment['original_registration_sha256']!=C.sha(ROOT/'registration.json'):raise ValueError('Original registration changed')
++    return dict(revision=amendment['revision'],path=str(path),sha256=C.sha(path),code=amendment['code'],prior_code_snapshots=amendment['prior_code_snapshots'])
++
++def verify_code(reg):
++    contract=active_contract(reg);E.verify(contract['code'])
++    if 'prior_code_snapshots' in contract:E.verify(contract['prior_code_snapshots'])
++    else:E.verify(reg['code'])
++    return contract
++
++def describe_sources():
++    jobs=[]
++    bench=C.ROOT/'experiments/r2_bench_parts_convergence_v1'
++    for label in ('SEAM_S15000','SEAM_S21000'):
++        manifest=bench/'evaluation/score_registrations'/(label+'.json')
++        for q in C.read(manifest)['requests']:
++            base=bench/'evaluation'/label/q['request_id'];score=bench/'evaluation/scores'/label/q['request_id']/'POST'
++            end=C.ROOT/'experiments/r2_bench_post_rescue_diagnostic_v1/hinge/evaluation'/label/q['request_id']/'post'
++            es=C.ROOT/'experiments/r2_bench_post_rescue_diagnostic_v1/hinge/evaluation/scores'/label/q['request_id']/'POST'
++            jobs.append(dict(panel='BENCH_'+label,q=q,manifest=str(manifest),base_dir=str(base),old_base=str(base/'post/post.npz'),
++                old_base_score=str(score),old_final=str(end/'post.npz'),old_final_score=str(es),old_final_chain='OLD_GEO_C + HINGE_OPP015_ONLY'))
++    back=C.ROOT/'experiments/r2_chair_back_transfer_v1';manifest=back/'eval_manifest.json'
++    for q in C.read(manifest)['requests']:
++        base=back/'evaluation/S2000'/q['request_id'];score=back/'evaluation/scores/S2000'/q['request_id']
++        jobs.append(dict(panel='CHAIR_BACK_S2000',q=q,manifest=str(manifest),base_dir=str(base),old_base=str(base/'post/post.npz'),
++            old_base_score=str(score/'BASE_POST'),old_final=str(base/'cpu/FINAL_POST/post.npz'),old_final_score=str(score/'FINAL_POST'),old_final_chain='OLD_GEO_C + HINGE_OPP015 + ALPHA + HOLE'))
++    seat=C.ROOT/'experiments/r2_seam_quality_wave1_wave2_v1';manifest=seat/'protocol.json'
++    for q in C.read(manifest)['evaluation']['requests']:
++        base=seat/'evaluation/PLAIN_S2000'/q['request_id'];end=C.ROOT/'experiments/r2_hinge_v2_cpu_v1'
++        jobs.append(dict(panel='CHAIR_SEAT_S2000',q=q,manifest=str(manifest),base_dir=str(base),old_base=str(base/'post/post.npz'),
++            old_base_score=str(seat/'evaluation/scores/PLAIN_S2000'/q['request_id']/'POST'),old_final=str(end/'cells/ALPHA_HOLE'/q['request_id']/'post.npz'),
++            old_final_score=str(end/'scores/ALPHA_HOLE'/q['request_id']),old_final_chain='OLD_GEO_C + HINGE_OPP015 + ALPHA + HOLE'))
++    if len(jobs)!=140 or collections.Counter(j['panel'] for j in jobs)!=dict(BENCH_SEAM_S15000=48,BENCH_SEAM_S21000=48,CHAIR_BACK_S2000=16,CHAIR_SEAT_S2000=28):raise ValueError('Fixed panel mismatch')
++    return jobs
++
++def freeze():
++    dest=ROOT/'registration.json'
++    if dest.exists():
++        r=C.read(dest);E.verify(r['protected']);verify_code(r);return r
++    jobs=describe_sources();protected={};audits=[]
++    for job in jobs:
++        q=job['q'];base=C.resolve(job['base_dir']);paths=[C.resolve(job['manifest']),base/'raw/raw.npz',base/'raw/source_condition.npz',
++            base/'raw/receipt.json',base/'post/proposal.npz',base/'post/pre_geo.npz',base/'post/receipt.json',C.resolve(job['old_base']),C.resolve(job['old_final'])]
++        for name in ('old_base_score','old_final_score'):
++            sp=C.resolve(job[name]);paths.extend([sp/'score.json',sp/'pairs.json'])
++            if (sp/'row.json').exists():paths.append(sp/'row.json')
++        for key in ('inference_npz','metadata_npz'):paths.append(C.resolve(q[key]))
++        paths.append(C.resolve(q['query_descriptor']['path']))
++        for p in paths:protected[str(p)]=C.sha(p)
++        rr=C.arrays(base/'raw/raw.npz');pr=C.arrays(base/'post/proposal.npz');source=C.arrays(base/'raw/source_condition.npz')
++        if set(pr)!=set(('official_unconstrained_proposal',)):raise ValueError('Unexpected D0 cache keys '+str(pr.keys()))
++        p=pr['official_unconstrained_proposal'];anchors=rr['raw_anchor_ids'];restore=p.copy();restore[anchors>=0]=rr['C_vertices'][anchors[anchors>=0]]
++        if restore.tobytes()!=C.arrays(base/'post/pre_geo.npz')['output'].tobytes():raise ValueError('Original hard restoration differs')
++        if rr['raw'].shape!=(q['N'],3,3) or rr['C'].tobytes()!=source['C_original'].tobytes():raise ValueError('RAW/source identity differs')
++        if 'boundary_edges' not in q:
++            inp=C.arrays(q['inference_npz']);meta=C.arrays(q['metadata_npz']);_,A,_,_,_=E.helpers()
++            _,_,top=A.topology(inp['C_vertices'][inp['C_faces_original']],meta['C_source_vertex_ids'][inp['C_faces_original']]);q['boundary_edges']=top['boundary_edge_count']
++        audits.append(dict(panel=job['panel'],request_id=q['request_id'],N=q['N'],K=q['K'],C_boundary_edges=q['boundary_edges'],proposal_original_hard_restore_exact=True))
++    code={str(p):C.sha(p) for p in Path(__file__).parent.glob('*.py')}
++    for mod in (P.H,P.alpha,P.holes,M,T):code[str(Path(mod.__file__))]=C.sha(mod.__file__)
++    code.update(H.Q.definition_hashes());code.update(E.source_hashes())
++    for p in (C.ROOT/'r2/src/meshflow_control/geo_c.py',C.ROOT/'r2/src/meshflow_control/geo_io.py',C.ROOT/'r2/src/meshflow_control/source_winding.py'):
++        code[str(p)]=C.sha(p)
++    C.write(ROOT/'synthetic_unit_tests.json',test_geometry.run());C.csvwrite(ROOT/'input_audit.csv',audits)
++    r=dict(status='FROZEN',version=P.VERSION,utc=C.utc(),jobs=jobs,protected=protected,code=code,inputs=140,
++        stages=STAGES,R_model=guard_geo.RADIUS,L_model=C.L,
++        floor='RAW shortest >=1.5R AND hard-restored D0 shortest <1.25R; exact first quadratic crossing of all3edges; one shared face alpha',
++        anticollapse='RAW longest >3R AND shortest >R; deterministic original GEO order; no two corners of protected face may join one existing coordinate cluster',
++        prior_degeneracy='Does not separate already coincident PRE_GEO corners or repair pre-existing collinearity; retained accounting',
++        post='GUARD_GEO -> one HINGE_OPP015 -> one original ALPHA -> one original HOLE',
++        baseline='OLD_BASE and actual OLD_FINAL reused read-only; Bench OLD_FINAL is HINGE only, not an old ALPHA/HOLE chain',
++        metrics='Original full135, existing179 where bridge scorer available; same queries and parent-equal summaries; no unique GT style rank',
++        closed_C='Boundary and seam-specific metrics NA, free quality applicable',stop='140 cache requests only; Step2 separate authorized registry',
++        GPU_calls=0,model_calls=0,new_D0=0,new_queries=0,new_noise=0)
++    C.write(dest,r);return r
++
++def cell(job):return ROOT/'cells'/job['panel']/job['q']['request_id']
++
++def score_current(q,mesh,dest,label,pairs=None):
++    # Original math cloned only to retain Bench's existing closed-C NA contract.
++    ns=dict(vars(M))
++    for name,obj in vars(M).items():
++        if inspect.isfunction(obj) and obj.__globals__ is vars(M):
++            fn=types.FunctionType(obj.__code__,ns,obj.__name__,obj.__defaults__,obj.__closure__);fn.__kwdefaults__=obj.__kwdefaults__;ns[name]=fn
++    prior=ns['role_reach']
++    def reach(*args,**kwargs):
++        internal,stats,rows=prior(*args,**kwargs)
++        if q['boundary_edges']==0:internal=dict(status='NA_CLOSED_C_NO_SEAM_INTERFACE',**{k:None for k in E.INTERNAL_FIELDS})
++        return internal,stats,rows
++    ns['role_reach']=reach
++    a=dict(mesh)
++    if 'index_domain' not in a:a['index_domain']=np.asarray('SOURCE_C_SHARED_GUARDED_GEO')
++    if np.any(a.get('face_role',np.asarray([]))=='BRIDGE'):pairs=None
++    return ns['score'](q,a,dest,label,existing_pairs=pairs)
++
++def baseline_row(job,stage):
++    key='old_base' if stage=='OLD_BASE' else 'old_final';sp=C.resolve(job[key+'_score'])
++    if (sp/'row.json').exists():row=C.read(sp/'row.json')
++    else:
++        score=C.read(sp/'score.json');mesh=C.arrays(job[key]);pairs=C.read(sp/'pairs.json')
++        row=metric_row(score,mesh,pairs)[0]
++        _,_,G,_,_=E.helpers();_,edges,_=G.actual_valid_graph(mesh['vertices'],mesh['faces'],job['q']['K'],pairs)
++        row.update(T.measure(mesh,job['q']['K'],edges,C.L)[0])
++    row=dict(row);row.update(panel=job['panel'],stage=stage,old_final_chain=job['old_final_chain'],C_boundary_edges=job['q']['boundary_edges'])
++    return row
++
++def work(job):
++    q=job['q'];dest=cell(job);done=dest/'complete.json'
++    if done.exists():r=C.read(done);E.verify(r['files']);return r
++    if dest.exists():raise RuntimeError('Partial attempt preserved; explicit engineering recovery required '+str(dest))
++    tick=time.perf_counter();contract=active_contract()
++    C.write(dest/'started.json',dict(utc=C.utc(),pid=os.getpid(),panel=job['panel'],request_id=q['request_id'],
++        execution_revision=contract['revision'],execution_registration_sha256=contract['sha256']))
++    try:
++        base=C.resolve(job['base_dir']);raw=C.arrays(base/'raw/raw.npz');proposal=C.arrays(base/'post/proposal.npz')['official_unconstrained_proposal']
++        source=C.arrays(base/'raw/source_condition.npz');old=C.arrays(job['old_base']);oldpairs=C.read(C.resolve(job['old_base_score'])/'pairs.json')
++        pre,canon,geo,g,w,anchors,fr=P.geometry_from_cached(raw,proposal,source)
++        save_npz(dest/'guarded_pre_geo.npz',dict(output=pre,raw_anchor_ids=raw['raw_anchor_ids']))
++        save_npz(dest/'guarded_canonical.npz',canon)
++        C.write(dest/'floor_faces.json',fr);C.csvwrite(dest/'floor_faces.csv',[{k:v for k,v in x.items() if k!='quadratics'} for x in fr])
++        C.write(dest/'geo.json',dict(stats=g['stats'],face_records=g['face_records'],guard_records=g['guard_records']))
++        C.write(dest/'source_restoration.json',w['restoration_summary']);C.write(dest/'orientation.json',w['orientation_result']);C.write(dest/'anchor_identity.json',anchors)
++        baseline=H.Q.connectivity_ledger(old['vertices'],old['faces'],q['K'],oldpairs,old['source_face_ids'],old['source_corner_ids'])
++        stages=[];current=geo;pairs=None;scored={}
++        for stage in STAGES:
++            p=dest/stage;now=time.perf_counter()
++            if stage=='GUARD_GEO':
++                result=score_current(q,current,p/'scores',stage);pairs=result['pairs'];records=[];summary=g['stats']
++                after=H.Q.connectivity_ledger(current['vertices'],current['faces'],q['K'],pairs,current['source_face_ids'],current['source_corner_ids'])
++                paired=H.Q.compare_ledgers(baseline,after,oldpairs,pairs,list(range(q['K'],q['N'])))
++                C.write(p/'old_base_paired_ledger.json',paired);C.write(p/'connectivity.json',after)
++                scored[stage]=result['row']
++            else:
++                previous=current;out,records,summary,before,after,npairs=P.finish_stage(stage,current,pre,raw['raw'],pairs)
++                if out['C'].tobytes()!=geo['C'].tobytes():raise AssertionError('CPU chain changed C')
++                current,pairs=out,npairs
++                if before is not None:
++                    paired=H.Q.compare_ledgers(before,after,C.read(dest/stages[-1]['stage']/'pairs.json'),pairs,summary['affected_source_raw_slots'])
++                    C.write(p/'paired_ledger.json',paired)
++                    for k in ('CF_lost_legal_edges','FF_lost_legal_edges','CF_new_illegal_pairs','FF_new_illegal_pairs','deleted_source_faces'):
++                        if paired['summary'][k]:raise AssertionError('Original fixed CPU guard violated '+k)
++                if stage=='FINAL':
++                    result=score_current(q,current,p/'scores',stage,pairs);scored[stage]=result['row']
++                    # Full original detector runs if BRIDGE exists; verify every contact identity/classification.
++                    for name in pairs:
++                        a={(tuple(x['pair']),x['classification']) for x in pairs[name]['contacts']};b={(tuple(x['pair']),x['classification']) for x in result['pairs'][name]['contacts']}
++                        if a!=b:raise AssertionError('Final independent scan disagrees')
++            save_npz(p/'post.npz',current);C.write(p/'pairs.json',pairs);C.write(p/'summary.json',summary);C.write(p/'candidate_records.json',records)
++            stages.append(dict(stage=stage,seconds=time.perf_counter()-now,summary=summary))
++        rows=[baseline_row(job,s) for s in ('OLD_BASE','OLD_FINAL')]
++        for stage,row in scored.items():rows.append(dict(row,panel=job['panel'],stage=stage,old_final_chain=job['old_final_chain'],C_boundary_edges=q['boundary_edges']))
++        C.write(dest/'metric_rows.json',rows)
++        # Source-slot relation accounting uses the unchanged prior POST plus a
++        # final graph with BRIDGE faces carrying new negative IDs, never GT IDs.
++        ids=current['parent_source_raw_slot'].copy() if 'parent_source_raw_slot' in current else current['source_face_ids'].copy();bridge=ids<0
++        ids[bridge]=-1-np.arange(bridge.sum())
++        corners=np.vstack((geo['source_corner_ids'],np.tile(np.arange(3),(int(bridge.sum()),1))))
++        finalledger=H.Q.connectivity_ledger(current['vertices'],current['faces'],q['K'],pairs,ids,corners)
++        paired=H.Q.compare_ledgers(baseline,finalledger,oldpairs,pairs,list(range(q['K'],q['N'])))
++        C.write(dest/'old_base_final_paired_ledger.json',paired)
++        fixed=raw['raw_anchor_ids']>=0
++        displacement=dict(max_guard_pre_vs_RAW=float(np.linalg.norm(pre.astype(float)-raw['raw'],axis=2).max()),
++            max_guard_pre_vs_D0_restored=float(max(r['max_guard_minus_proposal'] for r in fr)),
++            floor_faces=sum(r['floor_triggered'] for r in fr),protected_faces=sum(r['anti_collapse_protected'] for r in fr),
++            all_hard_anchor_coordinates_exact=bool(pre[fixed].tobytes()==raw['C_vertices'][raw['raw_anchor_ids'][fixed]].tobytes()))
++        if 'torch' in sys.modules:raise RuntimeError('CPU job imported neural framework')
++        rec=dict(status='COMPLETE',panel=job['panel'],request_id=q['request_id'],seconds=time.perf_counter()-tick,stages=stages,
++            execution_revision=contract['revision'],execution_registration_sha256=contract['sha256'],
++            displacement=displacement,peak_RSS_KiB=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,model_calls=0,GPU_calls=0,new_noise=0,
++            files={str(p):C.sha(p) for p in dest.rglob('*') if p.is_file()})
++        C.write(done,rec);print('COMPLETE',job['panel'],q['request_id'],round(rec['seconds'],2),flush=True);return rec
++    except BaseException as exc:
++        C.write(dest/'failure.json',dict(error=repr(exc),traceback=traceback.format_exc(),model_calls=0));raise
++
++def run(workers=4):
++    reg=freeze();done=ROOT/'completion.json'
++    if done.exists():r=C.read(done);E.verify(r['files']);return r
++    if not (ROOT/'resources_before.json').exists():C.write(ROOT/'resources_before.json',C.resources())
++    tick=time.perf_counter();first=work(reg['jobs'][0]);snapshot=C.resources();count=worker_count(snapshot,first,workers)
++    C.write(ROOT/'dispatch.json',dict(workers=count,threads_per_worker=1,resources=snapshot,first_seconds=first['seconds'],first_peak_RSS_KiB=first['peak_RSS_KiB'],GPU_workers=0),replace=(ROOT/'dispatch.json').exists())
++    # Start the second real cell, then add one independent CPU slot at a time.
++    with concurrent.futures.ProcessPoolExecutor(max_workers=count,mp_context=multiprocessing.get_context('spawn')) as pool:
++        receipts=[first];todo=iter(reg['jobs'][1:]);active={};slots=1
++        active[pool.submit(work,next(todo))]=True
++        while active:
++            completed,_=concurrent.futures.wait(active,return_when=concurrent.futures.FIRST_COMPLETED)
++            for f in completed:receipts.append(f.result());del active[f]
++            if slots<count:
++                snap=C.resources();available=worker_count(snap,first,workers)
++                slots=min(slots+1,available,count)
++            while len(active)<slots:
++                try:job=next(todo)
++                except StopIteration:break
++                active[pool.submit(work,job)]=True
++    E.verify(reg['protected']);contract=verify_code(reg)
++    C.csvwrite(ROOT/'execution_cells.csv',[dict(panel=r['panel'],request_id=r['request_id'],seconds=r['seconds'],
++        execution_revision=r.get('execution_revision','CORRECTED_GEO_V1'),**r['displacement']) for r in receipts])
++    r=dict(status='COMPLETE',requests=len(receipts),workers=count,seconds=time.perf_counter()-tick,model_calls=0,GPU_calls=0,new_noise=0,
++        seconds_scope='LAST_RESUME_CONTROLLER_WALL_NOT_TOTAL',sum_completed_cell_seconds=sum(x['seconds'] for x in receipts),
++        execution_revisions=dict(collections.Counter(x.get('execution_revision','CORRECTED_GEO_V1') for x in receipts)),
++        final_execution_registration_sha256=contract['sha256'],
++        files={str(cell(j)/'complete.json'):C.sha(cell(j)/'complete.json') for j in reg['jobs']})
++    C.write(done,r);return r
++
++if __name__=='__main__':
++    p=argparse.ArgumentParser();p.add_argument('action',choices=('freeze','run'));p.add_argument('--workers',type=int,choices=(1,2,3,4,5,6),default=4);a=p.parse_args()
++    r=freeze() if a.action=='freeze' else run(a.workers);print(json.dumps({k:v for k,v in r.items() if k not in ('jobs','files','protected','code')}),flush=True)
+--- /dev/null
++++ r2/pilots/unified_rescue_post_v1/summarize.py
+@@ -0,0 +1,85 @@
++"""Read only completed scores; retain all fields and paired quality costs."""
++from __future__ import annotations
++import collections,json
++import numpy as np
++from . import run as R
++C=R.C
++STAGES=('OLD_BASE','OLD_FINAL','GUARD_GEO','FINAL')
++def number(x):return isinstance(x,(int,float,bool)) and np.isfinite(float(x))
++
++def aggregate(root=R.ROOT):
++    root=C.resolve(root);reg=C.read(root/'registration.json');complete=C.read(root/'completion.json');R.E.verify(complete['files'])
++    rows=[];ledgers=[];faces=[];sources={};output=root/'tables'
++    for job in reg['jobs']:
++        d=root/'cells'/job['panel']/job['q']['request_id'];r=C.read(d/'complete.json');R.E.verify(r['files']);sources[str(d/'complete.json')]=C.sha(d/'complete.json')
++        for row in C.read(d/'metric_rows.json'):
++            row.update(part_type=job['q'].get('part_type','BACK_FULL' if 'BACK' in job['panel'] else 'SEAT_FULL'),closed_C=job['q']['boundary_edges']==0)
++            rows.append(row)
++        for stage,p in (('GUARD_GEO',d/'GUARD_GEO/old_base_paired_ledger.json'),('FINAL',d/'old_base_final_paired_ledger.json')):
++            ledgers.append(dict(panel=job['panel'],request_id=job['q']['request_id'],parent_id=job['q']['parent_id'],split=job['q']['split'],stage=stage,**C.read(p)['summary']))
++        for f in C.read(d/'floor_faces.json'):
++            faces.append(dict(panel=job['panel'],request_id=job['q']['request_id'],parent_id=job['q']['parent_id'],split=job['q']['split'],**{k:v for k,v in f.items() if k!='quadratics'}))
++    meta=set(R.E.META)|{'label','stage','panel','part_type','old_final_chain','closed_C','C_boundary_edges'}
++    original=set(C.read(C.ROOT/'r2/tools/hinge_opposite_v1/metric_policy.json')['directions'])
++    fields=sorted(original|{k for r in rows for k,v in r.items() if k not in meta and number(v)})
++    missing=[dict(panel=r['panel'],stage=r['stage'],request_id=r['request_id'],fields=sorted(original-set(r))) for r in rows if original-set(r)]
++    if missing:raise AssertionError(missing)
++    summary=[];parent=[];paired=[];common=[]
++    for panel in sorted({r['panel'] for r in rows}):
++        for stage in STAGES:
++            rr=[r for r in rows if r['panel']==panel and r['stage']==stage]
++            for grouping,groups in (('split',['ALL',*sorted({r['split'] for r in rr})]),('part_type',sorted({r['part_type'] for r in rr}))):
++                for group in groups:
++                    xx=[r for r in rr if group=='ALL' or r[grouping]==group]
++                    for field in fields:
++                        byc=collections.defaultdict(list)
++                        for r in xx:
++                            if number(r.get(field)):byc[r['parent_id'],r['condition_id']].append(float(r[field]))
++                        byp=collections.defaultdict(list)
++                        for (pid,cid),vv in byc.items():byp[pid].append(float(np.mean(vv)))
++                        pv={pid:float(np.mean(vv)) for pid,vv in byp.items()};vv=[float(r[field]) for r in xx if number(r.get(field))]
++                        summary.append(dict(panel=panel,stage=stage,grouping=grouping,group=group,metric=field,
++                            mean_parent_equal=float(np.mean(list(pv.values()))) if pv else None,mean_output=float(np.mean(vv)) if vv else None,
++                            n_requests=len(xx),n_valid=len(vv),n_valid_parents=len(pv),closed_C_requests=sum(r['closed_C'] for r in xx)))
++                        if grouping=='split' and group!='ALL':
++                            parent.extend(dict(panel=panel,stage=stage,split=group,parent_id=pid,metric=field,value=value) for pid,value in pv.items())
++    lookup={(r['panel'],r['request_id'],r['stage']):r for r in rows}
++    for job in reg['jobs']:
++        q=job['q']
++        for a,b in (('OLD_BASE','GUARD_GEO'),('OLD_BASE','FINAL'),('OLD_FINAL','FINAL'),('GUARD_GEO','FINAL')):
++            x,y=lookup[job['panel'],q['request_id'],a],lookup[job['panel'],q['request_id'],b]
++            for field in fields:
++                av,bv=x.get(field),y.get(field)
++                paired.append(dict(panel=job['panel'],request_id=q['request_id'],condition_id=q['condition_id'],parent_id=q['parent_id'],split=q['split'],
++                    baseline=a,candidate=b,metric=field,baseline_value=av,candidate_value=bv,delta=float(bv)-float(av) if number(av) and number(bv) else None,
++                    status='PASS' if number(av) and number(bv) else 'NA_NO_COMMON_VALUE'))
++        if job['panel']=='BENCH_SEAM_S15000':
++            for stage in STAGES:
++                x,y=lookup[job['panel'],q['request_id'],stage],lookup['BENCH_SEAM_S21000',q['request_id'],stage]
++                for field in fields:
++                    av,bv=x.get(field),y.get(field);common.append(dict(request_id=q['request_id'],condition_id=q['condition_id'],split=q['split'],stage=stage,metric=field,
++                        step15000=av,step21000=bv,delta=float(bv)-float(av) if number(av) and number(bv) else None))
++    checks=[]
++    for job in reg['jobs']:
++        q=job['q'];d=root/'cells'/job['panel']/q['request_id'];fr=C.read(d/'floor_faces.json');g=C.read(d/'geo.json')
++        old=lookup[job['panel'],q['request_id'],'OLD_BASE'];new=lookup[job['panel'],q['request_id'],'FINAL']
++        checks.append(dict(panel=job['panel'],request_id=q['request_id'],parent_id=q['parent_id'],split=q['split'],C_boundary_edges=q['boundary_edges'],
++            floor_triggered_faces=sum(x['floor_triggered'] for x in fr),anti_protected_faces=sum(x['anti_collapse_protected'] for x in fr),
++            anti_rejected_assignments=g['stats']['anti_collapse_rejections'],protected_deleted_faces=g['stats']['protected_deleted_faces'],
++            old_deleted_free=old['deleted_free_faces'],new_deleted_free=new['deleted_free_faces'],new_bridge_faces=new.get('new_bridge_faces'),
++            retained_free_change=new['actual_free_faces']-old['actual_free_faces'],C_preserved_exact=new['C_preserved_exact'],
++            old_bulk_reach=old['free_only_reached_bulk_area_fraction'],new_bulk_reach=new['free_only_reached_bulk_area_fraction'],
++            old_bulk_ge30=old['bulk_reach_ge_0_30_descriptive'],new_bulk_ge30=new['bulk_reach_ge_0_30_descriptive']))
++    outputs={}
++    for name,value in (('per_output',rows),('summary_parent_equal',summary),('per_parent',parent),('paired_per_output',paired),('bench_same_request_step_pairing',common),('connectivity_ledger',ledgers),('floor_per_face',faces),('request_guard_counts',checks)):
++        p=output/(name+'.csv');C.csvwrite(p,value);outputs[str(p)]=C.sha(p)
++    rec=dict(status='COMPLETE',rows=len(rows),requests=len(checks),fields=fields,n_fields=len(fields),all_original135_present=True,
++        original179_extra_policy='Old Bench/base original135 is retained; bridge/fixed-parent extension absent there is NA, not invented or rescored',
++        units='All original fractions remain0..1; count and model-length fields unscaled; display percentages multiply fractions by100',
++        applicability='Closed C seam/boundary metrics NA; bulk≥30 denominator includes only applicable nonempty BULK values',
++        aggregation='Noise -> condition -> parent equal; mixed category/endpoint panels are not pooled into one causal score',
++        ledger_scope='OLD_BASE to GUARD/FINAL raw-slot lineage; BRIDGE uses separate negative identity, never original face lineage',
++        comparisons='Guard pair isolates both guards together. FINAL includes HINGE/ALPHA/HOLE; Bench OLD_FINAL previously HINGE only. Chair OLD_FINAL is matched full chain.',
++        source_receipts=sources,files=outputs,code_sha256=C.sha(__file__),metric_calls=0,model_calls=0)
++    C.write(output/'completion.json',rec);print(json.dumps({k:v for k,v in rec.items() if k not in ('fields','files','source_receipts')}));return rec
++if __name__=='__main__':aggregate()
+--- /dev/null
++++ r2/pilots/unified_rescue_post_v1/test_geometry.py
+@@ -0,0 +1,44 @@
++"""Synthetic CPU correctness tests; no sampling or source-data mutation."""
++from pathlib import Path
++import sys,json
++import numpy as np
++sys.path.insert(0,str(Path(__file__).resolve().parents[2]/'src'))
++from meshflow_control import geo_c
++from . import floor,guard_geo
++
++def run():
++    tests=[];R=geo_c.RADIUS
++    cap,_=floor.first_entry([2.,0,0],[-4.,0,0],1.)
++    assert abs(cap-.25)<1e-12;tests.append('nonmonotone_first_crossing_not_late_feasible_endpoint')
++    cap,_=floor.first_entry([-1.,1,0],[2.,0,0],1.)
++    assert cap==1;tests.append('tangent_root_does_not_enter_forbidden_ball')
++    cap,_=floor.first_entry([2.,0,0],[-1.5,0,0],1.)
++    assert abs(cap-2/3)<1e-12;tests.append('single_entry')
++    for j in range(5):
++        raw=np.asarray([[[0,0,0],[1,0,0],[0,1,0]],[[2,0,0],[2+.01*j,.01,0],[2,1,0]],
++            [[2+.002,0,0],[3,0,0],[3,1,0]]],np.float32)
++        a=geo_c.process(raw,1);b=guard_geo.process(raw,1,protected_faces=np.zeros(3,bool))
++        for k,v in a.items():
++            if isinstance(v,np.ndarray):assert v.dtype==b[k].dtype and v.tobytes()==b[k].tobytes(),k
++            elif k=='face_records':assert v==b[k]
++    tests.append('guard_disabled_matches_original_all_arrays_5_fixtures')
++    raw=np.asarray([[[0,0,0],[1,0,0],[0,1,0]],[[2,0,0],[2.01,0,0],[2,1,0]]],np.float32)
++    a=geo_c.process(raw,1);b=guard_geo.process(raw,1,protected_faces=[False,True])
++    assert not a['source_face_kept'][1] and b['source_face_kept'][1]
++    assert b['stats']['anti_collapse_rejections']>0;tests.append('free_cluster_same_face_rejection')
++    raw=np.asarray([[[0,0,0],[1,0,0],[0,1,0]],[[.01,0,0],[.02,0,0],[2,1,0]]],np.float32)
++    a=geo_c.process(raw,1);b=guard_geo.process(raw,1,protected_faces=[False,True])
++    assert not a['source_face_kept'][1] and b['source_face_kept'][1];tests.append('unique_C_anchor_same_face_rejection')
++    raw=np.asarray([[[0,0,0],[1,0,0],[0,1,0]],[[.01,0,0],[0,0,0],[2,1,0]]],np.float32)
++    b=guard_geo.process(raw,1,protected_faces=[False,True])
++    assert b['source_face_kept'][1] and len(set(b['faces'][1]))==3
++    tests.append('later_exact_C_corner_reserved_against_earlier_merge')
++    raw=np.asarray([[[0,0,0],[1,0,0],[0,1,0]],[[2,0,0],[2.2,0,0],[2,.2,0]]],np.float32)
++    proposal=raw.copy();proposal[1,1]=[2.001,0,0]
++    anchors=np.full((2,3),-1,np.int64);anchors[0]=[0,1,2]
++    out,mask,records,pre=floor.protect(raw,proposal,anchors,raw[0],1,R)
++    assert records[1]['floor_triggered'] and floor.lengths(out[1]).min()>=1.25*R
++    assert out[0].tobytes()==raw[0].tobytes();tests.append('floor_FP32_writeback_and_hard_C')
++    assert 'torch' not in sys.modules
++    return dict(status='PASS',tests=tests,model_calls=0,GPU_calls=0)
++if __name__=='__main__':print(json.dumps(run(),indent=2))

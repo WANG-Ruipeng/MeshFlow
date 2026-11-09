@@ -1,0 +1,6 @@
+from pathlib import Path
+p=Path('/mnt/e/MeshFlow-Control/src/meshflow_control/evaluation/registry.py')
+s=p.read_text().replace("def records(row):","def records(row):")
+s=s.replace("else:status=row.get('metric_status',{}).get(name,'PASS' if value is not None else 'NOT_RUN')","else:\n            family=next((p for p in ('SeamCov','ConflictCov_C','ExposedRetain') if name.startswith(p)),name)\n            status=row.get('metric_status',{}).get(name,row.get('metric_status',{}).get(family,'PASS' if value is not None else 'NOT_RUN'))")
+s=s.replace("out.append(dict(request_id=row['request_id']","if name.startswith('SeamCov'):spec['denominator']=m.get('SeamCov_gamma_total_length')\n        elif name.startswith('ExposedRetain'):spec['denominator']=m.get('reference_exposed_points')\n        elif '_pair_count' in name or 'pairs' in name:spec['denominator']=K*(N-K) if name.startswith(('CF','Conflict')) else (N-K)*(N-K-1)//2\n        elif spec['denominator'] is None:spec['denominator']='defined statistic domain; see metric_id and sampling'\n        spec['unit']='percent_L' if name.endswith('_bbox_pct') else 'L_squared_normalized' if 'MSE' in name or 'D_sym' in name else 'fraction_or_count_as_named'\n        out.append(dict(request_id=row['request_id']",1)
+p.write_text(s)

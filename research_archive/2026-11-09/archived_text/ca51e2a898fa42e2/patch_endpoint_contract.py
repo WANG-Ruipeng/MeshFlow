@@ -1,0 +1,8 @@
+﻿from pathlib import Path
+p=Path('/mnt/e/MeshFlow/.worktrees/a-layout-value-20260924/experiments/a_radial/layout_endpoint/train.py')
+s=p.read_text(encoding='utf-8-sig')
+s=s.replace('import json\n','import json\nimport hashlib\n')
+s=s.replace("training=protocol['training']\n    require(arm", "training=protocol['training']\n    config_hash=hashlib.sha256(json.dumps({'training':training,'loss':protocol['loss']},sort_keys=True,separators=(',',':')).encode()).hexdigest()\n    require(config_hash==protocol['hashes']['config_sha256'],'Training/loss configuration hash mismatch')\n    require(protocol['loss']['weights']=={'endpoint':1.,'min_angle':1.,'p05_angle':1.},'Loss weights differ from fixed protocol')\n    require(training.get('rollout_steps',32)==32,'Rollout length changed')\n    require(arm")
+s=s.replace("require(manifest.get(initial.relative_to(run).as_posix())==initial_sha,'Initial checkpoint not bound by data manifest')", "require(manifest.get(initial.relative_to(run).as_posix())==initial_sha,'Initial checkpoint not bound by data manifest')\n    require(protocol['hashes']['initial_checkpoint_sha256'][str(seed)]==initial_sha,'Frozen initial checkpoint hash mismatch')")
+s=s.replace("require('model' in original and model_sha256(original['model'])==original['model_sha256'],'Invalid v1 initial checkpoint')", "require('model' in original and model_sha256(original['model'])==original['model_sha256'],'Invalid v1 initial checkpoint')\n    require(original['model_sha256']==protocol['hashes']['initial_model_sha256'][str(seed)],'Frozen initial model hash mismatch')")
+p.write_text(s,encoding='utf-8')

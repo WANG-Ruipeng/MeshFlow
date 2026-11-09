@@ -1,0 +1,2718 @@
+diff --git a/r2/pilots/bench_regional_mix_dual_v1/__init__.py b/r2/pilots/bench_regional_mix_dual_v1/__init__.py
+new file mode 100644
+--- /dev/null
++++ b/r2/pilots/bench_regional_mix_dual_v1/__init__.py
+@@ -0,0 +1 @@
++"""Frozen CPU comparison of assisted and automatic RAW/D0 region selection."""
+diff --git a/r2/pilots/bench_regional_mix_dual_v1/analysis/collect.py b/r2/pilots/bench_regional_mix_dual_v1/analysis/collect.py
+new file mode 100644
+--- /dev/null
++++ b/r2/pilots/bench_regional_mix_dual_v1/analysis/collect.py
+@@ -0,0 +1,260 @@
++"""Independent arithmetic/accounting from completed frozen CPU results.
++
++No model, detector, GEO, score, rendering, best selection, or visual labels.
++The original 177 fields are copied unchanged; every derived denominator is explicit.
++"""
++from __future__ import annotations
++import os
++for name in ('OMP_NUM_THREADS','OPENBLAS_NUM_THREADS','MKL_NUM_THREADS','NUMEXPR_NUM_THREADS'):
++    os.environ[name]='1'
++import argparse,csv,hashlib,json,math,statistics,sys
++from collections import Counter,defaultdict
++from datetime import datetime,timezone
++from pathlib import Path
++import numpy as np
++
++ROOT=Path(__file__).resolve().parents[4]
++OUT=ROOT/'experiments/r2_bench_regional_mix_dual_v1'
++DEST=OUT/'analysis'
++LABELS=('D0_ALL','RAW_ALL','ASSIST10','ASSIST01','ASSIST11','AUTO_COVER')
++STAGES=('BASE_POST','CLEAN_FINAL_POST')
++CORE=('CF_illegal_affected_free_fraction','FF_illegal_affected_free_fraction','CF_illegal_pair_count','FF_illegal_pair_count',
++      'ConflictCov_C','C_F_valid_edge_count','C_F_valid_edge_total_length','C_F_has_valid_edge',
++      'actual_free_faces','deleted_free_faces','free_minimum_angle_lt5_fraction','free_q_gt10_fraction',
++      'nonmanifold_edges','hinge_diag_isolated_1face_edge_components','hinge_diag_legal_opposed_edge_C_reached_free_area_fraction')
++
++def utc():return datetime.now(timezone.utc).isoformat()
++def resolve(p):
++    s=str(p).replace('\\','/')
++    for prefix in ('E:/MeshFlow/','/mnt/e/MeshFlow/'):
++        if s.startswith(prefix):return ROOT/s[len(prefix):]
++    path=Path(s);return path if path.is_absolute() else ROOT/path
++def read(p):return json.loads(resolve(p).read_text(encoding='utf-8-sig'))
++def sha(p):
++    h=hashlib.sha256()
++    with resolve(p).open('rb') as f:
++        for b in iter(lambda:f.read(1048576),b''):h.update(b)
++    return h.hexdigest()
++def csvread(p):
++    with resolve(p).open(encoding='utf-8-sig',newline='') as f:return list(csv.DictReader(f))
++def write(p,x):
++    p=resolve(p);p.parent.mkdir(parents=True,exist_ok=True)
++    with p.open('x',encoding='utf-8') as f:json.dump(x,f,ensure_ascii=False,indent=2,allow_nan=False)
++def csvwrite(p,rows):
++    p=resolve(p);p.parent.mkdir(parents=True,exist_ok=True);fields=list(dict.fromkeys(k for r in rows for k in r))
++    with p.open('x',encoding='utf-8-sig',newline='') as f:
++        w=csv.DictWriter(f,fieldnames=fields);w.writeheader()
++        for r in rows:w.writerow({k:json.dumps(v,ensure_ascii=False) if isinstance(v,(list,dict,tuple)) else v for k,v in r.items()})
++def number(v):
++    if str(v) in ('True','False'):return float(str(v)=='True')
++    try:x=float(v)
++    except (TypeError,ValueError):return None
++    return x if math.isfinite(x) else None
++def avg(vs):
++    good=[v for v in vs if v is not None];return statistics.mean(good) if good else None
++def divide(a,b):return a/b if b else None
++def areas(tri):
++    t=tri.astype(np.float64);return .5*np.linalg.norm(np.cross(t[:,1]-t[:,0],t[:,2]-t[:,0]),axis=1)
++def arrays(p):
++    with np.load(resolve(p),allow_pickle=False) as z:return {k:z[k].copy() for k in z.files}
++def checked_file(p,expected,book):
++    h=sha(p)
++    if h!=expected:raise ValueError('Hash differs: '+str(p))
++    book[str(resolve(p))]=h
++def mesh_slots(p,k,n,book):
++    z=arrays(p);book[str(resolve(p))]=sha(p)
++    ids=z.get('parent_source_raw_slot',z.get('source_face_ids'))
++    if ids is None or len(ids)!=len(z['output']):raise ValueError('Missing RAW face mapping')
++    originals=ids[ids>=0].astype(int)
++    if len(set(originals.tolist()))!=len(originals) or any(v>=n for v in originals):raise ValueError('Invalid original RAW slots')
++    aa=areas(z['output']);lookup={int(i):float(a) for i,a in zip(ids,aa) if i>=0}
++    if not set(range(k))<=set(lookup):raise ValueError('Known source face lost')
++    return lookup,float(aa[ids<0].sum()),int((ids<0).sum()),float(aa[k:].sum())
++
++def ledger_state(l,new):
++    """Recover exact sets from an existing D0-vs-candidate ledger, no scan."""
++    edge={kind:{} for kind in ('CF','FF')};pairs={kind:set() for kind in ('CF','FF')}
++    for r in l['edge_fates']:
++        if r['fate'] in (('RETAINED','NEW') if new else ('RETAINED','LOST')):
++            key=tuple(tuple(int(v) for v in part) for part in r['source_edge_key'])
++            edge[r['kind']][key]=r['new_length' if new else 'old_length']
++    for r in l['illegal_pair_fates']:
++        if r['fate'] in (('PERSISTENT','NEW') if new else ('PERSISTENT','RESOLVED_RETAINED','FACE_REMOVED')):
++            pairs[r['kind']].add((int(r['raw_slot_a']),int(r['raw_slot_b'])))
++    faces={int(r['raw_slot']) for r in l['face_fates'] if r['fate'] in (('RETAINED','NEWLY_RETAINED') if new else ('RETAINED','LOST'))}
++    return dict(edges=edge,pairs=pairs,faces=faces)
++
++def compare_ledgers(a,b,meta):
++    row=dict(meta);details=[]
++    for kind in ('CF','FF'):
++        ae,be=a['edges'][kind],b['edges'][kind];aa,bb=set(ae),set(be);ap,bp=a['pairs'][kind],b['pairs'][kind]
++        gone=ap-bp;gone_removed={p for p in gone if not set(p)<=b['faces']};gone_retained=gone-gone_removed
++        row.update({kind+'_old_legal_edges':len(aa),kind+'_retained_legal_edges':len(aa&bb),kind+'_lost_legal_edges':len(aa-bb),
++                    kind+'_new_legal_edges':len(bb-aa),kind+'_lost_length':sum(ae[e] for e in aa-bb),kind+'_new_length':sum(be[e] for e in bb-aa),
++                    kind+'_original_slot_old_illegal_pairs':len(ap),kind+'_original_slot_new_total_illegal_pairs':len(bp),
++                    kind+'_persistent_illegal_pairs':len(ap&bp),kind+'_new_illegal_pairs':len(bp-ap),
++                    kind+'_resolved_illegal_pairs_retained':len(gone_retained),kind+'_illegal_no_longer_observable_deleted':len(gone_removed)})
++        for edge in sorted(aa|bb):details.append(dict(meta,entity='LEGAL_EDGE',kind=kind,key=edge,
++            fate='RETAINED' if edge in aa&bb else 'LOST' if edge in aa else 'NEW',old_length=ae.get(edge),new_length=be.get(edge)))
++        for pair in sorted(ap|bp):details.append(dict(meta,entity='ILLEGAL_PAIR',kind=kind,key=pair,
++            fate='PERSISTENT' if pair in ap&bp else 'NEW' if pair in bp else 'FACE_REMOVED' if pair in gone_removed else 'RESOLVED_RETAINED'))
++    row.update(original_faces_lost=len(a['faces']-b['faces']),original_faces_newly_retained=len(b['faces']-a['faces']))
++    return row,details
++
++def run():
++    if 'torch' in sys.modules:raise RuntimeError('No model imports permitted')
++    if (DEST/'COMPLETE.json').exists():
++        done=read(DEST/'COMPLETE.json')
++        for p,h in done['files'].items():
++            if sha(p)!=h:raise ValueError('Existing analysis changed')
++        return done
++    reg=read(OUT/'jobs.json');rh=sha(OUT/'jobs.json');collection=read(OUT/'results/complete.json')
++    if collection.get('status')!='COMPLETE' or collection['registration_sha256']!=rh:raise RuntimeError('Wait for complete registered results')
++    if collection['collected_rows']!=72:raise ValueError('Expected 6 labels x 6 requests x 2 stages')
++    fields=reg['metric_fields'];assert len(fields)==len(set(fields))==177
++    panel=read(OUT/'panel/manifest.json');qmap={e['request_id']:e['request'] for e in panel['requests']};regions={e['request_id']:e['regions'] for e in panel['requests']}
++    book={str(OUT/'jobs.json'):rh,str(OUT/'panel/manifest.json'):sha(OUT/'panel/manifest.json'),str(OUT/'results/complete.json'):sha(OUT/'results/complete.json')}
++    checked_file(OUT/'results/per_output.csv',collection['files'][str(OUT/'results/per_output.csv')],book)
++    rawrows=csvread(OUT/'results/per_output.csv');rows=[]
++    for r in rawrows:
++        if any(f not in r for f in fields):raise ValueError('Missing original metric field')
++        row=dict(r);row['runtime_label']=r['label'];row['label']='D0_ALL' if r['label']=='M_D0' else r['label'];rows.append(row)
++    keys={(r['label'],r['request_id'],r['stage']) for r in rows}
++    expected={(label,rid,stage) for label in LABELS for rid in qmap for stage in STAGES}
++    if keys!=expected or len(rows)!=72:raise ValueError('Duplicate or missing output identity')
++    by={(r['label'],r['request_id'],r['stage']):r for r in rows};parents=sorted({q['parent_id'] for q in qmap.values()})
++    # Every original field is preserved verbatim; this is only a display-label alias.
++    for original,copy in zip(rawrows,rows):assert all(original[f]==copy[f] for f in fields)
++    commonI={stage:{rid for rid in qmap if all(by[label,rid,stage].get('I_status')=='PASS' and number(by[label,rid,stage].get('ConflictCov_C')) is not None for label in LABELS)} for stage in STAGES}
++    support=[];perparent=[]
++    for stage in STAGES:
++        for label in LABELS:
++            for parent in parents:
++                rr=[r for r in rows if r['label']==label and r['stage']==stage and r['parent_id']==parent]
++                assert len(rr)==2
++                out=dict(label=label,stage=stage,parent_id=parent,report_group=rr[0]['report_group'],request_count=2,request_ids=[r['request_id'] for r in rr])
++                for field in fields:
++                    vs=[number(r[field]) for r in rr];valid=[v for v in vs if v is not None]
++                    out[field]=avg(vs) if valid else None
++                    support.append(dict(label=label,stage=stage,parent_id=parent,field=field,numeric_n=len(valid),missing_or_nonnumeric_n=2-len(valid),original_value_counts=dict(Counter(r[field] for r in rr))))
++                ii=[r for r in rr if r['request_id'] in commonI[stage]]
++                out['I_common_PASS']=avg([number(r['ConflictCov_C']) for r in ii]);out['I_common_PASS_requests']=len(ii)
++                out['I_original_status_counts']=dict(Counter(r.get('I_status','MISSING') for r in rr));perparent.append(out)
++    jobs={j['job_id']:j for j in reg['jobs']};receipts={};artifacts={};ledger_states={};boundaries={};selection={}
++    for jid,j in jobs.items():
++        cp=OUT/'runs'/jid/'complete.json';r=read(cp)
++        if r.get('status')!='COMPLETE' or r['registration_sha256']!=rh or r['request_id']!=j['request']['request_id']:raise ValueError('Incomplete/rebound job')
++        if r['model_calls'] or r['D0_calls']:raise ValueError('Unexpected model call')
++        checked_file(cp,collection['input_job_receipts'][str(cp)],book);receipts[jid]=r
++        rid=j['request']['request_id'];label=j['label'];artifacts[label,rid]=r['artifacts']
++        for p in (j['selection_summary'],j['mixed_boundary']):book[str(resolve(p))]=sha(p)
++        selection[label,rid]=read(j['selection_summary']);boundary=read(j['mixed_boundary']);boundaries[label,rid]=boundary
++        for stage in STAGES:
++            p=r['artifacts']['ledger_'+stage];checked_file(p,r['files'][str(resolve(p))],book);ledger=read(p)
++            ledger_states[label,rid,stage]=ledger_state(ledger,True)
++            old=ledger_state(ledger,False);key=('D0_ALL',rid,stage)
++            if key in ledger_states and ledger_states[key]!=old:raise ValueError('Different D0 ledger identity')
++            ledger_states[key]=old
++    # The original D0 baseline is only read; derive its same-slot area table arithmetically.
++    refs={t['request_id']:t for t in reg['references']};area_rows=[];region_rows=[];slot_rows=[];boundary_rows=[]
++    for rid,q in qmap.items():
++        k,n=int(q['K']),int(q['N']);rp=refs[rid]['paths'];raw=arrays(rp['raw'])['raw'];rawarea=areas(raw);rawtotal=float(rawarea[k:].sum());book[rp['raw']]=sha(rp['raw'])
++        for label in LABELS:
++            if label=='D0_ALL':
++                sel=dict(selected_RAW_faces=0,free_faces=n-k,selected_RAW_fraction=0.,selected_RAW_area=0.,raw_free_area=rawtotal,selected_RAW_area_fraction=0.,mixed_boundary_clusters=0,RAW_D0_boundary_clusters=0,noncoincident_RAW_D0_clusters=0,C_bytes_preserved=True)
++                b=[]
++            else:sel=selection[label,rid];b=boundaries[label,rid]
++            gaps=[float(x['maximum_gap']) for x in b if x['D0_flat_corners']]
++            boundary_rows.append(dict(request_id=rid,parent_id=q['parent_id'],noise_index=q['noise_index'],label=label,
++                **{key:sel[key] for key in ('selected_RAW_faces','free_faces','selected_RAW_fraction','selected_RAW_area','raw_free_area','selected_RAW_area_fraction','mixed_boundary_clusters','RAW_D0_boundary_clusters','noncoincident_RAW_D0_clusters','C_bytes_preserved')},
++                mixed_cluster_containing_D0_maximum_gap_including_C=max(gaps) if gaps else None,
++                mixed_cluster_containing_D0_mean_maximum_gap_including_C=avg(gaps),
++                definition='Original RAW-GEO cluster co-membership. For clusters containing D0, cached maximum_gap compares RAW to D0 AND C members; C may dominate. Cached noncoincident_RAW_D0_clusters tests all members including C. These are not pure RAW-to-D0 gap measurements or final-connectivity claims.'))
++            runtime_slots=None
++            if label!='D0_ALL':
++                j=next(j for j in jobs.values() if j['label']==label and j['request']['request_id']==rid)
++                sp=OUT/'runs'/j['job_id']/'per_slot_deletion_area_displacement.csv';checked_file(sp,receipts[j['job_id']]['files'][str(sp)],book)
++                runtime_slots={(r['stage'],int(r['raw_slot'])):r for r in csvread(sp)}
++            for stage in STAGES:
++                mesh=rp['original_base' if stage=='BASE_POST' else 'original_final'] if label=='D0_ALL' else artifacts[label,rid]['base' if stage=='BASE_POST' else 'final']
++                lookup,bridgearea,bridgecount,actualfree=mesh_slots(mesh,k,n,book)
++                kept=set(lookup)&set(range(k,n));gone=set(range(k,n))-kept
++                retainedarea=float(rawarea[list(kept)].sum()) if kept else 0.;deletedarea=rawtotal-retainedarea
++                meta=dict(request_id=rid,parent_id=q['parent_id'],report_group=q['report_group'],noise_index=q['noise_index'],label=label,stage=stage)
++                area_rows.append(dict(meta,raw_free_faces=n-k,retained_original_free_faces=len(kept),deleted_original_free_faces=len(gone),
++                    raw_free_area=rawtotal,retained_RAW_reference_area=retainedarea,deleted_RAW_reference_area=deletedarea,
++                    retained_RAW_reference_area_fraction=divide(retainedarea,rawtotal),deleted_RAW_reference_area_fraction=divide(deletedarea,rawtotal),
++                    actual_original_free_area=sum(lookup[s] for s in kept),added_bridge_faces=bridgecount,added_bridge_area=bridgearea,
++                    actual_free_area_including_bridges=actualfree,actual_free_area_over_RAW=divide(actualfree,rawtotal)))
++                for slot in range(k,n):
++                    if runtime_slots is not None:
++                        oldslot=runtime_slots[stage,slot]
++                        if (oldslot['retained']=='True')!=(slot in kept) or not math.isclose(float(oldslot['raw_area']),float(rawarea[slot]),rel_tol=1e-12,abs_tol=1e-12):raise ValueError('Slot ledger mismatch')
++                    slot_rows.append(dict(meta,raw_slot=slot,retained=slot in kept,raw_reference_area=float(rawarea[slot]),actual_output_area=lookup.get(slot),
++                        assisted_region=next((r['region_id'] for r in regions[rid] if slot in r['source_face_ids']),'')))
++                for region in regions[rid]:
++                    ids=set(region['source_face_ids']);rs=ids&kept;total=float(rawarea[list(ids)].sum());survive=float(rawarea[list(rs)].sum()) if rs else 0.
++                    region_rows.append(dict(meta,region_id=region['region_id'],source_RAW_faces=len(ids),retained_original_faces=len(rs),deleted_original_faces=len(ids-rs),
++                        RAW_reference_area=total,retained_RAW_reference_area=survive,retained_RAW_reference_area_fraction=divide(survive,total),
++                        actual_region_output_area=sum(lookup[s] for s in rs),actual_region_area_over_RAW=divide(sum(lookup[s] for s in rs),total),
++                        retained_RAW_slots=sorted(rs),deleted_RAW_slots=sorted(ids-rs),
++                        limitation='Slot survival and reference-area mass do not certify support completeness or unchanged shape. Bridges excluded from original region identity.'))
++    comparisons=[];ledger_details=[];paired=[]
++    for rid,q in qmap.items():
++        for stage in STAGES:
++            for reference in ('D0_ALL','RAW_ALL'):
++                for label in LABELS:
++                    if reference==label:continue
++                    meta=dict(request_id=rid,parent_id=q['parent_id'],report_group=q['report_group'],noise_index=q['noise_index'],stage=stage,reference=reference,label=label)
++                    lr,ld=compare_ledgers(ledger_states[reference,rid,stage],ledger_states[label,rid,stage],meta);comparisons.append(lr);ledger_details.extend(ld)
++                    a,b=by[reference,rid,stage],by[label,rid,stage];p=dict(meta,I_common_all_six_PASS=rid in commonI[stage])
++                    for field in fields:
++                        av,bv=number(a[field]),number(b[field]);p['delta_'+field]=bv-av if av is not None and bv is not None else None
++                    p['delta_I_common_PASS']=p['delta_ConflictCov_C'] if rid in commonI[stage] else None
++                    p['reference_I_status']=a.get('I_status');p['candidate_I_status']=b.get('I_status');paired.append(p)
++    area_by={(r['label'],r['request_id'],r['stage']):r for r in area_rows}
++    tradeoff=[]
++    for r in rows:
++        key=r['label'],r['request_id'],r['stage'];ar=area_by[key];s=next(v for v in boundary_rows if v['label']==r['label'] and v['request_id']==r['request_id'])
++        tradeoff.append(dict(**{k:r[k] for k in ('label','request_id','parent_id','report_group','stage')},
++            **{k:number(r[k]) for k in CORE if k in r},I_status=r['I_status'],I_common_PASS=number(r['ConflictCov_C']) if r['request_id'] in commonI[r['stage']] else None,
++            **{k:ar[k] for k in ('retained_RAW_reference_area_fraction','actual_free_area_over_RAW','deleted_original_free_faces','added_bridge_faces')},
++            **{k:s[k] for k in ('selected_RAW_fraction','selected_RAW_area_fraction','RAW_D0_boundary_clusters','noncoincident_RAW_D0_clusters','mixed_cluster_containing_D0_maximum_gap_including_C')}))
++    summary=dict(status='COMPLETE',scope='Six repeatedly viewed development requests, three parents. All assisted combinations remain separate; no selected-best method or automatic-success claim.',
++                 stages={},definitions=dict(primary_average='First mean of valid noises within each parent, then equal mean across parents. Every valid count is recorded.',
++                    I='ConflictCov_C main comparison uses request intersection with I_status PASS and finite value for all six labels, separately per stage. Original unfiltered177 fields remain untouched.',
++                    area='RAW-reference mass tracks retained original slots. Actual output area can change under D0/GEO and includes separately reported bridges. These quantities are not interchangeable.',
++                    connectivity='Shared original RAW slot/corner ledger only; negative-ID bridges excluded from correspondence, included in full177 scorers.',
++                    region='Frozen assisted support regions, not automatic masks or clean-source target labels.',
++                    boundary='Cached gaps for mixed clusters containing D0 still include RAW-to-C member comparisons. C may dominate maximum gap and all-member noncoincidence. No pure RAW-to-D0 or final crack interpretation.'),accounting=dict(model_calls=0,scoring_calls=0,detector_calls=0,GEO_calls=0,new_visual_labels=0))
++    groups=['ALL',*sorted({q['report_group'] for q in qmap.values()})]
++    for stage in STAGES:
++        summary['stages'][stage]={}
++        for group in groups:
++            ids={rid for rid,q in qmap.items() if group=='ALL' or q['report_group']==group};pids=sorted({qmap[rid]['parent_id'] for rid in ids});ii=sorted(ids&commonI[stage]);ipids=sorted({qmap[rid]['parent_id'] for rid in ii})
++            gg=dict(parent_count=len(pids),request_count=len(ids),I_common_PASS_request_ids=ii,I_common_PASS_requests=len(ii),I_common_PASS_parent_ids=ipids,I_common_PASS_parents=len(ipids),labels={})
++            for label in LABELS:
++                rr=[r for r in perparent if r['label']==label and r['stage']==stage and r['parent_id'] in pids];oo=[by[label,rid,stage] for rid in ids]
++                metrics={f:dict(parent_equal_mean=avg([r[f] for r in rr]),valid_parent_count=sum(r[f] is not None for r in rr),valid_request_count=sum(number(r[f]) is not None for r in oo)) for f in fields}
++                iv=[r['I_common_PASS'] for r in rr if r['I_common_PASS_requests']]
++                area_macro={f:avg([avg([a[f] for a in area_rows if a['label']==label and a['stage']==stage and a['parent_id']==parent]) for parent in pids]) for f in ('retained_original_free_faces','deleted_original_free_faces','deleted_RAW_reference_area_fraction','retained_RAW_reference_area_fraction','actual_free_area_over_RAW','added_bridge_faces')}
++                gg['labels'][label]=dict(metrics=metrics,I_common_PASS_parent_mean=avg(iv),I_original_status_counts=dict(Counter(r.get('I_status','MISSING') for r in oo)),
++                    absolute_CF_pair_sum=sum(number(r['CF_illegal_pair_count']) or 0 for r in oo),absolute_FF_pair_sum=sum(number(r['FF_illegal_pair_count']) or 0 for r in oo),
++                    C_exact_status_counts=dict(Counter(r.get('C_preserved_exact','MISSING') for r in oo)),area_parent_equal_means=area_macro)
++            summary['stages'][stage][group]=gg
++    # Only now create outputs, after all inputs and expected 72 identities validated.
++    if DEST.exists():raise RuntimeError('Partial analysis retained; do not overwrite')
++    DEST.mkdir()
++    for name,table in [('per_output_full177.csv',rows),('per_parent.csv',perparent),('per_parent_field_support.csv',support),('paired_per_request.csv',paired),
++                       ('area_costs_per_output.csv',area_rows),('region_survival.csv',region_rows),('per_slot_area_accounting.csv',slot_rows),
++                       ('boundary_per_output.csv',boundary_rows),('candidate_tradeoff.csv',tradeoff),('connectivity_pairwise.csv',comparisons),('connectivity_pairwise_details.csv',ledger_details)]:csvwrite(DEST/name,table)
++    write(DEST/'summary.json',summary)
++    receipt=dict(status='COMPLETE',utc=utc(),version='regional_mix_readonly_accounting_v1',registration_sha256=rh,
++        original_metric_fields=177,per_output_rows=len(rows),parent_rows=len(perparent),request_pairs=len(paired),region_rows=len(region_rows),
++        source_code_sha256=sha(__file__),source_files=book,model_calls=0,scoring_calls=0,detector_calls=0,GEO_calls=0,new_visual_labels=0,
++        files={str(p):sha(p) for p in DEST.iterdir() if p.is_file()})
++    write(DEST/'COMPLETE.json',receipt);return receipt
++
++if __name__=='__main__':
++    ap=argparse.ArgumentParser();ap.add_argument('action',choices=('run',));ap.parse_args()
++    result=run();print(json.dumps({k:v for k,v in result.items() if k not in ('files','source_files')},indent=2))
+diff --git a/r2/pilots/bench_regional_mix_dual_v1/common.py b/r2/pilots/bench_regional_mix_dual_v1/common.py
+new file mode 100644
+--- /dev/null
++++ b/r2/pilots/bench_regional_mix_dual_v1/common.py
+@@ -0,0 +1,8 @@
++"""Local paths; reuse immutable helpers, never redirect historical outputs."""
++from r2.pilots.bench_four_routes_v1.hybrid.common import (
++    ROOT, L, resolve, read, sha, write, arrays, npz, csvwrite, verify, utc, clean,
++)
++
++OUT = ROOT / 'experiments/r2_bench_regional_mix_dual_v1'
++CODE = ROOT / 'r2/pilots/bench_regional_mix_dual_v1'
++OLD = ROOT / 'experiments/r2_bench_four_routes_v1/hybrid'
+diff --git a/r2/pilots/bench_regional_mix_dual_v1/coverage.py b/r2/pilots/bench_regional_mix_dual_v1/coverage.py
+new file mode 100644
+--- /dev/null
++++ b/r2/pilots/bench_regional_mix_dual_v1/coverage.py
+@@ -0,0 +1,294 @@
++"""Frozen centroid coverage heuristic over actual cached BASE_POST surfaces.
++
++No model, scorer, new GEO mapping, source Y, visual labels, smoothing or region
++expansion is used. Seven-point distances are diagnostics; only the centroid
++test selects seeds. A missing sampled surface is not proof of a missing part.
++"""
++from __future__ import annotations
++
++import csv
++import hashlib
++import json
++from pathlib import Path
++from datetime import datetime, timezone
++
++import numpy as np
++
++VERSION = 'auto_centroid_surviving_surface_v1'
++RADIUS = .015 / (.95 * .3762)
++POINT_NAMES = ('vertex0', 'vertex1', 'vertex2', 'midpoint01', 'midpoint12',
++               'midpoint20', 'centroid')
++CONFIG = dict(
++    version=VERSION, radius_model=RADIUS, missing_distance_multiplier=2.,
++    seed='valid RAW free face AND centroid finite-surface distance strictly > 2R',
++    surface='All triangles actually present in original cached BASE_POST, including exact C; no shortest-edge survival proxy',
++    raw_area_floor_L2=1e-12, component_area_fraction=.02, component_minimum_faces=2,
++    component_area_denominator='Sum of areas of ALL original RAW free faces, not C and not only seeds',
++    graph='Seed-induced common complete noncollapsed edge of cached RAW-GEO pre-cleanup coordinate cluster IDs; all incidences, including nonmanifold, retained',
++    component_filter='One fixed pass; size >=2 AND area >=.02 total RAW free area',
++    diagnostic_points=list(POINT_NAMES), diagnostic_ALL7='All seven distances strictly > 2R; ledger only, never an additional candidate',
++    selection='All three corners RAW for retained seed components; all other free faces D0 PRE_GEO; C exact RAW bytes',
++    expansion_rounds=0, smoothing=False, modified_GEO=False, C_normal_near_field=False,
++    interpretation='Coverage heuristic only; does not certify an empty surface/volume, support function, adoption, safe junction or low fallback ratio',
++    forbidden_inputs=['Y', 'source_full_mesh', 'visual_labels', 'scorer_results'])
++
++
++def areas(triangles):
++    t = np.asarray(triangles, np.float64)
++    return .5 * np.linalg.norm(np.cross(t[:, 1] - t[:, 0], t[:, 2] - t[:, 0]), axis=1)
++
++
++def query_points(raw):
++    t = np.asarray(raw, np.float64)
++    return np.stack((t[:, 0], t[:, 1], t[:, 2], (t[:, 0] + t[:, 1]) / 2,
++                     (t[:, 1] + t[:, 2]) / 2, (t[:, 2] + t[:, 0]) / 2,
++                     t.mean(axis=1)), axis=1)
++
++
++def same_face_coordinate_multisets(left, right):
++    """Source-restored C may permute corners, but cannot move/swap its faces."""
++    def sorted_bits(value):
++        bits = np.ascontiguousarray(value).view(np.uint32).reshape(-1, 3, 3)
++        order = np.lexsort((bits[:, :, 2], bits[:, :, 1], bits[:, :, 0]), axis=1)
++        return np.take_along_axis(bits, order[:, :, None], axis=1)
++    return sorted_bits(left).tobytes() == sorted_bits(right).tobytes()
++
++
++def nearest(points, surface):
++    """Finite closed-triangle Euclidean distances, with deterministic face ties."""
++    from r2.tools.cref_layer_audit_v1.geometry import finite_distances
++    points = np.asarray(points, np.float64).reshape(-1, 3)
++    surface = np.asarray(surface, np.float64)
++    if surface.ndim != 3 or surface.shape[1:] != (3, 3) or not len(surface):
++        raise ValueError('A nonempty actual BASE_POST surface is required')
++    if not np.isfinite(points).all() or not np.isfinite(surface).all():
++        raise ValueError('Nonfinite finite-surface query')
++    distance = np.empty(len(points), np.float64)
++    face_ids = np.empty(len(points), np.int64)
++    for start in range(0, len(points), 64):
++        d2, _, _ = finite_distances(points[start:start + 64], surface)
++        ids = np.argmin(d2, axis=1)
++        face_ids[start:start + len(ids)] = ids
++        distance[start:start + len(ids)] = np.sqrt(d2[np.arange(len(ids)), ids])
++    if not np.isfinite(distance).all():
++        raise ValueError('Nonfinite nearest-surface result')
++    return distance, face_ids
++
++
++def classify_distances(distances, valid, *, R=RADIUS):
++    if float(R) != RADIUS:
++        raise ValueError('Only the fixed original GEO radius is allowed')
++    d = np.asarray(distances, np.float64)
++    valid = np.asarray(valid, bool)
++    if d.shape != (len(valid), 7) or not np.isfinite(d[valid]).all():
++        raise ValueError('Seven finite distances per valid RAW face are required')
++    beyond = d > 2 * R
++    centroid = valid & beyond[:, 6]
++    all7 = valid & beyond.all(axis=1)
++    return centroid, all7, beyond.sum(axis=1)
++
++
++def edge_components(mask, cluster_ids):
++    """No radius clustering, vertex-only link, C path, or recursive expansion."""
++    mask = np.asarray(mask, bool)
++    ids = np.asarray(cluster_ids)
++    if ids.shape != (len(mask), 3) or ids.dtype.kind not in 'iu' or (ids < 0).any():
++        raise ValueError('Nonnegative cached RAW-GEO corner cluster IDs required')
++    incidence = {}
++    for face in np.flatnonzero(mask):
++        for a, b in ((0, 1), (1, 2), (2, 0)):
++            edge = tuple(sorted((int(ids[face, a]), int(ids[face, b]))))
++            if edge[0] != edge[1]:
++                incidence.setdefault(edge, set()).add(int(face))
++    adjacency = {int(f): set() for f in np.flatnonzero(mask)}
++    for owners in incidence.values():
++        for face in owners:
++            adjacency[face].update(owners - {face})
++    labels = np.full(len(mask), -1, np.int64)
++    components = []
++    for first in sorted(adjacency):
++        if labels[first] >= 0:
++            continue
++        todo = [first]
++        labels[first] = len(components)
++        members = []
++        while todo:
++            current = todo.pop()
++            members.append(current)
++            for other in sorted(adjacency[current], reverse=True):
++                if labels[other] < 0:
++                    labels[other] = len(components)
++                    todo.append(other)
++        components.append(sorted(members))
++    return labels, components, incidence
++
++
++def filter_components(components, raw_areas, total_raw_free_area):
++    threshold = CONFIG['component_area_fraction'] * total_raw_free_area
++    selected = np.zeros(len(raw_areas), bool)
++    records = []
++    for component_id, members in enumerate(components):
++        area = float(np.asarray(raw_areas)[members].sum())
++        size_pass = len(members) >= CONFIG['component_minimum_faces']
++        area_pass = area >= threshold
++        retained = size_pass and area_pass
++        if retained:
++            selected[members] = True
++        reasons = ([] if size_pass else ['SINGLE_FACE_COMPONENT']) + ([] if area_pass else ['AREA_BELOW_2PCT'])
++        records.append(dict(component_id=component_id, raw_slots=members, faces=len(members),
++                            raw_area=area, total_RAW_free_area=float(total_raw_free_area),
++                            area_fraction=area / total_raw_free_area if total_raw_free_area > 0 else None,
++                            threshold_area=threshold, minimum_faces_pass=size_pass,
++                            area_pass=area_pass, selected_RAW=retained,
++                            reason='RETAINED_SEED_COMPONENT' if retained else '|'.join(reasons)))
++    return selected, records
++
++
++def mixed_boundary(output, selected, known, cluster_ids):
++    """Record shared RAW-GEO clusters; proximity does not certify a legal edge."""
++    flat = output.reshape(-1, 3).astype(np.float64)
++    ids = cluster_ids.reshape(-1)
++    selected_corner = np.repeat(selected, 3)
++    free_corner = np.arange(len(flat)) >= 3 * known
++    records = []
++    for cluster in np.unique(ids):
++        members = np.flatnonzero(ids == cluster)
++        a = members[selected_corner[members]]
++        b = members[~selected_corner[members] & free_corner[members]]
++        c = members[~free_corner[members]]
++        if len(a) and (len(b) or len(c)):
++            other = np.concatenate((b, c))
++            distance = np.linalg.norm(flat[a, None, :] - flat[None, other, :], axis=2)
++            records.append(dict(cluster_id=int(cluster), RAW_flat_corners=a.tolist(),
++                                D0_flat_corners=b.tolist(), C_flat_corners=c.tolist(),
++                                maximum_mixed_gap=float(distance.max()), minimum_mixed_gap=float(distance.min()),
++                                exact_shared_coordinate_pairs=int((distance == 0).sum()),
++                                mixed_pairs=int(distance.size),
++                                all_members_same_position=bool(np.all(flat[members] == flat[members[0]]))))
++    return records
++
++
++def select(raw, pre, known, base_output, cluster_ids, *, L, R=RADIUS):
++    """Return one fixed candidate and complete selection/diagnostic ledgers.
++
++    Caller verifies frozen input hashes. base_output must be the original actual
++    BASE_POST triangle array, and cluster_ids the already cached RAW-GEO map.
++    This function deliberately cannot load assets, run GEO, or score a mesh.
++    """
++    if (not isinstance(raw, np.ndarray) or not isinstance(pre, np.ndarray)
++            or raw.dtype != np.float32 or pre.dtype != np.float32
++            or raw.shape != pre.shape or raw.ndim != 3 or raw.shape[1:] != (3, 3)):
++        raise ValueError('Matched-slot FP32 RAW and D0 PRE_GEO arrays required')
++    if isinstance(known, bool) or int(known) != known or not 0 < known < len(raw):
++        raise ValueError('Invalid canonical known-face count')
++    known = int(known)
++    base = np.asarray(base_output)
++    ids = np.asarray(cluster_ids)
++    if (base.dtype != np.float32 or base.ndim != 3 or base.shape[1:] != (3, 3)
++            or len(base) < known or not np.isfinite(base).all()):
++        raise ValueError('Actual FP32 original BASE_POST triangles required')
++    if (not np.isfinite(raw).all() or not np.isfinite(pre).all()
++            or not np.isfinite(L) or L <= 0 or float(R) != RADIUS):
++        raise ValueError('Invalid finite geometry, L, or frozen GEO radius')
++    if raw[:known].tobytes() != pre[:known].tobytes():
++        raise ValueError('RAW and PRE_GEO must preserve canonical C bytes')
++    if not same_face_coordinate_multisets(raw[:known], base[:known]):
++        raise ValueError('Source-restored BASE_POST C face coordinates differ beyond corner permutation')
++    if ids.shape != raw.shape[:2] or ids.dtype.kind not in 'iu' or (ids < 0).any():
++        raise ValueError('Cached RAW-GEO pre-cleanup cluster IDs required')
++    raw_area = areas(raw)
++    valid = raw_area > CONFIG['raw_area_floor_L2'] * L * L
++    valid[:known] = False
++    points = query_points(raw)
++    distances = np.full((len(raw), 7), np.nan, np.float64)
++    nearest_faces = np.full((len(raw), 7), -1, np.int64)
++    d, fids = nearest(points[valid].reshape(-1, 3), base)
++    distances[valid] = d.reshape(-1, 7)
++    nearest_faces[valid] = fids.reshape(-1, 7)
++    seed, all7, counts = classify_distances(distances, valid, R=R)
++    region, components, incidence = edge_components(seed, ids)
++    free_area = float(raw_area[known:].sum())
++    selected, component_records = filter_components(components, raw_area, free_area)
++    output = pre.copy()
++    output[selected] = raw[selected]
++    output[:known] = raw[:known]
++    rows = []
++    for face in range(len(raw)):
++        reason = ('C_FIXED' if face < known else 'RAW_INVALID_NOT_SELECTED' if not valid[face]
++                  else 'CENTROID_COVERED_D0' if not seed[face]
++                  else component_records[int(region[face])]['reason'])
++        row = dict(raw_slot=face, known=face < known, raw_valid=bool(valid[face]),
++                   raw_area=float(raw_area[face]), centroid_seed=bool(seed[face]),
++                   ALL7_seed_diagnostic=bool(all7[face]),
++                   centroid_vs_ALL7_disagree=bool(seed[face] != all7[face]),
++                   component_id=int(region[face]), selected_RAW=bool(selected[face]), reason=reason,
++                   distance_min=float(distances[face].min()) if valid[face] else None,
++                   distance_median=float(np.median(distances[face])) if valid[face] else None,
++                   distance_max=float(distances[face].max()) if valid[face] else None,
++                   points_strictly_beyond_2R=int(counts[face]) if valid[face] else None,
++                   maximum_from_D0=float(np.linalg.norm(output[face].astype(float) - pre[face], axis=1).max()))
++        for index, name in enumerate(POINT_NAMES):
++            row['distance_' + name] = float(distances[face, index]) if valid[face] else None
++            row['nearest_BASE_face_' + name] = int(nearest_faces[face, index]) if valid[face] else None
++        rows.append(row)
++    boundary = mixed_boundary(output, selected, known, ids)
++    if (output[:known].tobytes() != raw[:known].tobytes()
++            or output[selected].tobytes() != raw[selected].tobytes()
++            or output[~selected].tobytes() != pre[~selected].tobytes()
++            or np.any(selected & ~seed) or np.any(all7 & ~seed)):
++        raise AssertionError('Whole-face endpoint or seed-only contract changed')
++    summary = dict(version=VERSION, N=len(raw), K=known, R_model=float(R), threshold_model=2 * R,
++                   original_BASE_surface_faces=len(base), original_BASE_free_surface_faces=len(base) - known,
++                   original_BASE_exact_zero_area_faces=int((areas(base) == 0).sum()),
++                   original_BASE_C_corner_order_permuted_faces=sum(
++                       raw[f].tobytes() != base[f].tobytes() for f in range(known)),
++                   valid_RAW_free_faces=int(valid.sum()), invalid_RAW_free_faces=int((~valid[known:]).sum()),
++                   seed_faces=int(seed.sum()), centroid_seed_faces=int(seed.sum()),
++                   diagnostic_ALL7_seed_faces=int(all7.sum()),
++                   diagnostic_centroid_only_seed_faces=int((seed & ~all7).sum()),
++                   diagnostic_centroid_only_seed_RAW_area=float(raw_area[seed & ~all7].sum()),
++                   seed_components=len(components), retained_components=sum(r['selected_RAW'] for r in component_records),
++                   rejected_components=sum(not r['selected_RAW'] for r in component_records),
++                   selected_RAW_faces=int(selected.sum()), selected_RAW_face_fraction=float(selected[known:].mean()),
++                   selected_raw_area=float(raw_area[selected].sum()), free_raw_area=free_area,
++                   selected_RAW_area_fraction=float(raw_area[selected].sum() / free_area) if free_area > 0 else None,
++                   filtered_seed_faces=int((seed & ~selected).sum()),
++                   seed_graph_nonmanifold_edges=sum(len(v) > 2 for v in incidence.values()),
++                   mixed_boundary_clusters=len(boundary),
++                   split_mixed_boundary_clusters=sum(not r['all_members_same_position'] for r in boundary),
++                   C_bytes_preserved=True, expansion_rounds=0, seven_point_hard_gate=False,
++                   model_calls=0, D0_calls=0, GEO_calls=0, scorer_calls=0, new_noise=0)
++    return dict(output=output, seed=seed, selected_RAW=selected, region_ids=region,
++                cluster_ids=ids.copy(), distances=distances, nearest_BASE_face_ids=nearest_faces,
++                diagnostic_ALL7_seed=all7, per_face=rows, components=component_records,
++                boundary=boundary, summary=summary)
++
++
++def write_ledger(result, destination, *, request_id, source_identities):
++    """Write new selector-only evidence, never scientific scores or old assets."""
++    root = Path(__file__).resolve().parents[3]
++    allowed = (root / 'experiments/r2_bench_regional_mix_dual_v1').resolve()
++    destination = Path(destination).resolve()
++    if destination.exists() or not destination.is_relative_to(allowed):
++        raise ValueError('Selector ledger requires a new directory under this experiment')
++    destination.mkdir(parents=True)
++    with (destination / 'selection.npz').open('xb') as handle:
++        np.savez_compressed(handle, **{k: result[k] for k in (
++            'output', 'seed', 'selected_RAW', 'region_ids', 'cluster_ids', 'distances',
++            'nearest_BASE_face_ids', 'diagnostic_ALL7_seed')})
++    with (destination / 'per_face_selection.csv').open('x', encoding='utf-8-sig', newline='') as handle:
++        writer = csv.DictWriter(handle, fieldnames=list(result['per_face'][0]))
++        writer.writeheader()
++        writer.writerows(result['per_face'])
++    for name, payload in (('components.json', result['components']), ('mixed_boundary.json', result['boundary']),
++                          ('selection_summary.json', result['summary'])):
++        with (destination / name).open('x', encoding='utf-8') as handle:
++            json.dump(payload, handle, ensure_ascii=False, indent=2, allow_nan=False)
++    receipt = dict(status='SELECTOR_ONLY_COMPLETE', version=VERSION, request_id=request_id,
++                   utc=datetime.now(timezone.utc).isoformat(), config=CONFIG,
++                   source_identities=source_identities, model_calls=0, scorer_calls=0, GEO_calls=0,
++                   files={str(p): hashlib.sha256(p.read_bytes()).hexdigest()
++                          for p in sorted(destination.iterdir()) if p.is_file()})
++    with (destination / 'complete.json').open('x', encoding='utf-8') as handle:
++        json.dump(receipt, handle, ensure_ascii=False, indent=2, allow_nan=False)
++    return receipt
+diff --git a/r2/pilots/bench_regional_mix_dual_v1/coverage_tests.py b/r2/pilots/bench_regional_mix_dual_v1/coverage_tests.py
+new file mode 100644
+--- /dev/null
++++ b/r2/pilots/bench_regional_mix_dual_v1/coverage_tests.py
+@@ -0,0 +1,135 @@
++"""Synthetic CPU checks only; no registered request, GEO, model or scorer call."""
++from __future__ import annotations
++import os
++for name in ('OMP_NUM_THREADS', 'MKL_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'NUMEXPR_NUM_THREADS'):
++    os.environ[name] = '1'
++os.environ['CUDA_VISIBLE_DEVICES'] = ''
++import hashlib
++import json
++import sys
++from datetime import datetime, timezone
++from pathlib import Path
++import numpy as np
++from . import coverage as S
++
++
++def run():
++    checks = []
++    def ok(name, condition):
++        if not condition:
++            raise AssertionError(name)
++        checks.append(dict(name=name, status='PASS'))
++
++    triangle = np.asarray([[[0, 0, 0], [1, 0, 0], [0, 1, 0]]], np.float32)
++    d, ids = S.nearest([[.2, .2, 2], [2, 2, 0]], triangle)
++    ok('finite_triangle_not_infinite_plane_or_squared_distance',
++       np.allclose(d, [2., 3 / np.sqrt(2.)]) and np.array_equal(ids, [0, 0]))
++    d = np.full((2, 7), 2 * S.RADIUS)
++    d[1] = np.nextafter(2 * S.RADIUS, np.inf)
++    seed, _, _ = S.classify_distances(d, [True, True])
++    ok('strict_greater_than_threshold_equality_is_not_seed', seed.tolist() == [False, True])
++
++    raw = np.asarray([[[0, 0, 0], [.01, 0, 0], [0, .01, 0]],
++                      [[0, 0, 0], [1, 0, 0], [0, 1, 0]],
++                      [[1, 0, 0], [1, 1, 0], [0, 1, 0]],
++                      [[1, 0, 0], [2, 0, 0], [1, 1, 0]]], np.float32)
++    raw[0, 0, 0] = np.float32(-0.)
++    pre = raw.copy()
++    pre[1:, :, 2] += np.float32(.5)
++    cluster = np.asarray([[10, 11, 12], [0, 1, 2], [1, 3, 2], [1, 4, 3]], np.int64)
++    base = raw[[0, 3]].copy()
++    before = [a.tobytes() for a in (raw, pre, base, cluster)]
++    result = S.select(raw, pre, 1, base, cluster, L=1.)
++    ok('centroid_primary_all7_diagnostic_can_disagree_near_attached_endpoint',
++       result['seed'][1] and not result['diagnostic_ALL7_seed'][1])
++    ok('complete_edge_component_selected_without_expanding_into_covered_neighbor',
++       np.array_equal(np.flatnonzero(result['selected_RAW']), [1, 2]) and not result['seed'][3])
++    ok('whole_face_RAW_D0_and_signed_zero_C_bytes',
++       result['output'][1:3].tobytes() == raw[1:3].tobytes()
++       and result['output'][3:].tobytes() == pre[3:].tobytes()
++       and result['output'][:1].tobytes() == raw[:1].tobytes())
++    ok('inputs_unchanged', before == [a.tobytes() for a in (raw, pre, base, cluster)])
++    ok('mixed_boundary_gap_recorded_without_smoothing',
++       any(r['maximum_mixed_gap'] >= .5 for r in result['boundary']))
++    repeat = S.select(raw, pre, 1, base, cluster, L=1.)
++    ok('repeat_deterministic', repeat['output'].tobytes() == result['output'].tobytes()
++       and repeat['per_face'] == result['per_face'] and repeat['components'] == result['components'])
++    reordered = base.copy()
++    reordered[0] = reordered[0, [2, 0, 1]]
++    permuted = S.select(raw, pre, 1, reordered, cluster, L=1.)
++    ok('BASE_source_corner_permutation_allowed_C_coordinates_unchanged',
++       permuted['output'].tobytes() == result['output'].tobytes()
++       and permuted['summary']['original_BASE_C_corner_order_permuted_faces'] == 1)
++    moved = reordered.copy()
++    moved[0, 0, 0] += np.float32(.001)
++    try:
++        S.select(raw, pre, 1, moved, cluster, L=1.)
++    except ValueError:
++        ok('BASE_coordinate_change_not_accepted_as_corner_permutation', True)
++    else:
++        raise AssertionError('BASE C coordinate change accepted')
++    ok('BASE_face_reordering_forbidden', not S.same_face_coordinate_multisets(raw[:2], raw[[1, 0]]))
++    unsigned = base.copy()
++    unsigned[0, 0, 0] = np.float32(0.)
++    ok('BASE_signed_zero_bits_preserved', not S.same_face_coordinate_multisets(raw[:1], unsigned[:1]))
++
++    _, components, _ = S.edge_components([True, True], np.asarray([[0, 1, 2], [2, 3, 4]]))
++    chosen, records = S.filter_components(components, np.asarray([5., 5.]), 10.)
++    ok('vertex_only_contact_does_not_connect_and_single_face_rejected_even_large',
++       components == [[0], [1]] and not chosen.any()
++       and all(r['reason'] == 'SINGLE_FACE_COMPONENT' for r in records))
++    chosen, records = S.filter_components([[0, 1]], np.asarray([1., 1., 98.]), 100.)
++    ok('component_area_equal_two_percent_is_kept', chosen.tolist() == [True, True, False])
++    chosen, records = S.filter_components([[0, 1]], np.asarray([.5, .5, 99.]), 100.)
++    ok('area_filter_uses_all_RAW_free_not_seed_area_and_keeps_rejection_ledger',
++       not chosen.any() and records[0]['reason'] == 'AREA_BELOW_2PCT'
++       and records[0]['raw_slots'] == [0, 1] and records[0]['area_fraction'] == .01)
++
++    thin = np.asarray([[[0, 0, 2], [1, 0, 2], [0, 1, 2]],
++                       [[0, 0, 0], [1, 0, 0], [0, .001, 0]]], np.float32)
++    changed = thin.copy()
++    changed[1, :, 2] = .5
++    near = S.select(thin, changed, 1, thin.copy(), np.asarray([[0, 1, 2], [3, 4, 5]]), L=1.)
++    ok('actual_surviving_short_edge_surface_used_no_shortest_edge_proxy',
++       near['per_face'][1]['distance_centroid'] == 0 and not near['seed'][1])
++    invalid = raw.copy()
++    invalid[3] = invalid[3, 0]
++    inv_pre = invalid.copy()
++    inv = S.select(invalid, inv_pre, 1, base, cluster, L=1.)
++    ok('invalid_RAW_face_not_queried_or_selected', not inv['seed'][3]
++       and inv['per_face'][3]['distance_centroid'] is None)
++    bad = pre.copy()
++    bad[0, 0, 0] = np.float32(.1)
++    try:
++        S.select(raw, bad, 1, base, cluster, L=1.)
++    except ValueError:
++        ok('reject_nonrestored_C', True)
++    else:
++        raise AssertionError('nonrestored C accepted')
++    try:
++        S.select(raw, pre, 1, base, cluster, L=1., R=2 * S.RADIUS)
++    except ValueError:
++        ok('reject_radius_sweep', True)
++    else:
++        raise AssertionError('radius sweep accepted')
++    ok('no_torch_import', 'torch' not in sys.modules)
++    root = Path(__file__).resolve().parents[3]
++    out = root / 'experiments/r2_bench_regional_mix_dual_v1/audits/coverage_cpu_tests_v2.json'
++    previous = out.with_name('coverage_cpu_tests.json')
++    payload = dict(status='PASS', utc=datetime.now(timezone.utc).isoformat(), version=S.VERSION,
++                   implementation_revision=2,
++                   correction='BASE_POST C is source-corner-restored; verify per-face FP32 coordinate multiset, while RAW/PRE canonical C stays byte-exact',
++                   supersedes_receipt=dict(path=str(previous), sha256=hashlib.sha256(previous.read_bytes()).hexdigest()),
++                   checks=checks, synthetic_fixtures_only=True, real_requests_processed=0,
++                   model_calls=0, scorer_calls=0, GEO_calls=0, generated_candidates=0,
++                   code={str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in (
++                       Path(S.__file__), Path(__file__), root / 'r2/tools/cref_layer_audit_v1/geometry.py')})
++    out.parent.mkdir(parents=True, exist_ok=True)
++    with out.open('x', encoding='utf-8') as handle:
++        json.dump(payload, handle, ensure_ascii=False, indent=2, allow_nan=False)
++    print(json.dumps(payload, ensure_ascii=False, indent=2))
++    return payload
++
++
++if __name__ == '__main__':
++    run()
+diff --git a/r2/pilots/bench_regional_mix_dual_v1/dispatch.py b/r2/pilots/bench_regional_mix_dual_v1/dispatch.py
+new file mode 100644
+--- /dev/null
++++ b/r2/pilots/bench_regional_mix_dual_v1/dispatch.py
+@@ -0,0 +1,107 @@
++"""Bounded incremental CPU dispatch of the frozen jobs; no automatic retries."""
++from . import common as C
++import argparse, json, os, subprocess, sys, time
++from r2.pilots.bench_four_routes_v1.resources import snapshot
++
++
++def receipt(job):
++    return C.OUT/'runs'/job['job_id']/'complete.json'
++
++
++def command(job):
++    return [sys.executable,'-B','-m','r2.pilots.bench_regional_mix_dual_v1.runtime','run-one',
++            '--jobs',str(C.OUT/'jobs.json'),'--job-id',job['job_id']]
++
++
++def run():
++    from . import runtime
++    reg=C.read(C.OUT/'jobs.json');C.verify(reg['protected']);C.verify(reg['source_hashes'])
++    folder=C.OUT/'dispatch';folder.mkdir(parents=True,exist_ok=True)
++    ledger=folder/'events.jsonl'
++    def event(kind,**kw):
++        row=dict(utc=C.utc(),kind=kind,**kw)
++        with ledger.open('a',encoding='utf-8') as f:f.write(json.dumps(C.clean(row),ensure_ascii=False)+'\n')
++        print(json.dumps(C.clean(row),ensure_ascii=False),flush=True)
++    existing=[j for j in reg['jobs'] if receipt(j).exists()]
++    pending=[j for j in reg['jobs'] if not receipt(j).exists()]
++    registration_hash=C.sha(C.OUT/'jobs.json')
++    for job in existing:
++        prior=runtime.verify_result(C.read(receipt(job)))
++        if prior['registration_sha256']!=registration_hash or prior['job_sha256']!=runtime.canonical_hash(job):
++            raise ValueError('Existing receipt identity differs: '+job['job_id'])
++    for j in pending:
++        if (C.OUT/'runs'/j['job_id']).exists():raise RuntimeError('Partial job; inspect, do not retry: '+j['job_id'])
++    if not pending:
++        event('ALREADY_COMPLETE_NO_REPLAY',jobs=len(existing));return
++    dispatch_registration=folder/'registration.json'
++    if dispatch_registration.exists():
++        if C.read(dispatch_registration)['jobs_sha256']!=registration_hash:raise ValueError('Dispatch registration changed')
++        event('CONTINUE_UNSTARTED_ONLY',verified_completed=[j['job_id'] for j in existing])
++    else:
++        C.write(dispatch_registration,dict(jobs_sha256=registration_hash,maximum_workers=2,
++            threads_per_worker=1,initial_resources=snapshot(),resumed_complete_jobs=[j['job_id'] for j in existing]))
++    started=time.perf_counter();logs=[];active={}
++    def launch(job,phase):
++        path=folder/(job['job_id']+'.log')
++        if path.exists():raise RuntimeError('Attempt log exists: '+str(path))
++        log=path.open('xb');logs.append(log)
++        env=os.environ.copy();env['CUDA_VISIBLE_DEVICES']=''
++        for name in ('OMP_NUM_THREADS','MKL_NUM_THREADS','OPENBLAS_NUM_THREADS','NUMEXPR_NUM_THREADS'):env[name]='1'
++        p=subprocess.Popen(command(job),cwd=C.ROOT,stdout=log,stderr=subprocess.STDOUT,env=env)
++        active[p.pid]=(p,job,log,time.perf_counter())
++        event('START',job_id=job['job_id'],pid=p.pid,phase=phase,active_workers=len(active))
++    # Reused receipts do not estimate scientific workspace. Measure the first physical job.
++    physical=[j for j in pending if not (j.get('reuse_of') or j.get('reuse_of_external') or j.get('reuse_original_d0'))]
++    first=physical[0] if physical else pending[0]
++    pending.remove(first);launch(first,'FIRST_AUTHORIZED_JOB_MEASUREMENT')
++    pid=next(iter(active));p,j,log,tick=active[pid]
++    while p.poll() is None:time.sleep(1)
++    log.close();active.pop(pid)
++    if p.returncode:raise RuntimeError('First job failed; no retries: '+j['job_id'])
++    if not receipt(j).exists():raise RuntimeError('Missing first completion receipt')
++    r=C.read(receipt(j));after=snapshot()
++    peak_kib=r.get('peak_RSS_KiB',r.get('peak_rss_kib',0))
++    peak_bytes=float(peak_kib)*1024
++    if peak_bytes<=0:workers=1
++    else:
++        reserve=max(2*(1<<30),.1*after['ram']['total'])
++        memory_workers=int(max(0,after['ram']['available']-reserve)//(1.2*peak_bytes))
++        workers=min(2,memory_workers,max(1,after['cpu_count']//2))
++        if workers<1:raise RuntimeError('Insufficient resource headroom after measured job')
++    C.write(folder/'measured_dispatch.json',dict(first_job=j['job_id'],first_peak_RSS_KiB=peak_kib,
++        chosen_workers=workers,resources_after_first=after,peak_scope='fresh subprocess lifetime RSS, includes all CPU scientific phases',
++        parallel_wall_times_not_isolated_benchmarks=True))
++    event('COMPLETE',job_id=j['job_id'],seconds=time.perf_counter()-tick,workers_next=workers)
++    failed=[]
++    while pending or active:
++        # Dependencies are immutable cached aliases, so launch only after owner completion.
++        while len(active)<workers and pending and not failed:
++            ready=next((x for x in pending if not x.get('reuse_of') or (C.OUT/'runs'/x['reuse_of']/'complete.json').exists()),None)
++            if ready is None:break
++            current=snapshot()
++            margin=max(2*(1<<30),.1*current['ram']['total'])
++            if peak_bytes>0 and current['ram']['available']-margin<1.2*peak_bytes:
++                event('WAIT_MEMORY_HEADROOM',resources=current,observed_peak_bytes=peak_bytes)
++                break
++            event('RESOURCE_BEFORE_DISPATCH',resources=current,observed_peak_bytes=peak_bytes)
++            pending.remove(ready);launch(ready,'BOUNDED_CPU_POOL')
++        for pid,(p,j,log,tick) in list(active.items()):
++            if p.poll() is not None:
++                log.close();active.pop(pid)
++                if p.returncode or not receipt(j).exists():failed.append(j['job_id'])
++                elif not (j.get('reuse_of') or j.get('reuse_of_external') or j.get('reuse_original_d0')):
++                    peak_bytes=max(peak_bytes,float(C.read(receipt(j)).get('peak_RSS_KiB',0))*1024)
++                event('FAILED' if j['job_id'] in failed else 'COMPLETE',job_id=j['job_id'],returncode=p.returncode,
++                      seconds=time.perf_counter()-tick,resources_after=snapshot())
++        if failed and not active:raise RuntimeError('Failure preserved, remaining jobs not dispatched: '+str(failed))
++        if pending and not active and not any(not x.get('reuse_of') or (C.OUT/'runs'/x['reuse_of']/'complete.json').exists() for x in pending):
++            raise RuntimeError('Unresolved alias dependency')
++        if active or pending:time.sleep(1)
++    C.verify(reg['protected']);C.verify(reg['source_hashes'])
++    C.write(folder/'complete.json',dict(status='COMPLETE',logical_jobs=len(reg['jobs']),budget=reg['budget'],
++        seconds=time.perf_counter()-started,workers=workers,resources_final=snapshot(),
++        completions={str(receipt(j)):C.sha(receipt(j)) for j in reg['jobs']}))
++    event('ALL_COMPLETE',logical_jobs=len(reg['jobs']),seconds=time.perf_counter()-started)
++
++
++if __name__=='__main__':run()
+diff --git a/r2/pilots/bench_regional_mix_dual_v1/panel_prepare.py b/r2/pilots/bench_regional_mix_dual_v1/panel_prepare.py
+new file mode 100644
+--- /dev/null
++++ b/r2/pilots/bench_regional_mix_dual_v1/panel_prepare.py
+@@ -0,0 +1,191 @@
++"""Six pre-output development requests and assisted RAW support regions.
++
++CPU only: no model, target Y, score computation or backend execution.
++All original queries, noises, camera/section settings and source arrays stay read-only.
++"""
++from __future__ import annotations
++import os
++for key in ('OMP_NUM_THREADS','MKL_NUM_THREADS','OPENBLAS_NUM_THREADS','NUMEXPR_NUM_THREADS'):
++    os.environ[key]='1'
++os.environ['CUDA_VISIBLE_DEVICES']=''
++import argparse,csv,hashlib,io,json,subprocess,time
++from datetime import datetime,timezone
++from pathlib import Path
++import numpy as np
++
++ROOT=Path(__file__).resolve().parents[3]
++OUT=ROOT/'experiments/r2_bench_regional_mix_dual_v1/panel'
++OLD=ROOT/'experiments/r2_bench_four_routes_v1/hybrid'
++PARENTS=['a8e987a6a6486b962d6c8e51365a5a87','27eb79ddf26fd7ac7898580cb9d16864','459f90aa2162b1f1d46c340938e2ff1c']
++L=9.208138264587333
++VIEWED={
++ ('a8',0):('2026-10-28 03:15:46 UTC','panel_existing_a8_n0','RAW has broad thin legs; official D0 chain leaves near-line remnants. Central sections miss legs but show loss of seat-strip thickness.'),
++ ('a8',1):('2026-10-28 03:15:52 UTC','panel_existing_a8_n1','Both views show RAW leg surfaces versus thin D0 remnants; seat-strip cross sections also shrink. No exact weld certification.'),
++ ('27',0):('2026-10-28 03:15:56 UTC','panel_existing_27_n0','RAW lower end supports and arm frames are visible; D0 removes major leg surfaces. Back and curved C survive more clearly; upper frame is outside the selected lower zones.'),
++ ('27',1):('2026-10-28 03:16:01 UTC','panel_existing_27_n1','RAW lower legs remain visible in opposite views; D0 leaves thin end remnants. The central side cut does not pass through the legs.'),
++ ('45',0):('2026-10-28 03:16:07 UTC','panel_existing_459_n0','RAW has loop-like end supports and a layered/folded underside. D0 removes underside clutter but also major support/back surfaces; cleaning value and structural cost coexist.'),
++ ('45',1):('2026-10-28 03:16:22 UTC','panel_existing_459_n1','RAW has thin legs but a gray slatted seat above blue C. D0 thins the gray shell and legs; this local support test is not expected to repair C role or wrong height.'),
++}
++
++def now():return datetime.now(timezone.utc).isoformat()
++def read(p):return json.loads(Path(p).read_text(encoding='utf-8'))
++def sha(p):
++    h=hashlib.sha256()
++    with Path(p).open('rb') as f:
++        for b in iter(lambda:f.read(1048576),b''):h.update(b)
++    return h.hexdigest()
++def write(p,x):
++    p=Path(p);p.parent.mkdir(parents=True,exist_ok=True)
++    text=json.dumps(x,ensure_ascii=False,indent=2)+'\n'
++    if p.exists():
++        if p.read_text(encoding='utf-8')!=text:raise RuntimeError('Refuse overwrite: '+str(p))
++    else:
++        with p.open('x',encoding='utf-8') as f:f.write(text)
++def array_hash(a):
++    return hashlib.sha256(np.ascontiguousarray(a).tobytes()).hexdigest()
++def resources():
++    import psutil
++    r=dict(utc=now(),cpu_cores=os.cpu_count(),cpu_percent=psutil.cpu_percent(.1),RAM_available=psutil.virtual_memory().available,
++           loadavg=list(os.getloadavg()),threads=1,workers=1,model_calls=0,score_calls=0)
++    for key,args in [('gpu',['--query-gpu=name,memory.total,memory.used,memory.free,utilization.gpu','--format=csv,noheader']),
++                     ('gpu_processes',['--query-compute-apps=pid,process_name,used_memory','--format=csv,noheader'])]:
++        p=subprocess.run(['nvidia-smi',*args],capture_output=True,text=True);r[key]=p.stdout.strip();r[key+'_returncode']=p.returncode
++    return r
++
++def select_regions(raw,k):
++    """Fixed by C bounds, same rule for both noises; complete triangles only."""
++    c=raw[:k].astype(np.float64);v=raw.astype(np.float64)
++    low,high=c.min((0,1)),c.max((0,1));width=float(high[0]-low[0]);cx=float((high[0]+low[0])/2)
++    assert width>0
++    ycut=float(low[1]-.05*width);xleft=float(cx-.30*width);xright=float(cx+.30*width)
++    centers=v.mean(1);low_enough=v[:,:,1].min(1)<ycut;free=np.arange(len(v))>=k
++    masks=[free&low_enough&(centers[:,0]<=xleft),free&low_enough&(centers[:,0]>=xright)]
++    assert not (masks[0]&masks[1]).any()
++    defs=dict(version='assisted_C_bbox_outer20_lower_support_v1',C_bbox_min=low.tolist(),C_bbox_max=high.tolist(),
++              x_center=cx,C_width=width,x_left_max=xleft,x_right_min=xright,triangle_min_y_less_than=ycut,
++              exact_rule='free AND min(corner_y)<C_min_y-0.05*C_width AND centroid_x<=cx-0.30*C_width (P1) / >=cx+0.30*C_width (P2)',
++              scope='Whole RAW triangles; no clipping, recursion, source-Y lookup or result-based edits. Both noises share C-defined thresholds.',
++              boundary_limit='A selected triangle may cross a spatial threshold; switching its whole coordinates can break alignment to neighboring D0 triangles. No automatic coherence guarantee.')
++    return masks,defs
++
++def render(entry):
++    from r2.pilots.chair_multipart_seam_v1 import gallery as G
++    D,H=G.D,G.H;plt=H._mpl()
++    from matplotlib.collections import LineCollection
++    q=entry['request'];rid=q['request_id'];k=q['K'];raw=np.load(entry['paths']['raw'])['raw'];masks,defs=select_regions(raw,k)
++    path=OUT/'selection_images'/(rid+'.png');path.parent.mkdir(parents=True,exist_ok=True)
++    if path.exists():raise RuntimeError('Refuse rerender '+str(path))
++    fig=plt.figure(figsize=(17,11),dpi=120);gs=fig.add_gridspec(3,3,width_ratios=[1,1,.8],height_ratios=[1.15,1,1],left=.04,right=.98,bottom=.05,top=.91,hspace=.28,wspace=.24)
++    colors=[np.array([235,142,37]),np.array([157,83,190])];hexes=['#eb8e25','#9d53be'];depth=q['gallery_depth_bounds'];bounds=q['gallery_bounds']
++    for col,az in enumerate((-60,120)):
++        B=D.basis(az,23);im,owner=D.raster(raw,k,B,np.array(depth['center']),depth['span'],size=700);rgb=np.asarray(im).copy()
++        ax=fig.add_subplot(gs[0,col])
++        for mask,color in zip(masks,colors):
++            pixels=np.isin(owner,np.flatnonzero(mask));shade=rgb[pixels,0].astype(float)/185
++            rgb[pixels]=np.clip(shade[:,None]*color,0,255).astype(np.uint8)
++        ax.imshow(rgb);ax.axis('off');ax.set_title('RAW region membership | azimuth '+str(az))
++    # Original finite sections stay unchanged. Missing colored segments simply mean this cut misses the legs.
++    geom=dict(C=raw[:k],F=raw[k:],C_original=raw[:k],tri=raw)
++    for col,view in enumerate(('front','side')):
++        ax=fig.add_subplot(gs[1,col]);H.draw_section(ax,geom,np.array([],dtype=int),bounds,L,view,1)
++        axis,project=(2,(0,1)) if view=='front' else (0,(2,1));pos=bounds[view+'_positions'][1]
++        seg,ids=H.finite_sections(raw[k:],axis,pos,1e-12*L)
++        for mask,color in zip(masks,hexes):
++            keep=mask[k:][ids]
++            if keep.any():ax.add_collection(LineCollection(seg[keep][:,:,project],colors=color,linewidths=2,zorder=5))
++        ax.set_title('Inherited '+view+' section = '+format(pos,'.5f'),fontsize=9)
++    # Extra all-face front projection is solely an ID-selection diagram, not a replacement evaluation camera.
++    for col,(mask,color) in enumerate(zip(masks,hexes)):
++        ax=fig.add_subplot(gs[2,col]);ids=np.flatnonzero(mask)
++        for fi in range(k):ax.plot(*np.vstack([raw[fi],raw[fi,0]])[:,[0,1]].T,color='#1686c0',lw=.45,alpha=.5)
++        for i,fi in enumerate(ids):
++            tri=raw[fi];ax.plot(*np.vstack([tri,tri[0]])[:,[0,1]].T,color=color,lw=.75);center=tri.mean(0)
++            ax.annotate(str(fi),(center[0],center[1]),xytext=(7+(i%2)*10,(i%5-2)*9),textcoords='offset points',fontsize=6,color=color,arrowprops=dict(arrowstyle='-',lw=.35,color=color))
++        if len(ids):
++            v=raw[ids].reshape(-1,3);lo=v.min(0);hi=v.max(0);ax.set_xlim(lo[0]-.22,hi[0]+.30);ax.set_ylim(lo[1]-.16,hi[1]+.16)
++        ax.set_xlabel('X (model)');ax.set_ylabel('Y (model)');ax.grid(alpha=.12);ax.set_title(f'P{col+1}: selected RAW slot IDs (support zoom)',fontsize=9)
++    textax=fig.add_subplot(gs[:,2]);textax.axis('off');text=[]
++    for region in entry['regions']:
++        ids=region['source_face_ids'];text.append(region['region_id']+' | '+str(len(ids))+' RAW slots\n'+', '.join(map(str,ids)))
++    import textwrap
++    body='\n\n'.join(textwrap.fill(t,44,replace_whitespace=False) for t in text)
++    body+='\n\nC: blue; P1: orange; P2: purple.\nOther free: gray.\n\nThe bottom drawings are ID-only\nzoom supplements. Top cameras and\ncentral section positions are inherited.\n\nSelection uses RAW + C only.\nNo Y, candidate, or scoring consulted.\nNo connectivity correctness claimed.\n\nWhole-face switching can introduce\na mixed-coordinate boundary gap.'
++    textax.text(0,1,body,va='top',fontsize=10)
++    fig.suptitle(rid+f'\nPre-output assisted regions | N={len(raw)} K={k} | lower left/right support zones',fontsize=12)
++    b=io.BytesIO();fig.savefig(b,format='png');plt.close(fig)
++    with path.open('xb') as f:f.write(b.getvalue())
++    return dict(path=str(path),sha256=sha(path),status='PENDING_ACTUAL_VIEW',inherited_depth=depth,inherited_sections=bounds,
++                supplemental_view='Two region-only front projections with RAW slot labels; not used as alternative evaluation cameras')
++
++def prepare():
++    OUT.mkdir(parents=True,exist_ok=True);write(OUT/'resources_before.json',resources())
++    regpath=OLD/'registration.json';reg=read(regpath);entries=[];protected={str(regpath):sha(regpath)};face_rows=[]
++    for parent in PARENTS:
++        tasks=sorted((t for t in reg['tasks'] if t['request']['parent_id']==parent),key=lambda t:t['request']['noise_index'])
++        assert len(tasks)==2
++        prior_definition=None
++        for task in tasks:
++            q=task['request'];rid=task['request_id'];k=q['K'];rawfile=task['paths']['raw'];z=np.load(rawfile);raw=z['raw'];assert raw.shape==(q['N'],3,3)
++            assert np.isfinite(raw).all();assert np.array_equal(z['raw_slot_ids'],np.arange(len(raw)))
++            masks,definition=select_regions(raw,k)
++            if prior_definition is None:prior_definition=definition
++            else:assert prior_definition==definition
++            regions=[]
++            for idx,mask in enumerate(masks):
++                ids=np.flatnonzero(mask).tolist();assert ids and min(ids)>=k
++                regions.append(dict(region_id='P'+str(idx+1),source_face_ids=ids,source_id_domain='original_generated_RAW_slot',
++                                    definition={**definition,'side':'left' if idx==0 else 'right'},semantic_intent='lower end support; auxiliary nonblind AI_PROXY selection',
++                                    target_validity='UNKNOWN: membership is not a clean-GT or physical-support certification'))
++            stamp,event,note=VIEWED[(parent[:2],q['noise_index'])]
++            image=OLD/'gallery'/('CLEAN_FINAL_POST__'+rid+'.png')
++            evidence=dict(path=str(image),sha256=sha(image),actually_viewed=True,utc=stamp,view_event_id=event,
++                          reviewer='backend_data',review_type='NONBLIND_AI_PROXY',view_tool='functions.exec/tools.view_image',notes=note,
++                          display='Previously completed RAW/M_D0/HYBRID sheet; no new regional candidate exists at selection time')
++            relevant={name:p for name,p in task['paths'].items() if name in ('raw','pre','original_base','original_final','input','metadata','query')}
++            hashes={p:sha(p) for p in relevant.values()};protected.update(hashes);protected[str(image)]=sha(image)
++            selection=OLD/'outputs'/rid/'selection.npz';protected[str(selection)]=sha(selection)
++            entry=dict(request_id=rid,request=q,paths=task['paths'],input_hashes=hashes,regions=regions,evidence=[evidence],
++                       previous_hybrid_selection_path=str(selection),previous_hybrid_selection_sha256=sha(selection),
++                       raw_canonical_coordinate_sha256=array_hash(raw),raw_C_coordinate_sha256=array_hash(raw[:k]),
++                       regions_are_pre_output=True,source_Y_loaded=False,raw_faces=len(raw),known_faces=k)
++            entry['selection_image']=render(entry);protected[entry['selection_image']['path']]=entry['selection_image']['sha256']
++            for fi in range(len(raw)):
++                face_rows.append(dict(request_id=rid,raw_slot=fi,is_C=fi<k,region='P1' if masks[0][fi] else 'P2' if masks[1][fi] else '',
++                                      centroid_x=float(raw[fi,:,0].mean()),min_y=float(raw[fi,:,1].min())))
++            entries.append(entry)
++    assert len(entries)==6
++    manifest=dict(version='regional_mix_dual_assisted_panel_v1',status='REGIONS_FIXED_PENDING_SELECTION_IMAGE_REVIEW',created_utc=now(),
++                  selection_scope='AI_PROXY_ASSISTED_PRE_OUTPUT_DEVELOPMENT_FAULT_COVERAGE',requests=entries,protected=protected,
++                  selection_reason='a8 and 27 cover thin support/end-frame surface loss; 459 additionally exposes RAW folds and D0-chain cleanup value. Fixed before any regional candidate.',
++                  scope_limits=['3 development parents x 2 already viewed noises; not a representative or independent test set.',
++                    'No new model/noise/query/camera/section. No unique source Y used to choose regions.',
++                    'af/bcb and other high-N parents are outside this small structural feasibility panel; no high-N scope or latency certification follows. Their past long runtimes are not a result-based selection rule.',
++                    'The 459/n1 gray-above-blue organization error can remain despite successful local support restoration.',
++                    'Whole-face P1/P2 membership is assisted and deterministic after freeze; it is not the automatic detector result.'],
++                  accounting=dict(model_calls=0,denoiser_calls=0,scoring_calls=0,backend_calls=0,new_noise=0,source_Y_arrays_loaded=0),
++                  source_code_sha256=sha(__file__))
++    path=OUT/'region_membership.csv'
++    with path.open('x',newline='',encoding='utf-8') as f:
++        w=csv.DictWriter(f,fieldnames=list(face_rows[0]));w.writeheader();w.writerows(face_rows)
++    manifest['membership_csv']=dict(path=str(path),sha256=sha(path));write(OUT/'manifest_pending_review.json',manifest)
++    print(json.dumps(dict(status=manifest['status'],requests=[dict(request_id=e['request_id'],regions={r['region_id']:len(r['source_face_ids']) for r in e['regions']}) for e in entries]),indent=2))
++    return manifest
++
++def freeze():
++    m=read(OUT/'manifest_pending_review.json');review=read(OUT/'selection_image_review.json')
++    rr={r['request_id']:r for r in review['records']};assert set(rr)=={r['request_id'] for r in m['requests']}
++    for e in m['requests']:
++        r=rr[e['request_id']];assert r['actually_viewed'] is True and r['image_sha256']==e['selection_image']['sha256'] and r['region_membership_confirmed'] is True
++        e['selection_image']['actual_review']=r
++    for p,h in m['protected'].items():assert sha(p)==h,p
++    m.update(status='FROZEN',frozen_utc=now(),selection_image_review_sha256=sha(OUT/'selection_image_review.json'))
++    write(OUT/'manifest.json',m)
++    gate=dict(status='PASS',utc=now(),requests=6,parents=3,regions=12,all_C_excluded=True,same_parent_same_spatial_definition=True,
++              same_original_queries_and_noise=True,original_assets_unchanged=True,actual_prior_views=6,actual_region_image_views=6,
++              raw_slot_domain='original generated RAW indices; never target-Y face IDs',model_calls=0,scoring_calls=0,backend_calls=0,
++              manifest_sha256=sha(OUT/'manifest.json'),code_sha256=sha(__file__))
++    write(OUT/'COMPLETE.json',gate);print(json.dumps(gate,indent=2));return gate
++
++if __name__=='__main__':
++    p=argparse.ArgumentParser();p.add_argument('action',choices=['prepare','freeze']);a=p.parse_args()
++    prepare() if a.action=='prepare' else freeze()
+diff --git a/r2/pilots/bench_regional_mix_dual_v1/prepare.py b/r2/pilots/bench_regional_mix_dual_v1/prepare.py
+new file mode 100644
+--- /dev/null
++++ b/r2/pilots/bench_regional_mix_dual_v1/prepare.py
+@@ -0,0 +1,151 @@
++"""Freeze all logical candidates before dispatch; no models or scorer calls."""
++from . import common as C
++import csv, hashlib, io, json
++import numpy as np
++
++
++def array_hash(a):
++    return hashlib.sha256(np.ascontiguousarray(a).tobytes()).hexdigest()
++
++
++def immutable_npz(path, values):
++    if path.exists():
++        prior=C.arrays(path)
++        if set(prior)!=set(values) or any(prior[k].dtype!=v.dtype or prior[k].shape!=v.shape or prior[k].tobytes()!=v.tobytes() for k,v in values.items()):
++            raise ValueError('Prepared arrays changed: '+str(path))
++    else:C.npz(path,values)
++
++
++def immutable_csv(path, rows):
++    if not path.exists():C.csvwrite(path,rows);return
++    keys=list(dict.fromkeys(k for row in rows for k in row))
++    buffer=io.StringIO(newline='');writer=csv.DictWriter(buffer,fieldnames=keys);writer.writeheader();writer.writerows(rows)
++    if path.read_bytes()!=buffer.getvalue().encode('utf-8-sig'):raise ValueError('Prepared table changed: '+str(path))
++
++
++def boundary_ledger(output, selected, ids, known):
++    flat=output.reshape(-1,3).astype(float)
++    choice=np.repeat(selected,3)
++    free=np.arange(len(flat))>=known*3
++    result=[]
++    for cid in np.unique(ids):
++        members=np.flatnonzero(ids.reshape(-1)==cid)
++        a=members[choice[members]]
++        b=members[~choice[members]&free[members]]
++        c=members[~free[members]]
++        if len(a) and (len(b) or len(c)):
++            other=np.concatenate((b,c))
++            distances=np.linalg.norm(flat[a,None]-flat[None,other],axis=2)
++            result.append(dict(cluster_id=int(cid),RAW_flat_corners=a.tolist(),D0_flat_corners=b.tolist(),C_flat_corners=c.tolist(),
++                minimum_gap=float(distances.min()),maximum_gap=float(distances.max()),
++                exact_pairs=int((distances==0).sum()),total_pairs=int(distances.size),
++                all_members_same_position=bool(np.all(flat[members]==flat[members[0]]))))
++    return result
++
++
++def run():
++    from . import coverage, runtime
++    from meshflow_control import geo_c
++    from r2.pilots.bench_four_routes_v1.hybrid.selector import quantities
++    from r2.pilots.bench_group_weight_match_v1 import evaluation as E
++    target=C.OUT/'jobs.json'
++    if target.exists():
++        r=C.read(target);C.verify(r['protected']);C.verify(r['source_hashes']);return r
++    panel_path=C.OUT/'panel/manifest.json'
++    panel=C.read(panel_path)
++    old_path=C.OLD/'registration.json';old=C.read(old_path)
++    C.verify(panel.get('protected',{}));C.verify(old['protected']);C.verify(old['source_hashes'])
++    tasks={t['request_id']:t for t in old['tasks']}
++    assert len(panel['requests'])==6
++    protected={str(panel_path):C.sha(panel_path),str(C.OUT/'PROTOCOL.md'):C.sha(C.OUT/'PROTOCOL.md')}
++    protected.update({str(C.resolve(x)):C.sha(x) for x in panel.get('protected',{})})
++    jobs=[];references=[];selections=[]
++    for index,item in enumerate(panel['requests']):
++        rid=item['request_id'];task=tasks[rid];q=task['request'];paths=task['paths']
++        if item['request']!=q:raise ValueError('Panel request was altered: '+rid)
++        for p in paths.values():protected[str(C.resolve(p))]=C.sha(p)
++        raw=C.arrays(paths['raw'])['raw'];pre=C.arrays(paths['pre'])['output'];k=int(q['K']);n=len(raw)
++        if raw[:k].tobytes()!=pre[:k].tobytes():raise AssertionError('C mismatch')
++        oldsel_path=C.OLD/'outputs'/rid/'selection.npz'
++        old_receipt_path=oldsel_path.with_name('complete.json')
++        old_receipt=C.read(old_receipt_path)
++        if old_receipt['status']!='COMPLETE' or old_receipt['registration_sha256']!=C.sha(old_path):
++            raise ValueError('Old RAW-GEO producer identity differs')
++        C.verify(old_receipt['files']);protected[str(old_receipt_path)]=C.sha(old_receipt_path)
++        oldsel=C.arrays(oldsel_path);protected[str(oldsel_path)]=C.sha(oldsel_path)
++        ids=oldsel['cluster_ids'];base=C.arrays(paths['original_base'])['output']
++        area,_=quantities(raw)
++        masks={}
++        for region in item['regions']:
++            mask=np.zeros(n,bool);slots=np.asarray(region['source_face_ids'],int)
++            if len(slots)==0 or np.any(slots<k) or np.any(slots>=n) or len(set(slots))!=len(slots):raise ValueError('Invalid frozen region')
++            mask[slots]=True;masks[region['region_id']]=mask
++        if set(masks)!={'P1','P2'}:raise ValueError('Expected two frozen regions')
++        if np.any(masks['P1']&masks['P2']):raise ValueError('Assisted regions must be disjoint')
++        auto=coverage.select(raw,pre,k,base,ids,L=C.L,R=geo_c.RADIUS)
++        cdir=C.OUT/'selectors'/rid;cdir.mkdir(parents=True,exist_ok=True)
++        # Complete machine-readable automatic selector, including rejected components.
++        for key,value in auto.items():
++            if key not in ('output',) and not isinstance(value,np.ndarray):
++                C.write(cdir/('auto_'+key+'.json'),value)
++        immutable_npz(cdir/'auto_arrays.npz',{key:v for key,v in auto.items() if isinstance(v,np.ndarray)})
++        automatic=auto.get('selected_RAW',auto.get('selected_raw'))
++        if automatic is None:raise KeyError('Automatic selector must expose selected_RAW')
++        rawmask=np.arange(n)>=k
++        variants=[('RAW_ALL',rawmask),('ASSIST10',masks['P1']),('ASSIST01',masks['P2']),
++                  ('ASSIST11',masks['P1']|masks['P2']),('AUTO_COVER',automatic)]
++        seen={}
++        for label,mask in variants:
++            mask=np.asarray(mask,bool);assert mask.shape==(n,) and not mask[:k].any()
++            proposal=pre.copy();proposal[mask]=raw[mask];proposal[:k]=raw[:k]
++            if label=='AUTO_COVER' and not np.array_equal(proposal,auto['output']):raise AssertionError('AUTO contract mismatch')
++            jid=f'J{index:02d}_{label}';dest=C.OUT/'proposals'/jid
++            immutable_npz(dest/'proposal.npz',dict(output=proposal,known_faces=np.asarray(k),raw_slot_ids=np.arange(n),
++                  source_corner_ids=np.tile(np.arange(3),(n,1)),selected_RAW=mask))
++            bh=boundary_ledger(proposal,mask,ids,k);C.write(dest/'mixed_boundary.json',bh)
++            immutable_csv(dest/'selection_per_face.csv',[dict(raw_slot=f,known=f<k,selected_RAW=bool(mask[f]),
++                raw_area=float(area[f]),max_shift_from_D0=float(np.linalg.norm(proposal[f].astype(float)-pre[f],axis=1).max())) for f in range(n)])
++            detail=dict(job_id=jid,request_id=rid,parent_id=q['parent_id'],noise_index=q['noise_index'],label=label,
++                selected_RAW_faces=int(mask.sum()),free_faces=n-k,selected_RAW_fraction=float(mask.sum()/(n-k)),
++                selected_RAW_area=float(area[mask].sum()),raw_free_area=float(area[k:].sum()),
++                selected_RAW_area_fraction=float(area[mask].sum()/area[k:].sum()),
++                mixed_boundary_clusters=len(bh),RAW_D0_boundary_clusters=sum(bool(x['D0_flat_corners']) for x in bh),
++                noncoincident_RAW_D0_clusters=sum(bool(x['D0_flat_corners']) and not x['all_members_same_position'] for x in bh),
++                C_bytes_preserved=proposal[:k].tobytes()==raw[:k].tobytes(),proposal_array_sha256=array_hash(proposal))
++            selections.append(detail);C.write(dest/'selection_summary.json',detail)
++            job=dict(job_id=jid,label=label,request=q,paths=paths,
++                proposal=dict(path=str(dest/'proposal.npz'),sha256=C.sha(dest/'proposal.npz'),output_key='output'),
++                selection_summary=str(dest/'selection_summary.json'),mixed_boundary=str(dest/'mixed_boundary.json'),reuse_of=None)
++            digest=array_hash(proposal)
++            if digest in seen:
++                job['reuse_of']=seen[digest]
++            elif proposal.tobytes()==pre.tobytes():
++                job['reuse_original_d0']=True
++            elif proposal.tobytes()==C.arrays(C.OLD/'outputs'/rid/'pre_geo.npz')['output'].tobytes():
++                receipt=C.OLD/'outputs'/rid/'complete.json'
++                job['reuse_of_external']=dict(registration_path=str(old_path),registration_sha256=C.sha(old_path),request_id=rid,
++                    complete_path=str(receipt),complete_sha256=C.sha(receipt),cpu_dir=str(C.OLD/'cpu/HYBRID'/rid))
++            seen[digest]=jid;jobs.append(job)
++        references.append(task)
++    if len(jobs)!=30:raise AssertionError('Logical budget must be30')
++    sources={str(p):C.sha(p) for p in C.CODE.glob('*.py')}
++    sources.update(old['source_hashes'])
++    sources.update(runtime.definition_hashes())
++    from r2.tools.cref_layer_audit_v1 import geometry as finite_geometry
++    sources[str(C.resolve(finite_geometry.__file__))]=C.sha(finite_geometry.__file__)
++    sources[str(C.resolve(geo_c.__file__))]=C.sha(geo_c.__file__)
++    physical=[j for j in jobs if not j.get('reuse_of') and not j.get('reuse_of_external') and not j.get('reuse_original_d0')]
++    registration=dict(status='FROZEN',schema='bench_regional_mix_dual_v1',utc=C.utc(),jobs=jobs,references=references,
++        panel_sha256=C.sha(panel_path),protocol_sha256=C.sha(C.OUT/'PROTOCOL.md'),protected=protected,source_hashes=sources,
++        metric_fields=C.read(E.MANIFEST)['metric_fields'],L=C.L,R=geo_c.RADIUS,
++        budget=dict(logical_jobs=30,physical_jobs=len(physical),new_score_rows=2*len(physical),
++                    maximum_full_cascades=30,model_calls=0,D0_calls=0,training_updates=0,new_noise=0),
++        scheduling=dict(maximum_workers=2,threads_per_worker=1,first_measured_authorized_job=True),
++        no_GT_success=True,no_result_based_selection=True)
++    immutable_csv(C.OUT/'selection_per_output.csv',selections)
++    C.write(target,registration)
++    return registration
++
++
++if __name__=='__main__':
++    r=run();print(json.dumps(dict(status=r['status'],budget=r['budget']),ensure_ascii=False))
+diff --git a/r2/pilots/bench_regional_mix_dual_v1/runtime.py b/r2/pilots/bench_regional_mix_dual_v1/runtime.py
+new file mode 100644
+--- /dev/null
++++ b/r2/pilots/bench_regional_mix_dual_v1/runtime.py
+@@ -0,0 +1,538 @@
++"""Isolated CPU runner for frozen regional RAW/D0 coordinate proposals.
++
++This module does not generate proposals, dispatch pools, train, call D0, or
++assign visual labels. Complete jobs are verified and reused; partial jobs are
++never replayed automatically. Run only through the root's measured dispatch.
++"""
++from __future__ import annotations
++
++import os
++os.environ['CUDA_VISIBLE_DEVICES'] = ''
++for _name in ('OMP_NUM_THREADS','OPENBLAS_NUM_THREADS','MKL_NUM_THREADS','NUMEXPR_NUM_THREADS'):
++    os.environ[_name] = '1'
++
++import argparse
++import csv
++import hashlib
++import io
++import json
++import re
++import resource
++import sys
++import time
++import traceback
++from datetime import datetime, timezone
++from pathlib import Path
++import numpy as np
++
++ROOT = Path(__file__).resolve().parents[3]
++OUT = ROOT / 'experiments/r2_bench_regional_mix_dual_v1'
++L = float(np.sqrt(3.) * 2 / .3762)
++VERSION = 'bench_regional_mix_cpu_runtime_v1'
++for _path in (ROOT, ROOT / 'r2/src'):
++    sys.path.insert(0, str(_path))
++
++
++def utc():
++    return datetime.now(timezone.utc).isoformat()
++
++
++def resolve(value):
++    text = str(value).replace('\\','/')
++    for prefix in ('E:/MeshFlow/','/mnt/e/MeshFlow/'):
++        if text.startswith(prefix):
++            return ROOT / text[len(prefix):]
++    p = Path(text)
++    return p if p.is_absolute() else ROOT / p
++
++
++def sha(path):
++    h = hashlib.sha256()
++    with resolve(path).open('rb') as f:
++        for block in iter(lambda:f.read(1024*1024), b''):
++            h.update(block)
++    return h.hexdigest()
++
++
++def clean(value):
++    if isinstance(value,dict): return {str(k):clean(v) for k,v in value.items()}
++    if isinstance(value,(list,tuple)): return [clean(v) for v in value]
++    if isinstance(value,np.ndarray): return value.tolist()
++    if isinstance(value,np.generic): return value.item()
++    if isinstance(value,Path): return str(value)
++    return value
++
++
++def canonical_hash(value):
++    return hashlib.sha256(json.dumps(clean(value),sort_keys=True,separators=(',',':'),allow_nan=False).encode()).hexdigest()
++
++
++def read(path):
++    return json.loads(resolve(path).read_text(encoding='utf-8-sig'))
++
++
++def write_new(path,value):
++    p=resolve(path);p.parent.mkdir(parents=True,exist_ok=True)
++    with p.open('x',encoding='utf-8') as f:
++        json.dump(clean(value),f,ensure_ascii=False,indent=2,allow_nan=False)
++
++
++def npz(path,value):
++    p=resolve(path);p.parent.mkdir(parents=True,exist_ok=True)
++    with p.open('xb') as f: np.savez_compressed(f,**value)
++
++
++def arrays(path):
++    with np.load(resolve(path),allow_pickle=False) as z:
++        return {k:z[k].copy() for k in z.files}
++
++
++def csvwrite(path,rows):
++    p=resolve(path);p.parent.mkdir(parents=True,exist_ok=True)
++    fields=list(dict.fromkeys(k for r in rows for k in r))
++    with p.open('x',encoding='utf-8-sig',newline='') as f:
++        w=csv.DictWriter(f,fieldnames=fields);w.writeheader()
++        for row in rows:
++            w.writerow({k:json.dumps(clean(v),ensure_ascii=False) if isinstance(v,(dict,list,tuple)) else v for k,v in row.items()})
++
++
++def verify(book):
++    for path,expected in book.items():
++        if sha(path)!=expected: raise ValueError('Frozen hash changed: '+str(path))
++
++
++def assert_cpu():
++    if 'torch' in sys.modules:
++        raise RuntimeError('CPU-only boundary violated: torch imported')
++
++
++def resources():
++    """Measured raw GPU query plus normalized CPU fields; no GPU work."""
++    assert_cpu()
++    from r2.pilots.bench_adaptation_strength_v1.common import resources as original
++    r=original()
++    return dict(utc=utc(),cpu_logical=r['CPU_cores'],cpu_percent=r['CPU_percent'],
++                ram_total_bytes=r['RAM_total'],ram_available_bytes=r['RAM_available'],
++                loadavg=r['load'],gpu=r['gpu'],gpu_processes=r['gpu_processes'],
++                science_and_python_processes=r['science_and_python_processes'],
++                threads_per_worker=1,scope='Aggregate measured resources; no process-VRAM estimate',
++                peak_RSS_KiB=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
++
++
++def modules():
++    assert_cpu()
++    from meshflow_control import geo_c,geo_io,source_winding
++    from r2.pilots.seam_slot_c200_v1 import postprocess as P
++    from r2.pilots.bench_clean_multipart_seam_v1 import post_cpu as CPU
++    from r2.pilots.bench_four_routes_v1.hybrid.run import ledger_compare
++    assert_cpu()
++    return geo_c,geo_io,source_winding,P,CPU,ledger_compare
++
++
++def definition_hashes():
++    geo,io_,sw,P,CPU,ledger_compare=modules()
++    from r2.pilots.chair_multipart_seam_v1 import gallery as G
++    from r2.pilots.bench_four_routes_v1.hybrid import run as old_run
++    paths=[Path(__file__),Path(geo.__file__),Path(io_.__file__),Path(sw.__file__),
++           Path(P.__file__),Path(P.G.__file__),Path(CPU.__file__),Path(CPU.H.__file__),
++           Path(CPU.alpha.__file__),Path(CPU.holes.__file__),Path(CPU.M.__file__),
++           Path(old_run.__file__),Path(G.__file__),Path(G.D.__file__),Path(G.H.__file__)]
++    result={str(p):sha(p) for p in paths};result.update(CPU.H.Q.definition_hashes())
++    assert_cpu();return result
++
++
++def job_dir(job_id):
++    if not re.fullmatch(r'[A-Za-z0-9_-]+',job_id): raise ValueError('Unsafe job_id')
++    return OUT/'runs'/job_id
++
++
++def load_jobs(path):
++    p=resolve(path);reg=read(p)
++    if reg.get('status')!='FROZEN': raise ValueError('Jobs must be frozen')
++    jobs=reg['jobs'];ids=[j['job_id'] for j in jobs]
++    if len(ids)!=len(set(ids)) or not 1<=len(ids)<=30: raise ValueError('Invalid finite job budget')
++    if len({j['request']['request_id'] for j in jobs})>6: raise ValueError('More than six fixed requests')
++    if len(reg['metric_fields'])!=177 or len(set(reg['metric_fields']))!=177: raise ValueError('Expected original177 metric fields')
++    for j in jobs: job_dir(j['job_id'])
++    verify(reg['protected']);verify(reg['source_hashes'])
++    return reg,sha(p),{j['job_id']:j for j in jobs}
++
++
++def proposal_contract(job):
++    """Validate arrays without GEO, detector, score, renderer or model."""
++    q=job['request'];p=job['paths'];raw=arrays(p['raw']);source=arrays(p['source'])
++    prop=job['proposal'];verify({prop['path']:prop['sha256']});z=arrays(prop['path'])
++    x=z[prop.get('output_key','output')];N,K=int(q['N']),int(q['K'])
++    if x.dtype!=np.float32 or x.shape!=(N,3,3) or not np.isfinite(x).all(): raise ValueError('Malformed canonical proposal')
++    if raw['raw'].shape!=x.shape or raw['raw'].dtype!=x.dtype: raise ValueError('RAW domain differs')
++    if int(z['known_faces'])!=K or int(raw['known_faces'])!=K: raise ValueError('K differs')
++    if not np.array_equal(z['raw_slot_ids'],np.arange(N)): raise ValueError('RAW slots reordered')
++    if not np.array_equal(z['source_corner_ids'],np.tile(np.arange(3),(N,1))): raise ValueError('Proposal must use RAW canonical corner order')
++    if x[:K].tobytes()!=raw['raw'][:K].tobytes(): raise ValueError('Proposal C changed')
++    if raw['raw_seam_slot_mask'].any() or (raw['raw_anchor_ids'][K:]>=0).any(): raise ValueError('Native-only input required')
++    inp=arrays(q['inference_npz'])
++    if source['C_original'].tobytes()!=inp['C_vertices'][inp['C_faces_original']].tobytes(): raise ValueError('Source C identity differs')
++    identity=dict(request_id=q['request_id'],condition_id=q['condition_id'],parent_id=q['parent_id'],N=N,K=K,
++        noise_index=q['noise_index'],raw_sha256=sha(p['raw']),source_sha256=sha(p['source']),
++        input_sha256=sha(q['inference_npz']),metadata_sha256=sha(q['metadata_npz']),
++        query_sha256=sha(q['query_descriptor']['path']),query_descriptor=q['query_descriptor'],
++        proposal_array_sha256=hashlib.sha256(x.tobytes()).hexdigest(),proposal_shape=list(x.shape),proposal_dtype=str(x.dtype))
++    return identity,raw,source,x
++
++
++def verify_result(receipt):
++    if receipt.get('status')!='COMPLETE': raise ValueError('Incomplete producer')
++    verify(receipt['files'])
++    artifacts=receipt['artifacts'];cpu=read(artifacts['cpu_complete'])
++    if cpu.get('status')!='COMPLETE': raise ValueError('Incomplete CPU cascade')
++    verify(cpu['files']);assert_cpu();return receipt
++
++
++def _query_identity(q):
++    return dict(request_id=q['request_id'],condition_id=q['condition_id'],parent_id=q['parent_id'],
++        noise_index=q['noise_index'],N=q['N'],K=q['K'],
++        input_sha256=sha(q['inference_npz']),metadata_sha256=sha(q['metadata_npz']),
++        query_sha256=sha(q['query_descriptor']['path']),query_descriptor=q['query_descriptor'])
++
++
++def reuse_external(job,identity,x):
++    """Only a predeclared same-request official-chain result can be reused."""
++    c=job['reuse_of_external'];verify({c['registration_path']:c['registration_sha256'],c['complete_path']:c['complete_sha256']})
++    oldreg=read(c['registration_path']);old=read(c['complete_path']);oldroot=resolve(c['complete_path']).parent
++    if old.get('status')!='COMPLETE' or old['registration_sha256']!=c['registration_sha256']: raise ValueError('Old producer incomplete or rebound')
++    matches=[t for t in oldreg['tasks'] if t['request']['request_id']==c['request_id']]
++    if len(matches)!=1: raise ValueError('Old request is not unique')
++    task=matches[0];q=job['request'];p=task['paths']
++    if _query_identity(task['request'])!=_query_identity(q): raise ValueError('Reuse query/input identity differs')
++    if sha(p['raw'])!=identity['raw_sha256'] or sha(p['source'])!=identity['source_sha256']: raise ValueError('Reuse RAW/source differs')
++    # Verify the existing chain and selector's frozen source identities, and
++    # every old output/cascade file, without running the old selector.
++    verify(oldreg['source_hashes']);verify(oldreg['protected']);verify(old['files'])
++    if arrays(oldroot/'pre_geo.npz')['output'].tobytes()!=x.tobytes(): raise ValueError('Reuse canonical proposal differs')
++    cpu_dir=resolve(c['cpu_dir']);cpu=read(cpu_dir/'complete.json');verify(cpu['files'])
++    if cpu.get('status')!='COMPLETE' or cpu['request_id']!=q['request_id']: raise ValueError('Reuse cascade differs')
++    for name in ('base','pre','raw','pairs'):
++        expected={'base':oldroot/'post.npz','pre':oldroot/'pre_geo.npz','raw':resolve(p['raw']),'pairs':oldroot/'pairs.json'}[name]
++        if cpu['identity']['sources'].get(str(expected))!=sha(expected): raise ValueError('Old cascade source binding differs')
++    if cpu['identity']['seam_model'] is not False: raise ValueError('Expected original Native scorer applicability')
++    return dict(base=str(oldroot/'post.npz'),pre=str(oldroot/'pre_geo.npz'),pairs=str(oldroot/'pairs.json'),
++        final=str(cpu_dir/'CLEAN_FINAL_POST/post.npz'),final_pairs=str(cpu_dir/'CLEAN_FINAL_POST/pairs.json'),
++        cpu_dir=str(cpu_dir),cpu_complete=str(cpu_dir/'complete.json'),
++        metric_rows=str(cpu_dir/'metric_rows.json'),geometry=str(oldroot/'geometry.json'),
++        ledger_BASE_POST=str(oldroot/'ledger_BASE_POST.json'),ledger_CLEAN_FINAL_POST=str(oldroot/'ledger_CLEAN_FINAL_POST.json'))
++
++
++def reuse_original_d0(job,identity,x):
++    """Verify an exact cached M proposal and its original complete CPU chain."""
++    p=job['paths'];q=job['request'];pre=arrays(p['pre'])['output']
++    if pre.dtype!=x.dtype or pre.shape!=x.shape or pre.tobytes()!=x.tobytes():
++        raise ValueError('Original-D0 reuse requires exact canonical proposal bytes')
++    cpu_dir=resolve(p['original_final']).parent.parent
++    cp=cpu_dir/'complete.json';cpu=read(cp)
++    oldroot=ROOT/'experiments/r2_bench_group_weight_match_v1'
++    sp=oldroot/'evaluation/score_registration.json';sr=read(sp)
++    manifest=read(oldroot/'data/eval_manifest.json')
++    if sha(oldroot/'data/eval_manifest.json')!=sr['eval_manifest_sha256']:
++        raise ValueError('Original M evaluation manifest differs')
++    matches=[v for v in manifest['requests'] if v['request_id']==q['request_id']]
++    if len(matches)!=1 or _query_identity(matches[0])!=_query_identity(q):
++        raise ValueError('Original M request/query differs')
++    if cpu.get('status')!='COMPLETE' or cpu['request_id']!=q['request_id']:
++        raise ValueError('Original M CPU producer incomplete')
++    ci=cpu['identity']
++    if (ci['registration_sha256']!=sha(sp) or ci['seam_model'] is not False
++            or ci['label']!='M' or ci['version']!='bench_clean_original_hinge_opposite_alpha_hole_v1'):
++        raise ValueError('Original M pipeline identity differs')
++    verify(sr['source_hashes']);verify(cpu['files']);verify(ci['sources'])
++    for key in ('raw','pre','original_base'):
++        full=str(resolve(p[key]))
++        if ci['sources'].get(full)!=sha(full): raise ValueError('Original M source binding differs: '+key)
++    if sha(p['raw'])!=identity['raw_sha256'] or sha(p['source'])!=identity['source_sha256']:
++        raise ValueError('Original M RAW/source identity differs')
++    post_dir=resolve(p['original_base']).parent
++    return dict(base=str(resolve(p['original_base'])),pre=str(resolve(p['pre'])),
++        pairs=str(resolve(p['original_base_pairs'])),final=str(resolve(p['original_final'])),
++        final_pairs=str(resolve(p['original_final_pairs'])),cpu_dir=str(cpu_dir),cpu_complete=str(cp),
++        metric_rows=str(cpu_dir/'metric_rows.json'),geometry=str(post_dir/'geometry.json'),
++        source_score_registration=str(sp),source_eval_manifest=str(oldroot/'data/eval_manifest.json'))
++
++
++def contract(path):
++    reg,rh,jobs=load_jobs(path);rows=[]
++    identities={}
++    for job in reg['jobs']:
++        ident,raw,source,x=proposal_contract(job);identities[job['job_id']]=ident
++        reuse=job.get('reuse_of')
++        if reuse:
++            if reuse not in identities or reuse==job['job_id']: raise ValueError('Reuse owner must precede alias in registration')
++            if identities[reuse]!=ident: raise ValueError('Alias scientific identity differs')
++        if job.get('reuse_of_external'): reuse_external(job,ident,x)
++        if job.get('reuse_original_d0'): reuse_original_d0(job,ident,x)
++        if sum(bool(job.get(v)) for v in ('reuse_of','reuse_of_external','reuse_original_d0'))>1:
++            raise ValueError('Multiple reuse sources')
++        rows.append(dict(job_id=job['job_id'],request_id=ident['request_id'],identity=ident,
++                         execution='REUSE_INTERNAL' if reuse else 'REUSE_EXTERNAL' if job.get('reuse_of_external')
++                         else 'REUSE_ORIGINAL_D0' if job.get('reuse_original_d0') else 'NEW'))
++    assert_cpu()
++    return dict(status='PASS',version=VERSION,registration_sha256=rh,jobs=len(rows),rows=rows,
++        maximum_new_GEO_calls=sum(r['execution']=='NEW' for r in rows),
++        maximum_new_score_rows=2*sum(r['execution']=='NEW' for r in rows),model_calls=0,geometry_calls=0,scoring_calls=0)
++
++
++def event(path,name,**values):
++    with resolve(path).open('a',encoding='utf-8') as f:
++        f.write(json.dumps(clean(dict(event=name,utc=utc(),monotonic=time.perf_counter(),**values)),allow_nan=False)+'\n');f.flush()
++
++
++def _areas(tri):
++    t=tri.astype(np.float64)
++    return .5*np.linalg.norm(np.cross(t[:,1]-t[:,0],t[:,2]-t[:,0]),axis=1)
++
++
++def write_slot_ledgers(dest,raw,x,artifacts,K):
++    N=len(x);rawarea=_areas(raw['raw']);prearea=_areas(x);rows=[]
++    for stage,key in [('BASE_POST','base'),('CLEAN_FINAL_POST','final')]:
++        m=arrays(artifacts[key]);ids=m.get('parent_source_raw_slot',m.get('source_face_ids'))
++        if ids is None: raise ValueError('Missing original face identity')
++        originals=ids[ids>=0]
++        if len(set(originals.tolist()))!=len(originals): raise ValueError('Original slot duplicated')
++        areas=_areas(m['output']);lookup={int(i):float(a) for i,a in zip(ids,areas) if i>=0}
++        for slot in range(K,N):
++            rows.append(dict(stage=stage,raw_slot=slot,retained=slot in lookup,raw_area=float(rawarea[slot]),
++                proposal_area=float(prearea[slot]),actual_area=lookup.get(slot),
++                max_corner_displacement_from_RAW=float(np.linalg.norm(x[slot].astype(float)-raw['raw'][slot],axis=1).max())))
++    csvwrite(dest/'per_slot_deletion_area_displacement.csv',rows)
++
++
++def run_one(path,job_id):
++    reg,rh,jobs=load_jobs(path);job=jobs[job_id];dest=job_dir(job_id);done=dest/'complete.json'
++    if done.exists():
++        receipt=read(done)
++        if receipt['registration_sha256']!=rh or receipt['job_sha256']!=canonical_hash(job): raise ValueError('Completed job contract changed')
++        return verify_result(receipt)
++    if dest.exists(): raise RuntimeError('Partial job retained; explicit engineering recovery required: '+str(dest))
++    ident,raw,source,x=proposal_contract(job)
++    reuse_kind=None;artifacts=None;reuse_receipt=None
++    if job.get('reuse_of'):
++        owner=jobs[job['reuse_of']];op=job_dir(owner['job_id'])/'complete.json'
++        if not op.exists(): raise RuntimeError('Reuse dependency is not complete')
++        o=verify_result(read(op))
++        if o['registration_sha256']!=rh or o['scientific_identity']!=ident: raise ValueError('Reuse owner differs')
++        artifacts=o['artifacts'];reuse_kind='INTERNAL';reuse_receipt=str(op)
++    elif job.get('reuse_of_external'):
++        artifacts=reuse_external(job,ident,x);reuse_kind='EXTERNAL';reuse_receipt=job['reuse_of_external']['complete_path']
++    elif job.get('reuse_original_d0'):
++        artifacts=reuse_original_d0(job,ident,x);reuse_kind='ORIGINAL_D0';reuse_receipt=artifacts['cpu_complete']
++    dest.parent.mkdir(parents=True,exist_ok=True)
++    dest.mkdir()  # Atomic ownership claim: another worker cannot enter this job.
++    start=time.perf_counter();log=dest/'events.jsonl';phase='CLAIMED'
++    write_new(dest/'attempt.json',dict(version=VERSION,job_id=job_id,job_sha256=canonical_hash(job),
++        registration_sha256=rh,pid=os.getpid(),utc=utc(),scientific_identity=ident,reuse_kind=reuse_kind,
++        threads_per_worker=1,automatic_retry=False))
++    try:
++        write_new(dest/'resources_before.json',resources())
++        if reuse_kind is None:
++            geo,io_,sw,P,CPU,compare=modules();K=int(job['request']['K']);phase='GEO_SOURCE_EXPORT'
++            event(log,'CALL_STARTED',kind=phase)
++            output,canonical,post,g,orientation,anchors=P.geometry_from_proposal(raw,x,source)
++            if output.tobytes()!=x.tobytes(): raise AssertionError('Anchor restoration changed canonical candidate')
++            npz(dest/'pre_geo.npz',dict(output=output,known_faces=np.asarray(K),raw_anchor_ids=raw['raw_anchor_ids'],raw_seam_slot_mask=raw['raw_seam_slot_mask']))
++            npz(dest/'post_canonical.npz',canonical);npz(dest/'post.npz',post)
++            write_new(dest/'geometry.json',dict(stats=g['stats'],face_records=g['face_records']))
++            write_new(dest/'source_restoration.json',orientation['restoration_summary']);write_new(dest/'anchor_identity.json',anchors)
++            event(log,'CALL_COMPLETE',kind=phase)
++            phase='BASE_PAIR_DETECTOR';event(log,'CALL_STARTED',kind=phase)
++            pairs=CPU.H.scan(post['output'],K);write_new(dest/'pairs.json',pairs);event(log,'CALL_COMPLETE',kind=phase)
++            phase='FULL_CPU_CASCADE';event(log,'CALL_STARTED',kind=phase)
++            CPU.process_one(job['request'],job['label'],dest/'post.npz',dest/'pre_geo.npz',job['paths']['raw'],
++                dest/'pairs.json',dest/'cpu',False,rh)
++            event(log,'CALL_COMPLETE',kind=phase)
++            artifacts=dict(base=str(dest/'post.npz'),pre=str(dest/'pre_geo.npz'),pairs=str(dest/'pairs.json'),
++                final=str(dest/'cpu/CLEAN_FINAL_POST/post.npz'),final_pairs=str(dest/'cpu/CLEAN_FINAL_POST/pairs.json'),
++                cpu_dir=str(dest/'cpu'),cpu_complete=str(dest/'cpu/complete.json'),metric_rows=str(dest/'cpu/metric_rows.json'),
++                geometry=str(dest/'geometry.json'))
++        else:
++            event(log,'REUSED_WITHOUT_SCIENTIFIC_CALL',reuse_kind=reuse_kind,receipt=reuse_receipt)
++        # Original M reuse has no M-vs-M cross-backend ledger. Derive this
++        # identity comparison from preserved meshes/pair caches, never detectors.
++        if 'ledger_BASE_POST' not in artifacts:
++            geo,io_,sw,P,CPU,compare=modules();K=int(job['request']['K'])
++            phase='READ_ONLY_LEDGER';event(log,'LEDGER_STARTED')
++            for stage,oldkey,oldpairkey,newkey,newpairkey in [('BASE_POST','original_base','original_base_pairs','base','pairs'),
++                    ('CLEAN_FINAL_POST','original_final','original_final_pairs','final','final_pairs')]:
++                ledger=compare(arrays(job['paths'][oldkey]),arrays(artifacts[newkey]),read(job['paths'][oldpairkey]),read(artifacts[newpairkey]),K,CPU)
++                lp=dest/('ledger_'+stage+'.json');write_new(lp,ledger);artifacts['ledger_'+stage]=str(lp)
++            event(log,'LEDGER_COMPLETE')
++        phase='FINAL_RECEIPT'
++        write_slot_ledgers(dest,raw,x,artifacts,int(job['request']['K']))
++        rows=read(artifacts['metric_rows'])
++        if len(rows)!=2 or {r['stage'] for r in rows}!={'BASE_POST','CLEAN_FINAL_POST'}: raise AssertionError('Expected exactly two scored stages')
++        if any(any(f not in row for f in reg['metric_fields']) for row in rows): raise AssertionError('Missing original metric field')
++        write_new(dest/'logical_metric_alias.json',dict(job_id=job_id,label=job['label'],request_id=job['request']['request_id'],
++            metric_source=artifacts['metric_rows'],metric_source_sha256=sha(artifacts['metric_rows']),
++            source_labels=[r['label'] for r in rows],relabel_policy='Display metadata only; original177 values unchanged',reuse_kind=reuse_kind))
++        write_new(dest/'resources_after.json',resources());assert_cpu();verify(reg['protected']);verify(reg['source_hashes'])
++        result=dict(status='COMPLETE',version=VERSION,job_id=job_id,label=job['label'],request_id=job['request']['request_id'],
++            registration_sha256=rh,job_sha256=canonical_hash(job),scientific_identity=ident,
++            execution='REUSED_'+reuse_kind if reuse_kind else 'NEW',reuse_receipt=reuse_receipt,artifacts=artifacts,
++            seconds=time.perf_counter()-start,peak_RSS_KiB=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
++            RSS_scope='Process-lifetime peak; not job-incremental',GEO_calls=0 if reuse_kind else 1,
++            base_pair_detector_calls=0 if reuse_kind else 1,new_score_rows=0 if reuse_kind else 2,
++            full_cascade_calls=0 if reuse_kind else 1,logical_score_rows=2,
++            model_calls=0,D0_calls=0,new_noise=0,new_queries=0,ratings_generated=0,
++            files={str(p):sha(p) for p in dest.rglob('*') if p.is_file()})
++        # Seal reused physical artifacts too, without copying or changing them.
++        result['files'].update({str(resolve(p)):sha(p) for p in artifacts.values() if resolve(p).is_file()})
++        if reuse_receipt: result['files'][str(resolve(reuse_receipt))]=sha(reuse_receipt)
++        write_new(done,result);return verify_result(result)
++    except BaseException as error:
++        event(log,'FAILED',phase=phase,error=repr(error))
++        write_new(dest/'failure.json',dict(status='STOPPED_PARTIAL_NO_AUTOMATIC_RETRY',job_id=job_id,
++            phase=phase,error=repr(error),traceback=traceback.format_exc(),utc=utc(),
++            model_calls=0,D0_calls=0,scientific_call_events=str(log)))
++        raise
++
++
++def status(path):
++    reg,rh,jobs=load_jobs(path);rows=[]
++    for j in reg['jobs']:
++        d=job_dir(j['job_id']);p=d/'complete.json'
++        state='COMPLETE' if p.exists() else 'FAILED' if (d/'failure.json').exists() else 'PARTIAL' if d.exists() else 'NOT_STARTED'
++        rows.append(dict(job_id=j['job_id'],state=state,path=str(d)))
++    return dict(status='READ_ONLY_STATUS',registration_sha256=rh,jobs=rows,model_calls=0,scoring_calls=0)
++
++
++def collect(path):
++    reg,rh,jobs=load_jobs(path);dest=OUT/'results';done=dest/'complete.json'
++    if done.exists():
++        r=read(done)
++        if r['registration_sha256']!=rh:raise ValueError('Collection registration changed')
++        verify(r['files']);return r
++    if dest.exists():raise RuntimeError('Partial collection retained')
++    rows=[];book={};receipts=[]
++    for job in reg['jobs']:
++        p=job_dir(job['job_id'])/'complete.json';r=verify_result(read(p))
++        if r['registration_sha256']!=rh:raise ValueError('Job registration mismatch')
++        book[str(p)]=sha(p);receipts.append(r)
++        for source in read(r['artifacts']['metric_rows']):
++            row=dict(source,job_id=job['job_id'],label=job['label'],request_id=job['request']['request_id'],
++                condition_id=job['request']['condition_id'],parent_id=job['request']['parent_id'],
++                report_group=job['request']['report_group'],noise_index=job['request']['noise_index'],
++                physical_execution=r['execution'],physical_metric_source=r['artifacts']['metric_rows'],
++                original_metric_label=source['label'])
++            assert all(row[f]==source[f] for f in reg['metric_fields'])
++            rows.append(row)
++    candidate_rows=len(rows);baseline_rows=[]
++    for reference in reg['references']:
++        q=reference['request'];p=reference['paths']
++        cp=resolve(p['original_final']).parent.parent/'complete.json';producer=read(cp)
++        if producer.get('status')!='COMPLETE' or producer['request_id']!=q['request_id']:
++            raise ValueError('Original baseline producer incomplete')
++        verify(producer['files']);book[str(cp)]=sha(cp)
++        metric_path=cp.parent/'metric_rows.json'
++        for source in read(metric_path):
++            if source['stage'] not in ('BASE_POST','CLEAN_FINAL_POST'):raise ValueError('Original baseline stage differs')
++            row=dict(source,job_id='REFERENCE_M_D0',label='M_D0',request_id=q['request_id'],
++                condition_id=q['condition_id'],parent_id=q['parent_id'],report_group=q['report_group'],
++                noise_index=q['noise_index'],physical_execution='REUSED_ORIGINAL_BASELINE',
++                physical_metric_source=str(metric_path),original_metric_label=source['label'])
++            if any(f not in source for f in reg['metric_fields']):raise ValueError('Baseline metric missing')
++            assert all(row[f]==source[f] for f in reg['metric_fields'])
++            baseline_rows.append(row)
++    if len(baseline_rows)!=2*len(reg['references']):raise ValueError('Expected two baseline rows per request')
++    rows.extend(baseline_rows)
++    dest.mkdir();write_new(dest/'metric_rows.json',rows);csvwrite(dest/'per_output.csv',rows)
++    result=dict(status='COMPLETE',registration_sha256=rh,logical_jobs=len(receipts),logical_score_rows=candidate_rows,
++        reused_original_baseline_rows=len(baseline_rows),collected_rows=len(rows),
++        new_GEO_calls=sum(r['GEO_calls'] for r in receipts),new_score_rows=sum(r['new_score_rows'] for r in receipts),
++        physical_new_jobs=sum(r['execution']=='NEW' for r in receipts),reused_jobs=sum(r['execution']!='NEW' for r in receipts),
++        fields=reg['metric_fields'],model_calls=0,D0_calls=0,new_noise=0,new_queries=0,
++        input_job_receipts=book,files={str(p):sha(p) for p in dest.iterdir() if p.is_file()})
++    write_new(done,result);return result
++
++
++def render_one(path,job_id,stage):
++    if stage not in ('BASE_POST','CLEAN_FINAL_POST'):raise ValueError('Unregistered render stage')
++    reg,rh,jobs=load_jobs(path);job=jobs[job_id];receipt=verify_result(read(job_dir(job_id)/'complete.json'))
++    if receipt['registration_sha256']!=rh:raise ValueError('Render producer registration differs')
++    q=job['request'];p=job['paths'];a=receipt['artifacts'];K=int(q['K'])
++    if job['label']=='RAW_ALL':raise ValueError('RAW_ALL is a comparison column, not another primary review page')
++    raw_jobs=[j for j in reg['jobs'] if j['label']=='RAW_ALL' and j['request']['request_id']==q['request_id']]
++    if len(raw_jobs)!=1:raise ValueError('Exactly one same-request RAW_ALL reference required')
++    raw_receipt=verify_result(read(job_dir(raw_jobs[0]['job_id'])/'complete.json'))
++    if raw_receipt['registration_sha256']!=rh:raise ValueError('RAW_ALL registration differs')
++    cells=[dict(model='RAW',stage='RAW',path=p['raw']),
++           dict(model='M_D0',stage=stage,path=p['original_base' if stage=='BASE_POST' else 'original_final']),
++           dict(model='RAW_ALL',stage=stage,path=raw_receipt['artifacts']['base' if stage=='BASE_POST' else 'final']),
++           dict(model=job['label'],stage=stage,path=a['base' if stage=='BASE_POST' else 'final'])]
++    definition=dict(job_id=job_id,stage=stage,cells=cells,request=q,registration_sha256=rh,
++                    cameras='Inherited azimuth -60/120 elevation23',sections='Inherited front/side position index1')
++    dh=canonical_hash(definition);dest=job_dir(job_id)/'gallery';image=dest/(stage+'.png');done=image.with_suffix('.json')
++    if done.exists():
++        r=read(done)
++        if r['definition_sha256']!=dh or sha(image)!=r['image_sha256']:raise ValueError('Render changed')
++        verify(r['source_meshes']);return r
++    if image.exists():raise RuntimeError('Unsealed image retained')
++    from r2.pilots.chair_multipart_seam_v1 import gallery as G
++    D,H=G.D,G.H;plt=H._mpl();start=time.perf_counter();dest.mkdir(exist_ok=True)
++    fig=plt.figure(figsize=(21.2,13.5),dpi=110,facecolor='white');grid=fig.add_gridspec(4,4,left=.025,right=.99,bottom=.045,top=.92,wspace=.15,hspace=.23)
++    inp=arrays(q['inference_npz']);original=inp['C_vertices'][inp['C_faces_original']]
++    bounds=q['gallery_bounds'];depth=q['gallery_depth_bounds'];sources={};display=[]
++    try:
++        for col,cell in enumerate(cells):
++            tri,role=G.roles(arrays(cell['path']),K);sources[str(resolve(cell['path']))]=sha(cell['path'])
++            g=dict(C=tri[:K],F=tri[K:],C_original=original,tri=tri)
++            facts=dict(model=cell['model'],stage=cell['stage'],role_counts={k:int((role==k).sum()) for k in ('C','SEAM','BULK','BRIDGE')},views=[])
++            for row,az in enumerate((-60,120)):
++                raster,scope=G.role_raster(tri,role,K,D.basis(az,23),np.asarray(depth['center']),depth['span'])
++                ax=fig.add_subplot(grid[row,col]);ax.imshow(raster);ax.set_axis_off();ax.set_title(cell['model']+' '+cell['stage']+' | '+str(az),fontsize=9)
++                if scope['projected_vertices_outside_inherited_frame']:ax.text(.01,.01,'Inherited-frame clipping',transform=ax.transAxes,fontsize=7,color='#b34b27')
++                facts['views'].append(dict(azimuth=az,**scope))
++            for row,view in ((2,'front'),(3,'side')):
++                ax=fig.add_subplot(grid[row,col]);H.draw_section(ax,g,np.flatnonzero(role[K:]=='SEAM'),bounds,L,view,1)
++                from matplotlib.collections import LineCollection
++                axis,project=(2,(0,1)) if view=='front' else (0,(2,1));pos=bounds['front_positions' if view=='front' else 'side_positions'][1]
++                ff,ids=H.finite_sections(g['F'],axis,pos,1e-12*L);bm=role[K:][ids]=='BRIDGE'
++                if bm.any():ax.add_collection(LineCollection(ff[bm][:,:,project],colors='#41a46c',linewidths=1.6,zorder=3))
++                ax.set_title(cell['model']+' | '+view+f'={pos:.5f}',fontsize=8)
++            display.append(facts)
++        fig.suptitle(q['request_id']+' | '+job_id+f' | N={q["N"]} K={K}\nOriginal RAW / official D0 chain / whole RAW chain / regional candidate; blue C, gray free, green bridge',fontsize=10)
++        fig.text(.5,.012,'Actual AI_PROXY review is separate. Fixed sections alone do not certify cracks. No source-style ground truth.',ha='center',fontsize=8)
++        buffer=io.BytesIO();fig.savefig(buffer,format='png',dpi=110)
++        with image.open('xb') as f:f.write(buffer.getvalue())
++    finally:plt.close(fig)
++    assert_cpu();verify(sources)
++    result=dict(status='PENDING_ACTUAL_VIEW',job_id=job_id,request_id=q['request_id'],stage=stage,
++        definition_sha256=dh,registration_sha256=rh,image_path=str(image),image_sha256=sha(image),
++        cells=cells,source_meshes=sources,display=display,seconds=time.perf_counter()-start,
++        model_calls=0,scoring_calls=0,ratings_generated=0)
++    write_new(done,result);return result
++
++
++def main():
++    ap=argparse.ArgumentParser(description=__doc__)
++    ap.add_argument('command',choices=('contract','status','resources','run-one','verify','collect','render-one','code-hashes'))
++    ap.add_argument('--jobs',type=Path);ap.add_argument('--job-id');ap.add_argument('--stage',choices=('BASE_POST','CLEAN_FINAL_POST'))
++    args=ap.parse_args()
++    if args.command=='resources':result=resources()
++    elif args.command=='code-hashes':result=definition_hashes()
++    else:
++        if args.jobs is None:ap.error('--jobs required')
++        if args.command=='contract':result=contract(args.jobs)
++        elif args.command=='status':result=status(args.jobs)
++        elif args.command=='collect':result=collect(args.jobs)
++        else:
++            if not args.job_id:ap.error('--job-id required')
++            if args.command=='run-one':result=run_one(args.jobs,args.job_id)
++            elif args.command=='verify':
++                reg,rh,jobs=load_jobs(args.jobs);result=verify_result(read(job_dir(args.job_id)/'complete.json'))
++                if result['registration_sha256']!=rh:raise ValueError('Registration differs')
++            else:
++                if not args.stage:ap.error('--stage required')
++                result=render_one(args.jobs,args.job_id,args.stage)
++    # Do not dump large request manifests, detector ledgers or file maps.
++    if args.command in ('code-hashes','resources'):print(json.dumps(clean(result),ensure_ascii=False))
++    else: print(json.dumps(clean({k:v for k,v in result.items() if k not in ('files','rows','source_meshes','scientific_identity','fields','input_job_receipts','cells','display')}),ensure_ascii=False))
++
++
++if __name__=='__main__':main()
+diff --git a/r2/pilots/bench_regional_mix_dual_v1/support/__init__.py b/r2/pilots/bench_regional_mix_dual_v1/support/__init__.py
+new file mode 100644
+--- /dev/null
++++ b/r2/pilots/bench_regional_mix_dual_v1/support/__init__.py
+@@ -0,0 +1 @@
++"""Read-only closure and rendering helpers outside the frozen scientific code."""
+diff --git a/r2/pilots/bench_regional_mix_dual_v1/support/delivery.py b/r2/pilots/bench_regional_mix_dual_v1/support/delivery.py
+new file mode 100644
+--- /dev/null
++++ b/r2/pilots/bench_regional_mix_dual_v1/support/delivery.py
+@@ -0,0 +1,216 @@
++"""Offline gallery index and immutable evidence/source review package.
++
++index may run before report completion. preflight/seal require the final report
++review receipt. No model, geometry, detector, scoring or visual-label calls.
++"""
++from .. import runtime as R
++import argparse
++import difflib
++import hashlib
++import html
++import io
++import json
++import os
++from pathlib import Path
++from urllib.parse import quote
++import zipfile
++
++CODE=R.ROOT/'r2/pilots/bench_regional_mix_dual_v1'
++TEXT_SUFFIXES={'.json','.jsonl','.csv','.tsv','.md','.txt','.log','.html'}
++LIMIT=10_000_000
++
++
++def encoded(value):
++    return (json.dumps(R.clean(value),ensure_ascii=False,indent=2,allow_nan=False)+'\n').encode('utf-8')
++
++
++def digest(value):return hashlib.sha256(value).hexdigest()
++
++
++def index():
++    reg,rh,jobs=R.load_jobs(R.OUT/'jobs.json');render=R.read(R.OUT/'render_queue/complete.json')
++    if render.get('status')!='COMPLETE' or render['pages']!=24 or render['cells']!=96:
++        raise ValueError('All 24 exact render pages required')
++    R.verify(render['files']);folder=R.OUT/'gallery';folder.mkdir(exist_ok=True)
++    evidence=[];sections=[]
++    for reference in reg['references']:
++        q=reference['request'];rid=q['request_id'];cards=[]
++        for label in ('ASSIST10','ASSIST01','ASSIST11','AUTO_COVER'):
++            job=next(j for j in reg['jobs'] if j['request']['request_id']==rid and j['label']==label)
++            receipt_path=R.job_dir(job['job_id'])/'gallery/CLEAN_FINAL_POST.json'
++            receipt=R.read(receipt_path);image=R.resolve(receipt['image_path'])
++            if receipt['registration_sha256']!=rh or R.sha(image)!=receipt['image_sha256']:
++                raise ValueError('Rendered page identity differs')
++            link=quote(Path(os.path.relpath(image,folder)).as_posix(),safe='/')
++            meta=quote(Path(os.path.relpath(receipt_path,folder)).as_posix(),safe='/')
++            cards.append(f'<article><h3>{html.escape(label)}</h3><a href="{link}"><img loading="lazy" src="{link}" alt="{html.escape(job["job_id"])}"></a><p><a href="{meta}">Image and column identity receipt</a></p></article>')
++            evidence.append(dict(job_id=job['job_id'],request_id=rid,label=label,
++                image=str(image),image_sha256=R.sha(image),receipt=str(receipt_path),receipt_sha256=R.sha(receipt_path)))
++        sections.append('<section><h2>'+html.escape(rid)+'</h2><div class="cards">'+''.join(cards)+'</div></section>')
++    content=('''<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
++<title>Bench regional mix: all 24 FINAL comparisons</title><style>
++body{font:15px system-ui,sans-serif;margin:24px;color:#18202a;background:#f4f6f8}h1{font-size:24px}h2{font-size:16px;overflow-wrap:anywhere}h3{font-size:16px}.cards{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}article{background:white;padding:12px;border:1px solid #cad2db;border-radius:6px}img{width:100%;height:auto}section{margin:28px 0}a{color:#1359a0}p{line-height:1.5}@media(max-width:900px){.cards{grid-template-columns:1fr}}</style>
++<h1>Bench regional mixing: all 24 FINAL comparison pages</h1>
++<p>Six fixed development requests; four candidates for every request. Each image has four columns: original RAW, original M_D0 chain, whole-RAW chain, and the named regional candidate. Each column includes two fixed views and two inherited-position sections. Click any image for its full original resolution.</p>
++<p>ASSIST10 / ASSIST01 / ASSIST11 use the two preregistered assisted regions. AUTO_COVER is the fixed coverage heuristic. These are all candidates, without selecting a best result. Actual AI_PROXY review and limitations are preserved separately in <a href="../visual_review/PROTOCOL.md">the review protocol</a>.</p>
++'''+''.join(sections)+'</html>\n').encode('utf-8')
++    target=folder/'index.html';receipt=folder/'index.json'
++    if target.exists():
++        if target.read_bytes()!=content:raise ValueError('Existing gallery index differs; do not overwrite')
++        old=R.read(receipt)
++        if old['index_sha256']!=digest(content):raise ValueError('Index receipt differs')
++        return old
++    with target.open('xb') as handle:handle.write(content)
++    result=dict(status='COMPLETE',registration_sha256=rh,pages=24,cells=96,
++        index_path=str(target),index_sha256=digest(content),relative_paths_same_local_and_ZIP=True,
++        pages_in_fixed_order=evidence,render_calls=0,scientific_calls=0,new_visual_labels=0)
++    R.write_new(receipt,result);return result
++
++
++def checked_readiness(review_path):
++    reg,rh,jobs=R.load_jobs(R.OUT/'jobs.json');report=R.OUT/'REPORT.md';review=R.read(review_path)
++    if review.get('status')!='PASS' or review.get('report_sha256')!=R.sha(report):
++        raise ValueError('A PASS final review bound to current REPORT is required')
++    required={
++        'dispatch/complete.json':'COMPLETE','results/complete.json':'COMPLETE',
++        'analysis/COMPLETE.json':'COMPLETE','render_queue/complete.json':'COMPLETE',
++        'audits/execution/complete.json':'PASS','gallery/index.json':'COMPLETE'}
++    for rel,status in required.items():
++        record=R.read(R.OUT/rel)
++        if record.get('status')!=status:raise ValueError('Missing complete stage: '+rel)
++        if 'files' in record:R.verify(record['files'])
++    for j in reg['jobs']:R.verify_result(R.read(R.job_dir(j['job_id'])/'complete.json'))
++    for rel in ('REPORT.md','PROTOCOL.md','RUNBOOK.md','visual_review/PROTOCOL.md'):
++        if not (R.OUT/rel).is_file():raise ValueError('Required delivery missing: '+rel)
++    return reg,rh,review
++
++
++def source_entries(reg):
++    expected=dict(reg['source_hashes']);R.verify(expected)
++    expected={str(R.resolve(p)):value for p,value in expected.items()}
++    files={};records=[];seen={};new=[]
++    paths={R.resolve(p) for p in expected}|set(CODE.rglob('*.py'))|{R.ROOT/'native_t1/docs/control_metrics.md'}
++    for source in sorted(paths,key=str):
++        if source.suffix not in ('.py','.md','.json','.txt'):
++            raise ValueError('Unexpected frozen source type: '+str(source))
++        data=source.read_bytes();h=digest(data)
++        if str(source) in expected and h!=expected[str(source)]:raise ValueError('Frozen source changed')
++        if source.is_relative_to(R.ROOT):relative=source.relative_to(R.ROOT).as_posix()
++        else:relative='_external_sources/'+hashlib.sha256(str(source).encode()).hexdigest()[:16]+'/'+source.name
++        arc='source_archive/'+relative
++        if arc in seen and seen[arc]!=h:raise ValueError('Source archive collision')
++        seen[arc]=h;files[arc]=data
++        records.append(dict(original_path=str(source),archive_path=arc,sha256=h,bytes=len(data),
++            frozen_scientific_source=str(source) in expected,current_experiment_source=source.is_relative_to(CODE)))
++        if source.is_relative_to(CODE):
++            rel=source.relative_to(R.ROOT).as_posix()
++            lines=data.decode('utf-8-sig').splitlines(keepends=True)
++            new.append('diff --git a/'+rel+' b/'+rel+'\nnew file mode 100644\n'+''.join(
++                difflib.unified_diff([],lines,fromfile='/dev/null',tofile='b/'+rel)))
++    files['source_archive/source_hashes.json']=encoded(dict(status='SOURCE_SNAPSHOT',files=records,
++        policy='Frozen source hashes verified before copying. Support/analysis helpers are current non-scientific additions. No original model/scorer source was edited.'))
++    files['source_archive/code.diff']=(''.join(new)).encode('utf-8')
++    return files,records
++
++
++def assemble(review_path):
++    reg,rh,review=checked_readiness(review_path);files={};source_files,source_records=source_entries(reg)
++    files.update(source_files);inventory=[];excluded=[]
++    for p in sorted(R.OUT.rglob('*')):
++        if not p.is_file():continue
++        rel=p.relative_to(R.OUT).as_posix()
++        if rel.startswith(('delivery/','source_archive/')):continue
++        if p.suffix in ('.pt','.pth','.ckpt','.safetensors'):
++            raise ValueError('Unexpected weight in CPU-only experiment; never archive it')
++        data=p.read_bytes();h=digest(data)
++        included=p.suffix.lower() in TEXT_SUFFIXES or p.suffix.lower()=='.png'
++        inventory.append(dict(local_path=str(p),relative_path=rel,bytes=len(data),sha256=h,included_in_review=included))
++        if included:files[rel]=data
++        else:excluded.append(dict(path=str(p),sha256=h,bytes=len(data),reason='Array/binary asset retained locally; not duplicated in text-and-image review package'))
++    # Include exact preserved ledgers of external RAW_ALL / D0 aliases.
++    external=[]
++    for j in reg['jobs']:
++        receipt=R.read(R.job_dir(j['job_id'])/'complete.json')
++        for key,p in receipt['artifacts'].items():
++            source=R.resolve(p)
++            if not source.is_file() or source.is_relative_to(R.OUT) or source.suffix not in TEXT_SUFFIXES:continue
++            data=source.read_bytes();h=digest(data)
++            name='external_evidence/'+hashlib.sha256(str(source).encode()).hexdigest()[:16]+'/'+source.name
++            files[name]=data;external.append(dict(job_id=j['job_id'],role=key,original_path=str(source),archive_path=name,sha256=h,bytes=len(data)))
++    files['external_evidence/index.json']=encoded(external)
++    files['delivery/final_artifact_manifest.json']=encoded(dict(status='READ_ONLY_FINAL_SNAPSHOT',
++        registration_sha256=rh,report_sha256=R.sha(R.OUT/'REPORT.md'),report_review_path=str(R.resolve(review_path)),
++        report_review_sha256=R.sha(review_path),files=inventory,excluded_binary_assets=excluded,
++        scientific_calls=0,new_visual_labels=0))
++    files['README_REVIEW.txt']=('Open gallery/index.html for all 24 original-resolution comparison pages.\n'
++        'REPORT.md and all original177/parent/request/slot/selection/connectivity tables are included.\n'
++        'source_archive contains exact frozen source plus current support/analysis code; code.diff describes only this experiment additions.\n'
++        'Original absolute paths inside scientific receipts are provenance references and were not rewritten. External reused JSON ledgers have an explicit external_evidence/index.json mapping.\n'
++        'NPZ geometry/noise arrays remain locally with hashes in delivery/final_artifact_manifest.json. No weights or new model results are included.\n').encode()
++    scientific_json={
++        'report_sha256':R.sha(R.OUT/'REPORT.md'),'report_review_sha256':R.sha(review_path),
++        'jobs_sha256':rh,'original_png_pages':24,'source_files':len(source_records),
++        'members':[{ 'path':name,'bytes':len(data),'sha256':digest(data)} for name,data in sorted(files.items())],
++        'policy':'All text tables/ledgers and actual review records included. Original binary arrays are indexed, not copied. No visual or numerical reselection.'}
++    files['PACKAGE_MANIFEST.json']=encoded(scientific_json)
++    return files,scientific_json
++
++
++def compress(files,method):
++    out=io.BytesIO()
++    with zipfile.ZipFile(out,'w',compression=method,compresslevel=9 if method==zipfile.ZIP_DEFLATED else None) as archive:
++        for name,data in sorted(files.items()):
++            item=zipfile.ZipInfo(name,date_time=(2026,10,28,0,0,0));item.compress_type=method
++            item.external_attr=0o100644<<16
++            archive.writestr(item,data,compress_type=method,compresslevel=9 if method==zipfile.ZIP_DEFLATED else None)
++    result=out.getvalue()
++    with zipfile.ZipFile(io.BytesIO(result)) as archive:
++        if archive.testzip() is not None:raise ValueError('ZIP CRC failed')
++        if set(archive.namelist())!=set(files):raise ValueError('ZIP membership differs')
++        for name,data in files.items():
++            if digest(archive.read(name))!=digest(data):raise ValueError('ZIP member bytes differ: '+name)
++    return result
++
++
++def package(review_path,seal=False):
++    files,manifest=assemble(review_path);data=compress(files,zipfile.ZIP_DEFLATED);method='DEFLATE'
++    if len(data)>=LIMIT:
++        alternative=compress(files,zipfile.ZIP_LZMA)
++        if len(alternative)<len(data):data=alternative;method='LZMA'
++    # Keep all original24 pages and full evidence even if the preferred cap
++    # cannot be met. The honest byte count is returned; nothing is silently omitted.
++    result=dict(status='PREFLIGHT_PASS',bytes=len(data),decimal_MB=len(data)/1_000_000,
++        below_10MB=len(data)<LIMIT,compression=method,members=len(files),
++        report_sha256=manifest['report_sha256'],report_review_sha256=manifest['report_review_sha256'],
++        source_files=manifest['source_files'],original_gallery_pages=24,
++        science_calls=0,new_visual_labels=0,zip_sha256=digest(data))
++    if not seal:return result
++    dest=R.OUT/'delivery';done=dest/'complete.json'
++    if done.exists():
++        old=R.read(done)
++        if old['zip_sha256']!=result['zip_sha256']:raise ValueError('Sealed delivery differs; no overwrite')
++        R.verify(old['files']);return old
++    if (dest/'REVIEW.zip').exists() or (R.OUT/'source_archive').exists():
++        raise ValueError('Partial archive retained for explicit review')
++    # No original files are rewritten; materialize only the new deliverables.
++    for name,blob in files.items():
++        if name.startswith('source_archive/') or name=='delivery/final_artifact_manifest.json':
++            target=R.OUT/name;target.parent.mkdir(parents=True,exist_ok=True)
++            with target.open('xb') as handle:handle.write(blob)
++    target=dest/'REVIEW.zip'
++    with target.open('xb') as handle:handle.write(data)
++    with zipfile.ZipFile(target) as archive:
++        if archive.testzip() is not None:raise ValueError('Written ZIP CRC failed')
++        for name,blob in files.items():
++            if digest(archive.read(name))!=digest(blob):raise ValueError('Written ZIP member hash differs')
++    result.update(status='COMPLETE',utc=R.utc(),zip_path=str(target),
++        files={str(p):R.sha(p) for folder in (dest,R.OUT/'source_archive') for p in folder.rglob('*') if p.is_file()})
++    R.write_new(done,result);return result
++
++
++if __name__=='__main__':
++    parser=argparse.ArgumentParser();parser.add_argument('action',choices=('index','preflight','seal'))
++    parser.add_argument('--report-review',default=str(R.OUT/'audits/report_review.json'))
++    args=parser.parse_args()
++    result=index() if args.action=='index' else package(args.report_review,args.action=='seal')
++    print(json.dumps({k:v for k,v in result.items() if k not in ('files','pages_in_fixed_order')},ensure_ascii=False))
+diff --git a/r2/pilots/bench_regional_mix_dual_v1/support/execution_audit.py b/r2/pilots/bench_regional_mix_dual_v1/support/execution_audit.py
+new file mode 100644
+--- /dev/null
++++ b/r2/pilots/bench_regional_mix_dual_v1/support/execution_audit.py
+@@ -0,0 +1,89 @@
++"""Read preserved arrays, receipts and scores; never invoke geometry or scoring."""
++from .. import runtime as R
++import argparse
++import json
++
++
++def equal_fields(left,right,fields):
++    return all(json.dumps(left[f],sort_keys=True,allow_nan=True)==
++               json.dumps(right[f],sort_keys=True,allow_nan=True) for f in fields)
++
++
++def run(jobs_path):
++    reg,rh,jobs=R.load_jobs(jobs_path);folder=R.OUT/'audits/execution';done=folder/'complete.json'
++    if done.exists():
++        old=R.read(done)
++        if old['registration_sha256']!=rh:raise ValueError('Audit registration changed')
++        R.verify(old['inputs']);return old
++    result_rows=[];inputs={str(R.resolve(jobs_path)):rh};fields=reg['metric_fields']
++    for job in reg['jobs']:
++        jid=job['job_id'];dest=R.job_dir(jid);cp=dest/'complete.json'
++        receipt=R.verify_result(R.read(cp));inputs[str(cp)]=R.sha(cp)
++        if receipt['registration_sha256']!=rh or receipt['job_sha256']!=R.canonical_hash(job):
++            raise AssertionError('Job identity differs: '+jid)
++        identity,raw,source,x=R.proposal_contract(job)
++        if identity!=receipt['scientific_identity']:raise AssertionError('Scientific identity differs')
++        k=int(job['request']['K']);a=receipt['artifacts']
++        if R.arrays(a['pre'])['output'].tobytes()!=x.tobytes():raise AssertionError('Physical proposal differs')
++        for name in ('base','final'):
++            post=R.arrays(a[name])
++            if post['output'][:k].tobytes()!=source['C_original'].tobytes():
++                raise AssertionError('Source-oriented C differs: '+jid+'/'+name)
++        events=[json.loads(line) for line in (dest/'events.jsonl').read_text().splitlines() if line.strip()]
++        calls=[e['kind'] for e in events if e['event']=='CALL_STARTED']
++        finished=[e['kind'] for e in events if e['event']=='CALL_COMPLETE']
++        physical=receipt['execution']=='NEW'
++        expected=['GEO_SOURCE_EXPORT','BASE_PAIR_DETECTOR','FULL_CPU_CASCADE'] if physical else []
++        if calls!=expected or finished!=expected:raise AssertionError('Scientific event budget mismatch: '+jid)
++        if any(e['event']=='FAILED' for e in events) or (dest/'failure.json').exists():
++            raise AssertionError('Failure or replay needs explicit audit')
++        for key in ('model_calls','D0_calls','new_noise','new_queries'):
++            if receipt[key]!=0:raise AssertionError('Unexpected scientific call')
++        for key,value in [('GEO_calls',int(physical)),('base_pair_detector_calls',int(physical)),
++                          ('full_cascade_calls',int(physical)),('new_score_rows',2*int(physical))]:
++            if receipt[key]!=value:raise AssertionError('Count receipt differs')
++        rows=R.read(a['metric_rows'])
++        if len(rows)!=2 or {r['stage'] for r in rows}!={'BASE_POST','CLEAN_FINAL_POST'}:
++            raise AssertionError('Two-stage score identity differs')
++        if any(any(f not in r for f in fields) for r in rows):raise AssertionError('Original177 field missing')
++        result_rows.append(dict(job_id=jid,execution=receipt['execution'],C_exact=True,
++            physical_proposal_exact=True,new_GEO_calls=int(physical),new_full_cascades=int(physical),
++            new_score_rows=2*int(physical),new_base_pair_detector_calls=int(physical),
++            seconds=receipt['seconds'],peak_RSS_KiB=receipt['peak_RSS_KiB'],
++            CPU_complete=a['cpu_complete'],metric_rows=a['metric_rows']))
++    collected=R.read(R.OUT/'results/complete.json');R.verify(collected['files'])
++    inputs[str(R.OUT/'results/complete.json')]=R.sha(R.OUT/'results/complete.json')
++    rows=R.read(R.OUT/'results/metric_rows.json')
++    if len(rows)!=72:raise AssertionError('Expected 60 candidate plus 12 baseline rows')
++    for row in rows:
++        original=R.read(row['physical_metric_source'])
++        candidates=[v for v in original if v['request_id']==row['request_id'] and v['stage']==row['stage']]
++        if len(candidates)!=1 or not equal_fields(candidates[0],row,fields):
++            raise AssertionError('Collected original177 values differ')
++    baselines=[r for r in rows if r['label']=='M_D0']
++    if len(baselines)!=12:raise AssertionError('Original baseline count differs')
++    for row in baselines:
++        task=next(t for t in reg['references'] if t['request']['request_id']==row['request_id'])
++        original=R.read(task['paths'][row['stage']+'_row'])
++        if not equal_fields(original,row,fields):raise AssertionError('Original baseline177 differs')
++    physical=sum(r['execution']=='NEW' for r in result_rows)
++    if physical!=reg['budget']['physical_jobs'] or 2*physical!=reg['budget']['new_score_rows']:
++        raise AssertionError('Frozen physical budget differs')
++    R.assert_cpu();R.verify(reg['protected']);R.verify(reg['source_hashes'])
++    folder.mkdir(parents=True,exist_ok=True)
++    R.csvwrite(folder/'per_job.csv',result_rows)
++    result=dict(status='PASS',registration_sha256=rh,helper_sha256=R.sha(__file__),
++        logical_jobs=30,new_physical_jobs=physical,reused_jobs=30-physical,new_GEO_calls=physical,
++        new_full_cascades=physical,new_base_pair_detector_calls=physical,new_full_score_rows=2*physical,
++        detector_scope='Counts explicit initial scan only; internal cascade legality scans remain in original cascade records',
++        candidate_rows=60,original_baseline_rows=12,original_fields=177,
++        all_C_bytes_and_proposal_exact=True,all_177_values_match_original_sources=True,
++        aliases_have_zero_new_scientific_calls=True,failures=0,replays=0,
++        model_calls=0,D0_calls=0,new_noise=0,new_queries=0,inputs=inputs,
++        files={str(folder/'per_job.csv'):R.sha(folder/'per_job.csv')},utc=R.utc())
++    R.write_new(done,result);return result
++
++
++if __name__=='__main__':
++    p=argparse.ArgumentParser();p.add_argument('--jobs',required=True);a=p.parse_args()
++    r=run(a.jobs);print({k:v for k,v in r.items() if k not in ('files','inputs')})
+diff --git a/r2/pilots/bench_regional_mix_dual_v1/support/record_root_review.py b/r2/pilots/bench_regional_mix_dual_v1/support/record_root_review.py
+new file mode 100644
+--- /dev/null
++++ b/r2/pilots/bench_regional_mix_dual_v1/support/record_root_review.py
+@@ -0,0 +1,84 @@
++"""Transcribe root's actual 12-page image review; never infer ratings from scores."""
++from r2.pilots.bench_regional_mix_dual_v1.common import OUT, read, sha, write, utc
++
++
++def run():
++    target = OUT / 'visual_review/root_review.json'
++    if target.exists():
++        raise RuntimeError('Review already recorded; do not overwrite actual observations')
++    panel = read(OUT / 'panel/manifest.json')['requests']
++    variants = ['ASSIST10', 'ASSIST01', 'ASSIST11', 'AUTO_COVER']
++    pages, observations = [], []
++    # Each category below is an explicit human-readable transcription of images
++    # actually displayed with view_image in the root conversation, not a classifier.
++    ratings = {
++        'good': ('REASONABLE', 'PLAUSIBLE', 'PRESENT', 'NO_OBVIOUS', 'NO_OBVIOUS'),
++        'damaged': ('INCOMPLETE', 'PLAUSIBLE', 'MISSING_OR_DAMAGED', 'YES', 'NO_OBVIOUS'),
++        'support_restored': ('REASONABLE', 'PLAUSIBLE', 'PRESENT', 'YES', 'NO_OBVIOUS'),
++    }
++    for i in range(3):
++        rid = panel[i]['request_id']
++        evidence = []
++        for variant in variants:
++            jid = f'J{i:02}_{variant}'
++            image = OUT / 'runs' / jid / 'gallery/CLEAN_FINAL_POST.png'
++            receipt = read(image.with_suffix('.json'))
++            assert sha(image) == receipt['image_sha256']
++            evidence.append(jid)
++            bound = ('2026-10-28T03:37:35+00:00' if i == 0 or (i == 1 and variant in variants[:2])
++                     else '2026-10-28T03:41:40+00:00' if i == 1
++                     else '2026-10-28T03:42:19+00:00')
++            pages.append({
++                'job_id': jid, 'image_path': str(image), 'image_sha256': sha(image),
++                'image_receipt_sha256': sha(image.with_suffix('.json')),
++                'view_event': 'Root conversation functions.exec -> tools.view_image; actual image displayed',
++                'viewed_by_utc': bound, 'view_time_precision': 'upper bound from adjacent clock call, not exact view timestamp',
++                'views': ['oblique_-60', 'oblique_120', 'fixed_front_section', 'fixed_side_section'],
++            })
++        if i < 2:
++            notes = {
++                'RAW': '蓝色板条座面周围有四条具可见宽度的灰腿；主体和支撑关系可解释。正常板条间隔不算裂片，图像不认证焊接或无交。',
++                'M_D0': '四腿多数退成针线/残段；两视角都缺少原支撑表面。中部板条侧壁和底面在截面中残缺。蓝色C仍像座面。',
++                'RAW_ALL': '四条主要腿及板条侧壁大体保留，整体接近RAW；宏观完整不代表数值冲突已经消失。',
++                'ASSIST10': '一端两腿恢复为有宽度的表面，另一端仍为针线残余；中部板条侧壁仍保留D0的损失。',
++                'ASSIST01': '恢复另一端两腿，未选的一端仍明显缺主要支撑；中部侧壁残缺没有一起恢复。',
++                'ASSIST11': '两端四腿都恢复，蓝色C座面被使用；中部板条侧壁/底部仍残缺，故支撑正向与可见裂口同时记录。',
++                'AUTO_COVER': ('自动少量换回没有恢复主要四腿，外观仍接近D0针线支撑。' if i == 0
++                               else '实际查看的自动列与D0一致，四腿仍针线化；本请求选择为空且复用D0，但标签来自实际图审。'),
++            }
++        else:
++            notes = {
++                'RAW': '蓝色弧形座面与灰色背板、端部扶手及竖直支柱形成可解释Bench；两视角保留主要结构。截面孤立轮廓可能属于远端扶手，不据此认定漂浮面。',
++                'M_D0': '灰背板仍在、C仍充当座面，但端部主要支柱变成针线，扶手只剩细碎边线；不能把针线当保住支撑。',
++                'RAW_ALL': '保住RAW的端柱和扶手等主要结构，宏观完整；此标签不代表无自交或接缝合格。',
++                'ASSIST10': '只恢复一端下部支柱，另一端仍残缺；上部扶手细碎部分未纳入选区，仍有明显缺损。',
++                'ASSIST01': '相反一端下部支柱恢复，但另一端仍针线化；上部端框/扶手仍受D0损伤。',
++                'ASSIST11': '两端下部支柱都恢复，座背和主要支撑合理；上部扶手部分仍残缺/细线，记录局部缺口而不认证完整表面修复。',
++                'AUTO_COVER': '自动列主要恢复一端支柱；另一端仍针线/短残段，扶手也未完整恢复。主体有座背但主要支撑仍不全。',
++            }
++        for model in ['RAW', 'M_D0', 'RAW_ALL'] + variants:
++            category = 'good' if model in ('RAW', 'RAW_ALL') else 'support_restored' if model == 'ASSIST11' else 'damaged'
++            values = ratings[category]
++            row = dict(zip(['overall_shape', 'C_use', 'support_retention', 'visible_fragment_or_gap', 'layering_or_fold'], values))
++            row.update({
++                'request_id': rid, 'panel_index': i, 'model': model,
++                'stage': 'RAW' if model == 'RAW' else 'CLEAN_FINAL_POST',
++                'three_axis_joint': category in ('good', 'support_restored'),
++                'notes': notes[model], 'image_evidence': evidence if model in ('RAW', 'M_D0', 'RAW_ALL') else [f'J{i:02}_{model}'],
++                'reviewer': 'AI_PROXY_root', 'review_kind': 'AI_PROXY_NONBLIND',
++            })
++            observations.append(row)
++    assert len(pages) == 12 and len(observations) == 21
++    write(target, {
++        'status': 'ACTUAL_VIEW_COMPLETE', 'reviewer': 'AI_PROXY_root', 'review_kind': 'AI_PROXY_NONBLIND',
++        'recorded_at_utc': utc(), 'actual_viewed_page_count': 12, 'unique_output_count': 21,
++        'protocol_sha256': sha(OUT / 'visual_review/PROTOCOL.md'),
++        'candidate_metrics_read_before_review': False,
++        'limitations': 'Same historical development requests; nonblind AI proxy, not independent human certification. Support/shape labels do not certify topology, no intersection, watertightness or source reconstruction.',
++        'pages': pages, 'observations': observations,
++    })
++    print(target)
++
++
++if __name__ == '__main__':
++    run()
+diff --git a/r2/pilots/bench_regional_mix_dual_v1/support/render_queue.py b/r2/pilots/bench_regional_mix_dual_v1/support/render_queue.py
+new file mode 100644
+--- /dev/null
++++ b/r2/pilots/bench_regional_mix_dual_v1/support/render_queue.py
+@@ -0,0 +1,94 @@
++"""Measured rendering of the 24 registered FINAL comparison pages, <=2 workers.
++
++This helper is not a scientific dispatch controller. Root invokes it only
++after resource review and all required producers are complete. Existing pages
++are verified by frozen runtime.render_one; incomplete pages are never erased.
++"""
++from .. import runtime as R
++import argparse
++from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
++import multiprocessing
++import os
++import time
++
++
++def worker(jobs_path,job_id):
++    page=R.job_dir(job_id)/'gallery/CLEAN_FINAL_POST.json';existed=page.exists()
++    before=R.resources();tick=time.perf_counter()
++    result=R.render_one(jobs_path,job_id,'CLEAN_FINAL_POST')
++    after=R.resources()
++    return dict(job_id=job_id,verified_existing=existed,page=str(page),page_sha256=R.sha(page),
++        image_path=result['image_path'],image_sha256=result['image_sha256'],
++        process_peak_RSS_KiB=after['peak_RSS_KiB'],peak_scope='Fresh render subprocess lifetime peak',
++        pid=os.getpid(),seconds=time.perf_counter()-tick,resources_before=before,resources_after=after)
++
++
++def run(jobs_path):
++    reg,rh,jobs=R.load_jobs(jobs_path)
++    selected=[j for j in reg['jobs'] if j['label']!='RAW_ALL']
++    if len(selected)!=24:raise ValueError('Expected exactly 24 registered comparison pages')
++    root=R.OUT/'render_queue';root.mkdir(exist_ok=True)
++    done=root/'complete.json'
++    if done.exists():
++        result=R.read(done)
++        if result['registration_sha256']!=rh:raise ValueError('Render registration changed')
++        R.verify(result['files']);return result
++    # Check every prerequisite before creating an attempt; no backend invocation.
++    for job in reg['jobs']:
++        receipt=R.verify_result(R.read(R.job_dir(job['job_id'])/'complete.json'))
++        if receipt['registration_sha256']!=rh:raise ValueError('Producer registration differs')
++    number=1
++    while (root/f'attempt_{number:03d}.json').exists():number+=1
++    lock=root/'active.lock'
++    with lock.open('x',encoding='utf-8') as handle:handle.write(str(os.getpid()))
++    tick=time.perf_counter();files={};records=[];workers=1
++    try:
++        R.write_new(root/f'attempt_{number:03d}.json',dict(status='STARTED',pid=os.getpid(),utc=R.utc(),
++            registration_sha256=rh,maximum_workers=2,threads_per_worker=1,helper_sha256=R.sha(__file__),
++            resources=R.resources(),automatic_retry=False,scientific_calls=0))
++        def accept(record):
++            files[record['page']]=record['page_sha256'];files[record['image_path']]=record['image_sha256']
++            records.append(record)
++            print(record['job_id']+(' VERIFIED' if record['verified_existing'] else ' RENDERED'),flush=True)
++        pending=list(selected)
++        # Choose an actually unrendered authorized page for representative memory.
++        first=next((j for j in pending if not (R.job_dir(j['job_id'])/'gallery/CLEAN_FINAL_POST.json').exists()),pending[0])
++        pending.remove(first)
++        with ProcessPoolExecutor(max_workers=2,mp_context=multiprocessing.get_context('spawn')) as pool:
++            measured=pool.submit(worker,jobs_path,first['job_id']).result();accept(measured)
++            now=R.resources();peak=measured['process_peak_RSS_KiB']*1024
++            margin=max(2*(1<<30),.1*now['ram_total_bytes'])
++            slots=int(max(0,now['ram_available_bytes']-margin)//(1.2*peak)) if peak>0 else 1
++            workers=min(2,slots,max(1,now['cpu_logical']//2))
++            if workers<1:raise RuntimeError('Insufficient measured render memory headroom')
++            R.write_new(root/f'measured_dispatch_{number:03d}.json',dict(first=first['job_id'],chosen_workers=workers,
++                observed_peak_bytes=peak,resources=now,first_was_existing=measured['verified_existing']))
++            active={}
++            while pending or active:
++                while pending and len(active)<workers:
++                    now=R.resources();margin=max(2*(1<<30),.1*now['ram_total_bytes'])
++                    if now['ram_available_bytes']-margin<1.2*peak:break
++                    job=pending.pop(0);future=pool.submit(worker,jobs_path,job['job_id']);active[future]=job
++                if not active:raise RuntimeError('Resource headroom disappeared; preserve unstarted render queue')
++                finished,_=wait(active,return_when=FIRST_COMPLETED)
++                for future in finished:
++                    record=future.result();accept(record);active.pop(future)
++                    peak=max(peak,record['process_peak_RSS_KiB']*1024)
++        records.sort(key=lambda r:next(i for i,j in enumerate(selected) if j['job_id']==r['job_id']))
++        result=dict(status='COMPLETE',registration_sha256=rh,pages=24,cells=96,records=records,
++            workers=workers,seconds_this_attempt=time.perf_counter()-tick,resources_final=R.resources(),
++            model_calls=0,GEO_calls=0,scoring_calls=0,ratings_generated=0,files=files)
++        R.write_new(done,result);return result
++    except BaseException as error:
++        R.write_new(root/f'failure_{number:03d}.json',dict(utc=R.utc(),error=repr(error),
++            completed_pages_this_attempt=records,recovery='Review partial page; never automatically delete/replay it',
++            model_calls=0,GEO_calls=0,scoring_calls=0))
++        raise
++    finally:
++        # Remove only this process's explicit bookkeeping lock, never assets.
++        if lock.exists() and lock.read_text()==str(os.getpid()):lock.unlink()
++
++
++if __name__=='__main__':
++    p=argparse.ArgumentParser();p.add_argument('--jobs',required=True);a=p.parse_args()
++    r=run(a.jobs);print({k:r[k] for k in ('status','pages','cells','workers')})
+diff --git a/r2/pilots/bench_regional_mix_dual_v1/support/report_signoff.py b/r2/pilots/bench_regional_mix_dual_v1/support/report_signoff.py
+new file mode 100644
+--- /dev/null
++++ b/r2/pilots/bench_regional_mix_dual_v1/support/report_signoff.py
+@@ -0,0 +1,61 @@
++"""Bind the completed actual review and independent numerical check to REPORT."""
++from r2.pilots.bench_regional_mix_dual_v1.common import OUT, read, sha, write, verify, utc
++
++
++def run():
++    report = OUT / 'REPORT.md'
++    reviewed_sha = 'e3f035d664003998d007b20cde41a5d1c100ed86807066a9d43fffb387a13722'
++    assert sha(report) == reviewed_sha
++    inputs = {}
++    for name, status in [
++        ('audits/execution/complete.json', 'PASS'), ('analysis/COMPLETE.json', 'COMPLETE'),
++        ('visual_review/COMPLETE.json', 'COMPLETE'), ('dispatch/complete.json', 'COMPLETE'),
++        ('render_queue/complete.json', 'COMPLETE'), ('gallery/index.json', 'COMPLETE'),
++    ]:
++        path = OUT / name
++        record = read(path)
++        assert record['status'] == status, (name, record['status'])
++        if 'files' in record:
++            verify(record['files'])
++        inputs[str(path)] = sha(path)
++    v = read(OUT / 'visual_review/summary.json')
++    assert (v['actual_pages'], v['unique_outputs']) == (24, 42)
++    assert v['counts']['ASSIST11']['three_axis_joint'] == 4
++    assert v['counts']['ASSIST11']['support_PRESENT'] == 6
++    s = read(OUT / 'analysis/summary.json')['stages']['CLEAN_FINAL_POST']['ALL']
++    assert (s['parent_count'], s['request_count'], s['I_common_PASS_requests']) == (3, 6, 6)
++    target = OUT / 'audits/report_review.json'
++    if target.exists():
++        old = read(target)
++        assert old['report_sha256'] == reviewed_sha and old['status'] == 'PASS'
++        return old
++    receipt = dict(
++        status='PASS', utc=utc(), report_sha256=reviewed_sha, reviewer='AI_PROXY_root',
++        independent_reviewer='AI_PROXY_backend_data',
++        independent_review_evidence='Actual collaboration message/final review on 2026-10-28: PASS for this exact REPORT SHA; no source or score rerun.',
++        checks={
++            'all_main_metrics_and_three_parent_tables_match': True,
++            'area_denominators_distinguished': True,
++            'legal_edge_losses_and_new_illegal_pairs_disclosed': True,
++            'all_24_pages_actually_reviewed_42_unique_outputs': True,
++            'visual_nonblind_AI_PROXY_and_uncertain_disclosed': True,
++            'assisted_and_automatic_results_separate': True,
++            'all_assisted_combinations_preserved_no_best_selection': True,
++            'six_development_requests_not_generalization': True,
++            'all_177_values_preserved_and_NA_retained': True,
++            'zero_model_training_D0_or_new_generation': True,
++            '23_physical_jobs_46_new_scores_no_failure_or_replay': True,
++            'report_15_existing_delivery_links_checked': True,
++            'continuation_receipt_limitation_documented': True,
++            'no_default_change_cleanup_commit_push': True,
++        },
++        checked_stage_receipts=inputs,
++        scientific_calls=0, new_visual_labels=0,
++    )
++    write(target, receipt)
++    return receipt
++
++
++if __name__ == '__main__':
++    import json
++    print(json.dumps(run(), ensure_ascii=False))
+diff --git a/r2/pilots/bench_regional_mix_dual_v1/support/small_review.py b/r2/pilots/bench_regional_mix_dual_v1/support/small_review.py
+new file mode 100644
+--- /dev/null
++++ b/r2/pilots/bench_regional_mix_dual_v1/support/small_review.py
+@@ -0,0 +1,71 @@
++"""Lossless smaller review: omit only six auxiliary PRE-selection PNG pages."""
++import hashlib
++import io
++import json
++from pathlib import PurePosixPath
++import zipfile
++from r2.pilots.bench_regional_mix_dual_v1.common import OUT, read, sha, write, utc
++from .delivery import compress, encoded, digest
++
++
++def run():
++    done = read(OUT / 'delivery/complete.json')
++    full = OUT / 'delivery/REVIEW.zip'
++    assert done['status'] == 'COMPLETE' and sha(full) == done['zip_sha256']
++    target = OUT / 'delivery/REVIEW_SMALL.zip'
++    receipt = OUT / 'delivery/small_complete.json'
++    if receipt.exists():
++        old = read(receipt)
++        assert sha(target) == old['zip_sha256']
++        return old
++    assert not target.exists(), 'Partial small package: do not overwrite'
++    with zipfile.ZipFile(full) as z:
++        files = {name: z.read(name) for name in z.namelist()}
++    omitted = []
++    for name in list(files):
++        if name.startswith('panel/selection_images/') and name.endswith('.png'):
++            data = files.pop(name)
++            omitted.append(dict(path=name, bytes=len(data), sha256=digest(data),
++                reason='Auxiliary pre-output assisted-selection image only; retained locally and in full REVIEW.zip. Exact region IDs/rules and all 24 actual result PNG pages remain in this small package.'))
++    assert len(omitted) == 6
++    assert len([p for p in files if p.startswith('runs/') and p.endswith('/gallery/CLEAN_FINAL_POST.png')]) == 24
++    original = json.loads(files.pop('PACKAGE_MANIFEST.json'))
++    artifact = json.loads(files['delivery/final_artifact_manifest.json'])
++    omitted_names = {x['path'] for x in omitted}
++    for r in artifact['files']:
++        if r['relative_path'] in omitted_names:
++            r['included_in_review'] = False
++            r['small_review_omission'] = 'Only pre-selection auxiliary PNG; in full ZIP/local original'
++    artifact['small_review_omissions'] = omitted
++    files['delivery/final_artifact_manifest.json'] = encoded(artifact)
++    files['SMALL_PACKAGE_SCOPE.json'] = encoded(dict(
++        full_zip_sha256=sha(full), full_zip_bytes=full.stat().st_size,
++        omitted=omitted, all_24_result_PNGs_preserved=True,
++        complete_177_parent_output_slot_selection_connectivity_tables_preserved=True,
++        actual_visual_review_and_source_preserved=True, geometry_or_model_calls=0))
++    files['README_REVIEW.txt'] += b'\nSMALL PACKAGE: only six auxiliary pre-selection PNGs are omitted. All 24 FINAL comparison PNGs, all original metric and ledger tables, actual visual reviews and code remain. See SMALL_PACKAGE_SCOPE.json for exact omitted hashes.\n'
++    original['small_review_omissions'] = omitted
++    original['members'] = [dict(path=name, bytes=len(data), sha256=digest(data)) for name, data in sorted(files.items())]
++    files['PACKAGE_MANIFEST.json'] = encoded(original)
++    data = compress(files, zipfile.ZIP_DEFLATED)
++    method = 'DEFLATE'
++    if len(data) >= 10_000_000:
++        alternative = compress(files, zipfile.ZIP_LZMA)
++        if len(alternative) < len(data):
++            data, method = alternative, 'LZMA'
++    with target.open('xb') as h:
++        h.write(data)
++    with zipfile.ZipFile(target) as z:
++        assert z.testzip() is None
++        assert all(digest(z.read(n)) == digest(d) for n, d in files.items())
++    result = dict(status='COMPLETE', utc=utc(), zip_path=str(target), zip_sha256=sha(target),
++        bytes=len(data), decimal_MB=len(data) / 1_000_000, below_10MB=len(data) < 10_000_000,
++        compression=method, original_gallery_pages=24, omitted_auxiliary_pages=6,
++        full_zip_sha256=sha(full), complete_evidence_except_auxiliary_PRE_selection_PNG=True,
++        scientific_calls=0, new_visual_labels=0)
++    write(receipt, result)
++    return result
++
++
++if __name__ == '__main__':
++    print(json.dumps(run(), ensure_ascii=False))
+diff --git a/r2/pilots/bench_regional_mix_dual_v1/support/visual_collect.py b/r2/pilots/bench_regional_mix_dual_v1/support/visual_collect.py
+new file mode 100644
+--- /dev/null
++++ b/r2/pilots/bench_regional_mix_dual_v1/support/visual_collect.py
+@@ -0,0 +1,332 @@
++"""Validate and summarize recorded actual visual reviews, without rerating.
++
++Only the two review JSONs, frozen panel/jobs, image receipts and PNG bytes are
++read. No score/metric files, meshes, detector, renderer or model are consulted.
++Repeated baseline columns retain one observation per request/model/stage.
++"""
++from __future__ import annotations
++
++import csv
++import hashlib
++import json
++from collections import Counter
++from datetime import datetime, timezone
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[4]
++OUT = ROOT / 'experiments/r2_bench_regional_mix_dual_v1'
++DEST = OUT / 'visual_review'
++VARIANTS = ('ASSIST10', 'ASSIST01', 'ASSIST11', 'AUTO_COVER')
++RUNTIME_MODELS = ('RAW', 'M_D0', 'RAW_ALL') + VARIANTS
++LABELS = ('RAW', 'D0_ALL', 'RAW_ALL') + VARIANTS
++AXES = {
++    'overall_shape': ('REASONABLE', 'INCOMPLETE', 'UNCERTAIN'),
++    'C_use': ('PLAUSIBLE', 'REPLACED_OR_IGNORED', 'UNCERTAIN'),
++    'support_retention': ('PRESENT', 'MISSING_OR_DAMAGED', 'UNCERTAIN'),
++    'visible_fragment_or_gap': ('YES', 'NO_OBVIOUS', 'UNCERTAIN'),
++    'layering_or_fold': ('YES', 'NO_OBVIOUS', 'UNCERTAIN'),
++}
++JOINT_AXES = ('overall_shape', 'C_use', 'support_retention')
++ASSIGNMENTS = (('root_review.json', 'AI_PROXY_root', range(3)),
++               ('backend_data_review.json', 'AI_PROXY_backend_data', range(3, 6)))
++VERSION = 'regional_mix_actual_visual_collect_v1'
++
++
++def resolve(value):
++    text = str(value).replace('\\', '/')
++    for prefix in ('E:/MeshFlow/', '/mnt/e/MeshFlow/'):
++        if text.startswith(prefix):
++            return ROOT / text[len(prefix):]
++    path = Path(text)
++    return path if path.is_absolute() else ROOT / path
++
++
++def read(path):
++    return json.loads(resolve(path).read_text(encoding='utf-8-sig'))
++
++
++def sha(path):
++    return hashlib.sha256(resolve(path).read_bytes()).hexdigest()
++
++
++def write(path, value):
++    with Path(path).open('x', encoding='utf-8') as handle:
++        json.dump(value, handle, ensure_ascii=False, indent=2, allow_nan=False)
++
++
++def csvwrite(path, rows):
++    fields = list(dict.fromkeys(key for row in rows for key in row))
++    with Path(path).open('x', encoding='utf-8-sig', newline='') as handle:
++        writer = csv.DictWriter(handle, fieldnames=fields)
++        writer.writeheader()
++        for row in rows:
++            writer.writerow({key: json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list, tuple))
++                             else value for key, value in row.items()})
++
++
++def utc_value(value):
++    if value.endswith(' UTC'):
++        result = datetime.strptime(value, '%Y-%m-%d %H:%M:%S UTC').replace(tzinfo=timezone.utc)
++    else:
++        result = datetime.fromisoformat(value.replace('Z', '+00:00'))
++    if result.utcoffset() != timezone.utc.utcoffset(result):
++        raise ValueError('Actual view time must be explicitly UTC')
++    return result.isoformat()
++
++
++def counts(rows):
++    return dict(
++        unique_outputs=len(rows), three_axis_joint=sum(r['three_axis_joint'] for r in rows),
++        three_axis_uncertain_inputs=sum(any(r[a] == 'UNCERTAIN' for a in JOINT_AXES) for r in rows),
++        support_PRESENT=sum(r['support_retention'] == 'PRESENT' for r in rows),
++        support_MISSING_OR_DAMAGED=sum(r['support_retention'] == 'MISSING_OR_DAMAGED' for r in rows),
++        support_UNCERTAIN=sum(r['support_retention'] == 'UNCERTAIN' for r in rows),
++        axes={axis: {state: sum(r[axis] == state for r in rows) for state in states}
++              for axis, states in AXES.items()})
++
++
++def transition(reference, candidate):
++    before, after = reference['three_axis_joint'], candidate['three_axis_joint']
++    fate = 'RETAINED' if before and after else 'LOST' if before else 'GAINED' if after else 'NEITHER'
++    uncertain = any(r[a] == 'UNCERTAIN' for r in (reference, candidate) for a in JOINT_AXES)
++    row = dict(request_id=candidate['request_id'], parent_id=candidate['parent_id'],
++               noise_index=candidate['noise_index'], report_group=candidate['report_group'],
++               reference=reference['label'], label=candidate['label'],
++               reference_runtime_model=reference['runtime_model'], runtime_model=candidate['runtime_model'],
++               reference_stage=reference['stage'], stage=candidate['stage'],
++               reference_three_axis_joint=before, candidate_three_axis_joint=after,
++               three_axis_boolean_fate=fate,
++               three_axis_fate='UNCERTAIN_COMPARISON' if uncertain else fate,
++               three_axis_transition_has_uncertainty=uncertain,
++               reference_notes=reference['notes'], candidate_notes=candidate['notes'],
++               reference_image_evidence=reference['image_evidence'], candidate_image_evidence=candidate['image_evidence'],
++               reference_reviewer=reference['reviewer'], candidate_reviewer=candidate['reviewer'])
++    for axis in AXES:
++        row['reference_' + axis] = reference[axis]
++        row['candidate_' + axis] = candidate[axis]
++        row['transition_' + axis] = reference[axis] + ' -> ' + candidate[axis]
++    return row
++
++
++def run():
++    done = DEST / 'COMPLETE.json'
++    if done.exists():
++        receipt = read(done)
++        for path, digest in {**receipt['inputs'], **receipt['files']}.items():
++            if sha(path) != digest:
++                raise ValueError('Completed visual collection input/output changed: ' + path)
++        return receipt
++    output_names = ('per_output.csv', 'per_request_transitions.csv', 'summary.json')
++    if any((DEST / name).exists() for name in output_names):
++        raise ValueError('Partial visual collection retained; no overwrite')
++    if any(not (DEST / name).is_file() for name, _, _ in ASSIGNMENTS):
++        raise FileNotFoundError('Wait for both actual review JSONs; no polling or partial summary')
++    panel_path = OUT / 'panel/manifest.json'
++    jobs_path = OUT / 'jobs.json'
++    protocol_path = DEST / 'PROTOCOL.md'
++    panel = read(panel_path)['requests']
++    reg = read(jobs_path)
++    registration_sha = sha(jobs_path)
++    protocol_sha = sha(protocol_path)
++    if len(panel) != 6 or len({p['request_id'] for p in panel}) != 6:
++        raise ValueError('Expected the frozen six-request panel')
++    if reg['panel_sha256'] != sha(panel_path):
++        raise ValueError('Panel changed after job registration')
++    jobs = {j['job_id']: j for j in reg['jobs']}
++    inputs = {str(p): sha(p) for p in (panel_path, jobs_path, protocol_path, Path(__file__))}
++    review_hashes = {}
++    pages = {}
++    rows = []
++    output_identity = {}
++    reviewers = []
++    page_evidence = {}
++    for filename, owner, indices in ASSIGNMENTS:
++        path = DEST / filename
++        review = read(path)
++        digest = sha(path)
++        inputs[str(path)] = digest
++        review_hashes[str(path)] = digest
++        if (review['status'] != 'ACTUAL_VIEW_COMPLETE' or review['reviewer'] != owner
++                or review['review_kind'] != 'AI_PROXY_NONBLIND'
++                or review['protocol_sha256'] != protocol_sha
++                or review['actual_viewed_page_count'] != 12
++                or review.get('unique_output_count', review.get('unique_observation_count')) != 21):
++            raise ValueError('Actual review status, identity or declared counts differ: ' + filename)
++        if review.get('candidate_metrics_read_before_review', review.get('numerical_scores_read_before_rating')) is not False:
++            raise ValueError('Missing explicit no-candidate-metrics-before-review declaration')
++        if review.get('labels_generated_from_metrics', False) is not False:
++            raise ValueError('Visual labels cannot be derived from metric values')
++        if review.get('registration_sha256', registration_sha) != registration_sha:
++            raise ValueError('Review registration differs')
++        expected_pages = {f'J{i:02d}_{variant}' for i in indices for variant in VARIANTS}
++        actual_pages = review['pages']
++        if len(actual_pages) != 12 or {p['job_id'] for p in actual_pages} != expected_pages:
++            raise ValueError('Actual assigned pages differ: ' + filename)
++        for page in actual_pages:
++            jid = page['job_id']
++            if jid in pages:
++                raise ValueError('Duplicate actual page across reviewers')
++            q = jobs[jid]['request']
++            image_path = resolve(page['image_path'])
++            expected_image = OUT / 'runs' / jid / 'gallery/CLEAN_FINAL_POST.png'
++            image_receipt_path = expected_image.with_suffix('.json')
++            if image_path != expected_image:
++                raise ValueError('Unexpected actual image path')
++            image_hash = sha(image_path)
++            receipt_hash = sha(image_receipt_path)
++            if image_hash != page['image_sha256'] or receipt_hash != page.get('image_receipt_sha256', page.get('receipt_sha256')):
++                raise ValueError('Reviewed PNG or receipt hash differs: ' + jid)
++            image_receipt = read(image_receipt_path)
++            if (image_receipt['job_id'] != jid or image_receipt['request_id'] != q['request_id']
++                    or image_receipt['registration_sha256'] != registration_sha
++                    or image_receipt['stage'] != 'CLEAN_FINAL_POST'
++                    or image_receipt['image_sha256'] != image_hash):
++                raise ValueError('Render producer identity differs: ' + jid)
++            views = page.get('views', page.get('views_checked'))
++            alternatives = ({'oblique_-60', 'oblique_120', 'fixed_front_section', 'fixed_side_section'},
++                            {'azimuth_-60', 'azimuth_120', 'original_front_section', 'original_side_section'})
++            if not views or set(views) not in alternatives or len(views) != 4:
++                raise ValueError('Both views and both fixed sections must be recorded')
++            if page.get('actually_viewed', True) is not True or not page.get('view_event') or not page.get('view_time_precision'):
++                raise ValueError('Missing actual view event/assertion')
++            viewed_at = utc_value(page['viewed_by_utc'])
++            cells = image_receipt['cells']
++            expected_models = ('RAW', 'M_D0', 'RAW_ALL', jobs[jid]['label'])
++            if tuple(c['model'] for c in cells) != expected_models:
++                raise ValueError('Four-column visual definition changed')
++            for cell in cells:
++                expected_stage = 'RAW' if cell['model'] == 'RAW' else 'CLEAN_FINAL_POST'
++                if cell['stage'] != expected_stage:
++                    raise ValueError('Incorrect visual stage')
++                mesh = str(resolve(cell['path']))
++                mesh_hashes = {str(resolve(p)): h for p, h in image_receipt['source_meshes'].items()}
++                identity = dict(path=mesh, sha256=mesh_hashes[mesh])
++                key = q['request_id'], cell['model'], cell['stage']
++                if key in output_identity and output_identity[key] != identity:
++                    raise ValueError('Repeated baseline columns are different outputs')
++                output_identity[key] = identity
++            inputs[str(image_path)] = image_hash
++            inputs[str(image_receipt_path)] = receipt_hash
++            pages[jid] = page
++            page_evidence[jid] = dict(reviewer=owner, request_id=q['request_id'], image_path=str(image_path),
++                                      image_sha256=image_hash, image_receipt_path=str(image_receipt_path),
++                                      image_receipt_sha256=receipt_hash, view_event=page['view_event'],
++                                      original_view_utc=page['viewed_by_utc'], normalized_view_utc=viewed_at,
++                                      view_time_precision=page['view_time_precision'], recorded_views=views)
++        observations = review['observations']
++        expected_keys = {(panel[i]['request_id'], model) for i in indices for model in RUNTIME_MODELS}
++        if len(observations) != 21 or {(o['request_id'], o['model']) for o in observations} != expected_keys:
++            raise ValueError('Each reviewer must record exactly21 unique outputs')
++        for observation_index, observation in enumerate(observations):
++            i = observation['panel_index']
++            if i not in indices or observation['request_id'] != panel[i]['request_id']:
++                raise ValueError('Review panel index differs')
++            model = observation['model']
++            stage = 'RAW' if model == 'RAW' else 'CLEAN_FINAL_POST'
++            if observation['stage'] != stage or not str(observation.get('notes', '')).strip():
++                raise ValueError('Observation stage or concrete notes missing')
++            if observation.get('reviewer', owner) != owner or observation.get('review_kind', 'AI_PROXY_NONBLIND') != 'AI_PROXY_NONBLIND':
++                raise ValueError('Observation reviewer identity differs')
++            if observation.get('actually_viewed', True) is not True:
++                raise ValueError('Unviewed observation cannot be aggregated')
++            for axis, allowed in AXES.items():
++                if observation[axis] not in allowed:
++                    raise ValueError('Unknown original visual label: ' + axis)
++            joint = all(observation[axis] == AXES[axis][0] for axis in JOINT_AXES)
++            if type(observation['three_axis_joint']) is not bool or observation['three_axis_joint'] != joint:
++                raise ValueError('Original joint flag conflicts with recorded axes; no automatic relabeling')
++            expected_evidence = ({f'J{i:02d}_{v}' for v in VARIANTS} if model in RUNTIME_MODELS[:3]
++                                 else {f'J{i:02d}_{model}'})
++            if set(observation['image_evidence']) != expected_evidence or len(observation['image_evidence']) != len(expected_evidence):
++                raise ValueError('Observation image evidence differs')
++            q = panel[i]['request']
++            identity = output_identity[observation['request_id'], model, stage]
++            row = dict(label='D0_ALL' if model == 'M_D0' else model, runtime_model=model,
++                       request_id=observation['request_id'], parent_id=q['parent_id'],
++                       condition_id=q['condition_id'], report_group=q['report_group'],
++                       noise_index=q['noise_index'], panel_index=i, N=q['N'], K=q['K'], stage=stage,
++                       **{axis: observation[axis] for axis in AXES},
++                       three_axis_joint=observation['three_axis_joint'], notes=observation['notes'],
++                       reviewer=owner, review_kind='AI_PROXY_NONBLIND',
++                       image_evidence=observation['image_evidence'],
++                       source_mesh_path=identity['path'], source_mesh_sha256=identity['sha256'],
++                       source_review_path=str(path), source_review_sha256=digest,
++                       source_observation_index=observation_index,
++                       source_observation_json=observation)
++            rows.append(row)
++        reviewers.append(dict(reviewer=owner, actual_pages=12, displayed_cells=48,
++                              unique_observations=21, input_path=str(path), input_sha256=digest,
++                              limitations=review.get('limitations')))
++    if len(pages) != 24 or len(rows) != 42 or len(output_identity) != 42:
++        raise ValueError('Whole-panel actual-page/unique-output coverage differs')
++    expected = {(p['request_id'], label) for p in panel for label in LABELS}
++    if {(r['request_id'], r['label']) for r in rows} != expected:
++        raise ValueError('Expected seven models by six requests')
++    rows.sort(key=lambda r: (r['panel_index'], LABELS.index(r['label'])))
++    lookup = {(r['request_id'], r['label']): r for r in rows}
++    transitions = []
++    for item in panel:
++        rid = item['request_id']
++        for reference in ('RAW', 'D0_ALL', 'RAW_ALL'):
++            for label in LABELS[1:]:
++                if label != reference:
++                    transitions.append(transition(lookup[rid, reference], lookup[rid, label]))
++    if len(transitions) != 96:
++        raise ValueError('Expected16 explicit comparisons per request')
++    parents = sorted({r['parent_id'] for r in rows})
++    if len(parents) != 3 or any(len({r['request_id'] for r in rows if r['parent_id'] == parent}) != 2
++                                for parent in parents):
++        raise ValueError('Expected three parents with two requests each')
++    per_parent = {parent: {label: counts([r for r in rows if r['parent_id'] == parent and r['label'] == label])
++                           for label in LABELS} for parent in parents}
++    comparisons = {}
++    for reference, label in dict.fromkeys((r['reference'], r['label']) for r in transitions):
++        group = [r for r in transitions if r['reference'] == reference and r['label'] == label]
++        comparisons[reference + ' -> ' + label] = dict(
++            requests=len(group), joint_fates=dict(Counter(r['three_axis_fate'] for r in group)),
++            gained_request_ids=[r['request_id'] for r in group if r['three_axis_fate'] == 'GAINED'],
++            lost_request_ids=[r['request_id'] for r in group if r['three_axis_fate'] == 'LOST'],
++            retained_request_ids=[r['request_id'] for r in group if r['three_axis_fate'] == 'RETAINED'],
++            uncertain_request_ids=[r['request_id'] for r in group if r['three_axis_fate'] == 'UNCERTAIN_COMPARISON'],
++            axis_transitions={axis: dict(Counter(r['transition_' + axis] for r in group)) for axis in AXES},
++            per_parent={parent: dict(Counter(r['three_axis_fate'] for r in group if r['parent_id'] == parent))
++                        for parent in parents})
++    summary = dict(status='COMPLETE', version=VERSION, registration_sha256=registration_sha,
++                   protocol_sha256=protocol_sha, actual_pages=24, displayed_cells=96, unique_outputs=42,
++                   duplicate_baseline_display_cells_not_recounted=54,
++                   models=list(LABELS), unique_requests=6, unique_parents=3,
++                   label_display_alias={'M_D0': 'D0_ALL'}, runtime_model_preserved=True,
++                   review_kind='AI_PROXY_NONBLIND', input_review_hashes=review_hashes, reviewers=reviewers,
++                   counts={label: counts([r for r in rows if r['label'] == label]) for label in LABELS},
++                   per_parent=per_parent,
++                   per_group={group: {label: counts([r for r in rows if r['report_group'] == group and r['label'] == label])
++                                      for label in LABELS} for group in sorted({r['report_group'] for r in rows})},
++                   per_request={p['request_id']: {label: {key: lookup[p['request_id'], label][key]
++                                  for key in (*AXES, 'stage', 'three_axis_joint', 'notes', 'reviewer', 'image_evidence')}
++                                  for label in LABELS} for p in panel},
++                   comparisons=comparisons, actual_page_evidence=page_evidence,
++                   definition='Original five-axis labels and notes are copied, not rejudged. Strict three-axis flag is checked against original axes. Each repeated baseline is counted once per request. RAW is the pre-backend reference; all other models are CLEAN_FINAL_POST.',
++                   limitations='Two nonblind AI proxy reviewers on repeatedly viewed development requests, not independent human certification. Disagreements/UNCERTAIN are retained. Joint positives do not certify no fragmentation, folding, conflict, watertightness, or exact source reconstruction.',
++                   metrics_read=0, models_loaded=0, new_visual_labels=0, rendering_calls=0)
++    # Validate all immutable review, page and protocol bytes again before output.
++    for path, digest in inputs.items():
++        if sha(path) != digest:
++            raise ValueError('Visual evidence changed during collection: ' + path)
++    csvwrite(DEST / 'per_output.csv', rows)
++    csvwrite(DEST / 'per_request_transitions.csv', transitions)
++    write(DEST / 'summary.json', summary)
++    receipt = dict(status='COMPLETE', version=VERSION, utc=datetime.now(timezone.utc).isoformat(),
++                   registration_sha256=registration_sha, actual_pages=24, displayed_cells=96,
++                   unique_outputs=42, unique_models=7, unique_requests=6, transition_rows=len(transitions),
++                   inputs=inputs, input_review_hashes=review_hashes, original_labels_and_notes_unchanged=True,
++                   metrics_read=0, models_loaded=0, detector_calls=0, scorer_calls=0, rendering_calls=0,
++                   new_visual_labels=0,
++                   files={str(DEST / name): sha(DEST / name) for name in output_names})
++    write(done, receipt)
++    return receipt
++
++
++if __name__ == '__main__':
++    result = run()
++    print(json.dumps({key: value for key, value in result.items() if key not in ('inputs', 'files')},
++                     ensure_ascii=False, indent=2))

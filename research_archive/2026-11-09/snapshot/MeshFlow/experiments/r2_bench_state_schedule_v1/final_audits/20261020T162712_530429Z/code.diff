@@ -1,0 +1,1801 @@
+--- baseline_A/training.py
++++ state_schedule/training.py
+@@ -1,658 +1,368 @@
+-"""Three fixed 1500-update Bench arms; no model construction on import.
+-
+-Fresh AdamW in every arm. Official and COMMON are generator initializations,
+-not optimizer continuations. Source owner layouts are training labels only;
+-the frozen C-only inference layout is owned by the evaluation entrypoint.
++"""Two isolated, precommitted Bench mechanisms, 1500 updates each.
++
++Imports the proven IO/checkpoint utilities, never the old experiment state machine.
++No fixed neural probes: native training losses are not directly comparable.
+ """
+ from __future__ import annotations
+-
+ import os
+ os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+ for _key in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+     os.environ[_key] = "2"
+-from pathlib import Path
+ import argparse
+ import copy
+ import json
+-import random
+ import signal
+ import sys
+ import time
+ import traceback
+-
++from pathlib import Path
+ ROOT = Path(__file__).resolve().parents[3]
+ sys.path.insert(0, str(ROOT / "r2/src"))
+-from meshflow_control import runtime
+ import numpy as np
+ import torch
++from meshflow_control import runtime
+ from meshflow_control.config import MODEL_CONFIG
+ from meshflow_control.checkpoints import state_hash, rng_state, restore_rng
+ from meshflow_control.models.native import build_model, native_execution
+-from meshflow_control.training import schedule40 as base
++from meshflow_control.seam.model_adapter import seam_forward, corner_masked_fm_loss
+ from meshflow_control.training.context_checkpoint import _cpu_copy, _check_generator
+-from meshflow_control.seam.model_adapter import seam_forward, corner_masked_fm_loss
+ from meshflow_control.data.io import digest, append_event
+-from r2.pilots.user_condition_finetune_v1 import trainer as historical
+-from r2.pilots.bench_parts_convergence_v1.worker_entry import ScopedIO
+-from r2.pilots.seam_pool47_couple_v1.training import resource
++from r2.pilots.bench_adaptation_strength_v1 import training as T
+ from r2.pilots.bench_clean_multipart_seam_v1 import data as D
+-from r2.pilots.bench_clean_multipart_seam_v1.training import stat, tensors
+-
+-EXPERIMENT = "R2_BENCH_ADAPTATION_STRENGTH_V1"
+-SCHEMA = "bench_adaptation_strength_training_v1"
+-DEFAULT_ROOT = ROOT / "experiments/r2_bench_adaptation_strength_v1"
+-ARMS = ("A_COMMON_LR1E5", "B_COMMON_LR2E6", "C_OFFICIAL_LR2E6")
++from .common import OUT, ARMS, EXPERIMENT, resolve
++
++SCHEMA = "bench_state_schedule_training_v1"
+ UPDATES = 1500
+-PROBE_STEPS = (0, 500, 1000, 1500)
+-EXPORT_STEPS = (0, 500, 1500)
+-FULL_STEPS = (0, 500, 1000, 1500)
+-_IO = None
+-
+-
+-def resolve(path):
+-    path = str(path)
+-    if os.name != "nt" and len(path) > 2 and path[1] == ":":
+-        path = "/mnt/" + path[0].lower() + path[2:].replace("\\", "/")
+-    return Path(path) if Path(path).is_absolute() else ROOT / path
+-
+-
+-def _plain_read(path):
+-    return json.loads(Path(path).read_text(encoding="utf-8-sig"))
+-
+-
+-def read(path):
+-    return _IO.metadata_reader(_plain_read)(path) if _IO else _plain_read(path)
+-
+-
+-def write(path, value):
+-    path = Path(path)
+-    path.parent.mkdir(parents=True, exist_ok=True)
+-    tmp = path.with_name(path.name + f".partial.{os.getpid()}")
+-    with tmp.open("x", encoding="utf-8") as stream:
+-        json.dump(value, stream, ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False)
+-        stream.write("\n")
+-        stream.flush()
+-        os.fsync(stream.fileno())
+-    (_IO.replace if _IO else os.replace)(tmp, path)
+-
+-
+-def install_io(root, arm=None):
+-    global _IO
+-    log = Path(root) / "training" / (arm or "cpu") / "io_guard.jsonl"
+-    log.parent.mkdir(parents=True, exist_ok=True)
+-    _IO = ScopedIO(root, os.replace, log_path=log)
+-
+-
+-def source_global(arm):
++
++
++def checked():
++    reg = T.read(OUT / "training_registration.json")
++    if (reg["status"], reg["experiment"], reg["arms"], reg["updates"],
++        reg["batch"], reg["microbatch"], reg["hybrid_lambda"]) != (
++            "FROZEN", EXPERIMENT, list(ARMS), 1500, 8, 1, .25):
++        raise ValueError("Frozen definition differs")
++    for path, expected in reg["training_code_hashes"].items():
++        if digest(resolve(path)) != expected:
++            raise ValueError("Frozen training code differs: " + path)
++    for key in ("manifest", "input_schedule", "source_checkpoint"):
++        if digest(resolve(reg[key])) != reg[key + "_sha256"]:
++            raise ValueError("Frozen input differs: " + key)
++    manifest = T.read(resolve(reg["manifest"]))
++    steps = T.read(resolve(reg["input_schedule"]))["steps"]
++    if (len(manifest["rows"]), len(manifest["train"]), len(manifest["dev"])) != (316, 195, 39):
++        raise ValueError("Original pool differs")
++    if len({r["parent_id"] for r in manifest["train"]}) != 58:
++        raise ValueError("Training parents differ")
++    if [e["step"] for e in steps] != list(range(1, 1501)) or any(len(e["samples"]) != 8 for e in steps):
++        raise ValueError("Original 1500x8 stream differs")
++    ids = {r["condition_id"] for r in manifest["train"]}
++    if any(r["condition_id"] not in ids for e in steps for r in e["samples"]):
++        raise ValueError("Non-TRAIN row")
++    for row in manifest["rows"]:
++        if digest(resolve(row["case_path"])) != row["case_sha256"]:
++            raise ValueError("Case changed: " + row["condition_id"])
++    return reg, manifest, steps
++
++
++def statistics(pred, b, sample, arm):
++    error = (pred.detach().float() - b["target"]).reshape(int(sample["N"]), 3, 3).square().cpu().numpy()
++    fixed = np.asarray(sample["anchor_ids"]) >= 0
++    valid = np.asarray(sample["valid_mask"], bool)
++    free = valid[:, None] & ~fixed
++    tip = free & (fixed.sum(1) == 2)[:, None]
++    bulk = free & (fixed.sum(1) == 0)[:, None]
++    active = free.copy()
++    t = float(sample["t"])
++    s = float(sample["seam_time"]) if arm == "ASYNC_LEAD_SEAM" else t
++    if arm == "ASYNC_LEAD_SEAM":
++        active = np.asarray(sample["active_free_corner_mask"], bool)
++    tip_active = tip & active
++    endpoint_factor = np.full(free.shape, 1. - t, np.float32)
++    endpoint_factor[tip] = 1. - s
++    endpoint_error = error * endpoint_factor[..., None] ** 2
++    global_error = error.copy()
++    if arm == "ASYNC_LEAD_SEAM":
++        global_error[tip_active] /= .7 ** 2
++    return dict(
++        all_free_velocity_sse=float(error[active].sum(dtype=np.float64)),
++        all_free_scalar_count=int(free.sum()) * 3,
++        active_scalar_count=int(active.sum()) * 3,
++        seam_tip_velocity_sse=float(error[tip_active].sum(dtype=np.float64)),
++        seam_tip_scalar_count=int(tip_active.sum()) * 3,
++        inactive_tip_scalar_count=int((tip & ~active).sum()) * 3,
++        bulk_velocity_sse=float(error[bulk].sum(dtype=np.float64)),
++        bulk_scalar_count=int(bulk.sum()) * 3,
++        active_endpoint_sse=float(endpoint_error[active].sum(dtype=np.float64)),
++        seam_tip_active_endpoint_sse=float(endpoint_error[tip_active].sum(dtype=np.float64)),
++        bulk_endpoint_sse=float(endpoint_error[bulk].sum(dtype=np.float64)),
++        global_equivalent_velocity_sse=float(global_error[active].sum(dtype=np.float64)),
++    )
++
++
++def import_start(reg, arm):
++    payload = torch.load(resolve(reg["source_checkpoint"]), map_location="cpu", weights_only=True, mmap=True)
++    if (payload["arm"], payload["local_step"], payload["global_step"], payload["update_in_progress"]) != (
++            "A_COMMON_LR1E5", 0, 12000, False):
++        raise ValueError("Must import exact A step0")
++    for key, fn, expected in (
++        ("generator_state", state_hash, reg["source_generator_sha256"]),
++        ("optimizer", T.base.tree_hash, reg["source_optimizer_sha256"]),
++        ("rng", T.base.tree_hash, reg["source_rng_sha256"]),
++    ):
++        if fn(payload[key]) != expected:
++            raise ValueError("A step0 internal identity differs: " + key)
++    if payload["optimizer"]["state"]:
++        raise ValueError("A step0 must be fresh AdamW")
++    model = build_model(copy.deepcopy(MODEL_CONFIG), readout_mode="none", trainable=True).eval()
++    model.load_state_dict(payload["generator_state"], strict=True)
++    model.to("cuda")
++    optimizer = T.make_optimizer(model, "A_COMMON_LR1E5")
++    if payload["optimizer_parameter_names"] != T.group_names(model):
++        raise ValueError("Parameter names/order differ")
++    optimizer.load_state_dict(payload["optimizer"])
++    restore_rng(payload["rng"])
++    if T.base.tree_hash(rng_state()) != reg["source_rng_sha256"]:
++        raise ValueError("Imported runtime RNG differs")
++    audit = dict(source_path=reg["source_checkpoint"], source_sha256=reg["source_checkpoint_sha256"],
++                 generator_initial_sha256=reg["source_generator_sha256"],
++                 imported_optimizer_sha256=reg["source_optimizer_sha256"],
++                 imported_rng_sha256=reg["source_rng_sha256"], fresh_AdamW=True,
++                 source_global_step=12000, arm=arm, new_parameters=0, head_calls=0,
++                 generator_parameters=sum(p.numel() for p in model.parameters()))
++    return model, optimizer, audit
++
++
++def train(arm, resume=False):
+     if arm not in ARMS:
+         raise ValueError(arm)
+-    return 0 if arm == "C_OFFICIAL_LR2E6" else 12000
+-
+-
+-def group_names(model):
+-    names = [name for name, _ in model.named_parameters()]
+-    theta = [name for name in names if name.startswith("backbone.")]
+-    phi = [name for name in names if name == "role_embedding" or name.startswith("context_encoder.")]
+-    if not theta or not phi or set(theta + phi) != set(names) or len(theta + phi) != len(names):
+-        raise ValueError("Unregistered generator parameter outside backbone / role / Geo")
+-    return [theta, phi]
+-
+-
+-def make_optimizer(model, arm):
+-    names = group_names(model)
+-    named = dict(model.named_parameters())
+-    theta_lr = 1e-5 if arm == "A_COMMON_LR1E5" else 2e-6
+-    return torch.optim.AdamW([
+-        dict(params=[named[n] for n in names[0]], lr=theta_lr, name="theta_backbone"),
+-        dict(params=[named[n] for n in names[1]], lr=1e-5, name="phi_condition"),
+-    ], betas=(.9, .95), eps=1e-8, weight_decay=0.)
+-
+-
+-def validate_optimizer(model, optimizer, arm, step):
+-    if arm not in ARMS or not 0 <= step <= UPDATES:
+-        raise ValueError("Arm / completed local cursor differs")
+-    if type(optimizer) is not torch.optim.AdamW or model.training or model.readout_mode != "none":
+-        raise ValueError("Expected eval-mode native model with fresh grouped AdamW")
+-    names = group_names(model)
+-    named = dict(model.named_parameters())
+-    if len(optimizer.param_groups) != 2:
+-        raise ValueError("Exactly two generator groups required")
+-    for index, (group, ns) in enumerate(zip(optimizer.param_groups, names)):
+-        lr = (1e-5 if arm == "A_COMMON_LR1E5" else 2e-6) if index == 0 else 1e-5
+-        if [id(p) for p in group["params"]] != [id(named[n]) for n in ns]:
+-            raise ValueError("Optimizer parameter identity / order changed")
+-        if (group["lr"], tuple(group["betas"]), group["eps"], group["weight_decay"]) != (lr, (.9, .95), 1e-8, 0.):
+-            raise ValueError("Registered optimizer hyperparameters changed")
+-        for name in ns:
+-            p = named[name]
+-            if p.dtype != torch.float32 or not p.requires_grad:
+-                raise ValueError("Trainable FP32 parameter required: " + name)
+-            state = optimizer.state.get(p, {})
+-            if step == 0 and not state:
+-                continue
+-            if set(state) != {"step", "exp_avg", "exp_avg_sq"} or float(state["step"]) != step:
+-                raise ValueError("AdamW local cursor differs: " + name)
+-            if any(state[k].shape != p.shape or state[k].dtype != torch.float32 for k in ("exp_avg", "exp_avg_sq")):
+-                raise ValueError("FP32 moment shape differs: " + name)
+-    return names
+-
+-
+-def checked(root):
+-    root = resolve(root).resolve()
+-    reg = read(root / "training_registration.json")
+-    if root != DEFAULT_ROOT.resolve() or reg["status"] != "FROZEN" or reg["experiment"] != EXPERIMENT:
+-        raise ValueError("Only the frozen independent experiment root is accepted")
+-    if reg["arms"] != list(ARMS) or (reg["updates"], reg["batch"], reg["microbatch"], reg["hybrid_lambda"]) != (1500, 8, 1, .25):
+-        raise ValueError("Registered arm / update / batch definition differs")
+-    if reg["model_config"] != MODEL_CONFIG or reg["fixed_probe_local_steps"] != list(PROBE_STEPS):
+-        raise ValueError("Registered model / probes differ")
+-    if reg["training_seed"] != 20261020:
+-        raise ValueError("Shared runtime seed differs")
+-    if not reg["training_code_hashes"]:
+-        raise ValueError("Frozen training code hashes required")
+-    for path, expected in reg["training_code_hashes"].items():
+-        if digest(resolve(path)) != expected:
+-            raise ValueError("Frozen training code changed: " + path)
+-    for key in ("manifest", "input_schedule", "probe_manifest"):
+-        if digest(resolve(reg[key])) != reg[key + "_sha256"]:
+-            raise ValueError("Frozen input changed: " + key)
+-    manifest = read(resolve(reg["manifest"]))
+-    steps = read(resolve(reg["input_schedule"]))["steps"]
+-    if (len(manifest["rows"]), len(manifest["train"]), len(manifest["dev"])) != (316, 195, 39):
+-        raise ValueError("Expected existing 316 / eligible195 / DEV39 conditions")
+-    if len({row["parent_id"] for row in manifest["train"]}) != 58:
+-        raise ValueError("Expected 58 eligible TRAIN parents")
+-    if len(steps) != UPDATES or [int(s["step"]) for s in steps] != list(range(1, UPDATES + 1)):
+-        raise ValueError("Exactly original 1500-update schedule required")
+-    train_ids = {row["condition_id"] for row in manifest["train"]}
+-    for entry in steps:
+-        if len(entry["samples"]) != 8 or any(s["condition_id"] not in train_ids for s in entry["samples"]):
+-            raise ValueError("Frozen batch must contain eight eligible TRAIN examples")
+-    for row in manifest["rows"]:
+-        if digest(resolve(row["case_path"])) != row["case_sha256"]:
+-            raise ValueError("Frozen source case changed: " + row["condition_id"])
+-    if len(read(resolve(reg["probe_manifest"]))["rows"]) != 96:
+-        raise ValueError("Original 96-input probe required")
+-    return reg, manifest, steps
+-
+-
+-def require_cursor(ledger, step):
+-    if ledger.pending or ledger.failed:
+-        raise RuntimeError("Failed or pending call requires explicit recovery; never silently replay")
+-    expected = dict(train_forward=step * 8, train_backward=step * 8, optimizer_update=step)
+-    if any(ledger.attempted[k] != n or ledger.successful[k] != n for k, n in expected.items()):
+-        raise RuntimeError("Saved cursor trails actual completed work; rollback forbidden")
+-    sequence = [r["context"]["local_step"] for r in ledger.rows
+-                if r["event"] == "CALL_BEGIN" and r["kind"] == "optimizer_update"]
+-    if sequence != list(range(1, step + 1)):
+-        raise RuntimeError("Optimizer update sequence differs")
+-
+-
+-def initialize_generator(reg, arm):
+-    """CPU-only weight import; called once inside an authorized GPU worker."""
+-    if arm == "C_OFFICIAL_LR2E6":
+-        from r2.pilots.bench_control_transfer_v1.train import initialize
+-        model, obsolete_optimizer, audit = initialize(reg, device="cpu")
+-        del obsolete_optimizer
+-        if audit["generator_initial_sha256"] != reg["official_initial_generator_sha256"]:
+-            raise ValueError("Rebuilt official + original condition initialization hash differs")
+-    else:
+-        source = resolve(reg["source_checkpoint"])
+-        if digest(source) != reg["source_checkpoint_sha256"]:
+-            raise ValueError("Protected COMMON checkpoint hash differs")
+-        payload = torch.load(source, map_location="cpu", weights_only=True, mmap=True)
+-        if (payload["arm"], payload["global_step"], payload["step"], payload.get("EMA")) != ("COMMON", 12000, 12000, False):
+-            raise ValueError("Only COMMON12000 live generator accepted")
+-        if payload["model_config"] != MODEL_CONFIG or payload.get("head_state") is not None:
+-            raise ValueError("COMMON source architecture / head differs")
+-        if state_hash(payload["generator_state"]) != reg["source_generator_sha256"]:
+-            raise ValueError("COMMON live generator hash differs")
+-        model = build_model(copy.deepcopy(MODEL_CONFIG), readout_mode="none", trainable=True).eval()
+-        model.load_state_dict(payload["generator_state"], strict=True)
+-        audit = dict(source_path=str(source), source_sha256=reg["source_checkpoint_sha256"],
+-                     generator_initial_sha256=reg["source_generator_sha256"], inherited_optimizer=False)
+-        del payload
+-    _check_generator(model.state_dict())
+-    audit.update(arm=arm, fresh_AdamW=True, inherited_optimizer=False, inherited_rng=False,
+-                 source_global_step=source_global(arm), generator_parameters=sum(p.numel() for p in model.parameters()),
+-                 optimizer_parameter_names=group_names(model), head_calls=0, SEAM_new_generator_parameters=0)
+-    return model, audit
+-
+-
+-def save_payload(path, payload, *, replace=False):
+-    path = Path(path)
+-    path.parent.mkdir(parents=True, exist_ok=True)
+-    if path.exists() and not replace:
+-        raise FileExistsError("Immutable checkpoint already exists: " + str(path))
+-    tmp = path.with_name(path.name + f".partial.{os.getpid()}")
+-    with tmp.open("xb") as stream:
+-        torch.save(payload, stream)
+-        stream.flush()
+-        os.fsync(stream.fileno())
+-    _IO.replace(tmp, path)
+-    receipt = dict(path=str(path), sha256=digest(path), bytes=path.stat().st_size,
+-                   **{k: payload[k] for k in ("schema", "arm", "local_step", "global_step",
+-                      "generator_state_sha256", "optimizer_state_sha256", "rng_sha256") if k in payload})
+-    write(path.with_suffix(".json"), receipt)
+-    return receipt
+-
+-
+-def parameter_drift(current, reference, names):
+-    result = {}
+-    for label, group in zip(("theta_backbone", "phi_condition"), names):
+-        delta2 = ref2 = 0.
+-        max_abs = 0.
+-        count = 0
+-        for name in group:
+-            a, b = current[name].detach().cpu(), reference[name].detach().cpu()
+-            delta = a - b
+-            delta2 += float(delta.square().sum(dtype=torch.float64))
+-            ref2 += float(b.square().sum(dtype=torch.float64))
+-            max_abs = max(max_abs, float(delta.abs().max()))
+-            count += a.numel()
+-        result[label] = dict(parameters=count, delta_l2=float(np.sqrt(delta2)),
+-                             delta_rms=float(np.sqrt(delta2 / count)), reference_l2=float(np.sqrt(ref2)),
+-                             relative_l2=float(np.sqrt(delta2 / ref2)) if ref2 else None, max_abs_delta=max_abs)
+-    return result
+-
+-
+-def fixed_probes(root, arm, step, model, reg, cases, ledger):
+-    """Original supervised inputs; A owns the one shared COMMON step0 call set."""
+-    from r2.pilots.bench_parts_convergence_v1.train import _rng_snapshot, _assert_same_rng
+-    out = root / "training" / arm
+-    path = out / "fixed_loss" / f"step{step}.json"
+-    shared = root / "shared/fixed_loss/COMMON_step0.json"
+-    current_hash = state_hash(model.state_dict())
+-    if arm == "B_COMMON_LR2E6" and step == 0:
+-        value = read(shared)
+-        if value["generator_state_sha256"] != current_hash or value["probe_manifest_sha256"] != reg["probe_manifest_sha256"]:
+-            raise ValueError("Shared A/B step0 probe identity differs")
+-        receipt = dict(value, arm=arm, actual_generator_forwards=0, inherited_probe=str(shared),
+-                       inherited_probe_sha256=digest(shared))
+-        write(path, receipt)
+-        return receipt
+-    if path.exists():
+-        value = read(path)
+-        if value["generator_state_sha256"] != current_hash:
+-            raise ValueError("Existing fixed probe does not match current generator")
+-        return value
+-    calls = [r for r in ledger.rows if r["event"] == "CALL_BEGIN" and r["kind"] == "probe_forward"
+-             and r["context"]["local_step"] == step]
+-    if calls:
+-        raise RuntimeError("Incomplete fixed probe encountered: no silent forward replay")
+-    before = _rng_snapshot()
+-    started = time.perf_counter()
+-    rows = []
+-    for row in read(resolve(reg["probe_manifest"]))["rows"]:
+-        if digest(resolve(row["noise_npz"])) != row["noise_sha256"]:
+-            raise ValueError("Frozen probe noise changed")
+-        noise = D.arrays(row["noise_npz"])
+-        z, eps = noise.get("z", noise.get("noise")), noise.get("eps", noise.get("epsilon"))
+-        if z is None or eps is None:
+-            raise ValueError("Original probe noise missing")
+-        sample = D.sample_for_probe(cases[row["condition_id"]], z, eps, row["t"], row["permutation_seed"])
+-        b = tensors(sample)
+-        context = dict(local_step=step, global_step=source_global(arm) + step, probe_id=row["probe_id"])
+-        with torch.no_grad(), native_execution(model, coordinates=(b["x"], b["t"]), autocast=True):
+-            pred, _ = ledger.call("probe_forward", lambda: seam_forward(
+-                model, b["x"], b["t"], b["y"], b["valid"], b["known"], b["fixed"]).float(), context)
+-        error = (pred - b["target"]).reshape(int(sample["N"]), 3, 3).square().cpu().numpy()
+-        if not np.isfinite(error).all():
+-            raise FloatingPointError("Nonfinite fixed probe")
+-        rows.append(dict(probe_id=row["probe_id"], condition_id=row["condition_id"], parent_id=row["parent_id"],
+-                         split=row["group"], part=row["part_type"], t=row["t"], **stat(error, sample)))
+-        del pred, b
+-    _assert_same_rng(before)
+-    def aggregate(xs):
+-        result = {}
+-        for key, label in (("all_free", "ALL_free"), ("bulk", "bulk"), ("seam_tip", "seam_tip")):
+-            sse = sum(r[key + "_velocity_sse"] for r in xs)
+-            count = sum(r[key + "_scalar_count"] for r in xs)
+-            result[label] = dict(sse=sse, count=count, MSE=sse / count if count else None)
+-        return result
+-    summary = {}
+-    for split in ("TRAIN", "DEV"):
+-        xs = [r for r in rows if r["split"] == split]
+-        summary[split.lower()] = aggregate(xs)
+-        summary[split.lower()]["parts"] = {part: aggregate([r for r in xs if r["part"] == part])
+-                                          for part in sorted({r["part"] for r in xs})}
+-    value = dict(schema="BENCH_ADAPTATION_ORIGINAL_PROBE_V1", arm=arm, local_step=step,
+-                 global_step=source_global(arm) + step, generator_state_sha256=current_hash,
+-                 probe_manifest_sha256=reg["probe_manifest_sha256"], rows=rows, **summary,
+-                 actual_generator_forwards=96, head_forwards=0, backward_calls=0, RNG_unchanged=True,
+-                 wall_seconds=time.perf_counter() - started)
+-    write(path, value)
+-    if arm == "A_COMMON_LR1E5" and step == 0:
+-        if shared.exists() and read(shared) != value:
+-            raise ValueError("Immutable shared probe already differs")
+-        if not shared.exists():
+-            write(shared, value)
+-    return value
+-
+-
+-def train(root, arm, *, resume=False, target=UPDATES):
+-    root = resolve(root).resolve()
+-    install_io(root, arm)
+-    reg, manifest, steps = checked(root)
+-    reg_sha = digest(root / "training_registration.json")
+-    go = read(root / "training_dispatch_go.json")
+-    if not go.get("authorized") or go.get("training_registration_sha256") != reg_sha or arm not in go.get("arms", []):
+-        raise ValueError("Parent per-arm GPU dispatch release missing")
+-    if arm not in ARMS or not 0 < target <= UPDATES:
+-        raise ValueError("Unknown arm / target exceeds fixed budget")
+-    out = root / "training" / arm
++    T.install_io(OUT, arm)
++    reg, manifest, steps = checked()
++    reg_sha = digest(OUT / "training_registration.json")
++    go = T.read(OUT / "training_dispatch_go.json")
++    if not go.get("authorized") or go["training_registration_sha256"] != reg_sha or arm not in go["arms"]:
++        raise RuntimeError("Parent resource-aware release missing")
++    out = OUT / "training" / arm
+     out.mkdir(parents=True, exist_ok=True)
+     status_path = out / "status.json"
+-    previous = read(status_path) if status_path.exists() else None
++    previous = T.read(status_path) if status_path.exists() else None
+     if previous and previous["status"] == "COMPLETE":
+         if digest(resolve(previous["checkpoint"]["path"])) != previous["checkpoint"]["sha256"]:
+-            raise ValueError("Completed checkpoint changed")
++            raise ValueError("Final checkpoint changed")
+         return previous
+-    if previous and (not resume or previous["status"] not in ("INTERRUPTED_SAFE", "SAFE_SEGMENT")):
+-        raise RuntimeError("Unresolved previous attempt; no silent retry")
+-    if resume and previous is None:
+-        raise ValueError("No safe exact-cursor state to resume")
++    if previous and (not resume or previous["status"] != "INTERRUPTED_SAFE"):
++        raise RuntimeError("Unresolved prior attempt; no silent replay")
++    if resume and not previous:
++        raise ValueError("No exact saved cursor")
+     step = int(previous["local_step"]) if previous else 0
+-    if step >= target:
+-        raise ValueError("Target must advance the exact saved cursor")
+     attempt = "attempt_" + str(time.time_ns())
+     adir = out / "attempts" / attempt
+     adir.mkdir(parents=True, exist_ok=False)
+-    limits = dict(train_forward=12000, train_backward=12000, optimizer_update=1500,
+-                  probe_forward=288 if arm == "B_COMMON_LR2E6" else 384)
+-    ledger = historical.CallLedger(out / "calls.jsonl", limits, arm, attempt)
+-    require_cursor(ledger, step)
+-    state = dict(status="LOADING", arm=arm, local_step=step, global_step=source_global(arm) + step,
+-                 target_local_step=target, registration_sha256=reg_sha, pid=os.getpid(), attempt=attempt,
+-                 head_calls=0, fresh_optimizer=True)
++    ledger = T.historical.CallLedger(out / "calls.jsonl",
++        dict(train_forward=12000, train_backward=12000, optimizer_update=1500), arm, attempt)
++    T.require_cursor(ledger, step)
++    state = dict(status="LOADING", arm=arm, local_step=step, global_step=12000 + step,
++                 target_local_step=1500, registration_sha256=reg_sha, pid=os.getpid(),
++                 attempt=attempt, head_calls=0, probe_calls=0)
+     if previous:
+         state["checkpoint"] = previous["checkpoint"]
+-    initial_resource = resource()
+-    write(adir / "resources_dispatch.json", initial_resource)
+-    if initial_resource["free_mib"] is None or initial_resource["free_mib"] < 2048:
+-        raise RuntimeError("RESOURCE_WAIT: no model loaded")
+-    if arm == "B_COMMON_LR2E6" and step == 0 and not (root / "shared/fixed_loss/COMMON_step0.json").exists():
+-        raise RuntimeError("DEPENDENCY_WAIT: A must publish the shared step0 probe before B")
+-    observer = historical.GPUObserver("bench_adaptation_formal_training_" + arm, interval=2.)
++    initial = T.resource()
++    T.write(adir / "resources_dispatch.json", initial)
++    if initial["free_mib"] is None or initial["free_mib"] < 2048:
++        raise RuntimeError("RESOURCE_WAIT before model load")
++    observer = T.historical.GPUObserver("bench_state_schedule_" + arm, interval=2.)
+     started = time.perf_counter()
+     stop = {"signal": None}
+-    owned = False
+     def handler(sig, unused):
+         stop["signal"] = sig
+     handlers = {sig: signal.signal(sig, handler) for sig in (signal.SIGINT, signal.SIGTERM)}
++    owned = False
+     try:
+-        with historical.exclusive_writer(out), observer:
++        with T.historical.exclusive_writer(out), observer:
+             owned = True
+-            write(status_path, state)
++            T.write(status_path, state)
+             torch.set_num_threads(2)
+             runtime.configure_stable_runtime()
+             if previous:
+                 path = resolve(previous["checkpoint"]["path"])
+                 if digest(path) != previous["checkpoint"]["sha256"]:
+-                    raise ValueError("Resume checkpoint SHA differs")
+-                payload = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
+-                if (payload["schema"], payload["arm"], payload["local_step"], payload["registration_sha256"],
+-                    payload.get("update_in_progress")) != (SCHEMA, arm, step, reg_sha, False):
+-                    raise ValueError("Resume completed-state identity differs")
+-                for key, fn, hashkey in (("generator_state", state_hash, "generator_state_sha256"),
+-                                         ("optimizer", base.tree_hash, "optimizer_state_sha256"),
+-                                         ("rng", base.tree_hash, "rng_sha256")):
+-                    if fn(payload[key]) != payload[hashkey]:
+-                        raise ValueError("Resume internal hash differs: " + key)
++                    raise ValueError("Resume SHA differs")
++                p = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
++                if (p["schema"], p["arm"], p["local_step"], p["registration_sha256"],
++                    p["update_in_progress"]) != (SCHEMA, arm, step, reg_sha, False):
++                    raise ValueError("Wrong exact-cursor checkpoint")
++                for key, fn, hk in (("generator_state", state_hash, "generator_state_sha256"),
++                                   ("optimizer", T.base.tree_hash, "optimizer_state_sha256"),
++                                   ("rng", T.base.tree_hash, "rng_sha256")):
++                    if fn(p[key]) != p[hk]:
++                        raise ValueError("Resume hash mismatch: " + key)
+                 model = build_model(copy.deepcopy(MODEL_CONFIG), readout_mode="none", trainable=True).eval()
+-                model.load_state_dict(payload["generator_state"], strict=True)
++                model.load_state_dict(p["generator_state"], strict=True)
+                 model.to("cuda")
+-                optimizer = make_optimizer(model, arm)
+-                if payload["optimizer_parameter_names"] != group_names(model):
+-                    raise ValueError("Resume parameter grouping differs")
+-                optimizer.load_state_dict(payload["optimizer"])
+-                restore_rng(payload["rng"])
+-                if base.tree_hash(rng_state()) != payload["rng_sha256"]:
+-                    raise ValueError("Resume RNG is not exact")
+-                audit = payload["initialization"]
+-                del payload
++                optimizer = T.make_optimizer(model, "A_COMMON_LR1E5")
++                optimizer.load_state_dict(p["optimizer"])
++                restore_rng(p["rng"])
++                if T.base.tree_hash(rng_state()) != p["rng_sha256"]:
++                    raise ValueError("Resume RNG mismatch")
++                audit = p["initialization"]
++                del p
+             else:
+-                model, audit = initialize_generator(reg, arm)
+-                model.to("cuda")
+-                optimizer = make_optimizer(model, arm)
+-                # Equal post-initialization RNG. Every data noise/time/permutation
+-                # is additionally seeded by the identical frozen sample row.
+-                random.seed(reg["training_seed"])
+-                np.random.seed(reg["training_seed"])
+-                torch.manual_seed(reg["training_seed"])
+-                torch.cuda.manual_seed_all(reg["training_seed"])
+-                audit["fresh_runtime_rng_sha256"] = base.tree_hash(rng_state())
+-            validate_optimizer(model, optimizer, arm, step)
+-            write(adir / "initialization.json", audit)
+-            cases = {row["condition_id"]: D.load_case(row) for row in manifest["rows"]}
+-            reference_payload = None
+-            if previous:
+-                reference_path = out / "checkpoint_step0.pt"
+-                receipt = read(reference_path.with_suffix(".json"))
+-                if digest(reference_path) != receipt["sha256"]:
+-                    raise ValueError("Arm step0 reference changed")
+-                reference_payload = torch.load(reference_path, map_location="cpu", weights_only=True, mmap=True)
+-                reference = reference_payload["generator_state"]
+-            else:
+-                reference = _cpu_copy(model.state_dict())
+-            if state_hash(reference) != audit["generator_initial_sha256"]:
+-                raise ValueError("Parameter drift reference is not the arm starting generator")
++                model, optimizer, audit = import_start(reg, arm)
++            T.validate_optimizer(model, optimizer, "A_COMMON_LR1E5", step)
++            T.write(adir / "initialization.json", audit)
++            cases = {r["condition_id"]: D.load_case(r) for r in manifest["train"]}
++            reference_payload = torch.load(resolve(reg["source_checkpoint"]), map_location="cpu", weights_only=True, mmap=True)
++            reference = reference_payload["generator_state"]
+ 
+             def checkpoint_save():
+-                require_cursor(ledger, step)
+-                names = validate_optimizer(model, optimizer, arm, step)
++                T.require_cursor(ledger, step)
++                names = T.validate_optimizer(model, optimizer, "A_COMMON_LR1E5", step)
+                 g = _cpu_copy(model.state_dict())
+                 _check_generator(g)
+                 o, rng = _cpu_copy(optimizer.state_dict()), _cpu_copy(rng_state())
+-                payload = dict(schema=SCHEMA, experiment=EXPERIMENT, arm=arm, local_step=step,
+-                               global_step=source_global(arm) + step, source_global_step=source_global(arm),
+-                               seam_total_step=step, EMA=False, update_in_progress=False,
+-                               generator_state=g, generator_state_sha256=state_hash(g),
+-                               optimizer=o, optimizer_state_sha256=base.tree_hash(o), optimizer_parameter_names=names,
+-                               rng=rng, rng_sha256=base.tree_hash(rng), initialization=audit,
+-                               model_config=copy.deepcopy(MODEL_CONFIG), registration_sha256=reg_sha,
+-                               execution=ledger.snapshot(), stream_state=dict(batch_index=step, next_sample_index=8 * step),
+-                               parameter_drift=parameter_drift(g, reference, names), head_calls=0)
+-                dest = out / (f"checkpoint_step{step}.pt" if step in FULL_STEPS else "rolling.pt")
+-                if dest.exists() and step in FULL_STEPS:
+-                    old = read(dest.with_suffix(".json"))
+-                    if old["generator_state_sha256"] != payload["generator_state_sha256"] or old["optimizer_state_sha256"] != payload["optimizer_state_sha256"]:
+-                        raise ValueError("Existing immutable checkpoint differs")
+-                    state["checkpoint"] = old
++                p = dict(schema=SCHEMA, experiment=EXPERIMENT, arm=arm, local_step=step,
++                    global_step=12000+step, source_global_step=12000, seam_total_step=step,
++                    EMA=False, update_in_progress=False, generator_state=g,
++                    generator_state_sha256=state_hash(g), optimizer=o,
++                    optimizer_state_sha256=T.base.tree_hash(o), optimizer_parameter_names=names,
++                    rng=rng, rng_sha256=T.base.tree_hash(rng), initialization=audit,
++                    model_config=copy.deepcopy(MODEL_CONFIG), registration_sha256=reg_sha,
++                    execution=ledger.snapshot(), stream_state=dict(batch_index=step, next_sample_index=8*step),
++                    parameter_drift=T.parameter_drift(g, reference, names), head_calls=0)
++                immutable = step in (0, 1500)
++                dest = out / (f"checkpoint_step{step}.pt" if immutable else "rolling.pt")
++                if dest.exists() and immutable:
++                    receipt = T.read(dest.with_suffix(".json"))
++                    if any(receipt[k] != p[k] for k in ("generator_state_sha256", "optimizer_state_sha256", "rng_sha256")):
++                        raise ValueError("Immutable checkpoint differs")
++                    state["checkpoint"] = receipt
+                 else:
+-                    state["checkpoint"] = save_payload(dest, payload, replace=step not in FULL_STEPS)
++                    state["checkpoint"] = T.save_payload(dest, p, replace=not immutable)
+                     append_event(out / "checkpoint_history.jsonl", state["checkpoint"])
+-                write(out / "parameter_drift" / f"step{step}.json", dict(local_step=step, **payload["parameter_drift"]))
+-                if step in EXPORT_STEPS:
+-                    export_path = root / "inference" / f"{arm}_S{step}_generator.pt"
+-                    export = {k: payload[k] for k in ("experiment", "arm", "local_step", "global_step", "seam_total_step",
+-                                                     "generator_state", "generator_state_sha256", "model_config", "EMA")}
+-                    export.update(schema="bench_adaptation_strength_generator_v1",
+-                                  state_sha256=payload["generator_state_sha256"],
++                T.write(out / "parameter_drift" / f"step{step}.json", p["parameter_drift"])
++                if step == 1500:
++                    export = {k: p[k] for k in ("experiment", "arm", "local_step", "global_step",
++                        "seam_total_step", "generator_state", "generator_state_sha256", "model_config", "EMA")}
++                    export.update(schema="bench_state_schedule_generator_v1", state_sha256=p["generator_state_sha256"],
+                                   training_checkpoint_sha256=state["checkpoint"]["sha256"])
+-                    if not export_path.exists():
+-                        state["inference_export"] = save_payload(export_path, export)
+-                    else:
+-                        state["inference_export"] = read(export_path.with_suffix(".json"))
+-                        if state["inference_export"]["generator_state_sha256"] != payload["generator_state_sha256"]:
+-                            raise ValueError("Immutable inference export differs")
+-                write(status_path, state)
++                    state["inference_export"] = T.save_payload(out / "generator_step1500.pt", export)
++                T.write(status_path, state)
+ 
+             state["status"] = "TRAINING"
+             if not previous:
+                 checkpoint_save()
+-            if step in PROBE_STEPS:
+-                fixed_probes(root, arm, step, model, reg, cases, ledger)
+-            write(status_path, state)
+-            resume_step = step
+-            for entry in steps[step:target]:
++            from . import async_core, perturbed_core
++            for entry in steps[step:]:
+                 if stop["signal"] is not None:
+                     checkpoint_save()
+                     state.update(status="INTERRUPTED_SAFE", signal=stop["signal"])
+                     break
+                 current = int(entry["step"])
+                 tick = time.perf_counter()
+-                if current == resume_step + 1 or current % 25 == 1:
+-                    rr = resource()
++                if current == step+1 and (current == 1 or current % 25 == 1):
++                    rr = T.resource()
+                     append_event(out / "resource_checks.jsonl", dict(local_step_before=step, **rr))
+                     if rr["free_mib"] is None or rr["free_mib"] < 2048:
+                         checkpoint_save()
+-                        state.update(status="INTERRUPTED_SAFE", reason="measured_vram_headroom_below_2048MiB_or_unknown")
++                        state.update(status="INTERRUPTED_SAFE", reason="VRAM_headroom_below_2048MiB")
+                         break
+-                samples = [D.sample_for_training(cases[row["condition_id"]], row) for row in entry["samples"]]
++                samples, audits = [], []
++                for row in entry["samples"]:
++                    original = D.sample_for_training(cases[row["condition_id"]], row)
++                    if arm == "PERTURBED_STATE":
++                        s, audit_row = perturbed_core.apply_perturbation(original, row)
++                    else:
++                        s = async_core.transform_sample(original)
++                        audit_row = dict(tip_clock=float(s["seam_time"]),
++                            tip_active=float(s["t"]) < float(np.float32(.7)))
++                    samples.append(s)
++                    audits.append(audit_row)
+                 denominator = sum(int(s["free_coordinate_count"]) for s in samples)
+-                input_seconds = time.perf_counter() - tick
++                input_seconds = time.perf_counter()-tick
+                 batch_start = time.perf_counter()
+                 torch.cuda.reset_peak_memory_stats()
+                 optimizer.zero_grad(set_to_none=True)
+-                fm, rows = 0., []
+-                for mi, (sample, row) in enumerate(zip(samples, entry["samples"])):
+-                    context = dict(local_step=current, global_step=source_global(arm) + current,
++                total_loss, rows = 0., []
++                for mi, (s, row, audit_row) in enumerate(zip(samples, entry["samples"], audits)):
++                    context = dict(local_step=current, global_step=12000+current,
+                                    microbatch=mi, condition_id=row["condition_id"])
+-                    b = tensors(sample)
++                    b = T.tensors(s)
++                    forward = async_core.forward if arm == "ASYNC_LEAD_SEAM" else seam_forward
+                     with native_execution(model, coordinates=(b["x"], b["t"]), autocast=True):
+-                        pred, _ = ledger.call("train_forward", lambda: seam_forward(
++                        pred, _ = ledger.call("train_forward", lambda: forward(
+                             model, b["x"], b["t"], b["y"], b["valid"], b["known"], b["fixed"]).float(), context)
+-                        loss = corner_masked_fm_loss(pred, b["target"], b["valid"], b["fixed"], denominator=denominator)
++                        if arm == "ASYNC_LEAD_SEAM":
++                            loss, _ = async_core.loss_and_stats(pred, b, denominator=denominator)
++                        else:
++                            loss = corner_masked_fm_loss(pred, b["target"], b["valid"], b["fixed"], denominator=denominator)
+                         if not bool(torch.isfinite(loss)):
+-                            raise FloatingPointError("Nonfinite FM")
++                            raise FloatingPointError("Nonfinite objective")
+                         ledger.call("train_backward", loss.backward, context)
+-                    err = (pred.detach() - b["target"]).reshape(int(sample["N"]), 3, 3).square().cpu().numpy()
+-                    statistics = stat(err, sample)
+-                    if not np.isclose(statistics["all_free_velocity_sse"] / denominator, float(loss.detach()), rtol=4e-6, atol=1e-7):
+-                        raise ValueError("FM SSE / scalar denominator accounting differs")
+-                    fm += float(loss.detach())
+-                    tm = float(sample["t"])
+-                    time_bin = min(4, int(tm * 5))
+-                    append_event(out / "exposure.jsonl", {**row, **context, "t": tm,
+-                        "time_bin": f"{time_bin/5:.1f}-{(time_bin+1)/5:.1f}", "N": int(sample["N"]), "K": int(sample["K"]),
+-                        "FM_contribution": float(loss.detach()), **statistics})
+-                    rows.append(statistics)
++                    st = statistics(pred, b, s, arm)
++                    if not np.isclose(st["all_free_velocity_sse"]/denominator, float(loss.detach()), rtol=4e-6, atol=1e-7):
++                        raise ValueError("Loss accounting differs")
++                    total_loss += float(loss.detach())
++                    append_event(out / "exposure.jsonl", {**row, **context, "t": float(s["t"]),
++                        "N": int(s["N"]), "K": int(s["K"]), "loss_contribution": float(loss.detach()),
++                        **st, "mechanism": audit_row})
++                    rows.append(st)
+                     del pred, loss, b
+                 if any(p.grad is None for p in model.parameters()):
+                     raise RuntimeError("Unused generator parameter")
+-                gradient_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), 1., error_if_nonfinite=True))
+-                ledger.call("optimizer_update", optimizer.step,
+-                            dict(local_step=current, global_step=source_global(arm) + current))
++                gn = float(torch.nn.utils.clip_grad_norm_(model.parameters(), 1., error_if_nonfinite=True))
++                ledger.call("optimizer_update", optimizer.step, dict(local_step=current, global_step=12000+current))
+                 step = current
+-                validate_optimizer(model, optimizer, arm, step)
++                T.validate_optimizer(model, optimizer, "A_COMMON_LR1E5", step)
+                 if any(not bool(torch.isfinite(p).all()) for p in model.parameters()):
+-                    raise FloatingPointError("Nonfinite updated generator")
+-                sums = {key: sum(row[key] for row in rows) for key in rows[0]}
+-                result = dict(local_step=step, global_step=source_global(arm) + step, optimizer_local_step=step,
+-                              FM=fm, free_coordinate_denominator=denominator, **sums,
+-                              generator_gradient_norm=gradient_norm, input_seconds=input_seconds,
+-                              update_seconds=time.perf_counter() - batch_start,
+-                              peak_allocated_bytes=torch.cuda.max_memory_allocated(),
+-                              peak_reserved_bytes=torch.cuda.max_memory_reserved(),
+-                              peak_scope="one real formal batch including backward and both-group AdamW; not process VRAM",
+-                              theta_lr=optimizer.param_groups[0]["lr"], phi_lr=optimizer.param_groups[1]["lr"], head_calls=0)
++                    raise FloatingPointError("Nonfinite updated parameter")
++                sums = {key: sum(r[key] for r in rows) for key in rows[0]}
++                result = dict(local_step=step, global_step=12000+step, objective=total_loss,
++                    free_coordinate_denominator=denominator, **sums, generator_gradient_norm=gn,
++                    input_seconds=input_seconds, update_seconds=time.perf_counter()-batch_start,
++                    peak_allocated_bytes=torch.cuda.max_memory_allocated(),
++                    peak_reserved_bytes=torch.cuda.max_memory_reserved(),
++                    peak_scope="real formal batch including backward/AdamW; allocator not process VRAM")
+                 append_event(out / "training_log.jsonl", result)
+-                state.update(local_step=step, global_step=source_global(arm) + step, last=result,
+-                             elapsed_seconds=time.perf_counter() - started)
++                state.update(local_step=step, global_step=12000+step, last=result, elapsed_seconds=time.perf_counter()-started)
+                 if step % 250 == 0:
+                     checkpoint_save()
+-                if step in PROBE_STEPS:
+-                    fixed_probes(root, arm, step, model, reg, cases, ledger)
+-                write(status_path, state)
++                T.write(status_path, state)
+                 if step in (1, 5, 25) or step % 100 == 0:
+-                    write(out / f"resources_step{step}.json", resource())
++                    T.write(out / f"resources_step{step}.json", T.resource())
+                     print(json.dumps(dict(arm=arm, **result)), flush=True)
+                 if step == 1:
+-                    write(out / "first_formal_backward.json", dict(status="PASS", no_extra_model_forward=True, **result))
++                    T.write(out / "first_formal_backward.json", dict(status="PASS", no_extra_forward=True, **result))
+             else:
+-                if step % 250:
+-                    checkpoint_save()
+-                state["status"] = "COMPLETE" if step == UPDATES else "SAFE_SEGMENT"
+-            require_cursor(ledger, step)
+-            expected_probe_count = 96 * sum(s <= step for s in PROBE_STEPS) - (96 if arm == "B_COMMON_LR2E6" else 0)
+-            if ledger.successful["probe_forward"] != expected_probe_count:
+-                raise RuntimeError("Completed fixed-probe budget/cursor differs")
+-            write(status_path, state)
++                state["status"] = "COMPLETE"
++            T.require_cursor(ledger, step)
++            T.write(status_path, state)
+     except BaseException as exc:
+         state.update(status="OOM" if isinstance(exc, torch.cuda.OutOfMemoryError) else "FAILED",
+-                     error=repr(exc), traceback=traceback.format_exc(), no_automatic_retry=True)
+-        write(adir / "failure.json", state)
++                     error=repr(exc), traceback=traceback.format_exc(), no_automatic_replay=True)
++        T.write(adir / "failure.json", state)
+         raise
+     finally:
+         for sig, old in handlers.items():
+             signal.signal(sig, old)
+-        state.update(local_step=step, global_step=source_global(arm) + step,
+-                     elapsed_seconds=time.perf_counter() - started, calls=ledger.snapshot(), resources=observer.summary())
+-        write(adir / "resources.json", dict(samples=observer.samples, summary=observer.summary()))
++        state.update(local_step=step, global_step=12000+step, elapsed_seconds=time.perf_counter()-started,
++                     calls=ledger.snapshot(), resources=observer.summary())
++        T.write(adir / "resources.json", dict(samples=observer.samples, summary=observer.summary()))
+         if owned:
+-            write(status_path, state)
+-        write(adir / "final_status.json", state)
++            T.write(status_path, state)
++        T.write(adir / "final_status.json", state)
+     return state
+ 
+ 
+-def preflight_cpu(root):
+-    """One official CPU rebuild, no forward/update or CUDA initialization."""
+-    root = resolve(root).resolve()
+-    install_io(root)
+-    reg, manifest, steps = checked(root)
+-    if torch.cuda.is_initialized():
+-        raise RuntimeError("CPU initialization preflight requires an untouched CUDA context")
+-    path = root / "training_audit/initialization_preflight.json"
+-    if path.exists():
+-        old = read(path)
+-        if old["training_registration_sha256"] != digest(root / "training_registration.json"):
+-            raise ValueError("Existing preflight registration differs")
+-        return old
+-    torch.set_num_threads(2)
+-    model, audit = initialize_generator(reg, "C_OFFICIAL_LR2E6")
+-    names = group_names(model)
+-    named = dict(model.named_parameters())
+-    groups = []
+-    for label, ns in zip(("theta_backbone", "phi_condition"), names):
+-        groups.append(dict(name=label, tensors=len(ns), parameters=sum(named[n].numel() for n in ns),
+-                           parameter_names=ns, state_sha256=state_hash({n: named[n] for n in ns})))
+-    optimizers = []
+-    for arm in ARMS:
+-        optimizer = make_optimizer(model, arm)
+-        validate_optimizer(model, optimizer, arm, 0)
+-        if optimizer.state:
+-            raise ValueError("Fresh AdamW has inherited moments")
+-        optimizers.append(dict(arm=arm, groups=[{k: v for k, v in group.items() if k != "params"}
+-                                                for group in optimizer.param_groups],
+-                               state_entries=0, local_optimizer_step=0))
+-        del optimizer
+-    if torch.cuda.is_initialized():
+-        raise RuntimeError("CPU preflight unexpectedly initialized CUDA")
+-    value = dict(status="PASS", schema="bench_adaptation_initialization_cpu_preflight_v1",
+-                 training_registration_sha256=digest(root / "training_registration.json"),
+-                 initialization=audit, groups=groups, group_disjoint_complete=True, optimizers=optimizers,
+-                 train_conditions=len(manifest["train"]), train_parents=58, updates_per_arm=len(steps),
+-                 model_constructions=1, model_forwards=0, backward_calls=0, optimizer_updates=0,
+-                 CUDA_initialized=False, official_generator_initial_hash_matches=True)
+-    write(path, value)
+-    return value
+-
+-
+-def main():
+-    parser = argparse.ArgumentParser(description=__doc__)
+-    parser.add_argument("--root", default=str(DEFAULT_ROOT))
+-    parser.add_argument("--arm", choices=ARMS)
+-    group = parser.add_mutually_exclusive_group(required=True)
+-    group.add_argument("--check-cpu", action="store_true")
+-    group.add_argument("--preflight-cpu", action="store_true")
+-    group.add_argument("--execute", action="store_true")
+-    parser.add_argument("--resume", action="store_true")
+-    parser.add_argument("--target", type=int, default=UPDATES)
+-    args = parser.parse_args()
+-    if args.preflight_cpu:
+-        result = preflight_cpu(args.root)
+-    elif args.check_cpu:
+-        reg, manifest, steps = checked(args.root)
+-        result = dict(status="PASS", updates_per_arm=len(steps), train_conditions=len(manifest["train"]),
+-                      train_parents=58, actual_probe_forwards_total=1056, head_calls=0,
+-                      model_constructions=0, model_forwards=0, CUDA_initialized=torch.cuda.is_initialized())
++if __name__ == "__main__":
++    p = argparse.ArgumentParser()
++    p.add_argument("--arm", choices=ARMS)
++    p.add_argument("--resume", action="store_true")
++    p.add_argument("--check-cpu", action="store_true")
++    args = p.parse_args()
++    if args.check_cpu:
++        r, m, s = checked()
++        print(json.dumps(dict(status="PASS", updates=1500, train_conditions=len(m["train"]),
++                              new_neural_probes=0, CUDA_initialized=torch.cuda.is_initialized())))
+     else:
+         if not args.arm:
+-            parser.error("--execute requires --arm")
+-        result = train(args.root, args.arm, resume=args.resume, target=args.target)
+-    print(json.dumps(result, ensure_ascii=False, indent=2), flush=True)
+-
+-
+-if __name__ == "__main__":
+-    main()
++            p.error("--arm required")
++        print(json.dumps(train(args.arm, args.resume), indent=2))
+--- baseline_A/sample.py
++++ state_schedule/sample.py
+@@ -1,4 +1,4 @@
+-"""Registered eight-label Euler50 sampling; no layout-head calls or new noise."""
++"""Two registered endpoint samplers; historical A is never regenerated."""
+ from __future__ import annotations
+ import os
+ os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+@@ -23,8 +23,11 @@
+     from r2.pilots.seam_slot_c200_v1 import generate as G
+     from meshflow_control.seam import model_adapter as A
+     code = [Path(__file__), Path(__file__).with_name("eval_plan.py"), Path(S.__file__), Path(G.__file__), Path(A.__file__)]
++    if spec["arm"] == "ASYNC_LEAD_SEAM":
++        from . import async_core
++        code.append(Path(async_core.__file__))
+     result = dict(status="FROZEN", label=label, spec=spec, outputs=len(requests(label)),
+-                  solver="Euler50", head_forwards=0, source_labels_read=False,
++                  solver="Euler50", rollout_arm=spec["arm"], head_forwards=0, source_labels_read=False,
+                   generator_forwards=50 * len(requests(label)), new_noise=0,
+                   protected={str(p): sha(p) for p in inputs},
+                   code={str(p): sha(p) for p in code})
+@@ -98,6 +101,8 @@
+     tick = time.perf_counter()
+     try:
+         p = torch.load(gen, map_location="cpu", weights_only=True, mmap=True)
++        if p["arm"] != spec["arm"]:
++            raise ValueError("Wrong arm generator")
+         if int(p["local_step"]) != int(spec["local_step"]) or int(p["global_step"]) != int(spec["global_step"]):
+             raise ValueError("Wrong checkpoint step")
+         if p.get("EMA", False):
+@@ -121,7 +126,13 @@
+             dest = out / q["request_id"] / "raw"
+             dest.mkdir(parents=True)
+             T.write(dest / "attempt.json", dict(label=label, request=q, generator=identity, forward_budget=50))
+-            raw, trajectory, audit = S.rollout(model, lay, arrays(q["noise_npz"])["z"], "SEAM", dest / "calls.jsonl")
++            if spec["arm"] == "PERTURBED_STATE":
++                raw, trajectory, audit = S.rollout(
++                    model, lay, arrays(q["noise_npz"])["z"], "SEAM", dest / "calls.jsonl")
++            else:
++                from .async_core import rollout
++                raw, trajectory, audit = rollout(
++                    model, lay, arrays(q["noise_npz"])["z"], "SEAM", dest / "calls.jsonl")
+             mesh = raw_arrays(raw, lay, logits, source)
+             P.array_file(dest / "raw.npz", mesh)
+             P.array_file(dest / "trajectory.npz", dict(state=trajectory))
+--- baseline_A/post_d0.py
++++ state_schedule/post_d0.py
+@@ -1,4 +1,4 @@
+-"""Exactly one official Bench D0, gated by all 224 completed RAW outputs."""
++"""Exactly one official Bench D0, gated by all 96 new completed RAW outputs."""
+ from __future__ import annotations
+ import argparse, json, types
+ from .eval_plan import OUT, LABELS, all_raw_barrier, label_spec, requests
+--- baseline_A/evaluation.py
++++ state_schedule/evaluation.py
+@@ -155,74 +155,9 @@
+ 
+ 
+ def collect():
+-    """Preserve every field; per-parent means avoid condition-count weighting."""
+-    rows = []
+-    paths = {}
+-    for label in LABELS:
+-        for q in requests(label):
+-            for stage in STAGES:
+-                folder = score_dir(label, q, stage)
+-                receipt = read(folder / "complete.json")
+-                verify(receipt["files"])
+-                path = folder / "row.json"
+-                row = read(path)
+-                row.update(label=label, stage=stage, request_id=q["request_id"],
+-                           condition_id=q["condition_id"], parent_id=q["parent_id"],
+-                           noise_index=q["noise_index"], split=q["split"], part_type=q["part_type"],
+-                           closed_C=q["closed_C"], boundary_edges=q["boundary_edges"],
+-                           seam_applicability="NA_CLOSED_C_NO_SEAM_INTERFACE" if q["closed_C"] else "APPLICABLE")
+-                rows.append(row)
+-                paths[str(path)] = sha(path)
+-    if len(rows) != 672:
+-        raise ValueError("Expected 224 outputs x 3 complete scored stages")
+-    numeric = sorted({k for r in rows for k, v in r.items()
+-                      if isinstance(v, (float, int)) and not isinstance(v, bool)}
+-                     - {"noise_index", "N", "K", "boundary_edges"})
+-    def aggregate(data, keys):
+-        grouped = collections.defaultdict(list)
+-        for r in data:
+-            grouped[tuple(r[k] for k in keys)].append(r)
+-        out = []
+-        for values, rr in sorted(grouped.items()):
+-            row = dict(zip(keys, values))
+-            row["rows"] = len(rr)
+-            for metric in numeric:
+-                v = [float(r[metric]) for r in rr if isinstance(r.get(metric), (float, int))
+-                     and not isinstance(r.get(metric), bool) and np.isfinite(r[metric])]
+-                row[metric] = float(np.mean(v)) if v else None
+-                row[metric + "__valid_n"] = len(v)
+-            out.append(row)
+-        return out
+-    conditions = aggregate(rows, ("label", "stage", "split", "parent_id", "condition_id"))
+-    parents = aggregate(conditions, ("label", "stage", "split", "parent_id"))
+-    summary = aggregate(parents, ("label", "stage", "split"))
+-    pairs = []
+-    for stage in STAGES:
+-        by = {(r["label"], r["request_id"]): r for r in rows if r["stage"] == stage}
+-        for reference, arm, contrast in (
+-            ("A_S1500", "B_S1500", "PRIMARY_LR_B_MINUS_A"),
+-            ("B_S1500", "C_S1500", "PRIMARY_INITIALIZATION_C_MINUS_B"),
+-            ("A_S1500", "C_S1500", "ADDITIONAL_C_MINUS_A"),
+-        ):
+-            for q in requests("A_S1500"):
+-                a, b = by[reference, q["request_id"]], by[arm, q["request_id"]]
+-                r = dict(reference=reference, candidate=arm, contrast=contrast, stage=stage,
+-                         request_id=q["request_id"], condition_id=q["condition_id"],
+-                         parent_id=q["parent_id"], split=q["split"], part_type=q["part_type"])
+-                for metric in numeric:
+-                    av, bv = a.get(metric), b.get(metric)
+-                    r[metric + "__reference"] = av
+-                    r[metric + "__candidate"] = bv
+-                    r[metric + "__delta"] = float(bv - av) if isinstance(av, (float, int)) and isinstance(bv, (float, int)) else None
+-                pairs.append(r)
+-    for name, data in (("per_output", rows), ("per_condition", conditions), ("per_parent", parents),
+-                       ("parent_macro_summary", summary), ("paired_final", pairs)):
+-        C.csvwrite(OUT / "results" / (name + ".csv"), data)
+-    value = dict(status="COMPLETE", rows=len(rows), outputs=224, metric_fields=numeric,
+-                 all_fields_preserved=True, model_calls=0, source_rows=paths,
+-                 files={str(p): sha(p) for p in (OUT / "results").glob("*.csv")})
+-    P.immutable(OUT / "results/completion.json", value)
+-    return value
++    """Use the lossless collector; historical A scores are read-only."""
++    from .collect import run as collect_results
++    return collect_results()
+ 
+ 
+ if __name__ == "__main__":
+--- baseline_A/eval_plan.py
++++ state_schedule/eval_plan.py
+@@ -1,17 +1,20 @@
+-"""Read-only evaluation contract for the registered 224-output Bench study."""
++"""Frozen 48-request panel; two new final labels and a read-only historical A."""
+ from __future__ import annotations
+ from pathlib import Path
+ import numpy as np
+ from .common import ROOT, OUT, read, resolve, sha
+ from r2.pilots.bench_parts_convergence_v1 import panel as P
+ 
+-LABELS = (
+-    "COMMON_S0", "OFFICIAL_S0", "A_S500", "B_S500", "C_S500",
+-    "A_S1500", "B_S1500", "C_S1500",
+-)
+-FINAL_LABELS = ("A_S1500", "B_S1500", "C_S1500")
+-PROCESS_LABELS = LABELS[:5]
++LABELS = ("PERTURBED_STATE_S1500", "ASYNC_LEAD_SEAM_S1500")
++FINAL_LABELS = LABELS
++BASELINE_LABEL = "A_S1500"
++BASELINE_ROOT = ROOT / "experiments/r2_bench_adaptation_strength_v1"
++ALL_LABELS = (BASELINE_LABEL, *LABELS)
+ OLD = ROOT / "experiments/r2_bench_parts_convergence_v1"
++ARM_BY_LABEL = {
++    "PERTURBED_STATE_S1500": "PERTURBED_STATE",
++    "ASYNC_LEAD_SEAM_S1500": "ASYNC_LEAD_SEAM",
++}
+ 
+ 
+ def verify(files):
+@@ -27,34 +30,43 @@
+ 
+ def plan():
+     value = read(OUT / "registration.json")
+-    labels = value["evaluation_labels"]
+-    if set(labels) != set(LABELS):
+-        raise ValueError("The registered eight model labels are required")
++    if set(value["evaluation_labels"]) != set(LABELS):
++        raise ValueError("Exactly two newly generated endpoint labels required")
+     return value
+ 
+ 
+ def label_spec(label):
+     if label not in LABELS:
+-        raise ValueError("Unregistered evaluation label")
++        raise ValueError("Historical A is read-only; new endpoint label required")
+     spec = plan()["evaluation_labels"][label]
+-    expected = "full" if label in FINAL_LABELS else "process"
+-    if spec["subset"] != expected:
+-        raise ValueError("Wrong registered panel size")
++    if (spec["arm"], spec["subset"], int(spec["local_step"]), int(spec["global_step"])) != (
++            ARM_BY_LABEL[label], "full", 1500, 13500):
++        raise ValueError("Unexpected frozen final checkpoint or panel")
++    expected = OUT / "training" / spec["arm"] / "generator_step1500.pt"
++    if resolve(spec["generator_path"]).resolve() != expected.resolve():
++        raise ValueError("Generator export must belong to the registered new arm")
+     return spec
+ 
+ 
++def root_for(label):
++    if label == BASELINE_LABEL:
++        return BASELINE_ROOT
++    if label in LABELS:
++        return OUT
++    raise ValueError("Unknown model label")
++
++
+ def requests(label=None):
++    if label is not None and label not in ALL_LABELS:
++        raise ValueError("Unknown requested label")
+     manifest = read(OUT / "eval_manifest.json")
++    baseline = read(BASELINE_ROOT / "eval_manifest.json")
++    if manifest != baseline:
++        raise ValueError("Panel must exactly reproduce the historical A manifest")
+     verify(manifest.get("protected", {}))
+     rows = manifest["requests"]
+     if len(rows) != 48 or len({q["request_id"] for q in rows}) != 48:
+-        raise ValueError("Original 48 unique requests required")
+-    if label is not None and label_spec(label)["subset"] == "process":
+-        ids = plan()["process_request_ids"]
+-        if len(ids) != 16 or len(set(ids)) != 16:
+-            raise ValueError("Exactly 16 registered process requests required")
+-        by = {q["request_id"]: q for q in rows}
+-        rows = [by[rid] for rid in ids]
++        raise ValueError("48 original unique requests required")
+     return rows
+ 
+ 
+@@ -74,7 +86,7 @@
+ 
+ 
+ def cached_layout(q):
+-    """No head is imported; source metadata is used only for C export."""
++    """Only cached C-only predictions enter generation; source is export metadata."""
+     from r2.pilots.bench_parts_convergence_v1.data import inference_layout
+     from meshflow_control.source_winding import validate_source
+     core, source = source_assets(q)
+@@ -93,14 +105,15 @@
+ 
+ 
+ def raw_completion(label):
+-    return OUT / "evaluation" / label / ("raw_complete_" + label_spec(label)["subset"] + ".json")
++    label_spec(label)
++    return OUT / "evaluation" / label / "raw_complete_full.json"
+ 
+ 
+ def verify_raw(label):
+     qs = requests(label)
+     done = read(raw_completion(label))
+-    if done["status"] != "COMPLETE" or done["outputs"] != len(qs):
+-        raise ValueError("Incomplete RAW label: " + label)
++    if done["status"] != "COMPLETE" or done["outputs"] != 48:
++        raise ValueError("Incomplete new RAW label: " + label)
+     verify(done["files"])
+     receipts = []
+     for q in qs:
+@@ -108,7 +121,8 @@
+         r = read(path)
+         if (r["request_id"] != q["request_id"] or r["label"] != label
+                 or r["generator_forwards"] != 50 or r["D0_forwards"] != 0
+-                or r["raw_sha256"] != sha(path.parent / "raw.npz")):
++                or r["raw_sha256"] != sha(path.parent / "raw.npz")
++                or r["noise_sha256"] != q["noise_sha256"]):
+             raise ValueError("Invalid RAW receipt: " + str(path))
+         verify(r["files"])
+         receipts.append(path)
+@@ -120,28 +134,28 @@
+     for label in LABELS:
+         _, rr = verify_raw(label)
+         receipts.extend(rr)
+-    if len(receipts) != 224:
+-        raise ValueError("All 224 RAW must complete before any D0")
++    if len(receipts) != 96:
++        raise ValueError("All 96 new RAW outputs must complete before any new D0")
+     return receipts
+ 
+ 
+ def cpu_check():
+     import ast
+-    filenames = ("eval_plan.py", "sample.py", "post_d0.py", "evaluation.py", "gallery.py")
+-    for name in filenames:
++    names = ("eval_plan.py", "sample.py", "post_d0.py", "evaluation.py", "collect.py", "gallery.py")
++    for name in names:
+         ast.parse(Path(__file__).with_name(name).read_text(encoding="utf-8"))
+     rows = []
+     for q in requests():
+-        lay, _, _ = cached_layout(q)
++        layout, _, _ = cached_layout(q)
+         rows.append(dict(request_id=q["request_id"], N=q["N"], K=q["K"],
+-                         boundary_edges=len(lay["occupied"]), closed_C=bool(q["closed_C"]),
+-                         anchor_identity=True, source_identity=True, noise_identity=True))
+-    sizes = {label: len(requests(label)) for label in LABELS}
+-    assert sum(sizes.values()) == 224
+-    result = dict(status="PASS", sizes=sizes, checks=rows, parsed=list(filenames),
+-                  head_forwards=0, generator_forwards=0, D0_forwards=0, new_noise=0)
+-    P.immutable(OUT / "evaluation_cpu_checks.json", result)
+-    return result
++                         active=int(layout["occupied"].sum()), source_identity=True,
++                         noise_identity=True, cached_layout_identity=True))
++    for label in LABELS:
++        label_spec(label)
++    value = dict(status="PASS", new_outputs=96, reused_outputs=48, checks=rows,
++                 parsed=list(names), model_calls=0, new_noise=0, new_scores=0)
++    P.immutable(OUT / "evaluation_cpu_checks.json", value)
++    return value
+ 
+ 
+ if __name__ == "__main__":
+--- /dev/null
++++ state_schedule/async_core.py
+@@ -0,0 +1,362 @@
++"""Parameter-free ASYNC_LEAD_SEAM contract, local-velocity formulation.
++
++The only changed mechanism is the seam-tip clock s(t)=min(t/tau,1).
++Targets keep their original local-time units U=Y-Z_H. Active-tip and bulk
++errors share the ORIGINAL structural-free scalar denominator; inactive tips
++have no direct velocity loss. The physical ODE uses dX_tip/dt=s'(t)*v_tip.
++
++Never turn a generated tip into an input-C identity or pass it into Geo.
++No model is constructed, loaded or executed by importing this module.
++"""
++from __future__ import annotations
++
++import json
++import math
++import operator
++from pathlib import Path
++import time
++
++from meshflow_control import runtime as _runtime  # establish policy before torch
++import numpy as np
++import torch
++
++from meshflow_control.models.geometry import inject_context
++from meshflow_control.models.native import assert_native_runtime, native_execution, _corners
++from meshflow_control.seam.model_adapter import (
++    seam_forward, corner_masked_fm_loss, _validate_corner_masks,
++)
++
++TAU = 0.7
++SCHEMA = "ASYNC_LEAD_SEAM_LOCAL_VELOCITY_V1"
++
++
++def _tau(tau):
++    tau = float(tau)
++    if not math.isfinite(tau) or not 0 < tau <= 1:
++        raise ValueError("tau must be finite and in (0,1]")
++    return tau
++
++
++def seam_clock(t, tau=TAU):
++    """Same FP32 clock for NumPy preparation and torch forward."""
++    tau = _tau(tau)
++    if isinstance(t, torch.Tensor):
++        if not t.is_floating_point():
++            raise ValueError("Clock requires a floating-point time tensor")
++        if not bool(torch.isfinite(t).all()) or bool(((t < 0) | (t > 1)).any()):
++            raise ValueError("Time outside [0,1]")
++        return (t / t.new_tensor(tau)).clamp(max=1)
++    a = np.asarray(t, np.float32)
++    if not np.isfinite(a).all() or np.any((a < 0) | (a > 1)):
++        raise ValueError("Time outside [0,1]")
++    return np.minimum(a / np.float32(tau), np.float32(1))
++
++
++def mask_partition(valid, C_mask, fixed):
++    """Return structural free, seam faces, tip corners and bulk corners.
++
++    Supports reordered faces and arbitrary positions of the one free seam
++    corner. The current owner-only contract permits 0/2/3 fixed corners:
++    zero=bulk, two=seam, three=original C. Padding never contributes.
++    """
++    if (valid.dtype != torch.bool or C_mask.dtype != torch.bool or fixed.dtype != torch.bool
++            or C_mask.shape != valid.shape or fixed.shape != (*valid.shape, 3)):
++        raise ValueError("Expected bool[B,N] valid/C and bool[B,N,3] fixed")
++    if any(v.device != valid.device for v in (C_mask, fixed)):
++        raise ValueError("Masks must be colocated")
++    if bool((C_mask & ~valid).any()) or bool((fixed & ~valid[..., None]).any()):
++        raise ValueError("Invalid known/padding relation")
++    if bool((C_mask[..., None] & ~fixed).any()):
++        raise ValueError("Original C must have all three fixed corners")
++    count = fixed.sum(-1)
++    if bool((valid & ~C_mask & (count != 0) & (count != 2)).any()):
++        raise ValueError("Unsupported non-C corner layout")
++    seam = valid & ~C_mask & (count == 2)
++    free = valid[..., None] & ~fixed
++    tips = seam[..., None] & free
++    bulk = free & ~tips
++    return free, seam, tips, bulk
++
++
++def transform_sample(sample, tau=TAU):
++    """Transform one already-matched sample; do not mutate any input array.
++
++    Existing x0, x1, u, OT maps, permutations, source IDs and the original
++    free_coordinate_count remain unchanged. Parent code may continue to call
++    its existing ``tensors(sample)`` converter. Extra keys are audit metadata.
++    """
++    tau = _tau(tau)
++    t = np.float32(np.asarray(sample["t"]).item())
++    s = np.float32(seam_clock(t, tau))
++    valid = np.asarray(sample["valid_mask"], bool)
++    known = np.asarray(sample["known_mask"], bool)
++    fixed = np.asarray(sample["anchor_ids"]) >= 0
++    n = int(sample["N"])
++    if valid.shape != (n,) or known.shape != (n,) or fixed.shape != (n, 3):
++        raise ValueError("Sample mask shape differs")
++    if np.any(known & ~valid) or np.any(fixed & ~valid[:, None]) or np.any(known[:, None] & ~fixed):
++        raise ValueError("Invalid source masks")
++    count = fixed.sum(1)
++    if np.any(valid & ~known & (count != 0) & (count != 2)):
++        raise ValueError("Unsupported non-C corner layout")
++    free = valid[:, None] & ~fixed
++    seam = valid & ~known & (count == 2)
++    tips = seam[:, None] & free
++    scalar_count = int(free.sum()) * 3
++    if scalar_count != int(sample["free_coordinate_count"]) or scalar_count <= 0:
++        raise ValueError("Original free-coordinate denominator differs")
++    result = dict(sample)
++    active = free.copy()
++    if tau != 1 and seam.any():
++        x0 = np.asarray(sample["x0"], np.float32)
++        x1 = np.asarray(sample["x1"], np.float32)
++        if x0.shape != (n, 3, 3) or x1.shape != x0.shape:
++            raise ValueError("Expected sample endpoints [N,3,3]")
++        xt = np.asarray(sample["xt"], np.float32).copy()
++        xt[tips] = ((np.float32(1)-s)*x0[tips] + s*x1[tips])
++        xt[fixed] = x0[fixed]
++        result["xt"] = xt
++        if t >= np.float32(tau):
++            active[tips] = False
++    result.update(async_schema=SCHEMA, async_tau=np.asarray(tau, np.float32),
++                  seam_time=np.asarray(s, np.float32), seam_face_mask=seam,
++                  seam_tip_mask=tips, active_free_corner_mask=active,
++                  original_free_scalar_count=np.asarray(scalar_count, np.int64),
++                  async_active_tip_scalar_count=np.asarray(int((active & tips).sum())*3, np.int64),
++                  async_late_tip_teacher_forced=np.asarray(bool(t >= np.float32(tau) and seam.any() and tau != 1)))
++    return result
++
++
++def _select_face(bulk_value, known_value, seam_value, C_mask, seam):
++    return torch.where(C_mask[..., None], known_value[:, None],
++                       torch.where(seam[..., None], seam_value[:, None], bulk_value[:, None]))
++
++
++def _select_corner(bulk_value, known_value, seam_value, fixed, tips):
++    selected = torch.where(fixed[..., None], known_value[:, None, None],
++                           torch.where(tips[..., None], seam_value[:, None, None],
++                                       bulk_value[:, None, None]))
++    return selected.reshape(selected.shape[0], -1, selected.shape[-1])
++
++
++def forward(model, x, t, y, valid_mask, C_face_mask, corner_known, *, tau=TAU):
++    """Drop-in seam_forward signature; time changes, parameter/role/Geo do not."""
++    tau = _tau(tau)
++    _validate_corner_masks(x, valid_mask, C_face_mask, corner_known)
++    _, seam, tips, _ = mask_partition(valid_mask, C_face_mask, corner_known)
++    if tau == 1 or not bool(seam.any()):
++        return seam_forward(model, x, t, y, valid_mask, C_face_mask, corner_known)
++    assert_native_runtime(model, coordinates=(x, t))
++    if getattr(model, "readout_mode", "none") != "none" or len(getattr(model, "readouts", {})):
++        raise ValueError("Async accepts Native/T1 + role + Geo without READOUT")
++    batch, faces, _ = x.shape
++    if (t.shape != (batch,) or y.shape != (batch,) or y.dtype != torch.int64
++            or t.device != x.device or y.device != x.device):
++        raise ValueError("Expected colocated t[B] and int64 total N[B]")
++    if not bool(torch.isfinite(x).all()):
++        raise ValueError("Nonfinite coordinates")
++    s = seam_clock(t, tau)
++    if not torch.equal(valid_mask.sum(1), y) or bool(((y < 128) | (y > 256)).any()):
++        raise ValueError("Real total N must lie in N128..256")
++    if bool((C_face_mask.sum(1) == 0).any()):
++        raise ValueError("Original input C is required")
++
++    backbone = model.backbone
++    _, hidden = backbone.x_embedder(x)
++    hidden = hidden.view(batch, faces * 3, -1)
++    role = model.role_embedding[corner_known.long()].to(hidden.dtype)
++    hidden = hidden + role.reshape_as(hidden)
++    if model.context_encoder is not None:
++        delta = model.context_encoder(x, C_face_mask, valid_mask, observer=model.context_observer)
++        hidden = inject_context(hidden, delta, C_face_mask, observer=model.context_observer)
++    c_bulk = backbone.t_embedder(t)
++    c_known = backbone.t_embedder(torch.ones_like(t))
++    c_seam = backbone.t_embedder(s)
++    count = backbone.y_embedder(y // backbone.face_bin, False)
++    c_bulk, c_known, c_seam = c_bulk + count, c_known + count, c_seam + count
++    for block in backbone.layers:
++        bulk_mod = block.adaLN_modulation(c_bulk).chunk(6, dim=1)
++        known_mod = block.adaLN_modulation(c_known).chunk(6, dim=1)
++        seam_mod = block.adaLN_modulation(c_seam).chunk(6, dim=1)
++        shift_a, scale_a, gate_a = (
++            _select_face(b, k, s0, C_face_mask, seam)
++            for b, k, s0 in zip(bulk_mod[:3], known_mod[:3], seam_mod[:3]))
++        shift_m, scale_m, gate_m = (
++            _select_corner(b, k, s0, corner_known, tips)
++            for b, k, s0 in zip(bulk_mod[3:], known_mod[3:], seam_mod[3:]))
++        face_hidden = hidden.reshape(batch, faces, 3, -1).mean(dim=2)
++        face_hidden = gate_a * block.attn(
++            block.norm1(face_hidden) * (1 + scale_a) + shift_a, mask=valid_mask)
++        hidden = hidden + _corners(face_hidden)
++        hidden = hidden + gate_m * block.mlp(
++            block.norm2(hidden) * (1 + scale_m) + shift_m, mask=valid_mask)
++    final = backbone.final_layer
++    bulk_mod = final.adaLN_modulation(c_bulk).chunk(2, dim=1)
++    known_mod = final.adaLN_modulation(c_known).chunk(2, dim=1)
++    seam_mod = final.adaLN_modulation(c_seam).chunk(2, dim=1)
++    shift, scale = (
++        _select_corner(b, k, s0, corner_known, tips)
++        for b, k, s0 in zip(bulk_mod, known_mod, seam_mod))
++    hidden = final.norm_final(hidden) * (1 + scale) + shift
++    return final.linear(hidden).view(batch, faces, 9)
++
++
++def active_masks(b, tau=TAU):
++    """b uses existing tensors(sample) keys: t/valid/known/fixed."""
++    tau = _tau(tau)
++    free, seam, tips, bulk = mask_partition(b["valid"], b["known"], b["fixed"])
++    if b["t"].shape != (free.shape[0],):
++        raise ValueError("Expected one time per sample")
++    seam_clock(b["t"], tau)  # bounds check
++    active_tips = tips if tau == 1 else tips & (b["t"] < b["t"].new_tensor(tau))[:, None, None]
++    return free, seam, tips, bulk, active_tips, bulk | active_tips
++
++
++def loss_and_stats(pred, b, *, denominator=None, tau=TAU):
++    """Return (loss, JSON-safe statistics); b is the old tensors(sample) dict.
++
++    ``denominator`` must be the ORIGINAL effective-batch free scalar count.
++    all_free_* is retained as an alias for the active numerator/original
++    denominator, and is explicitly marked NONCOMPARABLE_TO_BASELINE_TOTAL.
++    """
++    tau = _tau(tau)
++    if pred.shape != b["target"].shape or pred.ndim != 3 or pred.shape[-1] != 9:
++        raise ValueError("Prediction and original local target must be [B,N,9]")
++    free, seam, tips, bulk, active_tips, active = active_masks(b, tau)
++    original = int(free.sum()) * 3
++    divisor = original if denominator is None else operator.index(denominator)
++    if original <= 0 or divisor < original:
++        raise ValueError("Original effective-batch denominator differs")
++    error = (pred.float() - b["target"].float()).reshape(*free.shape, 3)
++    if tau == 1 or not bool(seam.any()):
++        loss = corner_masked_fm_loss(pred, b["target"], b["valid"], b["fixed"], denominator=divisor)
++    else:
++        loss = error[active].square().sum() / divisor
++    with torch.no_grad():
++        squared = error.detach().double().square()
++        sum_error = lambda m: float(squared[m].sum().cpu())
++        bulk_sse, tip_sse = sum_error(bulk), sum_error(active_tips)
++        active_sse = bulk_sse + tip_sse
++        stats = dict(
++            schema=SCHEMA, tau=tau,
++            all_free_velocity_sse=active_sse, all_free_scalar_count=original,
++            total_loss_comparison="NONCOMPARABLE_TO_BASELINE_TOTAL",
++            active_local_velocity_sse=active_sse, original_free_scalar_count=original,
++            active_free_scalar_count=int(active.sum())*3,
++            seam_tip_velocity_sse=tip_sse, seam_tip_scalar_count=int(active_tips.sum())*3,
++            structural_seam_tip_scalar_count=int(tips.sum())*3,
++            inactive_seam_tip_scalar_count=int((tips & ~active_tips).sum())*3,
++            bulk_velocity_sse=bulk_sse, bulk_scalar_count=int(bulk.sum())*3,
++            equivalent_active_global_velocity_sse=bulk_sse + tip_sse/(tau*tau),
++            effective_batch_original_denominator=divisor,
++            tip_error_scope="ACTIVE_LOCAL_TIME_ONLY; LATE_TEACHER_FORCED_TIPS_EXCLUDED",
++        )
++    return loss, stats
++
++
++def endpoint_prediction(pred, b, *, tau=TAU):
++    """Local-velocity one-step probe; late training tip is a tautology, not fit."""
++    _, _, tips, _, _, _ = active_masks(b, tau)
++    t = b["t"]
++    s = seam_clock(t, tau)
++    remaining = (1-t)[:, None, None].expand_as(tips)
++    remaining = torch.where(tips, (1-s)[:, None, None], remaining)
++    remaining = torch.where(b["fixed"], torch.zeros_like(remaining), remaining)
++    x = b["x"].reshape(*tips.shape, 3)
++    return (x + remaining[..., None]*pred.float().reshape_as(x)).reshape_as(b["x"])
++
++
++def integration_step(state, velocity, anchor_values, valid, C_mask, fixed,
++                     step, *, steps=50, tau=TAU):
++    """One FP32 Euler step on [B,N,3,3]; zero-Delta-s tips are bitwise retained."""
++    tau = _tau(tau)
++    step, steps = operator.index(step), operator.index(steps)
++    if steps <= 0 or not 0 <= step < steps:
++        raise ValueError("Invalid registered integration step")
++    if state.dtype != torch.float32 or state.shape != (*valid.shape, 3, 3):
++        raise ValueError("Expected FP32 [B,N,3,3] integration state")
++    if anchor_values.shape != state.shape or velocity.numel() != state.numel():
++        raise ValueError("Velocity/anchor shape differs")
++    free, seam, tips, bulk = mask_partition(valid, C_mask, fixed)
++    v = velocity.float().reshape_as(state)
++    nxt = state.clone()
++    dt = 1/steps
++    if tau == 1 or not bool(seam.any()):
++        nxt[free] = state[free] + v[free]*dt
++    else:
++        nxt[bulk] = state[bulk] + v[bulk]*dt
++        # Piecewise-clock difference handles a step crossing tau exactly.
++        ds = min((step+1)/steps/tau, 1.) - min(step/steps/tau, 1.)
++        if ds > 0:
++            nxt[tips] = state[tips] + v[tips]*ds
++    nxt[fixed] = anchor_values[fixed]
++    return nxt
++
++
++def _event(path, event, **fields):
++    path = Path(path)
++    path.parent.mkdir(parents=True, exist_ok=True)
++    with path.open("a", encoding="utf-8", newline="\n") as stream:
++        stream.write(json.dumps(dict(event=event, unix=time.time(), **fields), allow_nan=False)+"\n")
++        stream.flush()
++
++
++def rollout(model, layout, noise, arm, ledger, *, tau=TAU):
++    """Old rollout interface; caller owns dispatch, weights, noise and outputs.
++
++    This is the only GPU entry in the module and runs only when explicitly
++    called. Exactly 50 generator calls; no teacher, source Y, or extra noise.
++    """
++    tau = _tau(tau)
++    if arm not in ("SEAM", "ASYNC", "ASYNC_LEAD_SEAM"):
++        raise ValueError("Only the registered asynchronous SEAM arm is supported")
++    n, k = int(layout["N"]), int(layout["K"])
++    if np.asarray(noise).shape != (n-k, 3, 3) or np.asarray(noise).dtype != np.float32:
++        raise ValueError("Expected original frozen FP32 noise")
++    fixed_np = np.asarray(layout["anchor_ids"]) >= 0
++    initial = np.zeros((n, 3, 3), np.float32)
++    initial[k:] = noise
++    initial[fixed_np] = layout["C_vertices"][layout["anchor_ids"][fixed_np]]
++    state = torch.from_numpy(initial[None]).cuda()
++    anchors = state.clone()
++    fixed = torch.from_numpy(fixed_np[None]).cuda()
++    C_mask = torch.from_numpy(layout["known_mask"][None]).cuda()
++    valid = torch.ones_like(C_mask)
++    y = torch.tensor([n], dtype=torch.int64, device=state.device)
++    _, seam, tips, _ = mask_partition(valid, C_mask, fixed)
++    trajectory = [initial.copy()]
++    cpu_rng, cuda_rng = torch.get_rng_state().clone(), torch.cuda.get_rng_state().clone()
++    torch.cuda.reset_peak_memory_stats()
++    tick = time.perf_counter()
++    frozen_tips = None
++    with torch.no_grad(), native_execution(model, coordinates=state):
++        for step in range(50):
++            t = torch.full((1,), step/50, dtype=torch.float32, device=state.device)
++            _event(ledger, "FORWARD_STARTED", step=step, schema=SCHEMA)
++            v = forward(model, state.reshape(1, n, 9), t, y, valid, C_mask, fixed, tau=tau)
++            torch.cuda.synchronize()
++            _event(ledger, "FORWARD_COMPLETE", step=step, schema=SCHEMA)
++            if not bool(torch.isfinite(v).all()):
++                raise FloatingPointError("Nonfinite async velocity")
++            state = integration_step(state, v, anchors, valid, C_mask, fixed, step, tau=tau)
++            if not bool(torch.isfinite(state).all()):
++                raise FloatingPointError("Nonfinite async state")
++            if (step+1)/50 >= tau:
++                if frozen_tips is None:
++                    frozen_tips = state[tips].clone()
++                elif not torch.equal(state[tips], frozen_tips):
++                    raise ValueError("Generated tip moved after local-clock completion")
++            trajectory.append(state[0].cpu().numpy().copy())
++    if not torch.equal(cpu_rng, torch.get_rng_state()) or not torch.equal(cuda_rng, torch.cuda.get_rng_state()):
++        raise RuntimeError("Unexpected sampling RNG")
++    trajectory = np.stack(trajectory)
++    if any(not np.array_equal(a[fixed_np], initial[fixed_np]) for a in trajectory):
++        raise ValueError("Original anchor moved")
++    return trajectory[-1], trajectory, dict(
++        schema=SCHEMA, tau=tau, generator_forwards=50, seconds=time.perf_counter()-tick,
++        anchored_all51_exact=True, tips_frozen_after_global_step=math.ceil(50*tau),
++        tip_freeze_value="ACTUAL_GENERATED_STATE; NO_SOURCE_Y",
++        frozen_tip_coordinates_exact=True, active_seam_faces=int(seam.sum()),
++        velocity_units="LOCAL_TIME; INTEGRATION_USES_DELTA_S",
++        peak_allocated_bytes=torch.cuda.max_memory_allocated(),
++        peak_reserved_bytes=torch.cuda.max_memory_reserved())
+--- /dev/null
++++ state_schedule/perturbed_core.py
+@@ -0,0 +1,210 @@
++"""CPU-only off-path endpoint corrective regression for the frozen Bench stream.
++
++This is NOT the CFM derivative of the perturbed interpolation.  The experiment
++deliberately supervises a one-step return to the unchanged target.  Only valid
++free corners change; the source layout, OT assignment and loss denominator do
++not.  This module has no torch/model imports and touches no global RNG.
++"""
++from __future__ import annotations
++
++import hashlib
++import json
++import math
++from collections.abc import Mapping
++
++import numpy as np
++
++VERSION = "bench_off_path_endpoint_corrective_v1"
++SALT = "R2_BENCH_STATE_SCHEDULE_V1/PERTURBED_ENDPOINT_CORRECTIVE/v1"
++PROBABILITY = 0.25
++TIME_MIN = 0.3
++TIME_MAX = 0.9
++ALPHA_MIN = 0.3
++ALPHA_MAX = 0.8
++
++
++def _json_value(value):
++    """Canonicalize row metadata, never model/sample arrays."""
++    if isinstance(value, Mapping):
++        if not all(isinstance(key, str) for key in value):
++            raise TypeError("Schedule row keys must be strings")
++        return {key: _json_value(item) for key, item in value.items()}
++    if isinstance(value, (list, tuple)):
++        return [_json_value(item) for item in value]
++    if isinstance(value, np.generic):
++        return _json_value(value.item())
++    if value is None or isinstance(value, (str, bool, int)):
++        return value
++    if isinstance(value, float) and math.isfinite(value):
++        return value
++    raise TypeError("Schedule row must contain finite JSON metadata")
++
++
++def derive_row_randomness(row):
++    """Independent, reproducible gate/alpha uniforms from the frozen row.
++
++    The row is canonical JSON (sorted keys); separate SHA256 domains supply
++    independent streams.  The upper 53 bits map to [0,1) exactly as a binary64
++    uniform.  No seed is derived from worker ID, arm, completion order, or a
++    mutable random state.  Caller must pass the original frozen schedule row.
++    """
++    if not isinstance(row, Mapping) or not row:
++        raise ValueError("A nonempty frozen schedule row is required")
++    payload = json.dumps(
++        _json_value(row), sort_keys=True, separators=(",", ":"),
++        ensure_ascii=False, allow_nan=False,
++    ).encode("utf-8")
++    row_sha = hashlib.sha256(payload).hexdigest()
++
++    def uniform(domain):
++        digest = hashlib.sha256(
++            SALT.encode("utf-8") + b"\0" + domain.encode("ascii") + b"\0" + payload
++        ).digest()
++        return (int.from_bytes(digest[:8], "big") >> 11) * (2.0 ** -53)
++
++    gate, alpha_uniform = uniform("gate"), uniform("alpha")
++    return dict(
++        salt=SALT, canonical_row_sha256=row_sha, gate_uniform=gate,
++        alpha_uniform=alpha_uniform,
++        alpha_candidate=ALPHA_MIN + (ALPHA_MAX - ALPHA_MIN) * alpha_uniform,
++        selected_by_probability=gate < PROBABILITY,
++    )
++
++
++def _validated_arrays(sample):
++    arrays = {}
++    for name in ("xt", "x1", "u"):
++        value = np.asarray(sample[name])
++        if (value.dtype != np.float32 or value.ndim != 3
++                or value.shape[1:] != (3, 3) or not np.isfinite(value).all()):
++            raise ValueError(f"{name} must be finite FP32 [faces,3,3]")
++        arrays[name] = value
++    if len({value.shape for value in arrays.values()}) != 1:
++        raise ValueError("State, target and velocity shapes differ")
++    faces = len(arrays["xt"])
++    valid = np.asarray(sample["valid_mask"])
++    known = np.asarray(sample["known_mask"])
++    anchors = np.asarray(sample["anchor_ids"])
++    free_recorded = np.asarray(sample["free_corner_mask"])
++    if (valid.dtype != np.bool_ or known.dtype != np.bool_
++            or valid.shape != (faces,) or known.shape != (faces,)):
++        raise ValueError("Expected boolean face-valid and original-C masks")
++    if anchors.shape != (faces, 3) or not np.issubdtype(anchors.dtype, np.integer):
++        raise ValueError("Expected integer anchor IDs [faces,3]")
++    if np.any(known & ~valid) or not known.any():
++        raise ValueError("Original C must contain valid faces")
++    if np.any(anchors[known] < 0):
++        raise ValueError("Every original C corner must be anchored")
++    fixed = anchors >= 0
++    if np.any(fixed & ~valid[:, None]):
++        raise ValueError("Padding cannot contain an anchored corner")
++    free = valid[:, None] & ~fixed
++    if (free_recorded.dtype != np.bool_ or free_recorded.shape != (faces, 3)
++            or not np.array_equal(free_recorded, free)):
++        raise ValueError("Recorded free-corner mask differs from valid anchors")
++    denominator = int(np.asarray(sample["free_coordinate_count"]).item())
++    if not free.any() or denominator != int(free.sum()) * 3:
++        raise ValueError("Original free scalar denominator is inconsistent")
++    if (not np.array_equal(arrays["xt"][fixed], arrays["x1"][fixed])
++            or np.any(arrays["u"][fixed] != 0)):
++        raise ValueError("Original fixed coordinates/zero target are violated")
++    time_array = np.asarray(sample["t"])
++    if time_array.size != 1:
++        raise ValueError("Expected one sample time")
++    time = float(time_array.item())
++    if not math.isfinite(time) or not 0 <= time <= 1:
++        raise ValueError("Time must lie in [0,1]")
++    return arrays, valid, known, fixed, free, denominator, time
++
++
++def apply_perturbation(sample, row, *, enabled=True):
++    """Return ``(sample_copy, audit)`` with frozen row-wise corruption policy.
++
++    At eligible times and the deterministic 25% gate, compute
++        d = alpha * (mean(original C corners) - mean(target free corners))
++        xt'[free] = xt[free] + t*d
++        u'[free]  = (x1[free] - xt'[free])/(1-t).
++    Means accumulate in FP64; d and state/target arithmetic are FP32, matching
++    the existing stream's coordinate precision.  The means use neither unique
++    vertex de-duplication nor surface-area weighting.  Source target geometry is
++    training-only, never passed to inference.
++
++    Disabled/ineligible/gate-rejected paths preserve EVERY original array
++    byte, including u (do not recompute its nominal straight-path identity).
++    """
++    if not isinstance(enabled, (bool, np.bool_)):
++        raise TypeError("enabled must be an explicit boolean")
++    arrays, valid, known, fixed, free, denominator, time = _validated_arrays(sample)
++    random = derive_row_randomness(row)
++    # Compare against the same FP32 boundary representation as stored times.
++    eligible = float(np.float32(TIME_MIN)) <= time <= float(np.float32(TIME_MAX))
++    applied = bool(enabled and eligible and random["selected_by_probability"])
++    before = arrays["u"][free].astype(np.float64)
++    old_sse = float(np.square(before).sum())
++    audit = dict(
++        version=VERSION, objective="OFF_PATH_ENDPOINT_CORRECTIVE_REGRESSION_NOT_PATH_CFM",
++        enabled=bool(enabled), eligible=bool(eligible), applied=applied, t=time,
++        probability=PROBABILITY, time_interval=[TIME_MIN, TIME_MAX],
++        alpha_range=[ALPHA_MIN, ALPHA_MAX], **random,
++        free_coordinate_count=denominator, free_corner_count=int(free.sum()),
++        fixed_corner_count=int(fixed.sum()), original_C_face_count=int(known.sum()),
++        valid_face_count=int(valid.sum()),
++        alpha=None, mu_C=None, mu_Y_free=None, displacement_model_xyz=[0.0, 0.0, 0.0],
++        d_norm_model=0.0, state_shift_norm_model=0.0,
++        original_target_velocity_sse=old_sse, target_velocity_sse=old_sse,
++        target_velocity_l2_gain=1.0 if old_sse > 0 else None,
++        target_velocity_mse_gain=1.0 if old_sse > 0 else None,
++        target_norm_gain_status="DEFINED" if old_sse > 0 else "NA_ZERO_ORIGINAL_NORM",
++        fixed_coordinates_unchanged=True, fixed_velocity_target_zero=True,
++        free_denominator_unchanged=True, endpoint_identity_max_abs=None,
++        center_definition="original_valid_C_corner_mean; target_valid_free_corner_mean",
++        global_rng_touched=False,
++    )
++    copied = dict(sample)
++    if not applied:
++        audit["reason"] = (
++            "DISABLED" if not enabled else "OUTSIDE_TIME_WINDOW" if not eligible
++            else "PROBABILITY_GATE_NOT_SELECTED"
++        )
++        return copied, audit
++
++    alpha = float(random["alpha_candidate"])
++    center_C = arrays["x1"][known].astype(np.float64).mean(axis=(0, 1))
++    center_Y = arrays["x1"][free].astype(np.float64).mean(axis=0)
++    delta = np.asarray(alpha * (center_C - center_Y), dtype=np.float32)
++    time32 = np.float32(time)
++    remainder = np.float32(1) - time32
++    if remainder <= 0:
++        raise ValueError("Corrective target requires a strictly positive remaining time")
++    shift = np.asarray(time32 * delta, dtype=np.float32)
++    xt_new, u_new = arrays["xt"].copy(), arrays["u"].copy()
++    xt_new[free] = arrays["xt"][free] + shift
++    u_new[free] = (arrays["x1"][free] - xt_new[free]) / remainder
++    if not np.isfinite(xt_new).all() or not np.isfinite(u_new).all():
++        raise FloatingPointError("Nonfinite off-path state or target")
++    if (not np.array_equal(xt_new[~free], arrays["xt"][~free])
++            or not np.array_equal(u_new[~free], arrays["u"][~free])):
++        raise AssertionError("Correction changed a fixed or padded corner")
++    copied["xt"], copied["u"] = xt_new, u_new
++    new_sse = float(np.square(u_new[free].astype(np.float64)).sum())
++    residual = (
++        xt_new[free].astype(np.float64)
++        + float(remainder) * u_new[free].astype(np.float64)
++        - arrays["x1"][free].astype(np.float64)
++    )
++    ratio = new_sse / old_sse if old_sse > 0 else None
++    audit.update(
++        reason="APPLIED", alpha=alpha, mu_C=center_C.tolist(), mu_Y_free=center_Y.tolist(),
++        displacement_model_xyz=delta.tolist(),
++        d_norm_model=float(np.linalg.norm(delta.astype(np.float64))),
++        state_shift_norm_model=float(np.linalg.norm(shift.astype(np.float64))),
++        target_velocity_sse=new_sse,
++        target_velocity_l2_gain=math.sqrt(ratio) if ratio is not None else None,
++        target_velocity_mse_gain=ratio,
++        endpoint_identity_max_abs=float(np.abs(residual).max()),
++        actual_fp32_remainder=float(remainder),
++    )
++    return copied, audit
++
++
++perturb_sample = apply_perturbation

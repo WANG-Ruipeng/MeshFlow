@@ -1,0 +1,1179 @@
+--- /dev/null
++++ b/r2/pilots/owner_layout_v1/__init__.py
+@@ -0,0 +1 @@
++"""Independent C-only owner layout pilot; no import side effects."""
+--- /dev/null
++++ b/r2/pilots/owner_layout_v1/binding_adapter.py
+@@ -0,0 +1,269 @@
++"""Prepared CPU adapter: new C-only owner layouts, actual GEO_C clusters.
++
++This file does not train, sample, or invoke D0. ``run`` and ``freeze`` require
++an explicit completed head/sampling gate. Importing it never dispatches work.
++The historic binding module and scorers remain byte-for-byte unchanged.
++"""
++from __future__ import annotations
++import argparse
++import concurrent.futures
++import inspect
++import json
++import multiprocessing
++import os
++from pathlib import Path
++import time
++import types
++
++from r2.pilots.seam_followup_v1 import binding as B
++
++C, E, Q, PE, np = B.C, B.E, B.Q, B.PE, B.np
++ROOT = C.ROOT / 'experiments/r2_owner_layout_v1'
++OUT = ROOT / 'binding'
++ARMS = ('LONG_OWNER', 'B_POOL47_OWNER')
++DELTA = .015
++CELLS = 56
++VERSION = 'owner_layout_actual_cluster_binding_v2_current_root_guard'
++LEGACY_SHA256 = 'c184cae7e66fe7ffa65f8f2d027a5c208b8121220fc2dc64e9a00f4fc87f1d60'
++DEFAULT_GATE = ROOT / 'binding_dispatch_gate.json'
++
++
++def state_merge(vertices, roots, original_members, preflat, fixed, pairs):
++    """Legacy whole-cluster union with the missing CURRENT free-tip guard.
++
++Pair order is (seam-side original cluster, bulk-side original cluster).
++When the seam side is originally free, BOTH current groups must stay free.
++Check again after each pair in a lateral-edge candidate, not just at entry.
++"""
++    v = vertices.copy(); r = roots.copy(); changed = set(); operations = []
++    for aa, bb in pairs:
++        a, b = int(r[int(aa)]), int(r[int(bb)])
++        if int(aa) not in fixed and (a in fixed or b in fixed):
++            return None, 'FREE_TIP_CURRENT_ROOT_IS_C'
++        if a == b:
++            continue
++        aset = set(np.flatnonzero(r == a).tolist())
++        bset = set(np.flatnonzero(r == b).tolist())
++        af, bf = bool(aset & fixed), bool(bset & fixed)
++        if af and bf:
++            return None, 'DISTINCT_C_ANCHOR_CONFLICT'
++        target = v[a].copy() if af else v[b].copy() if bf else ((v[a].astype(float) + v[b].astype(float)) / 2).astype(np.float32)
++        root = a if af else b if bf else min(a, b)
++        members = aset | bset
++        original_corners = np.concatenate([original_members[x] for x in sorted(members)])
++        maximum = float(np.linalg.norm(preflat[original_corners] - target.astype(float), axis=1).max())
++        operations.append(dict(original_cluster_ids=sorted(members), new_root=root,
++            target=target.tolist(), maximum_PRE_GEO_displacement=maximum,
++            original_corner_count=len(original_corners), fixed_C=af or bf))
++        for x in members:
++            v[x] = target
++        r[list(members)] = root
++        changed.update(members)
++    if not changed:
++        return None, 'ALREADY_SHARED_NOOP'
++    return dict(vertices=v, roots=r, changed_clusters=changed, operations=operations,
++                maxdisp=max(op['maximum_PRE_GEO_displacement'] for op in operations)), None
++
++
++def _private_core():
++    """Rebind legacy functions into a private namespace; never monkeypatch B.
++
++worker/aggregate/event use the new paths and two labels. candidate_inventory
++and decode use the tightened state_merge. score_output is the original scorer;
++its seam_to_bulk(..., applicable=True) follows raw_seam_slot_mask rather than
++an old label allow-list. No function mutates the imported legacy namespace.
++"""
++    if C.sha(B.__file__) != LEGACY_SHA256:
++        raise RuntimeError('Legacy binding source changed; adapter requires reviewed frozen version')
++    ns = dict(vars(B))
++    ns.update(OUT=OUT, BASE=ROOT, ARMS=ARMS, DELTAS=(DELTA,), VERSION=VERSION)
++    for name, obj in vars(B).items():
++        if inspect.isfunction(obj) and obj.__globals__ is vars(B):
++            clone = types.FunctionType(obj.__code__, ns, obj.__name__, obj.__defaults__, obj.__closure__)
++            clone.__kwdefaults__ = obj.__kwdefaults__
++            ns[name] = clone
++    ns['state_merge'] = state_merge
++    return ns
++
++
++CORE = _private_core()
++
++
++def _gate(path):
++    """A parent-owned gate is required, including actual complete new sampling."""
++    p = C.resolve(path)
++    if not p.is_file():
++        raise RuntimeError('Prepared only: missing explicit binding dispatch gate: ' + str(p))
++    gate = C.read(p)
++    if gate.get('status') != 'PASS' or gate.get('head_gate_passed') is not True or gate.get('sampling_complete') is not True:
++        raise RuntimeError('Head gate/sampling have not passed; no binding dispatch')
++    if tuple(gate.get('labels', ())) != ARMS or gate.get('requests_per_label') != 28 or gate.get('binding_cells') != CELLS:
++        raise RuntimeError('Gate does not match the fixed LONG/B 28-request, 56-cell matrix')
++    return p, gate
++
++
++def validate_arrays(base, pre, q):
++    """Fail before binding if the new postprocessor lost original cluster IDs."""
++    required = ('vertices', 'faces', 'output', 'known_faces', 'input_faces', 'source_face_ids',
++        'source_corner_ids', 'corner_vertex_ids', 'raw_seam_slot_mask', 'output_anchor_ids',
++        'raw_anchor_ids', 'source_face_kept', 'source_face_reason', 'duplicate_of_source_face')
++    absent = sorted(set(required) - set(base))
++    if absent:
++        raise ValueError('Missing actual GEO_C identity fields: ' + ', '.join(absent))
++    n, k = int(q['N']), int(q['K'])
++    if pre.shape != (n, 3, 3) or base['corner_vertex_ids'].shape != (n, 3):
++        raise ValueError('PRE_GEO and full raw-corner cluster map must retain N x 3 identities')
++    if len(base['raw_seam_slot_mask']) != n or int(base['known_faces']) != k or int(base['input_faces']) != n:
++        raise ValueError('Seam layout/N/K identity mismatch')
++    if base['raw_anchor_ids'].shape != (n, 3):
++        raise ValueError('raw_anchor_ids must preserve canonical raw corner identity')
++    if not np.array_equal(base['vertices'][base['faces']], base['output']):
++        raise ValueError('POST soup disagrees with actual indexed mesh')
++    if not np.array_equal(base['source_face_ids'][:k], np.arange(k)):
++        raise ValueError('C must be the first K retained source faces')
++    if np.any(base['raw_seam_slot_mask'][:k]):
++        raise ValueError('C faces cannot be marked as free seam slots')
++
++
++def freeze(gate_path=DEFAULT_GATE):
++    gate_path, gate = _gate(gate_path)
++    path = OUT / 'registration.json'
++    if path.exists():
++        reg = C.read(path)
++        CORE['verify'](reg['protected']); CORE['verify'](reg['code'])
++        return reg
++    manifest_path = ROOT / 'eval_manifest.json'
++    manifest = C.read(manifest_path); requests = manifest['requests']
++    if len(requests) != 28 or len({q['request_id'] for q in requests}) != 28:
++        raise ValueError('Exactly 28 unique frozen requests required')
++    protected = {str(manifest_path): C.sha(manifest_path), str(gate_path): C.sha(gate_path)}
++    for q in requests:
++        for key in ('inference_npz', 'metadata_npz'):
++            protected[q[key]] = C.sha(q[key])
++        descriptor = q['query_descriptor']
++        if C.sha(descriptor['path']) != descriptor['sha256']:
++            raise ValueError('Fixed query hash changed')
++        protected[descriptor['path']] = descriptor['sha256']
++        for arm in ARMS:
++            folder = ROOT / 'evaluation' / arm / q['request_id']
++            for rel in ('post/post.npz', 'post/pre_geo.npz', 'post/receipt.json'):
++                p = folder / rel; protected[str(p)] = C.sha(p)
++            validate_arrays(C.arrays(folder / 'post/post.npz'), C.arrays(folder / 'post/pre_geo.npz')['output'], q)
++            for name in ('score.json', 'pairs.json'):
++                p = ROOT / 'evaluation/scores' / arm / q['request_id'] / 'POST' / name
++                protected[str(p)] = C.sha(p)
++    baseline_csv = ROOT / 'evaluation/per_output.csv'
++    protected[str(baseline_csv)] = C.sha(baseline_csv)
++    code = {str(Path(__file__)): C.sha(__file__), str(Path(B.__file__)): C.sha(B.__file__),
++            **E.source_hashes(), **Q.definition_hashes()}
++    for name in ('geo_c', 'winding_solver'):
++        p = Path(PE.cpu_module(name).__file__); code[str(p)] = C.sha(p)
++    reg = dict(status='FROZEN', utc=C.utc(), version=VERSION, arms=list(ARMS), deltas=[DELTA], cells=CELLS,
++        requests=28, requests_manifest=requests, L=C.L, protected=protected, code=code,
++        parent_gate=gate, previous_definition='experiments/r2_seam_followup_v1/binding/registration.json',
++        change='New C-only owner layouts; same deterministic combined queue and all geometric guards; current-root C protection tightened before every merge pair',
++        unchanged='Actual original GEO_C clusters, both candidate kinds, 1.5%L maximum all-member PRE_GEO motion, source C fixed, original cleanup/orientation/124-field scorer',
++        no_extra_arms='No A_COUPLE, 2%L, oracle layout, radius reclustering or new queries',
++        success_definition='Only scorer-confirmed legal shared edges give surface/reachable-bulk credit; point aliases alone do not',
++        model_calls=0, GPU_dispatches=0, new_noise=0, new_queries=0)
++    C.write(path, reg)
++    for p, h in code.items():
++        dest = OUT / 'actual_code' / (h[:12] + '__' + Path(p).name)
++        dest.parent.mkdir(parents=True, exist_ok=True); dest.write_bytes(C.resolve(p).read_bytes())
++    CORE['event']('REGISTERED', cells=CELLS, registration_sha256=C.sha(path))
++    return reg
++
++
++def worker(job):
++    arm, q = job
++    if arm not in ARMS:
++        raise ValueError('Unregistered arm')
++    folder = ROOT / 'evaluation' / arm / q['request_id'] / 'post'
++    validate_arrays(C.arrays(folder / 'post.npz'), C.arrays(folder / 'pre_geo.npz')['output'], q)
++    return CORE['worker'](job)
++
++
++def run(workers=2, gate_path=DEFAULT_GATE):
++    reg = freeze(gate_path)
++    CORE['verify'](reg['protected']); CORE['verify'](reg['code'])
++    if (OUT / 'completion.json').exists():
++        done = C.read(OUT / 'completion.json'); CORE['verify'](done['files']); return done
++    C.resources(OUT / ('resources_before_' + str(time.time_ns()) + '.json'))
++    jobs = [(arm, q) for q in reg['requests_manifest'] for arm in ARMS]
++    tick = time.perf_counter(); CORE['event']('CPU_STARTED', authorized_cells=CELLS)
++    first = worker(jobs[0])
++    after = C.resources(OUT / ('resources_measured_' + str(time.time_ns()) + '.json'))
++    mem = {x.split(':')[0]: int(x.split()[1]) * 1024 for x in (after.get('memory') or '').splitlines()
++           if len(x.split()) > 1 and x.split()[1].isdigit()}
++    peak = max(x['peak_RSS_KiB'] for x in first) * 1024
++    n = 2 if workers == 2 and (os.cpu_count() or 1) >= 4 and mem.get('MemAvailable', 0) > max(4 << 30, 3 * peak) and (after['loadavg'] or [999])[0] < (os.cpu_count() or 1) - 2 else 1
++    C.write(OUT / ('dispatch_' + str(time.time_ns()) + '.json'), dict(workers=n, threads_per_worker=1,
++        first_actual_peak_RSS_bytes=peak, resources=after,
++        reason='One actual authorized cell measured before choosing remaining independent CPU concurrency'))
++    with concurrent.futures.ProcessPoolExecutor(max_workers=n, mp_context=multiprocessing.get_context('spawn')) as pool:
++        todo = iter(jobs[1:]); active = {}
++        for _ in range(n):
++            job = next(todo, None)
++            if job:
++                active[pool.submit(worker, job)] = job
++        while active:
++            done, _ = concurrent.futures.wait(active, return_when=concurrent.futures.FIRST_COMPLETED)
++            for future in done:
++                future.result(); active.pop(future)
++                job = next(todo, None)
++                if job:
++                    active[pool.submit(worker, job)] = job
++    result = CORE['aggregate']()
++    CORE['verify'](reg['protected']); CORE['verify'](reg['code'])
++    if len(result['rows']) != CELLS:
++        raise AssertionError('Incomplete 56-cell matrix')
++    final = dict(status='COMPLETE', cells=CELLS, model_calls=0, GPU_calls=0, new_queries=0,
++        numeric_metric_count=result['numeric_metric_count'], seconds=time.perf_counter()-tick, workers=n,
++        receipts=result['receipts'], protected_verified=len(reg['protected']), source_hash=C.sha(__file__),
++        files={str(p): C.sha(p) for p in OUT.glob('*.csv')}, visual_review='PENDING_ACTUAL_IMAGE_REVIEW')
++    C.resources(OUT / ('resources_finished_' + str(time.time_ns()) + '.json'))
++    C.write(OUT / 'completion.json', final); CORE['event']('CPU_COMPLETE', cells=CELLS, seconds=final['seconds'])
++    return final
++
++
++def selfcheck():
++    """Only small synthetic identity guards; no experiment cell or model call."""
++    v = np.array([[0, 0, 0], [1, 0, 0], [0, .1, 0], [0, .3, 0]], np.float32)
++    members = {i: np.asarray([i]) for i in range(4)}; r = np.arange(4, dtype=np.int64)
++    t, why = state_merge(v, r, members, v.astype(float), {0, 1}, [(2, 3)])
++    assert why is None and np.array_equal(t['vertices'][2], t['vertices'][3])
++    assert abs(float(t['vertices'][2, 1]) - .2) < 1e-7
++    assert state_merge(v, r, members, v.astype(float), {0, 1}, [(0, 1)])[1] == 'DISTINCT_C_ANCHOR_CONFLICT'
++    anchored = r.copy(); anchored[2] = 0
++    assert state_merge(v, anchored, members, v.astype(float), {0, 1}, [(2, 3)])[1] == 'FREE_TIP_CURRENT_ROOT_IS_C'
++    assert state_merge(v, anchored, members, v.astype(float), {0, 1}, [(3, 2)])[1] == 'FREE_TIP_CURRENT_ROOT_IS_C'
++    assert state_merge(v, r, members, v.astype(float), {0, 1}, [(0, 2), (2, 3)])[1] == 'FREE_TIP_CURRENT_ROOT_IS_C'
++    assert B.OUT != OUT and B.ARMS == ('LONG', 'A_COUPLE') and B.state_merge is not state_merge
++    assert CORE['decode'].__globals__['state_merge'] is state_merge
++    return dict(status='PASS', tests=7, model_calls=0, experiment_cells=0,
++                legacy_source_sha256=C.sha(B.__file__), adapter_source_sha256=C.sha(__file__))
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument('--stage', choices=('status', 'selfcheck', 'freeze', 'run', 'aggregate'), default='status')
++    parser.add_argument('--workers', type=int, choices=(1, 2), default=2)
++    parser.add_argument('--gate', default=str(DEFAULT_GATE))
++    args = parser.parse_args()
++    if args.stage == 'selfcheck':
++        result = selfcheck()
++    elif args.stage == 'freeze':
++        reg = freeze(args.gate); result = dict(status=reg['status'], cells=reg['cells'])
++    elif args.stage == 'run':
++        result = run(args.workers, args.gate); result = {k: v for k, v in result.items() if k not in ('receipts', 'files')}
++    elif args.stage == 'aggregate':
++        _gate(args.gate); agg = CORE['aggregate'](); result = dict(cells=len(agg['rows']), numeric_metric_count=agg['numeric_metric_count'])
++    else:
++        result = dict(status='PREPARED_NO_AUTO_DISPATCH', arms=ARMS, cells=CELLS, delta_fraction=DELTA,
++            gate_exists=C.resolve(args.gate).is_file(), completed=len(list((OUT / 'cells').glob('*/*/complete.json'))),
++            failed=len(list((OUT / 'cells').glob('*/*/failure.json'))))
++    print(json.dumps(C.clean(result), ensure_ascii=False), flush=True)
++
++
++if __name__ == '__main__':
++    main()
+--- /dev/null
++++ b/r2/pilots/owner_layout_v1/classification_analysis.py
+@@ -0,0 +1,71 @@
++"""Summarize saved head predictions, including old cached seven-C predictions."""
++import csv, json, collections
++from pathlib import Path
++import numpy as np
++from . import head as H
++
++
++def rows(p):
++    with Path(p).open(encoding='utf-8-sig',newline='') as f:return list(csv.DictReader(f))
++
++
++def main():
++    gate=H.read(H.OUT/'gate.json');dest=H.OUT/'classification_analysis';dest.mkdir(exist_ok=True)
++    if (dest/'complete.json').exists():raise SystemExit('Already summarized; no overwrite')
++    rr=rows(H.OUT/'evaluation_head/per_edge.csv')
++    truths={(r['condition_id'],int(r['edge_id'])):r['role'] for r in rr if r['arm']=='CONTEXT'}
++    cached=rows(H.OLD/'evaluation/occupancy_edges.csv')
++    cases={r['condition_id'] for r in cached}
++    combined=[]
++    for r in rr:
++        if r['condition_id'] in cases:combined.append(dict(r))
++    for r in cached:
++        if r['label'] not in ('LONG','B_POOL47'):continue
++        role=truths[(r['condition_id'],int(r['edge_id']))]
++        z=float(r['logit'])
++        combined.append(dict(arm=r['label']+'_CACHED',split=r['split'],condition_id=r['condition_id'],
++           parent_id=r['condition_id'].split('__')[0],edge_id=r['edge_id'],role=role,logit=z,
++           probability=float(1/(1+np.exp(-np.clip(z,-60,60)))),predicted_owner=r['predicted']))
++    H.csvwrite(dest/'seven_C_per_edge.csv',combined)
++    summaries=[];parents=[]
++    rolemap={'NULL':0,'OWNER':1,'ALIAS':2}
++    for arm in sorted({r['arm'] for r in combined}):
++        for split in ('TRAIN','DEV'):
++            r=[r for r in combined if r['arm']==arm and r['split']==split]
++            m=H.metrics(np.asarray([float(x['logit']) for x in r]),np.asarray([rolemap[x['role']] for x in r]))
++            summaries.append(dict(arm=arm,split=split,**m))
++            for parent in sorted({x['parent_id'] for x in r}):
++                p=[x for x in r if x['parent_id']==parent]
++                m=H.metrics(np.asarray([float(x['logit']) for x in p]),np.asarray([rolemap[x['role']] for x in p]))
++                parents.append(dict(arm=arm,split=split,parent_id=parent,**m))
++    H.csvwrite(dest/'seven_C_summary.csv',summaries);H.csvwrite(dest/'seven_C_parents.csv',parents)
++    failures=[r for r in rr if (float(r['logit'])>=0)!=(r['role']=='OWNER')]
++    if failures:H.csvwrite(dest/'all_failed_edges.csv',failures)
++    bins=[]
++    for arm in ('MLP','CONTEXT'):
++        for split in ('TRAIN','DEV'):
++            r=[x for x in rr if x['arm']==arm and x['split']==split]
++            pp=np.array([float(x['probability']) for x in r]);yy=np.array([x['role']=='OWNER' for x in r])
++            bb=np.minimum((pp*10).astype(int),9)
++            for i in range(10):
++                v=bb==i
++                bins.append(dict(arm=arm,split=split,bin=i,lower=i/10,upper=(i+1)/10,count=int(v.sum()),
++                    mean_probability=float(pp[v].mean()) if v.any() else None,
++                    empirical_owner_fraction=float(yy[v].mean()) if v.any() else None))
++    H.csvwrite(dest/'reliability_bins.csv',bins)
++    import matplotlib
++    matplotlib.use('Agg')
++    import matplotlib.pyplot as plt
++    fig,ax=plt.subplots(figsize=(6.5,4))
++    for arm in ('MLP','CONTEXT'):
++        r=rows(H.OUT/'heads'/arm/'learning_curve.csv')
++        ax.semilogy([int(x['step']) for x in r],[float(x['loss']) for x in r],label=arm)
++    ax.set(xlabel='Fixed CPU optimizer updates',ylabel='TRAIN parent-mean unweighted BCE')
++    ax.legend();ax.grid(alpha=.2);fig.tight_layout();fig.savefig(dest/'learning_curve.png',dpi=150);plt.close(fig)
++    H.write(dest/'complete.json',dict(status='COMPLETE',gate=gate['status'],new_model_calls=0,
++        failed_edges=len(failures),cached_old_head_forwards=0,
++        files={str(p):H.sha(p) for p in dest.iterdir() if p.is_file()}))
++    print(json.dumps(summaries,indent=2))
++
++
++if __name__=='__main__':main()
+--- /dev/null
++++ b/r2/pilots/owner_layout_v1/closeout_head.py
+@@ -0,0 +1,126 @@
++"""Close a failed frozen gate honestly; never runs or retries a model."""
++import csv,datetime,difflib,json,shutil
++from pathlib import Path
++from . import head as H
++
++def rows(p):
++    with Path(p).open(encoding='utf-8-sig',newline='') as f:return list(csv.DictReader(f))
++def pct(v):return 'NA' if v in (None,'','None') else f'{100*float(v):.2f}%'
++
++def main():
++    gate=H.read(H.OUT/'gate.json')
++    if gate['status']=='PASS':raise SystemExit('Gate passed: finish authorized geometry before final closeout.')
++    if (H.OUT/'completion.json').exists():raise SystemExit('Already complete; no overwrite')
++    r=H.contract();done={a:H.read(H.OUT/'heads'/a/'complete.json') for a in r['head_arms']}
++    assert all(x['updates']==2000 for x in done.values())
++    ev=H.read(H.OUT/'evaluation_head/complete.json');assert ev['head_batch_forwards']==4
++    assert not (H.OUT/'generation_registration.json').exists()
++    source=H.read(H.OUT/'prepared_code_checks.json');assert H.sha(source['feature_source'])==source['feature_source_sha256']
++    summary=rows(H.OUT/'evaluation_head/summary.csv');parents=rows(H.OUT/'evaluation_head/per_parent.csv')
++    lines=['| 头/分组 | owner召回 | 真Null拒识 | alias拒识 | TP/FN/FP/TN | Brier↓ | ECE10↓ |',
++           '|---|---:|---:|---:|---|---:|---:|']
++    for x in summary:
++        lines.append(f"| {x['arm']} / {x['split']} | {pct(x['owner_recall'])} | {pct(x['null_specificity'])} | {pct(x['alias_specificity'])} | {x['TP']}/{x['FN']}/{x['FP']}/{x['TN']} | {float(x['brier']):.6f} | {float(x['ECE10']):.6f} |")
++    plines=['| 父/分组 | owner正确/总数 | 真Null误激活/总数 | alias误激活/总数 |','|---|---:|---:|---:|']
++    peredge=rows(H.OUT/'evaluation_head/per_edge.csv')
++    for x in parents:
++        if x['arm']!='CONTEXT' or not (x['split']=='DEV' or x['parent_id'].startswith(('73b369','3f7417','85b169','8c9b20'))):continue
++        z=[q for q in peredge if q['arm']=='CONTEXT' and q['parent_id']==x['parent_id']]
++        null=sum(q['role']=='NULL' and float(q['logit'])>=0 for q in z)
++        alias=sum(q['role']=='ALIAS' and float(q['logit'])>=0 for q in z)
++        plines.append(f"| {x['parent_id'][:8]} / {x['split']} | {x['TP']}/{x['owner']} | {null}/{x['Null']} | {alias}/{x['alias']} |")
++    gates='\n'.join(f'- `{k}`：'+('PASS' if v else '**FAIL**') for k,v in gate['gates'].items())
++    text=f'''# R2 C-only owner 布局头独立实验
++
++2026-10-17。固定实验完成；**预定 CONTEXT 候选未通过准入门槛，按冻结协议停止后续生成。** 两头均真实训练2000步，并完成一次固定终点评价；不是只写方案，也不是根据DEV换候选或调阈值。
++
++这次回答的是“新C-only头能否同时恢复owner召回、保留Null/alias拒识”。它没有生成新mesh，因此没有本轮FF/I/主体接续的改善或退化结论。上轮LONG+绑定16/16及B换布局12/16仍是原记录，不移作本轮成绩。
++
++## 1. 实际完成的比较
++
++同一TRAIN47：400条边，360 owner、34真Null、6 alias。MLP897参数；CONTEXT17985参数、两层32宽四头注意力。两者共享原C-only24维特征＋边序rank与边数两维，仅TRAIN标准化。C/N是模型可观察输入；父ID、Y、来源面ID和标签没有进入forward。
++
++各2000个full47批更新，fresh AdamW、LR0.001、weight_decay0.0001，未加权BCE按父先平均再47父平均；固定初始化种子与最终checkpoint，阈值0.5，无调温/阈值扫描、无early stopping、无事后选best。每头94000次父曝光（每父2000），数据没有新增父、几何或噪声。CONTEXT预定为生成候选，MLP只作对照。
++
++训练全程CPU：BF16前向，FP32参数、优化器和BCE。两个进程并行，各1计算线程。MLP {done['MLP']['seconds']:.2f}秒，CONTEXT {done['CONTEXT']['seconds']:.2f}秒；是并发运行的各阶段墙钟，不作为孤立硬件对比。两份最终权重及完整学习曲线保留。
++
++终态每个头对TRAIN47一个packed batch、DEV3一个packed batch，共4次前向。总实际占用头前向4004、反向4000、更新4000；生成器/D0/GPU调用均0。每条件receipt中的batch参与标记不能再累加成额外前向。
++
++## 2. 全量分类与校准结果
++
++{chr(10).join(lines)}
++
++TRAIN为47父400边；DEV为3父24边（20 owner、1真Null、3 alias）。表中召回/拒识按对应角色计数，Brier/ECE按有效边micro统计；训练loss按父平均，分母不同。TRAIN校准好不代表跨父概率校准或开放生成成功。完整NLL、逐边概率和固定10-bin可靠性表另附。
++
++## 3. 主候选的关键逐父结果
++
++{chr(10).join(plines)}
++
++全部47训练父均保留在逐父CSV；此处只突出原七C面板，未按结果剔除任何输入。0/0表示该父没有此类标签，不称100%拒识。
++
++本次CONTEXT的5条owner漏判全部来自2d（边1/2/11/14/15）；2d同时误激活alias边9/12。608的唯一真Null边1以约0.99999999996概率被激活；610四条owner均正确。这个错误分布说明不能只给75%总体召回，也不能把三父一概称为失败。
++
++固定门槛结果：
++
++{gates}
++
++DEV没有参与更新、标准化、阈值或模型选择。它是已经多轮观察的DEV，不能称全新测试。协议原文“各DEV父≥90%意味着20/20”有算术错误，已在**终点评价前**独立勘误：实际代码执行逐父≥90%，2d允许12/13，故最低19/20；没有事后改门槛。见[勘误](PROTOCOL_ERRATA.md)。
++
++## 4. 应怎样解释
++
++这说明本版固定特征、容量、监督和预算没有同时满足跨父owner/Null/alias的准入要求，不能靠更高的总激活率宣布修复。400条边中90%为owner，全部打开就能取得100%owner召回，却会误开所有负类；所以二者必须一起看。
++
++**复核旧缓存还纠正了本次提议中的一个关键前提：LONG在这三个DEV上实际已经召回20/20个来源owner；其16/4/4布局是全部24边打开，另外误开了3条alias和1条真Null，并不是owner漏开。** 因此，之前LONG的DEV主体可达仍0/12，不能归因成“还没把该开的owner打开”。布局误激活可能有代价，但它与seam侧边、bulk几何未接通是不同问题。本轮没有新的生成来量化二者。
++
++对熟悉四父，新CONTEXT确有分类层面的正结果：62/62 owner召回且4/4真Null正确关闭，优于旧LONG的48/62及旧B的28/62召回；但这些父参加了训练，不能代替DEV。MLP也召回62/62，却误开其中2条真Null。注意力新增容量帮助了训练池分离，但DEV并未优于MLP；不能把“加上下文”自动当成泛化修复。
++
++这不是证明C-only预测在数学上不可能，也不是证明新布局会使生成质量变差。来源标签对应某一个完整网格的分配规范，不必是所有合理完成的唯一角色答案。alias还含同一来源面的owner优先顺序：当前二分类只决定是否占独立槽，**没有预测alias伙伴或恢复第三点引用**。边序rank依赖C局部顶点编号，不宣称任意重编号等变。
++
++旧B占用头并非只训练了200步：它继承旧头后又跑800更新；保留四C旧类别权重与47父新分布不一致是可检验因素，不能称实现已被证实训崩。此次同时改变了loss权重、独立训练预算、特征/标准化和fresh优化器，因此新旧头变化不单独归因于其中一项。两种新头之间的同特征同预算对照用于观察上下文增量。
++
++若继续这一方向，优先把“是否需要一张新的面”和“是否与另一边属于同一张面”分开定义，并处理C单独不能决定的多解性；不要自动加大生成器训练或把DEV加入头的监督。本次不执行下一版本。
++
++## 5. 下游阶段与停止条件
++
++| 阶段 | 状态 | 实际预算 |
++|---|---|---:|
++| MLP固定2000步 | COMPLETE | 2000更新 |
++| CONTEXT固定2000步 | COMPLETE | 2000更新 |
++| 两头固定终点评价 | COMPLETE | 4 packed前向 |
++| LONG/B新布局采样 | NOT_RUN_GATE_FAILED | 0/56 RAW |
++| 官方D0与原GEO_C | NOT_RUN_GATE_FAILED | 0/56 |
++| 1.5%L绑定 | NOT_RUN_GATE_FAILED | 0/56单元 |
++| 新mesh评分/图审 | NOT_RUN_GATE_FAILED | NA |
++
++后续生成/评分/绑定适配器已准备，但没有绕过门槛运行。绑定保护仅做7个微型CPU断言，零实验网格；没有把这7项当作新生成结果。未自动换用MLP、扫描阈值、延长训练、添加A损失、清理权重、修改默认或commit/push。
++
++## 6. 文件与可恢复性
++
++- [逐边预测848行](evaluation_head/per_edge.csv)、[逐父100行](evaluation_head/per_parent.csv)、[两头完整汇总](evaluation_head/summary.csv)。
++- [原七C与旧LONG/B头的配对](classification_analysis/seven_C_parents.csv)、[旧新头汇总](classification_analysis/seven_C_summary.csv)、[全部分类错误边](classification_analysis/all_failed_edges.csv)、[概率可靠性分箱](classification_analysis/reliability_bins.csv)。旧头只读缓存，没有重跑。
++- [学习曲线](classification_analysis/learning_curve.png)、[MLP最终权重](heads/MLP/step2000.pt)、[CONTEXT最终权重](heads/CONTEXT/step2000.pt)。
++- [固定门槛](gate.json)、[冻结合同](PROTOCOL.md)、[独立设计核对](DESIGN_REVIEW.md)、[源码核对](CODE_REVIEW.md)。
++- [实际代码与hash](evidence/)、[完整完成账本](completion.json)。原数据、评分器、权重及历史报告只读保留。
++
++只读入口：`python -B -m r2.pilots.owner_layout_v1.resume --stage status`。已完成训练不自动重跑；失败门槛阻止生成登记，根完成账本封存后不自动继续。
++'''
++    (H.OUT/'REPORT.md').write_text(text,encoding='utf-8')
++    evidence=H.OUT/'evidence';evidence.mkdir(exist_ok=True);sources=[];diff=[]
++    paths=sorted(Path(__file__).parent.glob('*.py'))+[Path(source['feature_source'])]
++    for i,p in enumerate(paths):
++        t=evidence/f'{i:02d}_{p.name}';shutil.copyfile(p,t)
++        sources.append(dict(source=str(p),sha256=H.sha(p),snapshot=str(t)))
++        if p.parent==Path(__file__).parent:
++            diff.extend(difflib.unified_diff([],p.read_text(encoding='utf-8-sig').splitlines(keepends=True),fromfile='/dev/null',tofile='b/'+str(p.relative_to(H.ROOT))))
++    H.csvwrite(evidence/'source_hashes.csv',sources);(evidence/'code.diff').write_text(''.join(diff),encoding='utf-8')
++    files=[H.OUT/'REPORT.md',H.OUT/'gate.json',H.OUT/'PROTOCOL.md',H.OUT/'PROTOCOL_ERRATA.md',H.OUT/'registration.json',
++           H.OUT/'evaluation_head/complete.json',evidence/'source_hashes.csv',evidence/'code.diff']
++    files+=list((H.OUT/'evaluation_head').glob('*.csv'))+list((H.OUT/'heads').glob('*/step2000.pt'))
++    H.write(H.OUT/'completion.json',dict(status='COMPLETE',outcome='HEAD_GATE_FAILED_NO_GENERATION',
++        utc=datetime.datetime.now(datetime.timezone.utc).isoformat(),head_updates=4000,head_forwards=4004,head_backwards=4000,
++        generator_forwards=0,D0_forwards=0,GPU_calls=0,new_RAW=0,new_POST=0,new_binding_cells=0,
++        per_edge_rows=len(peredge),per_parent_rows=len(parents),no_automatic_continuation=True,
++        protected_inputs_unchanged=True,files={str(p):H.sha(p) for p in files}))
++    print(json.dumps(H.read(H.OUT/'completion.json'),ensure_ascii=False,indent=2))
++
++if __name__=='__main__':main()
+--- /dev/null
++++ b/r2/pilots/owner_layout_v1/generation.py
+@@ -0,0 +1,302 @@
++"""Gate-controlled frozen LONG/B generation under one C-only owner layout.
++
++56 registered RAW outputs precede every D0 call. No training/head forward occurs
++here. Each GPU worker owns one model, one arm, one ledger and 28 fixed noises.
++Old sampling, official D0, GEO_C and source-winding code remain read-only.
++"""
++from __future__ import annotations
++import os
++os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
++for _k in ('OMP_NUM_THREADS','MKL_NUM_THREADS','OPENBLAS_NUM_THREADS','NUMEXPR_NUM_THREADS'):
++    os.environ.setdefault(_k,'1')
++import argparse
++import json
++from pathlib import Path
++import time
++import traceback
++import numpy as np
++from r2.pilots.seam_abc_v1 import generate as G
++from r2.pilots.seam_abc_v1 import postprocess as P
++
++ROOT=G.REPOSITORY
++OLD=ROOT/'experiments/r2_seam_abc_v1'
++OUT=ROOT/'experiments/r2_owner_layout_v1'
++ARMS={'LONG_OWNER':'LONG','B_POOL47_OWNER':'B_POOL47'}
++VERSION='owner_layout_frozen_generator_v1'
++
++
++def _layout_items(value):
++    raw=value.get('layouts',value)
++    return raw if isinstance(raw,dict) else {r['condition_id']:r for r in raw}
++
++
++def prepare(layout_manifest,gate_receipt):
++    """CPU only; consumes existing C-only head predictions, never predicts."""
++    OUT.mkdir(parents=True,exist_ok=True)
++    final=OUT/'generation_registration.json'
++    if final.exists():
++        result=G.read(final);G.verify_files(result['protected_files']);return result
++    lm,gate=Path(layout_manifest).resolve(),Path(gate_receipt).resolve()
++    layout_manifest_value=G.read(lm);decision=G.read(gate)
++    if decision.get('status')!='PASS' or decision.get('generation_allowed') is not True or decision.get('candidate')!='CONTEXT':
++        raise ValueError('Frozen CONTEXT gate must explicitly PASS and permit generation')
++    if decision['prediction_manifest_sha256']!=G.sha(lm):
++        raise ValueError('Gate prediction manifest identity differs')
++    items=_layout_items(layout_manifest_value)
++    old=G.read(OLD/'eval_manifest.json');oldreg=G.read(OLD/'registration.json')
++    required=('request_id','condition_id','parent_id','noise_index','N','K','seed',
++              'split','inference_npz','noise_npz','metadata_npz','query_descriptor')
++    requests=[{key:q[key] for key in required} for q in old['requests']]
++    if len(requests)!=28 or len({q['request_id'] for q in requests})!=28:
++        raise ValueError('Exactly 28 existing request identities required')
++    if not {q['condition_id'] for q in requests}.issubset(items):
++        raise ValueError('All seven registered C-only layout predictions required')
++    protected={str(lm):G.sha(lm),str(gate):G.sha(gate),str(OLD/'eval_manifest.json'):G.sha(OLD/'eval_manifest.json')}
++    layouts={}
++    from r2.prototypes.seam_slot_c200_v1.slot_data import inference_layout
++    from meshflow_control.seam.slot_data import edge_features as head_edge_features
++    for q in requests:
++        bundle=G.read_bundle(q);source=G.source_from_bundle(q,bundle);G.read_noise(q)
++        for name in ('inference_npz','noise_npz','metadata_npz'):protected[q[name]]=G.sha(q[name])
++        protected[q['query_descriptor']['path']]=q['query_descriptor']['sha256']
++        if q['condition_id'] in layouts:continue
++        item=items[q['condition_id']];pred=Path(item['prediction_npz']).resolve();rp=Path(item['receipt']).resolve()
++        receipt=G.read(rp)
++        if receipt['condition_id']!=q['condition_id'] or receipt['C_bundle_sha256']!=G.sha(q['inference_npz']):
++            raise ValueError('Prediction C identity differs')
++        if receipt.get('source_labels_used_in_forward') is not False:
++            raise ValueError('Head inference receipt must certify no source labels read')
++        if receipt.get('head_sha256')!=decision['checkpoint_sha256'] or receipt.get('threshold')!=.5 or receipt.get('features')!='C_only26':
++            raise ValueError('Head checkpoint, threshold or feature definition differs')
++        a=G.load_npz(pred)
++        occupied=a['occupied'];logits=a['occupancy_logits'] if 'occupancy_logits' in a else a['logits']
++        if occupied.dtype!=np.bool_ or logits.dtype!=np.float32 or logits.shape!=occupied.shape or not np.isfinite(logits).all():
++            raise ValueError('Owner predictions require bool occupied and finite FP32 logits in exact C boundary order')
++        if not np.array_equal(occupied,logits>=0):raise ValueError('Frozen threshold=.5 violated')
++        layout=inference_layout(**bundle,occupied=occupied)
++        head_edges,head_features=head_edge_features(bundle['C_vertices'],bundle['C_faces_original'],int(bundle['total_N']))
++        if not G.same(head_edges,layout['edge_records']) or not G.same(head_features,layout['features']):
++            raise ValueError('C-only head and generator disagree on ordered boundary features')
++        # If producer saved full layout geometry, ensure it is precisely the
++        # original C-only representation rather than a different owner decoder.
++        for key in layout:
++            if key in a and not G.same(np.asarray(layout[key]),a[key]):raise ValueError('Producer layout differs: '+key)
++        # Head producer computes its original ordered C-only26 features through
++        # boundary_from_C. Reconstruct that identical order from the protected C.
++        folder=OUT/'generation_inputs'/q['parent_id'][:8]
++        if folder.exists():raise ValueError('Incomplete registration artifact; explicit recovery required')
++        folder.mkdir(parents=True)
++        G.save_npz(folder/'layout.npz',dict(**{k:np.asarray(v) for k,v in layout.items()},occupancy_logits=logits))
++        G.save_npz(folder/'source_condition.npz',source)
++        record=dict(status='COMPLETE',condition_id=q['condition_id'],C_bundle_sha256=G.sha(q['inference_npz']),
++            prediction_npz=str(pred),prediction_sha256=G.sha(pred),prediction_receipt=str(rp),prediction_receipt_sha256=G.sha(rp),
++            active_edges=int(occupied.sum()),total_edges=len(occupied),new_head_forwards=0,source_labels_read=False,
++            files={str(p):G.sha(p) for p in (folder/'layout.npz',folder/'source_condition.npz')})
++        G.write(folder/'receipt.json',record)
++        for p in (pred,rp,folder/'layout.npz',folder/'source_condition.npz',folder/'receipt.json'):protected[str(p)]=G.sha(p)
++        layouts[q['condition_id']]=dict(path=str(folder/'layout.npz'),source_path=str(folder/'source_condition.npz'),
++            receipt=str(folder/'receipt.json'),active_edges=int(occupied.sum()),total_edges=len(occupied))
++    models={}
++    for arm,base in ARMS.items():
++        mr=ROOT/'experiments/r2_seam_quality_four_v1' if base=='LONG' else OLD
++        mp=mr/'inference'/(base+'_generator.pt');meta=G.read(mp.with_suffix('.json'))
++        if G.sha(mp)!=meta['sha256']:raise ValueError('Generator identity differs')
++        models[arm]=dict(source_arm=base,path=str(mp),sha256=meta['sha256'])
++        protected[str(mp)]=meta['sha256'];protected[str(mp.with_suffix('.json'))]=G.sha(mp.with_suffix('.json'))
++    d0=oldreg['d0_checkpoint'];protected[d0['path']]=d0['sha256']
++    protected[decision['checkpoint']]=decision['checkpoint_sha256']
++    G.verify_files(protected)
++    result=dict(schema=VERSION,status='FROZEN',arms=ARMS,requests=requests,layouts=layouts,models=models,
++        gate_receipt=str(gate),gate_receipt_sha256=G.sha(gate),layout_manifest=str(lm),d0_checkpoint=d0,
++        budget=dict(training_updates=0,head_forwards=0,pointer_forwards=0,RAW_outputs=56,generator_forwards=2800,
++            D0_outputs=56,D0_forwards=56,GEO_calls=56),
++        resources=dict(generator_estimate_mib=2600,D0_estimate_mib=3500),protected_files=protected,
++        contract='Two frozen final generators; same new C-only layout per C; unchanged Gaussian/N/C/Euler50; all56RAW before D0',
++        geometry='Single official D0; restore C and seam anchors; original GEO_C/source winding; binding is separate CPU stage')
++    G.write(final,result);return result
++
++
++def contract(require_go=False):
++    reg=G.read(OUT/'generation_registration.json')
++    if reg['schema']!=VERSION or reg['status']!='FROZEN' or reg['arms']!=ARMS:raise ValueError('Registration differs')
++    G.verify_files(reg['protected_files'])
++    gate=G.read(reg['gate_receipt'])
++    if gate.get('status')!='PASS' or gate.get('generation_allowed') is not True:raise ValueError('Gate not passed')
++    if require_go:
++        go=G.read(OUT/'generation_dispatch_go.json')
++        if go.get('authorized') is not True or go.get('registration_sha256')!=G.sha(OUT/'generation_registration.json') or go.get('code_sha256')!=G.sha(__file__):
++            raise ValueError('Parent execution release absent or changed')
++        G.verify_files(go['dependency_hashes'])
++    return reg
++
++
++def load_layout(reg,q):
++    item=reg['layouts'][q['condition_id']];a=G.load_npz(item['path']);logits=a.pop('occupancy_logits')
++    a={k:(v.item() if np.asarray(v).shape==() else v) for k,v in a.items()}
++    return a,logits,G.load_npz(item['source_path']),item
++
++
++def aggregate(stage,reg,arm,wall=None):
++    folder=OUT/'evaluation'/arm
++    receipts=[folder/q['request_id']/stage/'receipt.json' for q in reg['requests']]
++    values=[G.checked_receipt(p) for p in receipts]
++    if any(v['arm']!=arm for v in values):raise ValueError('Output identity differs')
++    result=dict(status='COMPLETE',schema=VERSION,arm=arm,outputs=28,
++        generator_forwards=sum(v.get('generator_forwards',0) for v in values),
++        D0_forwards=sum(v.get('D0_forwards',0) for v in values),new_head_forwards=0,training_updates=0,
++        wall_seconds=wall,files={str(p):G.sha(p) for p in receipts})
++    path=folder/(stage+'_complete.json')
++    if path.exists():return G.checked_receipt(path)
++    G.write(path,result);G.event(folder/'ledger.jsonl',stage.upper()+'_COMPLETE',**{k:v for k,v in result.items() if k!='files'})
++    return result
++
++
++def raw(arm):
++    if arm not in ARMS:raise ValueError('Unknown arm')
++    reg=contract(require_go=True);ar=OUT/'evaluation'/arm;ar.mkdir(parents=True,exist_ok=True)
++    if (ar/'raw_complete.json').exists():return G.checked_receipt(ar/'raw_complete.json')
++    pending=[]
++    for q in reg['requests']:
++        dest=ar/q['request_id']/'raw'
++        if (dest/'receipt.json').exists():G.checked_receipt(dest/'receipt.json')
++        elif dest.exists():raise RuntimeError('Unresolved RAW; no automatic retry '+str(dest))
++        else:pending.append(q)
++    if not pending:return aggregate('raw',reg,arm)
++    snap=G.resources();attempt=ar/('generation_attempt_'+str(time.time_ns()));attempt.mkdir()
++    G.write(attempt/'resources_before.json',snap);G.dispatch_guard(snap,reg['resources']['generator_estimate_mib'])
++    from meshflow_control import runtime
++    runtime.configure_stable_runtime()
++    import torch
++    from meshflow_control.checkpoints import state_hash
++    from meshflow_control.geo_io import write_indexed_ply
++    model,payload,identity=G._load_generator(OLD,ARMS[arm])
++    G.write(attempt/'model_identity.json',identity);G.write(attempt/'resources_resident.json',G.resources())
++    count=0;started=time.perf_counter()
++    try:
++        for q in pending:
++            layout,logits,source,item=load_layout(reg,q);dest=ar/q['request_id']/'raw';dest.mkdir(parents=True)
++            G.write(dest/'attempt.json',dict(request=q,arm=arm,checkpoint=identity,unix=time.time(),budget_forwards=50))
++            G.write(dest/'resources_before.json',G.resources())
++            value,trajectory,audit=G.rollout(model,layout,G.read_noise(q),dest/'calls.jsonl')
++            arrays=G.raw_arrays(value,layout,logits,source)
++            G.save_npz(dest/'raw.npz',arrays);G.save_npz(dest/'trajectory.npz',dict(state=trajectory))
++            G.save_npz(dest/'source_condition.npz',source);write_indexed_ply(dest/'raw.ply',arrays['vertices'],arrays['faces'])
++            G.write(dest/'audit.json',audit)
++            files={str(p):G.sha(p) for p in dest.iterdir() if p.is_file()}
++            G.write(dest/'receipt.json',dict(status='COMPLETE',schema=VERSION,arm=arm,request_id=q['request_id'],
++                condition_id=q['condition_id'],checkpoint=identity,input_bundle_sha256=G.sha(q['inference_npz']),
++                noise_sha256=G.sha(q['noise_npz']),layout_path=item['path'],layout_sha256=G.sha(item['path']),
++                raw_path=str(dest/'raw.npz'),raw_sha256=G.sha(dest/'raw.npz'),generator_forwards=50,D0_forwards=0,
++                head_forwards=0,source_labels_read=False,audit=audit,files=files))
++            count+=1;G.event(ar/'ledger.jsonl','RAW_SAVED',request_id=q['request_id'],generator_forwards=50)
++            if count==1:G.write(attempt/'resources_first_actual_rollout.json',G.resources())
++            print(json.dumps(dict(stage='RAW',arm=arm,completed=count,request_id=q['request_id'],seconds=audit['seconds'])),flush=True)
++        if state_hash(model.state_dict())!=payload['generator_state_sha256']:raise ValueError('Frozen model changed')
++        G.write(attempt/'resources_finished.json',G.resources())
++        return aggregate('raw',reg,arm,time.perf_counter()-started)
++    except BaseException as e:
++        G.write(attempt/'failure.json',dict(error=repr(e),traceback=traceback.format_exc(),completed=count,no_automatic_retry=True));raise
++    finally:
++        del model;torch.cuda.empty_cache()
++
++
++def all_raw(reg):
++    files={}
++    for arm in ARMS:
++        r=G.checked_receipt(OUT/'evaluation'/arm/'raw_complete.json')
++        if r['outputs']!=28 or r['generator_forwards']!=1400:raise ValueError('RAW budget incomplete')
++        for q in reg['requests']:
++            p=OUT/'evaluation'/arm/q['request_id']/'raw/receipt.json';v=G.checked_receipt(p)
++            if v['arm']!=arm or v['request_id']!=q['request_id']:raise ValueError('RAW identity mismatch')
++            files[str(p)]=G.sha(p)
++    if len(files)!=56:raise ValueError('All56RAW barrier failed')
++    return files
++
++
++def post(arm):
++    if arm not in ARMS:raise ValueError('Unknown arm')
++    reg=contract(require_go=True);barrier=all_raw(reg);ar=OUT/'evaluation'/arm
++    if (ar/'post_complete.json').exists():return G.checked_receipt(ar/'post_complete.json')
++    pending=[]
++    for q in reg['requests']:
++        dest=ar/q['request_id']/'post'
++        if (dest/'receipt.json').exists():G.checked_receipt(dest/'receipt.json')
++        elif dest.exists():
++            if not (dest/'proposal_receipt.json').exists() or (dest/'geometry_attempt.json').exists():
++                raise RuntimeError('Unresolved D0/geometry; no automatic replay '+str(dest))
++            G.checked_receipt(dest/'proposal_receipt.json');pending.append(q)
++        else:pending.append(q)
++    if not pending:return aggregate('post',reg,arm)
++    attempt=ar/('post_attempt_'+str(time.time_ns()));attempt.mkdir()
++    G.write(attempt/'all_RAW_barrier.json',dict(status='PASS',RAW=56,files=barrier))
++    checkpoint=reg['d0_checkpoint']
++    if checkpoint['sha256']!='6a31f4c7dcbea7a6ac58c26075b20c897fd19aad4c33b5295cc4c93ed7078c36':raise ValueError('D0 differs')
++    need=any(not (ar/q['request_id']/'post/proposal_receipt.json').exists() for q in pending)
++    model=None;calls=count=0;started=time.perf_counter()
++    if need:
++        snap=G.resources();G.write(attempt/'resources_before.json',snap);G.dispatch_guard(snap,reg['resources']['D0_estimate_mib'])
++        from meshflow_control.denoise_model import load_denoiser,predict_proposal
++        model,identity=load_denoiser(checkpoint['path'])
++        G.write(attempt/'model_identity.json',identity);G.write(attempt/'resources_resident.json',G.resources())
++    try:
++        from meshflow_control.geo_io import write_indexed_ply
++        for q in pending:
++            rd=ar/q['request_id']/'raw';G.checked_receipt(rd/'receipt.json')
++            raw_arrays=G.load_npz(rd/'raw.npz');source=G.load_npz(rd/'source_condition.npz');dest=rd.parent/'post'
++            if not dest.exists():
++                dest.mkdir();G.write(dest/'attempt.json',dict(arm=arm,request=q,D0_budget=1,GEO_calls=1,unix=time.time()))
++            if (dest/'proposal_receipt.json').exists():
++                receipt=G.checked_receipt(dest/'proposal_receipt.json')
++                if receipt['raw_sha256']!=G.sha(rd/'raw.npz'):raise ValueError('Proposal input changed')
++                proposal=G.load_npz(dest/'proposal.npz')['official_unconstrained_proposal']
++            else:
++                import torch
++                G.write(dest/'resources_before_D0.json',G.resources())
++                torch.cuda.synchronize();torch.cuda.reset_peak_memory_stats();tick=time.perf_counter()
++                G.event(dest/'calls.jsonl','D0_FORWARD_STARTED',budget=1)
++                proposal=predict_proposal(model,raw_arrays['raw']);torch.cuda.synchronize();calls+=1
++                G.event(dest/'calls.jsonl','D0_FORWARD_RETURNED',seconds=time.perf_counter()-tick)
++                G.save_npz(dest/'proposal.npz',dict(official_unconstrained_proposal=proposal))
++                G.write(dest/'proposal_receipt.json',dict(status='COMPLETE',raw_sha256=G.sha(rd/'raw.npz'),D0_forwards=1,
++                    seconds=time.perf_counter()-tick,peak_allocated_bytes=torch.cuda.max_memory_allocated(),
++                    peak_reserved_bytes=torch.cuda.max_memory_reserved(),peak_scope='Per D0 call; resident model included; not total process VRAM',
++                    files={str(dest/'proposal.npz'):G.sha(dest/'proposal.npz')}))
++            G.write(dest/'geometry_attempt.json',dict(unix=time.time(),geometry_calls=1,orientation_calls=1))
++            pre,canonical,final,geometry,oriented,anchors=P.geometry_from_proposal(raw_arrays,proposal,source)
++            G.save_npz(dest/'pre_geo.npz',dict(output=pre,C=raw_arrays['raw'][:q['K']],known_faces=raw_arrays['known_faces'],
++                raw_anchor_ids=raw_arrays['raw_anchor_ids'],raw_seam_slot_mask=raw_arrays['raw_seam_slot_mask']))
++            G.save_npz(dest/'post_canonical.npz',canonical);G.save_npz(dest/'post.npz',final)
++            write_indexed_ply(dest/'post.ply',final['vertices'],final['faces'])
++            G.write(dest/'geometry.json',dict(stats=geometry['stats'],face_records=geometry['face_records']))
++            G.write(dest/'anchor_identity.json',anchors);G.write(dest/'source_restoration.json',oriented['restoration_summary'])
++            orient=oriented['orientation_result'];G.write(dest/'orientation.json',dict(summary=orient['summary'],components=orient['component_rows'],edges=orient['edge_rows']))
++            files={str(p):G.sha(p) for p in dest.iterdir() if p.is_file()}
++            G.write(dest/'receipt.json',dict(status='COMPLETE',schema=VERSION,arm=arm,request_id=q['request_id'],condition_id=q['condition_id'],
++                raw_sha256=G.sha(rd/'raw.npz'),post_path=str(dest/'post.npz'),post_sha256=G.sha(dest/'post.npz'),D0_forwards=1,
++                GEO_calls=1,orientation_solves=1,official_D0_sha256=checkpoint['sha256'],anchors=anchors,source_labels_used=False,files=files))
++            count+=1;G.event(ar/'ledger.jsonl','POST_SAVED',request_id=q['request_id'],D0_forwards=1)
++            if count==1:G.write(attempt/'resources_first_actual_D0.json',G.resources())
++            print(json.dumps(dict(stage='POST',arm=arm,completed=count,request_id=q['request_id'])),flush=True)
++        G.write(attempt/'resources_finished.json',G.resources())
++        return aggregate('post',reg,arm,time.perf_counter()-started)
++    except BaseException as e:
++        G.write(attempt/'failure.json',dict(error=repr(e),traceback=traceback.format_exc(),completed=count,D0_calls=calls,no_automatic_retry=True));raise
++    finally:
++        if model is not None:
++            import torch
++            del model;torch.cuda.empty_cache()
++
++
++def main():
++    p=argparse.ArgumentParser();p.add_argument('stage',choices=('prepare','raw','post'))
++    p.add_argument('--arm',choices=tuple(ARMS));p.add_argument('--layouts');p.add_argument('--gate')
++    a=p.parse_args()
++    if a.stage=='prepare':
++        if not a.layouts or not a.gate:p.error('prepare requires --layouts and --gate')
++        result=prepare(a.layouts,a.gate)
++    else:
++        if not a.arm:p.error('raw/post require --arm')
++        result=(raw if a.stage=='raw' else post)(a.arm)
++    print(json.dumps(G.clean({k:v for k,v in result.items() if k not in ('requests','protected_files','files','layouts')})),flush=True)
++
++if __name__=='__main__':main()
+--- /dev/null
++++ b/r2/pilots/owner_layout_v1/head.py
+@@ -0,0 +1,205 @@
++"""Fixed-budget CPU-only C-only owner heads. Never imports a generator."""
++import os
++os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
++os.environ.setdefault('OMP_NUM_THREADS', '1')
++os.environ.setdefault('OPENBLAS_NUM_THREADS', '1')
++import argparse, csv, hashlib, json, math, time, traceback
++from pathlib import Path
++import numpy as np
++
++ROOT=Path(__file__).resolve().parents[3]
++OUT=ROOT/'experiments/r2_owner_layout_v1'
++OLD=ROOT/'experiments/r2_seam_abc_v1'
++
++def read(p): return json.loads(Path(p).read_text(encoding='utf-8-sig'))
++def sha(p): return hashlib.sha256(Path(p).read_bytes()).hexdigest()
++def write(p,d):
++    p=Path(p);p.parent.mkdir(parents=True,exist_ok=True)
++    with p.open('x',encoding='utf-8') as f:json.dump(d,f,ensure_ascii=False,indent=2)
++def csvwrite(p,rr):
++    with Path(p).open('x',encoding='utf-8-sig',newline='') as f:
++        w=csv.DictWriter(f,fieldnames=list(rr[0]));w.writeheader();w.writerows(rr)
++def arrays(p):
++    with np.load(p,allow_pickle=False) as z:return {k:z[k].copy() for k in z.files}
++
++def features(inp):
++    from meshflow_control.seam.slot_data import edge_features
++    edges,x=edge_features(inp['C_vertices'],inp['C_faces_original'],int(inp['total_N']))
++    e=len(x)
++    x=np.c_[x,np.arange(e,dtype=np.float32)/max(1,e-1),np.full(e,e/32,dtype=np.float32)].astype(np.float32)
++    return edges,x
++
++def prepare():
++    if (OUT/'registration.json').exists():return read(OUT/'registration.json')
++    reg=read(OLD/'B_DATA_REGISTRATION.json');records=reg['records'];dev=reg['DEV_records']
++    train=[];protected={str(OLD/'B_DATA_REGISTRATION.json'):sha(OLD/'B_DATA_REGISTRATION.json')}
++    for r in records:
++        d=arrays(r['inference_npz']);y=arrays(r['labels_npz']);edges,x=features(d)
++        assert np.array_equal(x[:,:24],y['edge_features'])
++        roles=np.where(y['occupied_labels'],1,np.where(y['source_alias_labels'],2,0)).astype(np.int64)
++        assert np.array_equal(y['source_supported_labels'],roles!=0)
++        train.append((x,roles))
++    flat=np.concatenate([x for x,y in train]);mu=flat.mean(0);sd=np.maximum(flat.std(0),1e-4)
++    for r in records+dev:
++        for k in ('inference_npz','labels_npz'):protected[r[k]]=sha(r[k])
++    nmax=max(r['edges'] for r in records+dev)
++    x=np.zeros((47,nmax,26),np.float32);mask=np.zeros((47,nmax),bool);roles=np.full((47,nmax),-1,np.int64)
++    for i,(f,y) in enumerate(train):x[i,:len(f)]=(f-mu)/sd;mask[i,:len(f)]=True;roles[i,:len(f)]=y
++    assert np.sum(roles==1)==360 and np.sum(roles==0)==34 and np.sum(roles==2)==6
++    data=OUT/'data';data.mkdir(exist_ok=True)
++    np.savez_compressed(data/'train.npz',x=x,mask=mask,roles=roles,mean=mu,std=sd)
++    protected[str(data/'train.npz')]=sha(data/'train.npz')
++    v=dict(status='FROZEN',records=records,DEV_records=dev,protected=protected,steps=2000,
++           lr=.001,weight_decay=.0001,seed=2026101701,protocol_sha256=sha(OUT/'PROTOCOL.md'),
++           code_sha256=sha(__file__),candidate='CONTEXT',threshold=.5,head_arms=['MLP','CONTEXT'],
++           gpu_calls=0,generator_training_updates=0)
++    write(OUT/'registration.json',v);print(json.dumps({'stage':'PREPARED','TRAIN':47,'DEV':3,'edges':400}))
++
++def build(arm):
++    import torch
++    from torch import nn
++    class Block(nn.Module):
++        def __init__(self):
++            super().__init__();self.n1=nn.LayerNorm(32);self.n2=nn.LayerNorm(32)
++            self.qkv=nn.Linear(32,96);self.proj=nn.Linear(32,32)
++            self.ff=nn.Sequential(nn.Linear(32,64),nn.SiLU(),nn.Linear(64,32))
++        def forward(self,x,mask):
++            b,e,_=x.shape
++            q,k,v=self.qkv(self.n1(x)).reshape(b,e,3,4,8).permute(2,0,3,1,4).unbind(0)
++            score=(q@k.transpose(-1,-2))/math.sqrt(8)
++            score=score.masked_fill(~mask[:,None,None,:],float('-inf'))
++            y=(score.float().softmax(-1).to(v.dtype)@v).transpose(1,2).reshape(b,e,32)
++            x=x+self.proj(y);return x+self.ff(self.n2(x))
++    class Model(nn.Module):
++        def __init__(self):
++            super().__init__();self.proj=nn.Linear(26,32)
++            self.blocks=nn.ModuleList([Block(),Block()]) if arm=='CONTEXT' else nn.ModuleList([])
++            self.out=nn.Linear(32,1)
++            for m in self.modules():
++                if isinstance(m,nn.Linear):nn.init.xavier_uniform_(m.weight);nn.init.zeros_(m.bias)
++        def forward(self,x,mask):
++            x=torch.nn.functional.silu(self.proj(x))
++            for block in self.blocks:x=block(x,mask)
++            return self.out(x).squeeze(-1).float()
++    return Model()
++
++def setup():
++    import torch
++    torch.set_num_threads(1);torch.set_num_interop_threads(1)
++    torch.use_deterministic_algorithms(True,warn_only=False)
++    torch.manual_seed(2026101701)
++    return torch
++
++def contract():
++    r=read(OUT/'registration.json')
++    assert sha(__file__)==r['code_sha256'] and sha(OUT/'PROTOCOL.md')==r['protocol_sha256']
++    for p,h in r['protected'].items():assert sha(p)==h,p
++    return r
++
++def train(arm):
++    r=contract();dest=OUT/'heads'/arm;dest.mkdir(parents=True,exist_ok=True)
++    if (dest/'complete.json').exists():print(json.dumps(read(dest/'complete.json')));return
++    if (dest/'started.json').exists():raise RuntimeError('Unresolved head attempt; no silent retry')
++    torch=setup();d=arrays(OUT/'data/train.npz')
++    x=torch.from_numpy(d['x']);mask=torch.from_numpy(d['mask']);y=torch.from_numpy((d['roles']==1).astype(np.float32))
++    model=build(arm);opt=torch.optim.AdamW(model.parameters(),lr=r['lr'],weight_decay=r['weight_decay'])
++    write(dest/'started.json',dict(arm=arm,unix=time.time(),steps=2000,device='cpu',params=sum(p.numel() for p in model.parameters())))
++    start=time.perf_counter();logs=[]
++    try:
++        for step in range(1,2001):
++            opt.zero_grad(set_to_none=True)
++            with torch.autocast('cpu',dtype=torch.bfloat16):z=model(x,mask)
++            loss=(torch.nn.functional.binary_cross_entropy_with_logits(z,y,reduction='none')*mask).sum(1)/mask.sum(1)
++            loss=loss.mean();assert bool(torch.isfinite(loss))
++            loss.backward();opt.step()
++            if step==1 or step%50==0:
++                rec=dict(step=step,loss=float(loss.detach()),seconds=time.perf_counter()-start)
++                logs.append(rec);print(json.dumps(dict(arm=arm,**rec)),flush=True)
++        torch.save(dict(arm=arm,step=2000,state_dict=model.state_dict(),optimizer=opt.state_dict(),
++                        normalization_mean=d['mean'],normalization_std=d['std'],threshold=.5,
++                        feature_schema='C_edge26_rank_context_v1',registration_sha256=sha(OUT/'registration.json')),
++                   dest/'step2000.pt')
++        csvwrite(dest/'learning_curve.csv',logs)
++        write(dest/'complete.json',dict(status='COMPLETE',arm=arm,updates=2000,head_forwards=2000,
++              head_backwards=2000,parent_exposures=94000,parameters=sum(p.numel() for p in model.parameters()),
++              seconds=time.perf_counter()-start,device='CPU',precision='BF16 forward / FP32 parameters, optimizer and BCE',
++              generator_forwards=0,D0_forwards=0,GPU_calls=0,checkpoint_sha256=sha(dest/'step2000.pt')))
++    except BaseException as e:
++        write(dest/'failure.json',dict(error=repr(e),traceback=traceback.format_exc(),step=step,no_retry=True));raise
++
++def metrics(z,roles):
++    p=1/(1+np.exp(-np.clip(z,-60,60)));y=roles==1;pred=z>=0
++    active=roles>=0
++    z,p,y,pred,roles=z[active],p[active],y[active],pred[active],roles[active]
++    result=dict(edges=len(z),owner=int(y.sum()),Null=int((roles==0).sum()),alias=int((roles==2).sum()),
++                TP=int((pred&y).sum()),FN=int((~pred&y).sum()),FP=int((pred&~y).sum()),TN=int((~pred&~y).sum()),
++                owner_recall=float(pred[y].mean()) if y.any() else None,
++                null_specificity=float((~pred[roles==0]).mean()) if (roles==0).any() else None,
++                alias_specificity=float((~pred[roles==2]).mean()) if (roles==2).any() else None,
++                brier=float(np.mean((p-y)**2)),nll=float(np.mean(np.logaddexp(0,z)-y*z)))
++    bins=np.minimum((p*10).astype(int),9);ece=0
++    for i in range(10):
++        m=bins==i
++        if m.any():ece+=m.mean()*abs(p[m].mean()-y[m].mean())
++    result['ECE10']=float(ece);return result
++
++def evaluate():
++    r=contract();torch=setup();d=arrays(OUT/'data/train.npz');dest=OUT/'evaluation_head';dest.mkdir(exist_ok=True)
++    if (dest/'started.json').exists():raise RuntimeError('Terminal evaluation already attempted; no silent replay')
++    write(dest/'started.json',dict(unix=time.time(),terminal_head_batches=4,model_selection='CONTEXT_FIXED'))
++    # DEV features are from C-only; source labels are read below solely for final scoring.
++    xs=[]
++    for q in r['DEV_records']:
++        _,f=features(arrays(q['inference_npz']));xs.append((f-d['mean'])/d['std'])
++    dx=np.zeros((3,d['x'].shape[1],26),np.float32);dm=np.zeros(dx.shape[:2],bool)
++    for i,f in enumerate(xs):dx[i,:len(f)]=f;dm[i,:len(f)]=True
++    allrows=[];parent=[];summaries=[];predictions={}
++    for arm in r['head_arms']:
++        done=read(OUT/'heads'/arm/'complete.json');assert done['updates']==2000
++        ck=OUT/'heads'/arm/'step2000.pt';assert sha(ck)==done['checkpoint_sha256']
++        model=build(arm);model.load_state_dict(torch.load(ck,map_location='cpu',weights_only=False)['state_dict']);model.eval()
++        for split,records,x,mask in [('TRAIN',r['records'],d['x'],d['mask']),('DEV',r['DEV_records'],dx,dm)]:
++            with torch.inference_mode(),torch.autocast('cpu',dtype=torch.bfloat16):
++                z=model(torch.from_numpy(x),torch.from_numpy(mask)).float().numpy()
++            rr=np.full(mask.shape,-1,np.int64)
++            for i,q in enumerate(records):
++                labels=arrays(q['labels_npz']);roles=np.where(labels['occupied_labels'],1,np.where(labels['source_alias_labels'],2,0))
++                e=len(roles);rr[i,:e]=roles
++                parent.append(dict(arm=arm,split=split,parent_id=q['parent_id'],**metrics(z[i,:e],roles)))
++                for j in range(e):
++                    allrows.append(dict(arm=arm,split=split,parent_id=q['parent_id'],condition_id=q['condition_id'],edge_id=j,
++                         role=['NULL','OWNER','ALIAS'][roles[j]],logit=float(z[i,j]),probability=float(1/(1+np.exp(-float(z[i,j])))),predicted_owner=bool(z[i,j]>=0)))
++                if arm=='CONTEXT':
++                    p=OUT/'head_predictions'/q['parent_id'][:8];p.mkdir(parents=True,exist_ok=True)
++                    np.savez_compressed(p/'prediction.npz',occupied=z[i,:e]>=0,occupancy_logits=z[i,:e].astype(np.float32))
++                    receipt=dict(condition_id=q['condition_id'],C_bundle_sha256=sha(q['inference_npz']),head_sha256=sha(ck),threshold=.5,
++                                 source_labels_used_in_forward=False,features='C_only26',head_batch_calls=1)
++                    write(p/'receipt.json',receipt)
++                    predictions[q['condition_id']]=dict(prediction_npz=str(p/'prediction.npz'),receipt=str(p/'receipt.json'))
++            summaries.append(dict(arm=arm,split=split,**metrics(z,rr)))
++    csvwrite(dest/'per_edge.csv',allrows);csvwrite(dest/'per_parent.csv',parent);csvwrite(dest/'summary.csv',summaries)
++    c=[p for p in parent if p['arm']=='CONTEXT'];tr=next(s for s in summaries if s['arm']=='CONTEXT' and s['split']=='TRAIN')
++    de=next(s for s in summaries if s['arm']=='CONTEXT' and s['split']=='DEV')
++    familiar=[p for p in c if p['parent_id'].startswith(('73b369','3f7417','85b169','8c9b20'))]
++    gates=dict(TRAIN_owner_ge90=tr['owner_recall']>=.9,TRAIN_trueNull_ge80=tr['null_specificity']>=.8,
++               TRAIN_alias_ge50=tr['alias_specificity']>=.5,
++               familiar_each_owner_ge90=all(p['owner_recall']>=.9 for p in familiar),
++               familiar_all_trueNull_inactive=all(p['null_specificity'] in (None,1.) for p in familiar),
++               DEV_each_owner_ge90=all(p['owner_recall']>=.9 for p in c if p['split']=='DEV'),
++               DEV_trueNull_inactive=de['null_specificity']==1.,DEV_alias_atleast2of3=de['alias_specificity']>=2/3)
++    passed=all(gates.values())
++    write(OUT/'head_predictions/manifest.json',predictions)
++    write(OUT/'gate.json',dict(status='PASS' if passed else 'FAIL',candidate='CONTEXT',gates=gates,
++          generation_allowed=passed,training_updates=4000,terminal_head_batch_calls=4,
++          checkpoint=str(OUT/'heads/CONTEXT/step2000.pt'),checkpoint_sha256=sha(OUT/'heads/CONTEXT/step2000.pt'),
++          prediction_manifest_sha256=sha(OUT/'head_predictions/manifest.json'),
++          failure_action='STOP_NO_REFIT_NO_THRESHOLD_TUNING_NO_GENERATION'))
++    write(dest/'complete.json',dict(status='COMPLETE',head_batch_forwards=4,per_edge_rows=len(allrows),per_parent_rows=len(parent),gate=passed))
++    print(json.dumps(read(OUT/'gate.json'),indent=2));print(json.dumps(summaries,indent=2))
++
++def main():
++    p=argparse.ArgumentParser();p.add_argument('stage',choices=['prepare','train','evaluate']);p.add_argument('--arm',choices=['MLP','CONTEXT']);a=p.parse_args()
++    if a.stage=='prepare':prepare()
++    elif a.stage=='train':train(a.arm)
++    else:evaluate()
++if __name__=='__main__':main()
+--- /dev/null
++++ b/r2/pilots/owner_layout_v1/resume.py
+@@ -0,0 +1,20 @@
++"""Read-only state by default; conditional generation refuses failed head gate."""
++import argparse,json,subprocess,sys
++from pathlib import Path
++ROOT=Path(__file__).resolve().parents[3]
++OUT=ROOT/'experiments/r2_owner_layout_v1'
++
++def read(p):return json.loads(p.read_text(encoding='utf-8-sig'))
++def main():
++    p=argparse.ArgumentParser();p.add_argument('--stage',choices=['status','evaluate-heads'],default='status');a=p.parse_args()
++    stages={}
++    for name,path in [('MLP',OUT/'heads/MLP/complete.json'),('CONTEXT',OUT/'heads/CONTEXT/complete.json'),
++                      ('head_gate',OUT/'gate.json'),('final',OUT/'completion.json')]:
++        stages[name]=read(path).get('status','RECORDED') if path.exists() else 'NOT_COMPLETE'
++    if a.stage=='status':print(json.dumps(dict(stages=stages,new_model_calls=0),indent=2));return
++    if (OUT/'completion.json').exists():raise SystemExit('Fixed task complete; no automatic continuation')
++    if not all(stages[k]=='COMPLETE' for k in ['MLP','CONTEXT']):raise SystemExit('Both fixed2000 heads must finish')
++    if (OUT/'evaluation_head/started.json').exists():raise SystemExit('Terminal evaluation already attempted; inspect rather than retry')
++    raise SystemExit(subprocess.call([sys.executable,'-B','-m','r2.pilots.owner_layout_v1.head','evaluate'],cwd=ROOT))
++
++if __name__=='__main__':main()
+--- /dev/null
++++ b/r2/pilots/owner_layout_v1/scoring.py
+@@ -0,0 +1,161 @@
++"""CPU-only unchanged 124-field ABC scoring of two frozen owner-layout arms.
++
++This adapter changes label applicability only. Old scorer, scores, queries and
++geometric definitions remain read-only; old LONG/B outputs are reused.
++"""
++from __future__ import annotations
++import os
++os.environ['CUDA_VISIBLE_DEVICES']=''
++for k in ('OMP_NUM_THREADS','MKL_NUM_THREADS','OPENBLAS_NUM_THREADS','NUMEXPR_NUM_THREADS'):os.environ[k]='1'
++import argparse
++import collections
++import concurrent.futures
++import json
++import multiprocessing
++from pathlib import Path
++import time
++import numpy as np
++from . import generation as G
++from r2.pilots.seam_abc_v1 import evaluate as E
++from r2.pilots.seam_abc_v1 import eval_common as C
++from r2.pilots.seam_quality_four_v1.summarize import flatten
++
++LABELS=('LONG','B_POOL47',*G.ARMS)
++COMPARISONS=(('LONG','LONG_OWNER'),('B_POOL47','B_POOL47_OWNER'),('LONG_OWNER','B_POOL47_OWNER'))
++
++
++def score_one(job):
++    C.ARMS=tuple(dict.fromkeys((*C.ARMS,*G.ARMS)))
++    return E.score_one(job)
++
++
++def prepare():
++    reg=G.contract();out=G.OUT/'evaluation';out.mkdir(parents=True,exist_ok=True)
++    final=out/'score_registration.json'
++    if final.exists():
++        sr=C.read(final);E.verify(sr['source_hashes']);E.verify(sr['protected']);return sr
++    protected={}
++    for q in reg['requests']:
++        for key in ('inference_npz','metadata_npz','noise_npz'):protected[q[key]]=C.sha(q[key])
++        protected[q['query_descriptor']['path']]=q['query_descriptor']['sha256']
++    value=dict(version='owner_layout_original_ABC_score_adapter_v1',status='FROZEN',
++        source_hashes={**E.source_hashes(),str(Path(__file__)):C.sha(__file__),str(Path(G.__file__)):C.sha(G.__file__)},
++        protected=protected,registration_sha256=C.sha(G.OUT/'generation_registration.json'),
++        cells=112,requests=28,stages=['RAW','POST'],new_labels=list(G.ARMS),cached_references=['LONG','B_POOL47'],
++        new_model_calls=0,new_queries=0,comparisons=COMPARISONS,
++        scorer='Exact unchanged ABC evaluate.score_one; only new-label seam graph applicability enabled',
++        quality_definition=E.helpers()[0].cpu_math()['control'].frozen_definition(),L=C.L)
++    C.write(final,value);return value
++
++
++def run():
++    reg=C.read(G.OUT/'generation_registration.json');sp=G.OUT/'evaluation/score_registration.json';sr=C.read(sp)
++    E.verify(sr['source_hashes']);E.verify(sr['protected'])
++    if sr['registration_sha256']!=C.sha(G.OUT/'generation_registration.json'):raise ValueError('Registration changed')
++    final=G.OUT/'evaluation/score_completion.json'
++    if final.exists():
++        result=C.read(final)
++        for r in result['receipts']:E.verify({r['path']:r['sha256']});E.verify(C.read(r['path'])['files'])
++        return result
++    for arm in G.ARMS:
++        G.G.checked_receipt(G.OUT/'evaluation'/arm/'raw_complete.json')
++        G.G.checked_receipt(G.OUT/'evaluation'/arm/'post_complete.json')
++    jobs=[(str(G.OUT),arm,q,stage,C.sha(sp)) for arm in G.ARMS for q in reg['requests'] for stage in ('RAW','POST')]
++    before=C.resources();C.write(G.OUT/'evaluation/resources_before_score.json',before)
++    started=time.perf_counter();first=score_one(jobs[0]);after=C.resources()
++    mem={x.split(':')[0]:int(x.split()[1])*1024 for x in (after.get('memory') or '').splitlines() if len(x.split())>1 and x.split()[1].isdigit()}
++    workers=2 if (os.cpu_count() or 1)>=4 and mem.get('MemAvailable',0)>max(4<<30,3*first['peak_RSS_KiB']*1024) and (after['loadavg'] or [999])[0]<(os.cpu_count() or 1)-2 else 1
++    C.write(G.OUT/'evaluation/score_dispatch.json',dict(workers=workers,threads=1,first_authorized_cell=first,resources=after))
++    receipts=[first]
++    with concurrent.futures.ProcessPoolExecutor(max_workers=workers,mp_context=multiprocessing.get_context('spawn')) as pool:
++        todo=iter(jobs[1:]);active={}
++        for _ in range(workers):
++            j=next(todo,None)
++            if j:active[pool.submit(score_one,j)]=j
++        while active:
++            done,_=concurrent.futures.wait(active,return_when=concurrent.futures.FIRST_COMPLETED)
++            for f in done:receipts.append(f.result());del active[f]
++            print(json.dumps(dict(scored=len(receipts),registered=112)),flush=True)
++            for _ in done:
++                j=next(todo,None)
++                if j:active[pool.submit(score_one,j)]=j
++    receipts.sort(key=lambda r:r['path'])
++    value=dict(status='COMPLETE',cells=112,receipts=receipts,workers=workers,seconds=time.perf_counter()-started,
++        full_quality_scans=sum(not r['reused'] for r in receipts),new_queries=0,model_calls=0)
++    C.write(final,value);return value
++
++
++def summarize():
++    reg=C.read(G.OUT/'generation_registration.json');rows=[];roles=[];deleted=[];refs={}
++    for label in LABELS:
++        root=G.OUT if label in G.ARMS else G.OLD
++        for q in reg['requests']:
++            for stage in ('RAW','POST'):
++                p=root/'evaluation/scores'/label/q['request_id']/stage/'score.json'
++                s=C.read(p);E.verify(s['files']);refs[str(p)]=C.sha(p)
++                row=flatten(s,label);row['split']=q['split'];pair=C.read(p.parent/'pairs.json');mesh=C.arrays(s['identity']['mesh_path'])
++                k=q['K'];ids=mesh['raw_slot_ids'];seam=mesh['raw_seam_slot_mask'][ids];counts=collections.Counter()
++                for kind,scan in pair.items():
++                    for contact in scan['contacts']:
++                        if contact['classification'] not in E.ILLEGAL:continue
++                        i,j=map(int,contact['pair'])
++                        if kind=='FF':
++                            i+=k;j+=k;role='seam-seam' if seam[i] and seam[j] else 'seam-bulk' if seam[i] or seam[j] else 'bulk-bulk'
++                        else:j+=k;role='C-seam' if seam[j] else 'C-bulk'
++                        counts[role]+=1
++                        roles.append(dict(label=label,split=q['split'],stage=stage,request_id=q['request_id'],kind=kind,role=role,
++                            classification=contact['classification'],raw_face_i=int(ids[i]),raw_face_j=int(ids[j])))
++                for role in ('seam-seam','seam-bulk','bulk-bulk','C-seam','C-bulk'):row['illegal_pairs_'+role]=counts[role]
++                if sum(counts[r] for r in ('seam-seam','seam-bulk','bulk-bulk'))!=row['FF_illegal_pair_count']:raise ValueError('Partition mismatch')
++                rows.append(row)
++                if stage=='POST':
++                    for fi in np.flatnonzero(~mesh['source_face_kept']):
++                        deleted.append(dict(label=label,split=q['split'],request_id=q['request_id'],raw_slot_id=int(fi),
++                            role='SEAM' if mesh['raw_seam_slot_mask'][fi] else 'BULK',reason=str(mesh['source_face_reason'][fi]),
++                            duplicate_of_raw_slot=int(mesh['duplicate_of_source_face'][fi])))
++    numeric=sorted(k for k in set().union(*(r.keys() for r in rows)) if k not in (*E.META,'label','stage') and any(isinstance(r.get(k),(float,int,bool)) for r in rows))
++    if len(numeric)!=124:raise ValueError('Expected identical 124 numeric field definitions')
++    summary=[]
++    for label in LABELS:
++        for split in ('TRAIN','DEV','ALL'):
++            for stage in ('RAW','POST'):
++                rr=[r for r in rows if r['label']==label and r['stage']==stage and (split=='ALL' or r['split']==split)]
++                registered={'TRAIN':16,'DEV':12,'ALL':28}[split]
++                for metric in numeric:
++                    vals=[r[metric] for r in rr if isinstance(r.get(metric),(int,float,bool))]
++                    summary.append(dict(label=label,split=split,stage=stage,metric=metric,n_registered=registered,n_valid=len(vals),
++                        mean=float(np.mean(vals)) if vals else None,median=float(np.median(vals)) if vals else None,
++                        min=float(np.min(vals)) if vals else None,max=float(np.max(vals)) if vals else None,
++                        sum=float(np.sum(vals)) if vals else None,status='PASS' if len(vals)==registered else 'NA_OR_PARTIAL'))
++    lookup={(r['label'],r['stage'],r['request_id']):r for r in rows};paired=[]
++    for base,candidate in COMPARISONS:
++        for q in reg['requests']:
++            for stage in ('RAW','POST'):
++                a,b=lookup[base,stage,q['request_id']],lookup[candidate,stage,q['request_id']]
++                for metric in numeric:
++                    x,y=a.get(metric),b.get(metric);valid=isinstance(x,(float,int,bool)) and isinstance(y,(float,int,bool))
++                    paired.append(dict(baseline=base,candidate=candidate,request_id=q['request_id'],parent_id=q['parent_id'],split=q['split'],
++                        noise_index=q['noise_index'],stage=stage,metric=metric,baseline_value=x,candidate_value=y,
++                        delta=float(y)-float(x) if valid else None,status='PASS' if valid else 'NA'))
++    groups=collections.defaultdict(list);fields=('baseline','candidate','parent_id','split','stage','metric')
++    for r in paired:groups[tuple(r[f] for f in fields)].append(r)
++    parents=[]
++    for key,rr in sorted(groups.items()):
++        vv=[r for r in rr if r['status']=='PASS']
++        parents.append(dict(zip(fields,key),n_registered=4,n_valid=len(vv),
++            **{f:float(np.mean([r[f] for r in vv])) if vv else None for f in ('baseline_value','candidate_value','delta')},
++            status='PASS' if len(vv)==4 else 'NA_OR_PARTIAL'))
++    for name,data in [('per_output',rows),('summary',summary),('paired_per_noise',paired),('paired_per_parent',parents),('illegal_pairs_by_role',roles),('deleted_faces',deleted)]:
++        C.csvwrite(G.OUT/'evaluation'/(name+'.csv'),data)
++    value=dict(status='COMPLETE_NUMERICAL_PENDING_ACTUAL_VIEW',numeric_fields=124,source_scores=refs,
++        new_scans=112,reused_scores=112,model_calls=0,new_queries=0,
++        files={str(p):C.sha(p) for p in (G.OUT/'evaluation').glob('*.csv')})
++    C.write(G.OUT/'evaluation/summary_completion.json',value);return value
++
++
++def main():
++    p=argparse.ArgumentParser();p.add_argument('stage',choices=('prepare','score','summarize'));a=p.parse_args()
++    result={'prepare':prepare,'score':run,'summarize':summarize}[a.stage]()
++    print(json.dumps({k:v for k,v in result.items() if k not in ('source_hashes','protected','receipts','files','source_scores')}),flush=True)
++
++if __name__=='__main__':main()

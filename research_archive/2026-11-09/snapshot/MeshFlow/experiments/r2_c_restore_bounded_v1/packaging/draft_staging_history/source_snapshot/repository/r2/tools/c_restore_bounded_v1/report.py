@@ -1,0 +1,119 @@
+"""Read completed evidence only; write the experiment report without new scores."""
+from . import common as C
+import numpy as np
+
+def table(headers,rows):
+ return '\n'.join(['| '+' | '.join(headers)+' |','|'+'|'.join(['---']*len(headers))+'|']+['| '+' | '.join(map(str,r))+' |' for r in rows])
+def main():
+ reg=C.registration();execution=C.read(C.OUT/'execution_completion.json');audit=C.read(C.OUT/'independent_audit/completion.json')
+ assert execution['status']==audit['status']=='PASS'
+ d=C.rows(C.OUT/'decision_per_output.csv');s=C.rows(C.OUT/'decision_summary.csv');paired=C.rows(C.OUT/'paired_per_parent_noise.csv')
+ methods=['D0_BASE','RBF','BLEND'];allrows={r['method']:r for r in s if r['group']=='ALL'}
+ metrics=[('CF proper受影响free ↓','CF',100),('FF illegal受影响free ↓','FF',100),('I / ConflictCov_C ↓','I',100),
+  ('free小角<5° ↓','small_angle_lt5',100),('严格模型单位1e-6 A-VMR ↑','strict_AVMR',100),('严格PMR ↑','strict_PMR',100),
+  ('A-VMR@2%L ↑','AVMR_02L',100),('C边界顶点→free顶点平均距离 ↓','distance_mean_model',1),('PRE同定义平均距离 ↓','pre_distance_mean_model',1),
+  ('无方向合法图可达free面积%','reachable_area',100),('反向绕序路径可达free面积%','opposed_reach_after',100),('保留free面数','free_faces',1)]
+ mt=table(['指标（除距离/面数外为%）',*methods],[[name,*[f'{float(allrows[m][key])*scale:.6f}' for m in methods]] for name,key,scale in metrics])
+ counts=table(['连接观察',*methods],[[name,*[allrows[m][key]+'/12' for m in methods]] for name,key in [('有效C/F共边输出','outputs_with_valid_edges'),('反向共边输出，修复前后相同','outputs_with_opposed_edges_after')]])
+ case=[]
+ for r in [x for x in paired if x['method']=='BLEND' and x['reference']=='D0_BASE']:
+  orig=next(x for x in d if x['request_id']==r['request_id'] and x['method']=='BLEND')
+  case.append([r['parent_id'][:4]+' n'+r['candidate'],r['region_type'],f"{float(r['distance_mean_model_delta']):+.6f}",f"{float(r['I_delta'])*100:+.3f}",f"{float(r['FF_delta'])*100:+.3f}",orig['valid_edges']])
+ ct=table(['父/噪声','区域','Δ平均距离','ΔI(pp)','ΔFF(pp)','BLEND有效共边数'],case)
+ orientation=[]
+ for m in methods:
+  rs=[C.read(p) for p in (C.OUT/'oriented'/m).glob('*/receipt.json')]
+  orientation.append([m,sum(q['summary']['fixed_C_anchor_conflict_components']>0 for q in rs),sum(q['summary']['parity_conflict_components']>0 for q in rs),sum(q['summary']['flipped_free_faces'] for q in rs),sum(q['summary']['nonmanifold_edges'] for q in rs)])
+ ot=table(['方法','含固定C矛盾的输出/12','含奇偶环矛盾的输出/12','翻转free面总数','非流形边总数'],orientation)
+ logs=[C.read(p) for p in (C.OUT/'pre_geo/BLEND').glob('*/diagnostics.json')]
+ maxdisp=max(q['free_applied_FP32_displacement_norm']['max'] for q in logs)
+ scored=C.read(C.OUT/'score_completion.json');gallery=C.read(C.OUT/'gallery/manifest.json');dispatch=C.read(C.OUT/'CPU_dispatch.json')
+ document=f'''# R2 C 恢复：固定C方向审计与有界融合对照
+
+状态：COMPLETE。固定开发面板6父×2噪声，36份POST比较；2026-10-11。实验标识：{reg['version']}。
+
+**保留RBF作为局部接近/匹配候选，有界BLEND暂不替代。** BLEND把RBF两例大的I尾部压低，但距离收益全面减弱、有效共边减少，FF还更高。此次没有找到同时保留RBF长处又消除主要代价的版本。
+
+**方向低分需要重新解释：规范化C自身的绕序已不一致。** 原始来源面在本6条条件内方向一致，逐面角点规范化以后出现同向共享边。在固定C角点顺序的严格合同下，free-only全图方向一致约束无解。这是输入表示与方向合同的矛盾，不能称为RBF制造了物理缝隙，也不能把原始来源网格说成有方向缺陷。实际无方向共边、相交、重叠及可见错层的证据不受这个解释修正影响。
+
+## 1. 实际执行与固定定义
+
+- 复用上一轮同12 USER_MIX RAW、官方D0无约束proposal、原RBF PRE/POST及24份POST完整质量缓存；新训练/模型加载/前向/生成器采样/抽噪均为0。
+- 按顺序完成D0/RBF共24份方向处理，12份BLEND、12次相同GEO_C、12份原定义完整质量评分，再对12份BLEND作相同方向处理。36份都保留C坐标、面顺序及绕序。旧结果不覆写。
+- 新融合唯一配方：同Wendland C2核，半径0.1L；b=C−C_hat；s_i=k_i/同源顶点副本数；alpha_i=s_i/max(1,sum(s))；u=sum(alpha_i b_i)。权重非负、总和≤1，作用边缘平滑趋零。无矩阵求解、正则/半径/解算器扫描。
+- 同旧RBF保留0.02L安全限幅，并核验实际FP32位移≤min(0.02L,参与锚点最大修正)。本12例所有限幅与舍入修正均未触发；最大实际位移{maxdisp:.9f}，上限0.02L={.02*reg['fixed_L']:.9f}。因此结果不是由更频繁裁剪产生。
+- 固定L={reg['fixed_L']:.15f}，不是按每个输出bbox重定尺度。模型单位严格1e-6不宣称与论文原坐标尺度相同。全部C源拓扑开放边界为描述性域，没有登记用户必接接口。
+- PRE保留全部8档AVMR/PMR、逐边界距离和共边图；完整PRE CF/FF/I为NA_NOT_BUDGETED。POST使用原质量定义、冻结C查询点及实际free面数分母，无唯一GT排名。
+- 方向修复使用完整实际索引图中两面非退化邻接（C-C、C-F、F-F），与几何pair是否合法分开。相同边方向要求flip XOR=1，相反要求0；每个C固定flip=0。可满足分量按确定性解翻free；矛盾分量整体保留。非流形/退化边单列，不声称整体流形或法向朝外。
+- 翻面后的CF/FF/I/AVMR/距离继承无方向几何等价的原评分证据，不冒充重新执行原评分器；每面无序顶点集合、顶点数组、source_face_ids和源角点排列映射都核验。原pair witness仍属于原绕序缓存。合法图的绕序与可达性另算。
+
+冻结协议：[registration.json](registration.json)。可恢复入口：[README_RESUME.md](README_RESUME.md)。
+
+## 2. 全12例结果
+
+均先逐输出再宏平均；每父两噪声等权，不把12份当12个独立父。方向整理前后的下表几何质量不变。
+
+{mt}
+
+{counts}
+
+三组有效C/F共边总数分别1、9、3。BLEND新增有效连接仅86ec n0；其2条共边包含1条反向边，86ec n1保留1条。bdd29 n0的RBF共边在BLEND中消失。四份seat在三组均无有效共边，不能宣称座面接合已解决。全部8档PMR均为0。
+
+RBF相对D0的距离11/12改善；BLEND10/12改善，但BLEND相对RBF距离12/12更大。BLEND严格AVMR相对D0增加5.688pp，RBF增加12.103pp。三组PRE严格AVMR均0，精确顶点/边收益仍是在GEO之后出现，应归因于协调恢复与同一GEO组合。
+
+BLEND的I相对D0为+0.301pp，比RBF的+0.704pp小；但只1例降低、6例持平、5例增加。BLEND的FF为8例增加、3例持平、1例下降。其小角率略低于D0和RBF，不足以抵消以上权衡。
+
+## 3. 逐父噪声与尾部
+
+下表为BLEND−D0；I和FF为百分点，负值表示该项降低，原始逐例与BLEND−RBF配对均保存。
+
+{ct}
+
+866e n0原RBF的I增量+7.959pp，在BLEND中为0；bdd29 n0从+6.055pp降到+0.879pp。这支持较温和传播可以减小这两个尾部。但86ec n0原RBF的I/FF同时下降，在BLEND却分别+0.195/+3.571pp；86ec n1的I/FF为+2.441/+6.306pp。不能把两例尾部改善说成对所有输出更安全。
+
+BLEND保留free面总量与D0相同；RBF总量少8面。相同总量不代表逐例删面身份相同，本轮保留全部source_face_ids和GEO删除记录。原始PRE融合不删面，方向修复也不删面。
+
+数据：[decision_per_output.csv](decision_per_output.csv)、[paired_per_parent_noise.csv](paired_per_parent_noise.csv)、[quality_per_output.csv](quality_per_output.csv)、[AVMR_PMR_per_output.csv](AVMR_PMR_per_output.csv)、[boundary_vertices.csv](boundary_vertices.csv)、[blend_per_free_corner.csv](blend_per_free_corner.csv)。
+
+## 4. 为什么翻free面没有增加接合方向可达性
+
+{ot}
+
+三组的有效共边反向数量、反向路径可达面积均未增加。确实有free面被翻转，但主要发生在不受矛盾C分量阻断的区域，不能把“执行了翻面”当成“接合修好了”。
+
+来源审计核对原C的源顶点ID边，而非只看GEO按坐标构造的索引：六条条件依次33ec、534b、866e、86ec、bdd29、f596，同向两面共享边分别0、1、1、10、11、5。共28条独立边在original_source_faces绕序下全部相反，按保存的C_source_corner_permutations重排后变同向。5/6条件、两噪声共10/12输出已包含直接C-C矛盾；不是RBF独有，也不是坐标焊接才制造。
+
+MeshFlow的面角点规范化可改变绕序，不能默认模型输入已经保持一致表面法向。这个发现局限于本6条DEV条件及其已核验来源，不扩大成整套训练数据结论。
+
+RBF的86ec n0无方向合法图可达85.333%，当前反向路径仅3.047%；本轮两者仍保持原值。差值不代表82%的表面隔着缝；也不能由无方向可达就认证所有连接用途合理。当前策略是矛盾分量整体不改，未求最大可满足子图，不能证明任何局部free翻面都无益。未执行允许重排C角点的另一种合同。
+
+完整分量、约束和前后图：[orientation_per_output.csv](orientation_per_output.csv)、[orientation_components.csv](orientation_components.csv)、[orientation_constraints.csv](orientation_constraints.csv)、[topology_per_output.csv](topology_per_output.csv)。[六条件来源归因](review/source_C_orientation_conditions.csv)、[逐输出来源归因](review/source_C_orientation_audit.csv)、[边级与源码证据](review/source_C_orientation_edge_evidence.json)显示：原C所选面的45条双面共享边全相反，规范化后28条变同向；24份D0/RBF中的109条直接C-C矛盾全部对应同一原source-ID边，coordinate-only或source/indexed mismatch均0。额外96份来源文件只读前后hash一致。
+
+## 5. 图片与审计
+
+24张同相机/同尺度三组图均已实际查看，形成36条非盲AI_PROXY记录。BLEND多数轮廓接近D0，没有观察到新增整组腿消失，也没有清楚的广泛接续修复。33ec n0蓝C仍位于灰座面下方，866e n1座位前沿叠层仍在，86ec n1蓝拱背与更高灰背部并存。其余背板/框与额外灰背部共存的现象也未明显解决。遮挡与图像分辨率限制下，共边和相交以数值证据为准；这不是人类盲评或完整质量认证。
+
+[全部24图](gallery/index.html)、[36条图审](gallery/visual_review.csv)、[实际查看回执](gallery/visual_review_completion.json)。
+
+8项BLEND与7项方向CPU正负控通过。BLEND首轮一项测试把FP64的6×(1/6)和1作逐位等号比较而失败；保留原件后只把测试数学等式容差改为2e-16，算法未修改。正式12例没有科学失败或重放。
+
+独立审计采用与执行BFS不同的XOR并查集：12份融合公式及FP32端点、36份完整约束图/角点身份、{audit['actual_legal_graph_edges_checked']}条合法图边、{audit['boundary_and_threshold_checks']}项边界/阈值检查、576阈值行、648决策值、648配对差和18357汇总统计全部通过。1408份原文件/源码/权重执行前后hash不变；独立二次检查1407份非权重文件，权重引用全量执行校验回执。没有修改原评分器、旧报告、默认模型或Git。
+
+初始RTX5080约16GiB，Windows资源快照2487MiB占用/13493MiB空闲、2%利用率；本轮GPU worker=0。CPU24逻辑核，首份正式评分峰值RSS {dispatch['first_authorized_job']['peak_RSS_KiB']/1024:.2f}MiB，WSL可用内存约{dispatch['available_RAM_bytes']/2**30:.2f}GiB；据实启用{dispatch['workers']}个CPU评分worker，每个2线程。评分及BLEND方向阶段{scored['seconds']:.2f}秒，渲染{gallery['seconds']:.2f}秒，总执行入口{execution['phase_seconds']:.2f}秒（含保护hash，准备/编码/人工检查另计），独立审计{audit['seconds']:.2f}秒。并发墙钟不是独占性能基准。
+
+证据：[execution_completion.json](execution_completion.json)、[independent_audit/completion.json](independent_audit/completion.json)、[CPU_dispatch.json](CPU_dispatch.json)、[ledger.jsonl](ledger.jsonl)。完整源码、原实际评分代码、diff/hash随小审阅包保留；NPZ/PLY/原PNG留本地，不夹带大权重。
+
+## 6. 决策与一个优先下一步
+
+RBF仍是三个方案里“边界更近/顶点匹配更多”的候选；D0的平均FF/I更低；BLEND的小角与RBF两例I尾部较好，但没有形成更值得替代的总体折中。本轮不自动晋级任何方案，也不按父ID挑优拼接结果。
+
+**优先下一步是校正方向合同，而非继续调位移幅度。** 在明确“保持C几何与连接”是否允许仅重排角点后，单独核验全网格方向整理，把表示造成的绕序矛盾与真正缝隙/非法连接分开。检验假说：规范化角点排列是当前方向可达性低的一项表示性障碍；解除这一障碍应能改善方向一致性，同时CF/FF/I、无方向共边和C几何保持不变。它不会自动解决座面错层或RBF相交代价。
+
+这项新合同没有在本轮执行。固定任务已完成停止；未追加训练、模型前向、参数扫描、默认切换、commit或push。
+'''
+ # BOM keeps Chinese Markdown readable in the local Windows editors.
+ C.atomic(C.OUT/'REPORT.md',lambda f:f.write(('\ufeff'+document).encode('utf-8')),True)
+ C.write(C.OUT/'report_validation.json',dict(status='PASS',report_sha256=C.sha(C.OUT/'REPORT.md'),UTF8_BOM=True,paired_outputs=36,execution_and_independent_audit_PASS=True))
+ print('REPORT_COMPLETE')
+
+if __name__=='__main__':main()

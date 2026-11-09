@@ -1,0 +1,157 @@
+--- archive_before.py
++++ archive.py
+@@ -18,7 +18,7 @@
+ import zipfile
+ from . import common as C
+ 
+-VERSION = "full_contour_readout_small_review_archive_v1"
++VERSION = "full_contour_readout_small_review_archive_v1_1"
+ MAX_BYTES = 10_000_000
+ PREVIEW_TARGET_BYTES = 6_000_000
+ MAIN = ("CONTOUR_S0", "CONTOUR_S1000", "CONTOUR_S3000", "CONTOUR_S6000")
+@@ -241,6 +241,77 @@
+                      receipt_path=str(receipt) if receipt else ""))
+ 
+ 
++def collect_review_gallery_manifests(entries, reviews):
++    """Bind actual CSV review pages to their original small gallery manifests.
++
++    This copies manifest bytes only. Images are hash-checked and stay local;
++    no rendering, preview creation, visual rating, or completion claim occurs.
++    """
++    manifests, image_hashes, references = {}, {}, []
++    for cohort, (csv_path, csv_sha, rows) in reviews:
++        for row_number, row in enumerate(rows, 2):
++            for kind, path_key, hash_key in (
++                    ("depth", "image_path", "image_sha256"),
++                    ("sections", "section_image_path", "section_image_sha256")):
++                source = row.get(path_key, "")
++                expected = row.get(hash_key, "")
++                if not source or not expected:
++                    raise ValueError("Actual review page path/hash missing: " + path_key)
++                image_path = C.resolve(source)
++                if str(image_path) not in image_hashes:
++                    image_hashes[str(image_path)] = checked_file(image_path)[1]
++                if image_hashes[str(image_path)] != expected:
++                    raise ValueError("Actual reviewed page hash differs: " + source)
++                # Depth pages sit beside manifest; section pages use images/.
++                candidates = (image_path.parent / "manifest.json",
++                              image_path.parent.parent / "manifest.json")
++                manifest_path = next((v for v in candidates if v.is_file()), None)
++                if manifest_path is None:
++                    raise RuntimeError("Actual reviewed gallery manifest missing: " + source)
++                key = str(manifest_path)
++                if key not in manifests:
++                    checked, digest = checked_file(manifest_path)
++                    data = C.read(checked)
++                    if data.get("status") not in ("COMPLETE", "COMPLETE_RENDERING_NOT_REVIEW"):
++                        raise ValueError("Actual reviewed gallery is incomplete")
++                    member = "reviews/source_gallery_manifests/" + relative_source(checked)
++                    entries.file(checked, member, expected=digest,
++                                 role="actual_review_source_gallery_manifest")
++                    manifests[key] = (data, digest, member)
++                data, digest, member = manifests[key]
++                pages = [v for v in data.get("images", ())
++                         if C.resolve(v["path"]) == image_path]
++                if len(pages) != 1:
++                    raise ValueError("Actual review image not unique in source gallery")
++                page = pages[0]
++                if (page.get("sha256") != expected
++                        or page.get("request_id") != row["request_id"]
++                        or page.get("parent_id") != row["parent_id"]
++                        or int(page["candidate"]) != int(row["candidate"])
++                        or row["label"] not in data.get("labels", ())):
++                    raise ValueError("Actual review identity differs from source gallery")
++                references.append(dict(
++                    cohort=cohort, review_csv_path=str(csv_path), review_csv_sha256=csv_sha,
++                    review_csv_line=row_number, label=row["label"],
++                    request_id=row["request_id"], stage=row["stage"], kind=kind,
++                    source_image_path=source, source_image_sha256=expected,
++                    manifest_image_path=page["path"], source_manifest_path=key,
++                    source_manifest_sha256=digest, manifest_archive_member=member,
++                    source_image_included=False))
++    entries.add("reviews/ACTUAL_REVIEW_SOURCE_PAGES.csv", csv_bytes(references))
++    identity = dict(
++        status="SOURCE_IDENTITY_BOUND", review_page_references=len(references),
++        distinct_source_images=len(image_hashes), source_gallery_manifests=len(manifests),
++        original_manifest_bytes_copied=True, original_review_CSV_unchanged=True,
++        source_images="LOCAL_ONLY; original paths and verified SHA256 are in ACTUAL_REVIEW_SOURCE_PAGES.csv",
++        final_48_previews="SEPARATE_ALL_MODEL_DISPLAY_SET; not the actual subset pages used by reviewers",
++        new_renders=0, new_visual_reviews=0, new_model_calls=0,
++        limitations=["The final all-model previews may differ in layout and scale from actual reviewed subset pages.",
++                     "Manifest copying and image hashing do not constitute visual review."])
++    entries.json("reviews/SOURCE_PAGE_IDENTITY.json", identity)
++    return identity
++
++
+ def collect(gate):
+     entries = Entries()
+     reg = gate["reg"]
+@@ -254,6 +325,8 @@
+     entries.file(C.CODE / "README.md", "IMPLEMENTATION.md")
+     entries.file(gate["new_review"][0], "reviews/new_AI_PROXY_144.csv", expected=gate["new_review"][1])
+     entries.file(gate["old_review"][0], "reviews/baseline_AI_PROXY_192.csv", expected=gate["old_review"][1])
++    collect_review_gallery_manifests(entries, (("new_candidate", gate["new_review"]),
++                                              ("historical_baseline", gate["old_review"])))
+     for pointer in ("evaluation/comparison/latest.json", "training_analysis/latest.json"):
+         entries.file(C.OUT / pointer, "contracts/" + pointer)
+     for name, summary_path in (("comparison", gate["comparison_path"]), ("training", gate["training_path"])):
+@@ -418,6 +491,7 @@
+         raise RuntimeError("Exactly 24 depth and 24 section previews required")
+     page = '<!doctype html><meta charset="utf-8"><title>All 24 requests: compact previews</title>'
+     page += '<p>All requests retained. Compressed previews of saved evidence; not new renders/reviews. Original paths and hashes: PREVIEWS.json.</p>'
++    page += '<p>These 48 all-model preview pages are a separate display set, not the actual subset pages used by reviewers. Actual reviewed page paths, SHA256, and original gallery manifests are under reviews/.</p>'
+     for kind in ("depth", "sections"):
+         page += "<h1>" + html.escape(kind) + "</h1>"
+         for item in manifest:
+@@ -470,6 +544,35 @@
+             if len(rows) != expected_rows:
+                 raise ValueError("Packed full evidence row count differs: " + name)
+             counts[name] = len(rows)
++        source_refs = list(csv.DictReader(io.StringIO(
++            z.read("reviews/ACTUAL_REVIEW_SOURCE_PAGES.csv").decode("utf-8-sig"))))
++        wanted_refs = set()
++        for cohort, csv_name in (("new_candidate", "reviews/new_AI_PROXY_144.csv"),
++                                 ("historical_baseline", "reviews/baseline_AI_PROXY_192.csv")):
++            for row in csv.DictReader(io.StringIO(z.read(csv_name).decode("utf-8-sig"))):
++                for kind, pk, hk in (("depth", "image_path", "image_sha256"),
++                                     ("sections", "section_image_path", "section_image_sha256")):
++                    wanted_refs.add((cohort, row["label"], row["request_id"], row["stage"],
++                                     kind, row[pk], row[hk]))
++        actual_refs = [(r["cohort"], r["label"], r["request_id"], r["stage"],
++                        r["kind"], r["source_image_path"], r["source_image_sha256"])
++                       for r in source_refs]
++        if len(actual_refs) != 672 or len(set(actual_refs)) != 672 or set(actual_refs) != wanted_refs:
++            raise ValueError("Actual reviewed page references differ from complete original CSVs")
++        manifest_cache = {}
++        for r in source_refs:
++            member = r["manifest_archive_member"]
++            if member not in manifest_cache:
++                payload = z.read(member)
++                manifest_cache[member] = (bytes_sha(payload), json.loads(payload))
++            digest, data = manifest_cache[member]
++            pages = [v for v in data.get("images", ()) if v["path"] == r["manifest_image_path"]]
++            if (digest != r["source_manifest_sha256"] or len(pages) != 1
++                    or pages[0].get("sha256") != r["source_image_sha256"]
++                    or pages[0].get("request_id") != r["request_id"]
++                    or r["label"] not in data.get("labels", ())):
++                raise ValueError("Packed actual review source manifest binding differs")
++        counts["reviews/ACTUAL_REVIEW_SOURCE_PAGES.csv"] = len(source_refs)
+         preview = json.loads(z.read("PREVIEWS.json"))
+         if len(preview) != 48 or any(sum(r["kind"] == kind for r in preview) != 24 for kind in ("depth", "sections")):
+             raise ValueError("Incomplete preview coverage")
+@@ -519,11 +622,14 @@
+             text_compression="ZIP_LZMA", images_compression="ZIP_STORED",
+             prior_partial_snapshots_included=False, actual_new_AI_PROXY_rows=144,
+             historical_baseline_AI_PROXY_rows=192, inherited_candidate_zero_rows=48,
++            actual_review_source_manifests_included=True, actual_source_images_duplicated=False,
++            final_preview_set_differs_from_actual_review_source_pages=True,
+             final_audit_sha256=gate["audit_sha"], report_sha256=gate["report_sha"],
+             registration_sha256=gate["reg_sha"],
+             final_audit_itself_declared_report_binding=gate["audit_report_binding_present"],
+             source_signature=source_signature,
+             limitations=["Compressed previews do not substitute for original image review.",
++                         "The 48 all-model previews are distinct from actual reviewer subset pages; original paths, hashes and source gallery manifests are preserved under reviews/.",
+                          "Score CSVs can be re-aggregated; meshes, full OT arrays and weights remain local.",
+                          "Historical/inherited labels are not counted as new visual reviews."])
+         members = dict(entries.data, **pictures)

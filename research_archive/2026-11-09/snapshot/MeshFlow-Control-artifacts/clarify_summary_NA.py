@@ -1,0 +1,6 @@
+from pathlib import Path
+p=Path('/mnt/e/MeshFlow-Control/tools/summarize_results.py');s=p.read_text()
+s=s.replace("def constraints(m,key):","def reference_only(key):\n    return key.startswith(('SeamCov','ExposedRetain','Gamma','GT_','F_to_GT','D_sym','fixed_query','coverage','free_to_R12','R12_','remainder_','boundary_','Precision','Recall','Fscore','reference_','ConflictCov_C_GT')) or 'minus_GT' in key or key=='free_area_over_GT_free_area'\n\ndef constraints(m,key):")
+s=s.replace("unit_rows.append(item);keyed_units", "if panel=='P2' and reference_only(metric):item.update(status='NA_NOT_APPLICABLE',status_counts={'NA_NO_SOURCE_GT':expected})\n                        unit_rows.append(item);keyed_units")
+s=s.replace("table(out/'diversity_paired.csv',div_paired);", "for collection in (profile_rows,contrast_rows):\n        for r in collection:\n            if r['panel']=='P2' and reference_only(r['metric']):\n                r.update(status='NA_NOT_APPLICABLE',not_applicable_units=r['expected_units'],applicable_units=0,missing_units=0,observed_distribution_warning='No unique source GT; not a measurement failure')\n    for r in pair_rows:\n        if r['panel']=='P2' and reference_only(r['metric']):r['status']='NA_NOT_APPLICABLE'\n    table(out/'diversity_paired.csv',div_paired);")
+p.write_text(s)

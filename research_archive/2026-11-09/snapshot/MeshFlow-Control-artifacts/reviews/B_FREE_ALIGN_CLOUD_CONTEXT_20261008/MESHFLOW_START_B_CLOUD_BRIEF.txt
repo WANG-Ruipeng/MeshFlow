@@ -1,0 +1,398 @@
+MeshFlow 条件补全项目与 B_FREE_ALIGN 云端交接说明
+日期：2026-10-08
+本轮研究：CHAIR_CONTEXTUAL_ALIGNMENT_SIE_PILOT_V1
+
+用途：请基于以下实际实现和已完成结果，分析是否以及如何继续研究 B。当前只进行总结与方案讨论，不启动新训练、模型前向、采样或参数扫描。默认模型仍为 START。
+
+阅读时请区分三个层次：
+原始 MeshFlow 是无条件形状生成底座；
+START 是我们已经做过条件适配的 Native T1 + C-only Geo + HYBRID-FM；
+本轮 B 是从 START 出发，加入训练专用的 free 特征对齐监督后得到的新权重。
+“加入了某种机制”与“已证实稳定改善控制”是不同结论。
+
+一、我们的任务到底是什么
+
+输入是用户指定的真实三角面集合 C、明确的总面数 N，以及高斯噪声或种子。每个三角形有三角点坐标，内部表示为 FP32 [K,3,3] 或 [K,9]。生成器输出其余 N-K 个自由面 F，最终 RAW 是 C 与 F 的拼接。
+
+目标是学习合理且多样的条件补全分布 p(F | C,N)，让输入面能够成为最终物体的合理组成部分。我们不要求给定 C 只能还原出唯一的来源椅子，也不把所有不同于来源的款式视作错误。
+
+需要分开评价：
+1. 保持 C 的坐标、顺序、重数和绕序；
+2. F 是否在几何上合理衔接 C，是否产生穿插、近重复或错层；
+3. 整体是否连贯、是否符合预期用途，以及同 C 下是否存在合理多样性。
+
+目前第1项有明确的硬保持机制；第2、3项仍是研究难点。C 精确保留不等于成功利用 C。
+
+当前模型输入不包括完整目标、来源 UID、真实接口 Gamma、参考可见性、目标包围盒，也没有文本或“这是座面/靠背”的语义标签。seat2/back2 等是评估条件名称，不是额外模型输入。指定用途的视觉检查应作为应用压力测试解释，不能暗中变成模型已收到的语义条件。
+
+triangle soup 记录每面三个角的分组与坐标，没有显式保留来源网格任意的共享顶点 ID 图。坐标相等可用于诊断或后处理索引化，但不能宣称原拓扑 ID 已被模型完整保留。
+
+二、原始 MeshFlow 提供了什么
+
+依据 MeshFlow: Mesh Generation with Equivariant Flow Matching（SIGGRAPH 2026）和本地继承代码，底座直接在连续三角面坐标上做 flow matching。它不需要先生成隐式场再提取网格，也不使用自回归面序列。
+
+核心表示与计算：
+- 网格表示为 N×3×3 的 triangle soup，从随机三角形噪声逐步预测速度并积分到网格。
+- 等变 DiT 保留面集合及面内顶点重排的结构。每个角有坐标特征；一个 block 先把每面的三个角特征均值池化为面特征，进行面级 self-attention，再广播回三个角，最后做角级 MLP。
+- 原始 nested OT 在面分配和面内角匹配两个层次减少不必要的训练路径交叉。
+- 原论文的 face conditioning 指希望生成的“总面数”，不是输入一组已知三角面 C。这里的结构等变主要指面与面内角的重排，不应扩写为任意空间旋转、平移等变。
+
+本地所用官方 chair 系列骨干配置为 v3、12层、hidden768、12个主干attention head、坐标Fourier特征、velocity参数化。原配置上限800面；当前条件START的已维护API范围是128..256，不能把两者混用。
+
+官方论文：
+https://arxiv.org/html/2606.23489v1
+官方代码：
+https://github.com/qiisun/MeshFlow
+本地对应来源：E:\MeshFlow\models\equidit.py 与 configs\snet\base-120m-ot-v-chair.yaml。
+
+三、我们怎样把 MeshFlow 变成条件补全 START
+
+3.1 Native T1 的已知面原生输入
+
+C 直接放在生成状态的 known 槽，free 槽放当前噪声/中间状态。known 和 free 一起通过原来的主干 self-attention，不是另挂一个 ControlNet，也不是只在最终输出时拼一个未被模型看到的 C。
+
+新增一个 2×768 的角色嵌入表，区分 known/free，并广播到每面的三个角。使用独立 valid_mask 和 known_mask：padding 不参与有效上下文；free=valid且非known；总面数 N 等于 valid 数量。
+
+每个已知面使用时间1，自由面使用当前时间t，分别计算原主干的 adaLN 调制，面数条件 N//20 继续沿用。T1就是让干净的已知面始终处在t=1语义位置。
+
+已知面的坐标固定，不代表其隐藏特征固定。经过共享注意力之后，known特征也会受到当前free状态影响。这正是后来曾比较known/free内部表征的背景。
+
+3.2 C-only Geo 几何特征
+
+Geo已经包含在START中，本轮B没有新加Geo。
+
+对每个known三角形从C本身提取13维：
+质心3维、排序边长3维、面积1维、单位法线外积6个独立分量。
+法线项为 nx²、ny²、nz²、nxny、nxnz、nynz，对法线翻转不变；不是直接使用有向法线向量。
+
+共享小编码器共149,888参数，编码到768维。在坐标嵌入加角色嵌入后、第一层主干前，几何残差只加入known面的三个角。free/padding的直接Geo残差为0；它们通过后续主干attention间接利用C信息。
+
+当前生产版本的传播矩阵 P=I。虽然代码仍计算共边邻接、旧metadata存在graph字样，实际没有跨known面的邻接消息传播，不能称其已经是完整GNN。Geo输出直接相加，没有独立标量Geo gate。初始化时输出层为零，但训练后的START不能被理解为仍然零作用。
+
+3.3 自由面FM训练与硬保持
+
+训练时已知C保持干净，仅自由面参与流路径和FM误差。模型本身仍输出所有面的速度；known速度不要求为零。采样器只更新free，并在每步写回原C。
+
+因此50步Euler的51个保存状态均可核验C精确保留。保住C主要来自采样合同，不是B学出来的新能力；它也不保证free边界与C共边、焊接、流形、水密或无自交。
+
+FM有效batch目标是：
+L_FM = sum_i sum_valid_free_coordinates (v_theta-u)^2 / [9 * sum_i(N_i-K_i)]
+这里是整个有效batch的自由坐标总数作分母，不是8个样本各自MSE的简单平均。
+
+3.4 HYBRID训练配对
+
+START还采用了训练期HYBRID coupling，lambda=0.25。这改变噪声与目标的训练配对，不增加推理层。
+
+先只对free部分执行原nested OT：原pre-OT尺度下，对高斯Z和目标做六种角排列代价及Hungarian面匹配，再用逆面/角映射把目标放回原高斯槽位。原匹配之后才按既定规则将目标乘2，不能简写成在最终模型尺度直接重新OT。
+
+接着使用独立epsilon：
+Z_h = sqrt(0.75) * Z + 0.5 * epsilon
+X_t = (1-t) * Z_h + t * Y_OT
+u = Y_OT - Z_h
+
+时间沿用 t=sigmoid(Normal(0,1))。混合后没有第二次OT。这个选择是希望在OT路径与独立噪声扰动之间形成不同的训练配对；不能由公式本身推出控制一定提高。
+
+部署时仍从普通登记高斯出发，不执行OT，也不执行上述噪声混合。
+
+3.5 START的身份与谱系
+
+可确认谱系为：
+官方chair预训练骨干
+→ Native T1/Geo条件适配
+→ Geo条件累计4000步
+→ HYBRID再1000步
+→ 当前START，conditional_total5000。
+
+“5000”是本地条件适配累计步数，不是官方底座从零训练总步数。首次1000内的更细阶段历史不是这份说明的新增结论。
+
+START有194个参数张量、130,401,155个参数；它已经包含角色和Geo模块。当前默认路径：
+E:\MeshFlow\native_t1\checkpoints\chair_hybrid_start_total5000.pt
+
+文件SHA256：
+d640ec187291a114a961959848b542e7176202a82a5707afedc144177d013d80
+模型state SHA256：
+166c71fef888f26494fc4a0af1776b77a484efa72a6f3ce06552c604fbecc972
+
+推理采用N128..256、50步Euler、BF16主干前向、FP32参数与积分、确定性math SDPA、TF32关闭。实际高斯使用原NumPy MT19937规则。没有按输入C自动归一化或自动推断N。
+
+四、本轮B究竟改了什么
+
+本轮三个臂的准确名字：
+A = A_FM：START的普通HYBRID-FM续训对照。
+B = B_FREE_ALIGN：相同续训，加free特征的教师对齐。
+C臂 = C_KNOWN_ALIGN：相同续训，加known特征的教师对齐。
+下文“输入C”指三角面条件；“C臂”才指实验模型。
+
+A/B/C都独立从同一个START和完整AdamW step5000/moments恢复，各训练1000步。B不是先训练A再从A继续，也没有比A多1000步。所有臂共享同一冻结的8000样本流、输入、噪声、OT、时间和增强。
+
+4.1 捕获哪一份特征
+
+在第4个block（0-based index3）的attention模块内部输出投影之后，捕获实际[B,N,768]输出。位置在主干外部gate_a乘法、向角广播、残差和该block后续MLP之前。
+
+B只选择valid free面对应的消息，C臂选择valid known面消息。原主干self-attention仍在全部valid known+free上共同计算，所以B的“free”指辅助头读取位置，不是“不读输入C”，也不是只更新某种独立的free参数。
+
+捕获hook只记录原张量，不替换输出，不detach。B/C的捕获层位、教师、头结构、初始化、系数和数据一致，主要预设差别就是选择free还是known消息。
+
+4.2 训练专用对齐头
+
+输入可变数量的768维选中面消息，输出一个全局768维向量：
+- 一个768维learned query；
+- 24 heads，每head32维；
+- 无bias的Q/K/V/O投影；
+- 非仿射LayerNorm，epsilon=1e-5；
+- query加attention结果的残差；
+- LayerNorm后接768→1024→768的SiLU MLP，MLP有bias；
+- 总计3,934,720参数，FP32计算，无dropout；
+- query正态初始化，线性层Xavier，B/C初始化完全相同。
+
+这是正常非零初始化的辅助头。它不是旧READOUT的zero-output残差分支。
+
+4.3 教师看什么
+
+使用冻结的google/siglip-base-patch16-256视觉编码器，revision：
+b078df89e446d623010d890864d4207fe6399f61。
+
+教师只在训练前离线编码32个完整、干净的TRAIN父网格。每个网格4张固定视图，共128张图、8次batch前向。图像为256×256，方位45/135/225/315度，仰角20度，共用由训练数据确定的相机尺度，固定灰材质，不给C/free着色，不加线框或标签，不修几何。
+
+每个视图取768维pooler_output，分别单位化，四视图等权平均，再单位化，成为这个完整训练几何的全局目标。
+
+教师目标既不是C-only特征，也不是局部接缝特征，不是对新生成图像在线打分，更不是SIE奖励。完整形状只用于训练监督；部署模型没有读取完整目标。
+
+4.4 损失和实际梯度
+
+每步有效batch8、microbatch1、8个不同父。4个样本alpha=1；另外4个进行x方向连续U[0.9,1.1]宽度增强。全部8例计算原FM。
+
+只有4个alpha=1样本计算辅助loss，避免用未变宽的教师监督变宽目标：
+L_align = (1/4) * sum_(alpha=1) [1 - cos(head(free_messages), teacher)]
+L_B = L_FM + 0.1 * L_align
+
+每个合格microbatch实际加0.1/4乘单例loss，一次combined backward。主干不是冻结的：生成器全部参数仍由FM训练；辅助loss还沿捕获图回传到早期生成器。
+
+辅助路径可更新第4层attention及其上游，但不会直接经过该层外gate乘法、该层后续MLP或第5–12层。后半主干仍由FM更新，也会接收已经发生变化的上游表征。不能把它描述为直接监督最终free速度、最终网格，或对所有层施加同一个对齐loss。
+
+AdamW：generator lr=1e-5，head lr=1e-4，betas=(0.9,0.95)，wd=0；生成器与头分别clip norm1。旧生成器moments延续，新头moments为零。没有额外scheduler、EMA、warmup、梯度自适应cap、条件drop或CFG。
+
+4.5 推理发生什么变化
+
+导出只保留生成器权重，容量仍为130,401,155参数。教师、对齐头和capture不进入推理，生成器算子结构与START一致。实际导出strict load和capture开/关逐位一致检查已经通过。
+
+B在推理时的不同是权重经过了额外目标的更新，不是多了一条新的前向控制分支。训练成本确实增加，不能把“推理无新增模块”写成训练也无新增成本。
+
+本轮方法受Learning to read the contextual tokens in Diffusion Transformers中CoAl启发，但没有实现其空条件加权，没有训练LLM Reader，教师改为mesh多视图，且仅alpha=1监督。因此应称CoAl-inspired mesh pilot，不能称完整论文复现：
+https://arxiv.org/html/2610.06844v1
+
+最简图示：
+训练：
+输入C + noisy free → 原START主干 → 速度预测 → 原FM loss
+                         |
+                         第4层attention的free消息
+                         ↓
+                    训练专用对齐头
+                         ↓
+完整训练网格 → 冻结SigLIP多视图目标（stop-gradient）→ cosine alignment loss
+                                    ↓
+                              回传早期生成器和头
+
+推理：
+输入C + 普通Gaussian + 总N → B生成器权重 + 50步Euler → 原样C + 生成F
+
+五、当前项目其他组件的地位
+
+1. 完整评价与证据体系：保存RAW、51状态、真实噪声、逐输出/父/噪声表、S/I/E、几何、来源距离、多样性和完整多视图。它使候选可核查，本身不是新的生成模型结构。
+2. 可选GEO_C后处理：已经正式入库，CPU执行、保持C、仅对free做固定尺度整理和删退化/重复面；默认RAW采样不自动启用。本轮START/A/B/C均未用后处理，B的结果不能归因于后处理。既有后处理也没有保证水密或全面修复。
+3. MOMENT、CAPPED、局部锚定等不属于当前默认START，也不属于本轮B。不要把历史探索中的loss、权重、求解器或几何修补混进B。
+4. E:\MeshFlow-Control的README、docs/method.md有前一轮Direct Context Readout的A/B/C定义。那个B_MIXED_READOUT在多个block加入推理残差分支，与本轮B_FREE_ALIGN不同。当前研究必须以context_contract.py、METHOD_AND_DEVIATIONS.md和本轮protocol.json为准。
+5. 原MeshFlow工作区和独立MeshFlow-Control源码仓库分开；权重、数据、RAW、图集和日志在外部制品目录。本轮没有切默认模型或自动commit/push。
+
+六、这轮已经实际完成了什么
+
+三臂各1000步，共3000 optimizer更新；
+生成器正式训练24,000 forward / 24,000 combined backward；
+B/C辅助头合计8,000 forward，其backward参与同一次combined backward，不额外再加为生成器调用；
+教师128张图片、8次batch forward；
+预检与导出检查12生成器F/10零更新B；
+稀疏梯度观察12次额外autograd；
+新生成160条完整Euler50，合计8000 NFE；复用32份可信START缓存；
+192份输出评分、288对同C多样性比较；
+48张来源隐藏页和32张P1参考页均实际AI查看；
+模型调用失败0、训练重放0、未决GPU持锁0；
+GPU累计持锁约85.55分钟，在6小时上限内。
+
+全部192份输出的七项C/N/Gaussian/finite/导出合同通过。人类可用性NOT_RUN；有一名AI审阅者早期接触过匿名映射，所以不能称严格方法盲评。
+
+训练只覆盖32个父、453个既有READY条件（20%条件250个，40%条件203个），不是把全部本地椅子数据都用于这次训练。既有C分区按来源完整边相连。全部几何/条件/尺度沿用原数据合同，没有因B新增一批更简单的训练C。
+
+七、评估面板与SIE到底测什么
+
+P1：8个既有DEV父，每父4个固定噪声。OLD是n0/n1；NEW是本轮登记的n6/n7。每模型32份，共128份。NEW仅为同一批观察过的父换新噪声，不是未见父泛化；CONFIRM未读取。
+
+P2：seat2（两三角座面）、seat32（同一座面细分）、back2、seat_back4四种手工稀疏条件，各4噪声、N192，每模型16份，共64份。seat2/seat32不是两个独立形状证据。P2没有唯一来源完整网格。
+
+S、I、E是独立指标，没有加成一个统一controlness分数：
+- S↑：参考接口接缝覆盖。沿来源可信C/free接口Gamma长度加权，主阈值距离<0.01L0、切向差≤20度，还要求有限投影覆盖和对应C/free碰撞资格。衡量对这个参考接口的几何接近，不等于拓扑焊接。
+- I↓：C面积上的冲突覆盖。2048个面积采样点落入proper crossing邻域或near-duplicate邻域的并集；带宽0.005L，近重复支持另要求远离C开放边0.01L、无向法线夹角≤15度。不是相交面比例、体积或唯一语义失败标签，合理薄壁也可能触发近重复。
+- E↑：参考中可见的C表面在生成结果中保留对应外露方向的程度。26固定方向，保留参考资格和遮挡判定的未决上下界。不能写成整个C都应该暴露。
+
+S/E在P1依赖来源参考，P2均NA；P2仍可计算I及几何统计。来源双向距离只作诊断，不把恢复来源款式作为开放补全唯一要求。
+P1 E有96份PARTIAL、32份PASS，主筛选使用原保守全局界；PARTIAL不是自动失败或零。
+P1先父内平均噪声，再8父等权；P2先在每种条件内平均4噪声，再4条件等权，不能当作4个独立父。下面的差值都是百分点pp，不是相对百分比。检测上下界不等于统计置信区间。
+
+八、B的实际结果
+
+8.1 P1绝对值
+每格依次为 S% / I% / E%，保留三位小数；完整原精度和E界在原CSV。
+
+模型       OLD                         NEW                         ALL
+START      14.269 / 4.251 / 84.486      10.593 / 7.297 / 92.739      12.431 / 5.774 / 88.613
+A_FM       11.878 / 2.884 / 89.644      15.303 / 3.671 / 92.890      13.590 / 3.278 / 91.267
+B_FREE     14.105 / 2.969 / 90.323      15.276 / 4.370 / 92.400      14.691 / 3.670 / 91.361
+C_KNOWN    13.344 / 3.500 / 91.049      14.227 / 4.886 / 93.196      13.786 / 4.193 / 92.123
+
+8.2 配对差值
+正ΔS/ΔE较好；正ΔI是代价。
+
+比较          噪声       ΔS        ΔI        ΔE
+B-A           OLD       +2.227    +0.085    +0.679
+B-A           NEW       -0.026    +0.699    -0.491
+B-A           ALL       +1.100    +0.392    +0.094
+B-START       OLD       -0.164    -1.282    +5.836
+B-START       NEW       +4.684    -2.927    -0.339
+B-START       ALL       +2.260    -2.104    +2.749
+B-C_KNOWN     ALL       +0.905    -0.523    -0.761
+
+非常关键：
+B的“旧噪声S收益”是相对A，不是OLD已经超过START。
+B在NEW相对START的S上升，普通续训A同样出现，不能全部归因于对齐。
+B相对C臂的S/I更有利，但E较低，没有全面支配C臂。
+
+8.3 B相对A的八父分布
+以下是4噪声父均差值pp，UID仅缩写；原CSV保留完整UID。
+
+父UID前缀       ΔS        ΔI        ΔE
+33ec1e64       -0.135    +0.098    -0.050
+341bcae1        0.000    +0.159    -1.711
+534b0e6e       +0.752    -0.281    -0.679
+866e7248       +2.143    +1.160    -1.562
+86ec9c79       +0.333    -0.061    +0.049
+bdd29e65       -0.829    -1.086    +0.366
+c1b8c2f0       +0.105    -0.183    -0.244
+f59627a0       +6.434    +3.333    +4.587
+
+S改善5/8父、中位+0.219pp。f596约贡献8父S总增量的73.1%；排除该父仍为+0.339pp，全部留一父范围+0.339至+1.376pp。信号不是完全由单父决定正负，但强度明显集中。
+
+B相对START平均S+2.260pp，却仅3/8父改善、中位-0.643pp，主要由866e与86ec推动。因此目前不能说B已经普遍优于START。
+
+8.4 预设筛选
+
+本轮筛选是开发性规则，不是论文标准或显著性检验：
+ALL S均值增益≥1pp：B=+1.100，PASS
+ALL父S增益中位>0：B=+0.219，PASS
+S改善父数≥5/8：B=5/8，PASS
+NEW S均值增益>0：B=-0.0261003pp，FAIL
+ALL I均值代价≤1pp：B=+0.392，PASS
+ALL E均值变化≥-1pp：B=+0.094，PASS
+
+B只有NEW这一项失败，幅度很小，数值上接近持平。正式标签保留FAIL；科学解释为“同父新噪声收益未获支持”。不能据此说B显著有害或完全无效，也不能事后放宽阈值改成PASS。
+
+8.5 不应被均值掩盖的代价
+
+f596 n7的I：A=30.029%，B=43.799%，B-A增加13.770pp。
+866e n0的E：B-A下降7.227pp。
+ALL四噪声父均未触发>10pp的I/E严重退化，但单输出代价仍存在。
+
+P1 ALL near-duplicate覆盖：A=1.877%，B=2.419%；crossing覆盖：A=1.482%，B=1.474%。I增加包含近重复覆盖变化，不能由这个分解单独认定其成因。
+
+B的FF受影响free比例仍为约90.520%，这是原有限三角检测的“被非法相交/共面重叠触及的自由面并集比例”，不是论文全网格Ri，更不是模型体积的90%相交。所有模型精确C/free共边数为0，S改善尚不表示拓扑焊接。
+
+P1 ALL双向来源MSE/L0²：
+A：F→GT 0.0016001；GT→F 0.0023068
+B：F→GT 0.0016085；GT→F 0.0022932
+这是两个方向的小幅取舍，来源距离不作为唯一合法补全否决器。
+
+B的P1 ALL固定候选表面距离多样性约0.001440878，A约0.001441853，差约-0.07%；未见整体塌缩证据。这是候选之间的距离，不是越大越好的质量分。
+
+8.6 P2与实际C用途
+
+P2 I均值：
+START 8.652%；A 5.637%；B 5.362%；C臂5.734%。
+B相对A改善0.275pp，相对START改善约3.290pp，其中多数共同改善已由A普通续训产生。
+
+完整AI审图发现，稀疏seat2的部分A/B/C输出仍把橙色生成座面放在蓝色输入座面之上；back2/seat_back4中也存在输入竖板与生成主背板分处座面两侧的情况。坐标复制与预期用途整合仍有差距，I较低没有充分保证解决它们。图像不能确认的真实相交、薄壁或焊接均保留不确定。
+
+P2是稀疏分布外压力测试，其失败不应单独否定全部条件上的能力；但P1接缝小增益也不能被写成开放式输入用途问题已解决。
+
+九、训练日志支持什么机制解释
+
+B全程raw alignment loss均值0.0258023；末100步0.0019192，末窗cosine约0.998081。
+相同训练曝光频率下，常量平均教师目标基线loss约0.0618282。
+32个教师目标并不相同，pairwise cosine均值0.876316，范围0.736769至0.990787。
+
+B全程FM均值0.1146751，A为0.1146497，差很小。生成器clip次数B16/A15，头clip0。
+
+真实稀疏梯度观测表明，B的加权辅助梯度确实到达所观察的早期生成器参数：
+step1/100/1000的aux范数约0.010778 / 0.000721 / 0.000195；
+与相应FM梯度cos约-0.0227 / -0.0344 / +0.0165。
+
+这些范数仅覆盖首个合格microbatch的7个早期参数张量，已经包含0.1/4系数，不是全模型、全batch梯度预算。不能把它解释成辅助loss在整个训练中持续占某个固定比例。
+
+在线loss来自随更新变化的权重和输入，末窗结果不是固定终点的独立泛化评价。32个训练父和相似的全局椅子特征仍允许训练集拟合。证据说明辅助目标已接入且不只存在于断开的头中；不能直接证明生成收益的唯一机制是“学会更好地使用C”。
+
+一种待检验解释是：B让早期free状态更容易表达完整形状的全局语义，作为表征正则化小幅改变生成轨迹，而不是直接教会边界接合。另一种可能是收益集中于少量父/噪声，与其原有续训漂移有关。二者尚未被本轮因果隔离。
+
+十、当前判断与希望云端分析的问题
+
+当前证据最支持：
+B是一个值得保留的free-token辅助训练候选；相对匹配A有小幅参考接合信号，相对C臂的S/I更好，推理无额外结构成本。它只有一个接近零的筛选失败项，不宜因为FAIL直接封存。但收益对父与噪声敏感，有局部冲突代价，还没有稳定替换START的依据。
+
+已有成果、表征拟合、生成收益、开放式控制成功和默认模型晋级应分别判断。
+
+希望云端优先回答：
+1. 在这些证据下，怎样准确定位B的贡献：一般表征正则化、来源形状拟合、条件响应增强，哪些已得到支持、哪些仍是假说？
+2. 是否认同优先保留B而不继续known侧C；这个选择应怎样表述才不抹掉C的E收益与B的坏尾部？
+3. 若只能提出一个下一步，应怎样用最小、事先冻结的验证区分“B真实有可重复收益”和“少量父/噪声上的偶然增益”？优先分清固定权重验证与新训练，列明它们各自能回答什么。
+4. 对全局多视图教师与局部C用途之间的错位，有哪些判断可以先用已有结果完成？不要仅因有机会新增模块，就默认需要更大head、更多层、更大lambda、RL或几何loss。
+
+当前缺失：独立训练seed复现、未见父确认、更多冻结噪声、严格独立人类用途评价，以及隔离“全局语义/款式”与“实际C响应”的实验。NEW仅同父新噪声。不能将这些缺失材料写成已完成，也不要用本轮结果否定完整CoAl或MeshFlow底座。
+
+十一、可追溯来源与本地交付
+
+原始代码与维护基线：
+E:\MeshFlow
+START说明：native_t1\docs\chair_start.md
+条件模型：native_t1\chair_model.py、native_t1\model.py
+Geo：native_t1\context_geometry.py
+保持C采样：native_t1\chair_sampling.py
+可选后处理：native_t1\docs\postprocessing.md
+工作区状态：WORKSPACE.md
+
+独立研究源码：
+E:\MeshFlow-Control
+本轮定义：src\meshflow_control\training\context_contract.py
+对齐头及捕获：src\meshflow_control\training\context_alignment.py
+训练：src\meshflow_control\training\context_trainer.py
+教师：src\meshflow_control\teachers\siglip_targets.py
+本轮评估：docs\contextual_alignment_evaluation.md
+
+固定实验结果目录：
+E:\MeshFlow-Control-artifacts\experiments\chair_contextual_alignment_sie_v1
+
+权威文件：
+EXPERIMENT_REPORT.md
+METHOD_AND_DEVIATIONS.md
+protocol.json
+teacher_manifest.json
+checkpoint_manifest.json
+per_output_metrics.csv
+paired_parent_metrics.csv
+paired_noise_metrics.csv
+sie_summary.csv
+visual_review.csv
+OPEN_GALLERY.html
+audit\training_interpretation_complete.md
+analysis\leave_one_parent_out.csv
+DELIVERY_MANIFEST.json
+FINAL_STATUS.json
+
+START为保留基线；B可恢复训练checkpoint为checkpoints\B_step1000.pt，纯推理导出为inference\B_generator_step1000.pt。权重不包含在这份说明中。
+
+原实验已封存为STOPPED_FIXED_TASK_COMPLETE。本说明是之后的只读核对与文字总结，不回写原实验报告、指标、源码或权重。

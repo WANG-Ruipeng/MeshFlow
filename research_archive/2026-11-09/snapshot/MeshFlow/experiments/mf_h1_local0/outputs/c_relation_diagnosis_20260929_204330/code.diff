@@ -1,0 +1,1695 @@
+diff --git a/experiments/mf_h1_local0/c_relation_math.py b/experiments/mf_h1_local0/c_relation_math.py
+new file mode 100755
+index 0000000..4342f28
+--- /dev/null
++++ b/experiments/mf_h1_local0/c_relation_math.py
+@@ -0,0 +1,438 @@
++"""Independent teacher-only decomposition of the unchanged FC/FF objectives.
++
++No models, optimizers, geometry matching, or artifact writes are used here.
++Real output-space gradients are analytic. Only run_cpu_tests uses autograd;
++the caller must explicitly invoke it and account for its returned call counts.
++"""
++from __future__ import annotations
++
++from collections import defaultdict
++import hashlib
++import math
++import numpy as np
++import torch
++
++
++NUMERICAL_POLICY = dict(
++    fp64_fixture_atol=1e-12, fp64_fixture_rtol=1e-10,
++    actual_fp32_loss_atol=5e-7, actual_fp32_loss_rtol=5e-6,
++    output_dot_negative_atol=1e-12, output_dot_negative_norm_product_rtol=1e-8,
++    FM_ratio_norm_floor=1e-12, parameter_gram_chunk_elements=262144,
++    squared_explicit_time_weights={"0.1": .81, "0.3": .49, "0.5": .25, "0.7": .09, "0.9": .01},
++)
++SUBSETS = ('all', 'interface', 'free_only', 'shared', 'singleton',
++           'interface_shared', 'interface_singleton', 'free_only_shared', 'free_only_singleton')
++
++
++def _array(value):
++    if isinstance(value, torch.Tensor):
++        value = value.detach()
++        if value.dtype == torch.bfloat16:
++            value = value.float()
++        value = value.cpu().numpy()
++    return np.asarray(value)
++
++
++def _tokens(value):
++    value = _array(value)
++    if value.ndim == 3 and value.shape[0] == 1 and value.shape[-1] == 9:
++        value = value[0]
++    if value.ndim == 2 and value.shape[-1] == 9:
++        value = value.reshape(-1, 3, 3)
++    if value.ndim != 3 or value.shape[1:] != (3, 3):
++        raise ValueError('Require one sample of [N,9], [1,N,9], or [N,3,3] coordinates')
++    if value.dtype not in (np.float32, np.float64) or not np.isfinite(value).all():
++        raise ValueError('Finite FP32 coordinates required; FP64 allowed for mathematical fixtures')
++    return value
++
++
++def _record(array):
++    array = np.ascontiguousarray(array)
++    h = hashlib.sha256(str((array.dtype, array.shape)).encode())
++    h.update(array.tobytes())
++    return dict(dtype=str(array.dtype), shape=list(array.shape), sha256=h.hexdigest())
++
++
++def _residual(array):
++    value = np.asarray(array, dtype=np.float64)
++    return dict(elements=int(value.size), RMS=float(np.sqrt(np.mean(value**2))) if value.size else None,
++                max_abs=float(np.max(np.abs(value))) if value.size else None)
++
++
++def _same(a, b):
++    a, b = np.ascontiguousarray(a), np.ascontiguousarray(b)
++    return a.dtype == b.dtype and a.shape == b.shape and a.tobytes() == b.tobytes()
++
++
++def _prepare(sample, velocity, labels):
++    arrays = {key: _tokens(sample[key]) for key in ('xt', 'x0', 'x1', 'u', 'context')}
++    arrays['v'] = _tokens(velocity)
++    shape = arrays['xt'].shape
++    if any(value.shape != shape for value in arrays.values()):
++        raise ValueError('All teacher coordinate arrays must have the same sample shape')
++    n = shape[0]
++    known = _array(sample['known_mask']).reshape(-1)
++    valid = _array(sample['valid_mask']).reshape(-1)
++    if known.shape != (n,) or valid.shape != (n,) or known.dtype != np.bool_ or valid.dtype != np.bool_:
++        raise ValueError('Separate boolean valid and known masks required')
++    if np.any(known & ~valid):
++        raise ValueError('Known mask includes invalid faces')
++    free = valid & ~known
++    if not free.any():
++        raise ValueError('At least one free face is required')
++    tv = _array(sample['t']).reshape(-1)
++    if len(tv) != 1 or not 0 < float(tv[0]) < 1:
++        raise ValueError('A single teacher time strictly inside (0,1) is required')
++    dtype = arrays['xt'].dtype
++    if any(value.dtype != dtype for value in arrays.values()):
++        raise ValueError('Explicitly cast model velocity to the FP32 state dtype before analysis')
++    t = float(tv[0]); alpha = float(np.asarray(1, dtype=dtype) - np.asarray(t, dtype=dtype))
++    if not _same(arrays['xt'][known], arrays['context'][known]):
++        raise ValueError('Actual teacher Xt known coordinates do not match C bitwise')
++    key = 'corner_source_vertex_ids' if 'corner_source_vertex_ids' in labels else 'corner_source_ids'
++    ids = _array(labels[key])
++    if ids.shape != (n, 3) or not np.issubdtype(ids.dtype, np.integer):
++        raise ValueError('Trusted corner source vertex IDs [N,3] required')
++    by_free = defaultdict(list); by_known = defaultdict(list)
++    for face in np.flatnonzero(valid):
++        target = by_known if known[face] else by_free
++        for corner in range(3):
++            target[int(ids[face, corner])].append(int(3 * face + corner))
++    fc_old = {int(g['source_vertex_id']): g for g in labels['fc_groups']}
++    ff_old = {int(g['source_vertex_id']): g for g in labels['ff_groups']}
++    if len(fc_old) != len(labels['fc_groups']) or len(ff_old) != len(labels['ff_groups']):
++        raise ValueError('Duplicate old relation group IDs')
++    groups = []
++    yflat, cflat = arrays['x1'].reshape(-1, 3), arrays['context'].reshape(-1, 3)
++    for gid, indices in sorted(by_free.items()):
++        idx = np.asarray(indices, dtype=np.int64); y = yflat[idx[0]]
++        if any(not _same(yflat[i], y) for i in idx):
++            raise ValueError('Same trusted source vertex has inconsistent free target coordinates')
++        interface = gid in by_known; m = len(idx)
++        if interface:
++            if gid not in fc_old or sorted(map(int, fc_old[gid]['free_corner_indices'])) != indices:
++                raise ValueError('Independent interface grouping differs from unchanged FC labels')
++            anchor = _array(fc_old[gid]['anchor'])
++            if not _same(anchor, y) or any(not _same(cflat[i], y) for i in by_known[gid]):
++                raise ValueError('FC anchor, known C, and free target source coordinates disagree')
++        if m >= 2:
++            if gid not in ff_old or sorted(map(int, ff_old[gid]['free_corner_indices'])) != indices:
++                raise ValueError('Independent shared grouping differs from unchanged FF labels')
++        groups.append(dict(source_vertex_id=gid, indices=idx, m=m, interface=interface,
++                           target=y.astype(np.float64), anchor=y.astype(np.float64) if interface else None))
++    if set(fc_old) != {g['source_vertex_id'] for g in groups if g['interface']}:
++        raise ValueError('Old FC group population differs')
++    if set(ff_old) != {g['source_vertex_id'] for g in groups if g['m'] >= 2}:
++        raise ValueError('Old FF group population differs')
++    if labels['FC_count'] != len(fc_old) or labels['FF_count'] != len(ff_old):
++        raise ValueError('Old FC/FF group denominator differs')
++    endpoint = arrays['context'].copy()
++    endpoint[free] = arrays['xt'][free] + np.asarray(alpha, dtype=dtype) * arrays['v'][free]
++    oracle = arrays['context'].copy()
++    oracle[free] = arrays['xt'][free] + np.asarray(alpha, dtype=dtype) * arrays['u'][free]
++    epsilon = arrays['v'].astype(np.float64) - arrays['u'].astype(np.float64)
++    return dict(arrays=arrays, known=known, valid=valid, free=free, ids=ids, groups=groups,
++                t=t, alpha=alpha, endpoint=endpoint, oracle=oracle, epsilon=epsilon,
++                FM_denominator=int(free.sum()) * 9, FC_denominator=len(fc_old), FF_denominator=len(ff_old))
++
++
++def _decompose(values, target):
++    center = values.mean(axis=0)
++    position = float(np.mean((center - target)**2))
++    spread = float(np.mean((values - center)**2))
++    endpoint = float(np.mean((values - target)**2))
++    return dict(Position=position, Spread=spread, EndpointError=endpoint,
++                center=center.tolist(), identity_residual=endpoint-position-spread)
++
++
++def _in_subset(g, subset):
++    tags = {'all', 'interface' if g['interface'] else 'free_only', 'shared' if g['m'] >= 2 else 'singleton'}
++    tags.add(('interface' if g['interface'] else 'free_only') + ('_shared' if g['m'] >= 2 else '_singleton'))
++    return subset in tags
++
++
++def _subset(rows, subset):
++    selected = [g for g in rows if _in_subset(g, subset)]
++    count = len(selected); corners = sum(g['m'] for g in selected)
++    result = dict(group_count=count, corner_count=corners, status='AVAILABLE' if count else 'EMPTY_SUBSET')
++    for space in ('endpoint', 'epsilon'):
++        sums = {key:sum(g[space][key] for g in selected) for key in ('Position','Spread','EndpointError')}
++        weighted = {key:sum(g['m']*g[space][key] for g in selected) for key in sums}
++        result[space] = dict(group_sums=sums,
++            group_equal={key:value/count if count else None for key,value in sums.items()},
++            corner_weighted={key:value/corners if corners else None for key,value in weighted.items()})
++    return result
++
++
++def analyze_teacher(sample, velocity, labels, *, legacy_losses=None):
++    """JSON-safe decomposition; no autograd and no call to a legacy loss.
++
++    legacy_losses, when supplied, are values already computed by the original
++    implementation on this same single state, with FM/FC/FF or L_FM/L_FC/L_FF
++    keys. Group sums/counts are exposed for aggregation without reweighting K.
++    """
++    p = _prepare(sample, velocity, labels); a = p['arrays']; free = p['free']
++    endpoint = p['endpoint'].astype(np.float64).reshape(-1, 3)
++    eps = p['epsilon'].reshape(-1, 3); rows = []
++    nf, nfc, nff = (p[k+'_denominator'] for k in ('FM','FC','FF'))
++    for g in p['groups']:
++        d = _decompose(endpoint[g['indices']], g['target'])
++        e = _decompose(eps[g['indices']], np.zeros(3, dtype=np.float64))
++        coefficient = 2*g['m']/(g['m']-1) if g['m'] >= 2 else None
++        pair = coefficient*d['Spread'] if coefficient is not None else None
++        epair = coefficient*e['Spread'] if coefficient is not None else None
++        rows.append(dict(source_vertex_id=g['source_vertex_id'], m=g['m'], interface=g['interface'],
++            group_type='interface' if g['interface'] else 'free_only', shared=g['m']>=2,
++            free_corner_indices=g['indices'].tolist(), target_position=g['target'].tolist(),
++            known_anchor=None if g['anchor'] is None else g['anchor'].tolist(), endpoint=d, epsilon=e,
++            pairwise_coefficient=coefficient, pairwise_endpoint_MSE=pair, pairwise_epsilon_MSE=epair,
++            FC_global_denominator_contribution=d['EndpointError']/nfc if g['interface'] else 0.,
++            FF_global_denominator_contribution=pair/nff if pair is not None else 0.))
++    interface = [g for g in rows if g['interface']]; shared = [g for g in rows if g['shared']]
++    fc_sum = sum(g['endpoint']['EndpointError'] for g in interface)
++    ff_sum = sum(g['pairwise_endpoint_MSE'] for g in shared)
++    fc_pos = sum(g['endpoint']['Position'] for g in interface)/max(nfc,1)
++    fc_spread = sum(g['endpoint']['Spread'] for g in interface)/max(nfc,1)
++    ff_interface = sum(g['FF_global_denominator_contribution'] for g in shared if g['interface'])
++    ff_free_only = sum(g['FF_global_denominator_contribution'] for g in shared if not g['interface'])
++    epsilon_losses = dict(FM=float(np.mean(p['epsilon'][free]**2)),
++        FC=sum(g['epsilon']['EndpointError'] for g in interface)/max(nfc,1),
++        FF=sum(g['pairwise_epsilon_MSE'] for g in shared)/max(nff,1))
++    losses = dict(FM=epsilon_losses['FM'],FC=fc_sum/max(nfc,1),FF=ff_sum/max(nff,1),
++        FC_sum=fc_sum,FF_sum=ff_sum,FC_position_component=fc_pos,FC_spread_component=fc_spread,
++        FF_interface_contribution=ff_interface,FF_free_only_contribution=ff_free_only,
++        denominators=dict(FM_free_coordinates=nf,FC_interface_groups=nfc,FF_shared_groups=nff),
++        normalization='Per-state group-equal FC/FF; original effective-batch training sums groups across all 8 samples before division',
++        auxiliary_weighted=.1*(fc_sum/max(nfc,1)+ff_sum/max(nff,1)))
++    xt64=a['xt'].astype(np.float64); y64=a['x1'].astype(np.float64); z64=a['x0'].astype(np.float64)
++    actual64=p['endpoint'].astype(np.float64); v64=a['v'].astype(np.float64)
++    path64=(1-p['t'])*z64+p['t']*y64
++    dt=a['xt'].dtype; path_actual=(np.asarray(1,dtype=dt)-np.asarray(p['t'],dtype=dt))*a['x0']+np.asarray(p['t'],dtype=dt)*a['x1']
++    endpoint64=a['context'].astype(np.float64).copy()
++    endpoint64[free]=xt64[free]+(1-p['t'])*v64[free]
++    residuals=dict(
++        Xt_vs_recomputed_state_dtype_equation=_residual((a['xt']-path_actual)[free]),
++        Xt_vs_FP64_linear_path_from_stored_arrays=_residual((xt64-path64)[free]),
++        u_vs_FP64_Y_minus_Z=_residual((a['u'].astype(np.float64)-(y64-z64))[free]),
++        oracle_v_equals_u_endpoint_error=_residual((p['oracle'].astype(np.float64)-y64)[free]),
++        predicted_endpoint_state_dtype_vs_FP64_arithmetic=_residual((actual64-endpoint64)[free]),
++        endpoint_error_vs_actual_alpha_times_epsilon=_residual((actual64-y64-p['alpha']*p['epsilon'])[free]),
++        endpoint_error_vs_FP64_one_minus_t_times_epsilon=_residual((actual64-y64-(1-p['t'])*p['epsilon'])[free]),
++        epsilon_state_dtype_vs_FP64_subtraction=_residual(((a['v']-a['u']).astype(np.float64)-p['epsilon'])[free]))
++    scaling = {key:dict(endpoint=losses[key],direct_velocity=epsilon_losses[key],
++        expected_explicit_scaled=p['alpha']**2*epsilon_losses[key],
++        difference=losses[key]-p['alpha']**2*epsilon_losses[key]) for key in ('FC','FF')}
++    group_scale = {key:max((abs(g['endpoint'][key]-p['alpha']**2*g['epsilon'][key]) for g in rows),default=0.)
++                   for key in ('Position','Spread','EndpointError')}
++    reconcile = dict(status='NOT_SUPPLIED',note='No legacy loss rerun is hidden in this analysis')
++    if legacy_losses is not None:
++        entries={}
++        for key in ('FM','FC','FF'):
++            value=legacy_losses.get(key,legacy_losses.get('L_'+key))
++            if value is None:raise ValueError('Supply all three original per-state losses')
++            actual=float(_array(value).reshape(())); expected=losses[key]
++            tolerance=NUMERICAL_POLICY['actual_fp32_loss_atol']+NUMERICAL_POLICY['actual_fp32_loss_rtol']*abs(expected)
++            entries[key]=dict(original=actual,independent=expected,difference=actual-expected,
++                              tolerance=tolerance,passed=abs(actual-expected)<=tolerance)
++        reconcile=dict(status='PASS' if all(x['passed'] for x in entries.values()) else 'FAIL_DEFINITION_OR_NUMERICS',values=entries)
++    return dict(schema='c_relation_teacher_decomposition_v1',groups=rows,
++        subsets={key:_subset(rows,key) for key in SUBSETS},losses=losses,velocity_error_losses=epsilon_losses,
++        time=dict(stored_t=p['t'],actual_state_dtype_one_minus_t=p['alpha'],actual_explicit_squared_weight=p['alpha']**2,
++                  FP64_explicit_squared_weight=(1-p['t'])**2,declared_grid_weights=NUMERICAL_POLICY['squared_explicit_time_weights'],
++                  interpretation='Explicit coefficients are not measured gradient ratios or training-time expectations'),
++        identities=dict(max_abs_endpoint_minus_Position_minus_Spread=max(abs(g['endpoint']['identity_residual']) for g in rows),
++            max_abs_epsilon_endpoint_minus_Position_minus_Spread=max(abs(g['epsilon']['identity_residual']) for g in rows),
++            FC_minus_Position_plus_Spread=losses['FC']-fc_pos-fc_spread,
++            FF_minus_global_partition_contributions=losses['FF']-ff_interface-ff_free_only,
++            group_explicit_time_scaling_max_abs_residual=group_scale),
++        explicit_time_scaling=scaling,floating_point_audit=residuals,legacy_loss_reconciliation=reconcile,
++        array_records={**{key:_record(value) for key,value in a.items()},'known_mask':_record(p['known']),
++            'valid_mask':_record(p['valid']),'corner_source_vertex_ids':_record(p['ids']),
++            'Yhat_actual_state_dtype':_record(p['endpoint']),'Yhat_FP64_arithmetic':_record(endpoint64)},
++        coordinate_units='Original model coordinates; MSE_xyz divides squared 3-vector norm by 3; no bbox normalization',
++        decomposition_reduction_dtype='float64 on decoded actual state-dtype endpoint',
++        source_mapping_status='PASS_EXACT_GROUP_TARGET_AND_ANCHOR_CHECK',model_calls=0,autograd_calls=0)
++
++
++def gradient_norm_dot_statistics(fm, fc, ff, *, names=None, chunk_elements=262144):
++    """Accumulate six Gram entries by tensor/chunk, never concatenate gradients.
++
++    Inputs are aligned parameter-gradient sequences (None means zero). GPU
++    tensors stay on their device; at most three chunks are cast to FP64 at once.
++    Only six final scalar entries are copied to the host. Names describe the
++    exact supplied subset; a caller must not relabel a subset as the full model.
++    """
++    lists=[list(fm),list(fc),list(ff)]
++    if not len(lists[0])==len(lists[1])==len(lists[2]):raise ValueError('Aligned gradient sequences required')
++    if names is not None and len(names)!=len(lists[0]):raise ValueError('Names must align with gradient tensors')
++    if not isinstance(chunk_elements,int) or chunk_elements<=0:raise ValueError('Positive chunk size required')
++    total=None;device=None;elements=0;chunks=0;none=[0,0,0]
++    with torch.no_grad():
++        for triple in zip(*lists):
++            nonempty=[x for x in triple if x is not None]
++            if not nonempty:
++                none=[x+1 for x in none];continue
++            converted=[None if x is None else (x.detach() if isinstance(x,torch.Tensor) else torch.as_tensor(x)) for x in triple]
++            ref=next(x for x in converted if x is not None)
++            if any(x is not None and (x.shape!=ref.shape or x.device!=ref.device) for x in converted):raise ValueError('Gradient shape/device mismatch')
++            if total is None:device=ref.device;total=torch.zeros(6,dtype=torch.float64,device=device)
++            if ref.device!=device:raise ValueError('One statistics call requires one device')
++            flats=[None if x is None else x.reshape(-1) for x in converted];elements+=ref.numel()
++            for i,x in enumerate(flats):none[i]+=x is None
++            for start in range(0,ref.numel(),chunk_elements):
++                end=min(start+chunk_elements,ref.numel());chunks+=1
++                values=[None if x is None else x[start:end].to(dtype=torch.float64) for x in flats]
++                def dot(i,j):
++                    return total.new_zeros(()) if values[i] is None or values[j] is None else (values[i]*values[j]).sum()
++                total.add_(torch.stack([dot(0,0),dot(1,1),dot(2,2),dot(0,1),dot(0,2),dot(1,2)]))
++        gram=[0.]*6 if total is None else total.cpu().tolist()
++    if not all(math.isfinite(value) for value in gram):raise ValueError('Nonfinite gradient Gram entries')
++    aa,bb,cc,ab,ac,bc=gram
++    norms=dict(FM=math.sqrt(max(aa,0)),FC=math.sqrt(max(bb,0)),FF=math.sqrt(max(cc,0)))
++    auxsq=.01*(bb+cc+2*bc);auxnorm=math.sqrt(max(auxsq,0.))
++    def pair(dot,n0,n1):
++        return dict(dot=dot,cosine=None if n0==0 or n1==0 else dot/(n0*n1),
++                    status='UNDEFINED_ZERO_NORM' if n0==0 or n1==0 else 'DEFINED',norm_product=n0*n1)
++    directions=dict(FM_vs_FC=pair(ab,norms['FM'],norms['FC']),FM_vs_FF=pair(ac,norms['FM'],norms['FF']),
++                    FC_vs_FF=pair(bc,norms['FC'],norms['FF']),FM_vs_weighted_aux=pair(.1*(ab+ac),norms['FM'],auxnorm))
++    near=norms['FM']<=NUMERICAL_POLICY['FM_ratio_norm_floor']
++    return dict(unweighted_norms=norms,weighted_norms=dict(FM=norms['FM'],FC=.1*norms['FC'],FF=.1*norms['FF'],combined_aux=auxnorm),
++        unweighted_gram=dict(FM_FM=aa,FC_FC=bb,FF_FF=cc,FM_FC=ab,FM_FF=ac,FC_FF=bc),
++        directions=directions,weighted_dots=dict(FM_vs_0p1FC=.1*ab,FM_vs_0p1FF=.1*ac,weighted_FC_vs_FF=.01*bc),
++        ratios_to_FM=dict(FC=None if near else .1*norms['FC']/norms['FM'],FF=None if near else .1*norms['FF']/norms['FM'],
++                          combined_aux=None if near else auxnorm/norms['FM']),
++        ratio_status='UNDEFINED_FM_NEAR_ZERO' if near else 'DEFINED',FM_near_zero=near,
++        FM_ratio_norm_floor=NUMERICAL_POLICY['FM_ratio_norm_floor'],combined_aux_squared_norm_unclamped=auxsq,
++        coverage=dict(tensors=len(lists[0]),elements_with_any_gradient=elements,None_counts=dict(zip(('FM','FC','FF'),none)),
++                      names=None if names is None else list(names),device=str(device),chunk_elements=chunk_elements,chunks=chunks),
++        accumulation_dtype='float64',autograd_calls=0)
++
++
++def _analytic_output_gradients(p, ideal=False):
++    shape=p['arrays']['v'].shape; gradients={key:np.zeros(shape,dtype=np.float64) for key in ('FM','FC','FF')}
++    gradients['FM'][p['free']]=2*p['epsilon'][p['free']]/p['FM_denominator']
++    endpoint=p['endpoint'].astype(np.float64).reshape(-1,3)
++    epsilon=p['epsilon'].reshape(-1,3);alpha=p['alpha']
++    fc=gradients['FC'].reshape(-1,3);ff=gradients['FF'].reshape(-1,3)
++    for g in p['groups']:
++        idx=g['indices'];m=g['m']
++        error=alpha*epsilon[idx] if ideal else endpoint[idx]-g['target']
++        if g['interface']:fc[idx]=2*alpha*error/(3*m*p['FC_denominator'])
++        if m>=2:ff[idx]=4*alpha*(error-error.mean(axis=0))/(3*(m-1)*p['FF_denominator'])
++    return gradients
++
++
++def output_gradient_diagnostics(sample, velocity, labels):
++    """Analytic velocity-space gradients, distinct from parameter gradients."""
++    p=_prepare(sample,velocity,labels);result={}
++    for ideal in (False,True):
++        gradients=_analytic_output_gradients(p,ideal)
++        stats=gradient_norm_dot_statistics(*[[gradients[k][p['free']]] for k in ('FM','FC','FF')],names=['free_velocity_coordinates'])
++        psd={}
++        for key in ('FM_vs_FC','FM_vs_FF','FM_vs_weighted_aux'):
++            d=stats['directions'][key]
++            tolerance=NUMERICAL_POLICY['output_dot_negative_atol']+NUMERICAL_POLICY['output_dot_negative_norm_product_rtol']*d['norm_product']
++            psd[key]=dict(dot=d['dot'],negative_tolerance=tolerance,significant_negative=d['dot'] < -tolerance)
++        stats['PSD_output_error_check']=psd
++        result['ideal_linear_error_reference' if ideal else 'actual_endpoint_analytic']=stats
++    result.update(space='Output free velocity, not model parameters',analytic_evaluations=1,autograd_calls=0,model_calls=0,
++        formulas=dict(FM='2*epsilon/(3*free_corner_count)',FC='2*(1-t)*(Yhat_i-c_g)/(3*m_g*FC_group_count)',
++                      FF='4*(1-t)*(Yhat_i-Ybar_g)/(3*(m_g-1)*FF_group_count)'),
++        numerical_note='Actual uses decoded FP32 Yhat and actual FP32 (1-t); ideal uses (1-t)*epsilon. Both reductions are FP64; neither is a new model backward.')
++    return result
++
++
++def run_cpu_tests():
++    """Explicit fixed fixtures; called once by the experiment owner, not on import."""
++    from .t1_interface_relations import build_relation_labels,prepare_relations,relation_sums,endpoint_from_velocity
++    counts=dict(model_forwards=0,model_backwards=0,optimizer_updates=0,CPU_autograd_grad_calls=0,finite_difference_loss_evaluations=0,legacy_relation_loss_evaluations=0)
++    def grad(*args,**kwargs):
++        counts['CPU_autograd_grad_calls']+=1
++        return torch.autograd.grad(*args,**kwargs)
++    ids=np.asarray([[0,1,2],[0,3,4],[0,3,5],[1,3,6]],dtype=np.int64)
++    known=np.asarray([True,False,False,False]);valid=np.ones(4,dtype=bool)
++    vertices=np.asarray([[0,0,0],[1,0,0],[0,1,0],[.2,.3,.4],[-.2,.1,.7],[.6,.4,.1],[.3,-.5,.2]],dtype=np.float32)
++    Y=vertices[ids];context=np.zeros_like(Y);context[known]=Y[known]
++    x1=Y.copy();x1[known]=0
++    Z=np.arange(36,dtype=np.float32).reshape(4,3,3)/31-.5;Z[known]=0
++    t=np.float32(.5);xt=(1-t)*Z+t*x1;xt[known]=context[known]
++    sample=dict(x0=Z.reshape(4,9),x1=x1.reshape(4,9),u=(x1-Z).reshape(4,9),xt=xt.reshape(4,9),t=t,
++                context=context.reshape(4,9),known_mask=known,valid_mask=valid)
++    labels=build_relation_labels(ids,known,context);labels['corner_source_vertex_ids']=ids
++    # FP64 ideal input fixtures retain exactly corresponding target coordinates.
++    double={k:np.asarray(v,dtype=np.float64) if k in ('x0','x1','u','xt','t','context') else v.copy() for k,v in sample.items()}
++    double['u']=double['x1']-double['x0'];double['xt']=.5*double['x0']+.5*double['x1'];double['xt'][known]=double['context'][known]
++    dl=build_relation_labels(ids,known,context);dl['corner_source_vertex_ids']=ids
++    for g in dl['fc_groups']:g['anchor']=g['anchor'].astype(np.float64)
++    velocity=double['u']+np.sin(np.arange(36)).reshape(4,9)*.15
++    analyzed=analyze_teacher(double,velocity,dl)
++    tol=NUMERICAL_POLICY['fp64_fixture_atol']
++    assert analyzed['identities']['max_abs_endpoint_minus_Position_minus_Spread']<tol
++    assert abs(analyzed['identities']['FF_minus_global_partition_contributions'])<tol
++    assert max(analyzed['identities']['group_explicit_time_scaling_max_abs_residual'].values())<tol
++    oracle=analyze_teacher(double,double['u'],dl)
++    assert oracle['losses']['FC']<tol and oracle['losses']['FF']<tol
++    # Enumerate unordered pairs independently from the variance identity.
++    p=_prepare(double,velocity,dl);end=p['endpoint'].reshape(-1,3)
++    explicit=[]
++    for g in p['groups']:
++        if g['m']>=2:
++            x=end[g['indices']];pairs=[np.mean((x[i]-x[j])**2) for i in range(len(x)) for j in range(i+1,len(x))]
++            explicit.append(float(np.mean(pairs)))
++    assert abs(np.mean(explicit)-analyzed['losses']['FF'])<tol
++    # Analytic output gradients versus independent small FP64 autograd.
++    v=torch.tensor(velocity,dtype=torch.float64,requires_grad=True)
++    e=torch.tensor(double['xt'])+.5*v;eflat=e.reshape(-1,3);uf=torch.tensor(double['u'])
++    fm=((v-uf)[torch.from_numpy(~known)]**2).mean();fc=[];ff=[]
++    for g in p['groups']:
++        x=eflat[g['indices']]
++        if g['interface']:fc.append(((x-torch.tensor(g['target']))**2).mean())
++        if g['m']>=2:ff.append(torch.stack([((x[i]-x[j])**2).mean() for i in range(len(x)) for j in range(i+1,len(x))]).mean())
++    losses=(fm,torch.stack(fc).mean(),torch.stack(ff).mean());analytic=_analytic_output_gradients(p)
++    for index,(key,loss) in enumerate(zip(('FM','FC','FF'),losses)):
++        got=grad(loss,v,retain_graph=index<2)[0].numpy().reshape(4,3,3)
++        assert np.allclose(got,analytic[key],atol=tol,rtol=NUMERICAL_POLICY['fp64_fixture_rtol'])
++    # Directional finite differences, no autodiff reuse.
++    direction=np.cos(np.arange(36)).reshape(4,9);h=1e-5
++    plus=analyze_teacher(double,velocity+h*direction,dl)['losses'];minus=analyze_teacher(double,velocity-h*direction,dl)['losses']
++    counts['finite_difference_loss_evaluations']+=2
++    for key in ('FM','FC','FF'):
++        numerical=(plus[key]-minus[key])/(2*h);expected=float(np.sum(analytic[key]*direction.reshape(4,3,3)))
++        assert np.isclose(numerical,expected,atol=tol,rtol=NUMERICAL_POLICY['fp64_fixture_rtol'])
++    # Actual unchanged FP32 endpoint/loss code, with detached C and anchors.
++    pack=prepare_relations(labels,'cpu');pack['fc_anchors'].requires_grad_(True)
++    c=torch.tensor(sample['context'][None],requires_grad=True);vf=torch.tensor(velocity.astype(np.float32)[None],requires_grad=True)
++    real=endpoint_from_velocity(torch.tensor(sample['xt'][None]),vf,torch.tensor([t]),torch.tensor(known[None]),c)
++    terms=relation_sums(real,pack);counts['legacy_relation_loss_evaluations']+=1
++    oracle_actual=endpoint_from_velocity(torch.tensor(sample['xt'][None]),torch.tensor(sample['u'][None]),torch.tensor([t]),torch.tensor(known[None]),c)
++    oracle_terms=relation_sums(oracle_actual,pack);counts['legacy_relation_loss_evaluations']+=1
++    assert float(oracle_terms['FC_sum'].detach())<1e-12 and float(oracle_terms['FF_sum'].detach())<1e-12
++    detached=grad(terms['FC_sum']+terms['FF_sum'],(vf,c,pack['fc_anchors']),allow_unused=True)
++    assert detached[1] is None and detached[2] is None and torch.count_nonzero(detached[0][:,known])==0
++    original=dict(FC=float(terms['FC_sum'].detach())/terms['FC_count'],FF=float(terms['FF_sum'].detach())/terms['FF_count'],
++                  FM=float(((vf.detach()[0,~known]-torch.tensor(sample['u'][~known]))**2).mean()))
++    fp32=analyze_teacher(sample,vf.detach(),labels,legacy_losses=original)
++    assert fp32['legacy_loss_reconciliation']['status']=='PASS'
++    # Face/corner permutations carry trusted identities and all arrays together.
++    order=np.asarray([2,0,3,1]);corners=np.asarray([[2,0,1],[1,2,0],[2,1,0],[0,2,1]])
++    def perm(a):return np.take_along_axis(a.reshape(4,3,3)[order],corners[...,None],axis=1).reshape(4,9)
++    moved={k:perm(val) if k in ('x0','x1','u','xt','context') else val for k,val in double.items()}
++    moved['known_mask']=known[order];moved['valid_mask']=valid[order]
++    ids2=np.take_along_axis(ids[order],corners,axis=1);ct=perm(context).reshape(4,3,3).astype(np.float32)
++    labels2=build_relation_labels(ids2,known[order],ct);labels2['corner_source_vertex_ids']=ids2
++    for g in labels2['fc_groups']:g['anchor']=g['anchor'].astype(np.float64)
++    moved_result=analyze_teacher(moved,perm(velocity),labels2)
++    assert all(np.isclose(moved_result['losses'][key],analyzed['losses'][key],atol=tol,rtol=1e-10) for key in ('FM','FC','FF'))
++    stats=output_gradient_diagnostics(double,velocity,dl)
++    assert not any(x['significant_negative'] for x in stats['ideal_linear_error_reference']['PSD_output_error_check'].values())
++    zeros=gradient_norm_dot_statistics([np.zeros(3)],[np.ones(3)],[None],names=['fixture'],chunk_elements=2)
++    assert zeros['ratio_status']=='UNDEFINED_FM_NEAR_ZERO' and zeros['directions']['FM_vs_FC']['cosine'] is None
++    probe=[np.arange(7,dtype=np.float64)/7,np.sin(np.arange(7)),np.cos(np.arange(7))]
++    gram=gradient_norm_dot_statistics(*[[x] for x in probe],names=['nonzero_fixture'],chunk_elements=2)
++    for key,i,j in [('FM_FM',0,0),('FC_FC',1,1),('FF_FF',2,2),('FM_FC',0,1),('FM_FF',0,2),('FC_FF',1,2)]:
++        assert np.isclose(gram['unweighted_gram'][key],np.dot(probe[i],probe[j]),atol=tol,rtol=1e-10)
++    assert np.isclose(gram['weighted_norms']['combined_aux'],np.linalg.norm(.1*probe[1]+.1*probe[2]),atol=tol,rtol=1e-10)
++    return dict(status='PASS',fixture_families=9,numerical_policy=NUMERICAL_POLICY,counts=counts,
++        fixtures=['group_decomposition_and_partition','oracle_endpoint','explicit_unordered_pairs','analytic_output_gradients',
++                  'directional_finite_difference','legacy_FP32_losses_and_detached_anchors','face_corner_equivariance',
++                  'output_PSD_quadratic','chunked_gradient_zero_norm_policy'])
+diff --git a/experiments/mf_h1_local0/c_relation_report.py b/experiments/mf_h1_local0/c_relation_report.py
+new file mode 100755
+index 0000000..2715d79
+--- /dev/null
++++ b/experiments/mf_h1_local0/c_relation_report.py
+@@ -0,0 +1,363 @@
++"""JSON-only aggregation and reporting for the zero-update C diagnosis.
++
++No model, geometry scorer, OT, autograd, checkpoint load, or repair is imported.
++The caller owns all artifact writes. Repeated teacher group observations are
++pooled by their actual group counts; they are not new independent objects.
++"""
++from __future__ import annotations
++
++from collections import Counter, defaultdict
++import math
++
++import numpy as np
++
++TIMES=(.1,.3,.5,.7,.9)
++SUBSETS=('all','interface','free_only','shared','singleton','interface_shared',
++         'interface_singleton','free_only_shared','free_only_singleton')
++QUANTITIES=('Position','Spread','EndpointError')
++DIRECTIONS=('FM_vs_FC','FM_vs_FF','FC_vs_FF','FM_vs_weighted_aux')
++SCOPES=('full_model','coordinate_embedding','first_QKV','final_output')
++
++
++def _get(value,*keys,default=None):
++    for key in keys:
++        if not isinstance(value,dict) or key not in value:return default
++        value=value[key]
++    return value
++
++
++def _stats(values):
++    x=np.asarray([float(v) for v in values if v is not None and math.isfinite(float(v))],dtype=np.float64)
++    return dict(count=len(x),mean=float(x.mean()) if len(x) else None,
++        median=float(np.median(x)) if len(x) else None,
++        minimum=float(x.min()) if len(x) else None,maximum=float(x.max()) if len(x) else None,
++        q25=float(np.quantile(x,.25)) if len(x) else None,q75=float(np.quantile(x,.75)) if len(x) else None)
++
++
++def _t(row):
++    state=row['state']
++    if 'registered_t' in state:return float(state['registered_t'])
++    return TIMES[int(state['time_index'])]
++
++
++def _group_pool(rows,subset):
++    values=[row['analysis']['subsets'][subset] for row in rows]
++    groups=sum(v['group_count'] for v in values);corners=sum(v['corner_count'] for v in values)
++    result=dict(states=len(rows),group_observations=groups,corner_observations=corners)
++    for space in ('endpoint','epsilon'):
++        sums={key:sum(v[space]['group_sums'][key] for v in values) for key in QUANTITIES}
++        result[space]=dict(group_sums=sums,group_equal={key:sums[key]/groups if groups else None for key in QUANTITIES})
++    return result
++
++
++def _loss_pool(rows):
++    """Retain each loss's real denominator when pooling multiple states."""
++    items=[row['analysis'] for row in rows]
++    counts={key:sum(a['losses']['denominators'][key] for a in items)
++            for key in ('FM_free_coordinates','FC_interface_groups','FF_shared_groups')}
++    output=dict(states=len(rows),denominators=counts)
++    for space,source in (('endpoint','losses'),('epsilon','velocity_error_losses')):
++        values={}
++        for key,denom in (('FM','FM_free_coordinates'),('FC','FC_interface_groups'),('FF','FF_shared_groups')):
++            numerator=sum(a[source][key]*a['losses']['denominators'][denom] for a in items)
++            values[key]=numerator/counts[denom] if counts[denom] else None
++        output[space]=values
++    nfc,nff=counts['FC_interface_groups'],counts['FF_shared_groups']
++    output['FC_position_component']=sum(a['losses']['FC_position_component']*a['losses']['denominators']['FC_interface_groups'] for a in items)/nfc if nfc else None
++    output['FC_spread_component']=sum(a['losses']['FC_spread_component']*a['losses']['denominators']['FC_interface_groups'] for a in items)/nfc if nfc else None
++    for key in ('FF_interface_contribution','FF_free_only_contribution'):
++        output[key]=sum(a['losses'][key]*a['losses']['denominators']['FF_shared_groups'] for a in items)/nff if nff else None
++    output['FF_partition_residual']=None if nff==0 else output['endpoint']['FF']-output['FF_interface_contribution']-output['FF_free_only_contribution']
++    return output
++
++
++def _teacher_pools(rows,include_K=False):
++    buckets=defaultdict(list)
++    for row in rows:
++        key=(row['model'],int(row['additional_step']),int(row['state']['parent']),_t(row))
++        if include_K:key+=(int(row['state']['K']),)
++        buckets[key].append(row)
++    result=[]
++    for key,subset in sorted(buckets.items()):
++        value=dict(model=key[0],additional_step=key[1],parent=key[2],t=key[3],
++            K=key[4] if include_K else sorted({int(r['state']['K']) for r in subset}),
++            group_pool={name:_group_pool(subset,name) for name in SUBSETS},loss_pool=_loss_pool(subset))
++        result.append(value)
++    return result
++
++
++def _teacher_pairs(pools):
++    indexed=defaultdict(dict)
++    for row in pools:
++        key=(row['additional_step'],row['parent'],row['t'],str(row['K']))
++        indexed[key][row['model']]=row
++    output=[]
++    for key,models in sorted(indexed.items()):
++        if set(models)!={'A','C'}:continue
++        a,c=models['A'],models['C'];groups={}
++        for subset in SUBSETS:
++            ag,cg=a['group_pool'][subset],c['group_pool'][subset]
++            if (ag['group_observations'],ag['corner_observations'])!=(cg['group_observations'],cg['corner_observations']):
++                raise ValueError('A/C source-group denominators differ')
++            g=dict(group_observations=ag['group_observations'],corner_observations=ag['corner_observations'])
++            for space in ('endpoint','epsilon'):
++                av,cv=ag[space]['group_equal'],cg[space]['group_equal']
++                g[space]=dict(A=av,C=cv,C_minus_A={q:None if av[q] is None or cv[q] is None else cv[q]-av[q] for q in QUANTITIES})
++            groups[subset]=g
++        output.append(dict(additional_step=a['additional_step'],parent=a['parent'],t=a['t'],K=a['K'],
++            group_pool=groups,A_losses=a['loss_pool'],C_losses=c['loss_pool']))
++    return output
++
++
++def _numeric_leaves(value,prefix=''):
++    for key,child in value.items():
++        name=prefix+'.'+key if prefix else key
++        if isinstance(child,dict):yield from _numeric_leaves(child,name)
++        elif isinstance(child,(float,int)) and not isinstance(child,bool):yield name,float(child)
++
++
++def _gradient_summary(rows):
++    by_model_scope=[]
++    for model in ('A','C'):
++        chosen=[r for r in rows if r['model']==model]
++        for scope in SCOPES:
++            values=[r['parameter_space'][scope] for r in chosen]
++            by_model_scope.append(dict(model=model,scope=scope,states=len(values),
++                unweighted_norms={key:_stats([v['unweighted_norms'][key] for v in values]) for key in ('FM','FC','FF')},
++                weighted_norms={key:_stats([v['weighted_norms'][key] for v in values]) for key in ('FM','FC','FF','combined_aux')},
++                ratios_to_FM={key:_stats([v['ratios_to_FM'][key] for v in values]) for key in ('FC','FF','combined_aux')},
++                directions={key:dict(cosine=_stats([v['directions'][key]['cosine'] for v in values]),
++                    dot=_stats([v['directions'][key]['dot'] for v in values]),
++                    negative_dot_count=sum(v['directions'][key]['dot']<0 for v in values),
++                    undefined_cosine_count=sum(v['directions'][key]['cosine'] is None for v in values)) for key in DIRECTIONS},
++                FM_near_zero_count=sum(v['FM_near_zero'] for v in values)))
++    by_model_time=[]
++    for model in ('A','C'):
++        for t in TIMES:
++            chosen=[r for r in rows if r['model']==model and _t(r)==t]
++            values=[r['parameter_space']['full_model'] for r in chosen]
++            by_model_time.append(dict(model=model,t=t,parents=[r['state']['parent'] for r in chosen],states=len(chosen),
++                unweighted_norms={key:_stats([v['unweighted_norms'][key] for v in values]) for key in ('FM','FC','FF')},
++                weighted_norms={key:_stats([v['weighted_norms'][key] for v in values]) for key in ('FM','FC','FF','combined_aux')},
++                ratios_to_FM={key:_stats([v['ratios_to_FM'][key] for v in values]) for key in ('FC','FF','combined_aux')}))
++    psd={}
++    for space in ('actual_endpoint_analytic','ideal_linear_error_reference'):
++        psd[space]={key:dict(checked=len(rows),
++            significant_negative_count=sum(r['output_space'][space]['PSD_output_error_check'][key]['significant_negative'] for r in rows),
++            dot=_stats([r['output_space'][space]['directions'][key]['dot'] for r in rows]))
++            for key in ('FM_vs_FC','FM_vs_FF','FM_vs_weighted_aux')}
++    return dict(by_model_scope=by_model_scope,by_model_time=by_model_time,output_PSD=psd,
++        teacher_velocity_bitwise_equal_count=sum(r['teacher_velocity_bitwise_equal'] for r in rows),
++        time_comparison='Each t has two parents and first fixed noise only; it does not estimate a training trajectory or logit-normal expectation')
++
++
++def summarize_results(results):
++    """Aggregate already measured JSON only, without reading any assets."""
++    rows=results.get('teacher_rows',[]);grads=results.get('gradient_rows',[])
++    pools=_teacher_pools(rows);per_K=_teacher_pools(rows,True)
++    pairs=_teacher_pairs(pools);per_K_pairs=_teacher_pairs(per_K)
++    maxima=defaultdict(float);status=Counter();mapping=Counter()
++    for row in rows:
++        analysis=row['analysis'];status[analysis['legacy_loss_reconciliation']['status']]+=1
++        mapping[analysis['source_mapping_status']]+=1
++        for name,value in _numeric_leaves(analysis['identities']):maxima[name]=max(maxima[name],abs(value))
++        for name,value in _numeric_leaves(analysis['floating_point_audit']):
++            if name.endswith(('RMS','max_abs')):maxima['floating_point.'+name]=max(maxima['floating_point.'+name],abs(value))
++    endpoint_pairs=[r for r in pairs if r['additional_step']==500]
++    tradeoffs={}
++    for subset in ('interface','free_only_shared'):
++        selected=[r['group_pool'][subset]['endpoint']['C_minus_A'] for r in endpoint_pairs]
++        tradeoffs[subset]=dict(parent_time_cells=len(selected),
++            Spread_decreased=sum(r['Spread'] is not None and r['Spread']<0 for r in selected),
++            Position_increased=sum(r['Position'] is not None and r['Position']>0 for r in selected),
++            Spread_decreased_Position_increased=sum(r['Spread'] is not None and r['Spread']<0 and r['Position']>0 for r in selected),
++            Position_and_Spread_decreased=sum(r['Spread'] is not None and r['Spread']<0 and r['Position']<0 for r in selected))
++    midpoint=[];indexed={(r['model'],r['additional_step'],r['parent'],r['t'],r['K']):r for r in per_K}
++    for model in ('A','C'):
++        for parent in (0,1):
++            for t in TIMES:
++                a=indexed.get((model,250,parent,t,12));b=indexed.get((model,500,parent,t,12))
++                if a is None or b is None:continue
++                value=dict(model=model,parent=parent,t=t,K=12,step250=a,step500=b,step500_minus250={})
++                for subset in ('interface','free_only_shared'):
++                    value['step500_minus250'][subset]={q:b['group_pool'][subset]['endpoint']['group_equal'][q]-a['group_pool'][subset]['endpoint']['group_equal'][q] for q in QUANTITIES}
++                midpoint.append(value)
++    ac_by_step={(v['additional_step'],v['parent'],v['t']):v for v in per_K_pairs if v['K']==12}
++    ac_stage_changes=[]
++    for parent in (0,1):
++        for t in TIMES:
++            a=ac_by_step.get((250,parent,t));b=ac_by_step.get((500,parent,t))
++            if a is None or b is None:continue
++            value=dict(parent=parent,t=t,K=12,groups={})
++            for subset in ('interface','free_only_shared'):
++                value['groups'][subset]={}
++                for q in QUANTITIES:
++                    early=a['group_pool'][subset]['endpoint']['C_minus_A'][q]
++                    late=b['group_pool'][subset]['endpoint']['C_minus_A'][q]
++                    value['groups'][subset][q]=dict(C_minus_A_step250=early,C_minus_A_step500=late,strict_sign_reversal=early*late<0)
++            ac_stage_changes.append(value)
++    reversal_counts={subset:{q:sum(v['groups'][subset][q]['strict_sign_reversal'] for v in ac_stage_changes) for q in QUANTITIES}
++                     for subset in ('interface','free_only_shared')}
++    saved=results.get('saved_generation',{});saved_model_parent=[]
++    for model in ('A','C'):
++        for parent in (0,1):
++            subset=[r for r in saved.get('outputs',[]) if r['model']==model and r['parent']==parent]
++            keys=sorted({key for r in subset for key in r['saved']['values']})
++            saved_model_parent.append(dict(model=model,parent=parent,outputs=len(subset),
++                metrics={key:_stats([r['saved']['values'].get(key) for r in subset]) for key in keys},
++                cheap={key:_stats([r['cheap_geometry'].get(key) for r in subset]) for key in ('free_total_area','centered_coordinate_RMS','bbox_diagonal')}))
++    return dict(schema='c_relation_summary_v1',teacher_rows=len(rows),gradient_rows=len(grads),
++        teacher_group_pools=pools,teacher_AC_pairs=pairs,teacher_per_K_pools=per_K,teacher_per_K_AC_pairs=per_K_pairs,
++        teacher_tradeoffs=tradeoffs,midpoint_K12_direction=midpoint,
++        checkpoint_AC_direction_changes=dict(parent_time_cells=len(ac_stage_changes),strict_sign_reversal_counts=reversal_counts,paired=ac_stage_changes),
++        gradient=_gradient_summary(grads),
++        saved_model_parent=saved_model_parent,
++        numerical_audit=dict(identity_max_abs=dict(maxima),legacy_loss_status_counts=dict(status),source_mapping_status_counts=dict(mapping)),
++        reduction='Within a parent/time/subset sum actual per-source-group values across K/noise and divide by total group observations. K-specific losses preserve their actual FC/FF or free-coordinate denominators. No teacher-time average is called a training expectation.',
++        evidence_scope='Two existing parents. Noise pairs, time states and repeated groups are not additional independent objects. Saved generation, paired teacher states and local gradients are separate evidence families.',
++        new_model_calls=0,new_backward_calls=0,new_OT_calls=0,new_geometry_scores=0,optimizer_updates=0)
++
++
++def _f(value,digits=6):
++    if value is None:return 'NOT_AVAILABLE'
++    if isinstance(value,bool):return str(value)
++    if isinstance(value,int):return str(value)
++    if isinstance(value,float):return format(value,f'.{digits}g')
++    return str(value).replace('|','\\|').replace('\n',' ')
++
++
++def _table(headers,rows):
++    return '\n'.join(['| '+' | '.join(_f(header) for header in headers)+' |','| '+' | '.join('---' for _ in headers)+' |']+
++        ['| '+' | '.join(_f(v) for v in row)+' |' for row in rows])+'\n'
++
++
++def render_report(r):
++    """Return the sole Markdown report; the runner writes and hashes it."""
++    s=r.get('summary') or summarize_results(r);saved=r.get('saved_generation',{});lines=[]
++    def add(text=''):lines.append(text)
++    add('# C 共享关系监督：零更新机制诊断\n')
++    add('本轮只复用已存完整生成、运行固定 teacher 前向和诊断反向。没有 optimizer 更新，没有新增完整生成，也没有 FC-only/FF-only 训练消融。零更新不等于零反向。\n')
++    add('L_FF 指源顶点副本一致性训练损失；FF_intersections 指自由面非法相交数。它们不是同一个指标，名称相近不构成因果关系。所有结果限于两个既有父对象。\n')
++    interpretation=r.get('interpretation',{})
++    if interpretation.get('answers'):
++        add('## 要回答的五个问题\n')
++        for i,text in enumerate(interpretation['answers'],1):add(f'{i}. {text}\n')
++    else:add('解释状态：固定测量已汇总；尚未录入最终证据复核，不据此自动选择下一轮。\n')
++    add('## 执行边界与资产\n')
++    add(f"源运行：`{r.get('source_run',saved.get('source_run'))}`。状态：{r.get('status')}。\n")
++    counts=r.get('counts',{})
++    add(_table(['实际账本','次数'],[(key,value) for key,value in counts.items() if isinstance(value,(int,float))]))
++    add(f"前向分账：`{counts.get('forward_by_stage',{})}`。参数梯度反向采用 autograd.grad，各次如实计入；解析输出梯度与小型公式测试另列。\n")
++    add(_table(['checkpoint','实际文件 SHA256','可用'],[(key,value.get('sha256'),value.get('status')) for key,value in r.get('assets',{}).get('checkpoints',{}).items()]))
++    add(_table(['加载模型','参数数','严格加载','诊断前后 hash 相同'],[(key,value.get('parameters'),value.get('strict_load'),value.get('parameters_unchanged')) for key,value in r.get('models',{}).items()]))
++    add(f"公共运行配置：`{_get(r,'protocol','runtime',default={})}`。所有前向实际 runtime 记录保存在 JSON；各模型独立加载，GT 源身份仅用于标签和分析。\n")
++    add(f"保护检查：文件元数据 {_get(r,'protection','after','status')}；关键字节 SHA {_get(r,'protection','critical_hashes_after','status')}。完整模型梯度没有保存为大文件。\n")
++    add('## 公式、分母与数值核对\n')
++    add('每个源顶点组使用三坐标 MSE：EndpointError = Position + Spread。Position 度量组中心是否位于正确 GT 顶点；Spread 度量该组自由角副本是否一致。FC 对接口组等权，再对组内角等权；FF 仅包含 m≥2 组，对组等权，每组为无序角对 MSE。\n')
++    add('L_FC = mean_interface(Position + Spread)；每组 pairwise MSE = 2m/(m−1) × Spread。下表 FF 接口和 free-only 项始终保留相同全体共享组分母，可以相加恢复原 FF。m=1 不计 FF。模型 FM 采用全部有效自由坐标均值，权重与关系组等权不同。\n')
++    add('在同一 (parent,t,subset) 跨 K 和噪声时，先累加实际 group_sums，再除以总 group_count；重复观测不是新增独立对象。完整 per-K、singleton、interface_shared 及 free_only_shared 表保留在结果 JSON。\n')
++    add(f"CPU 固定公式审计：`{_get(r,'gates','CPU_formula','status')}`，fixture families `{_get(r,'gates','CPU_formula','fixture_families')}`；小型计算账本 `{_get(r,'gates','CPU_formula','counts',default={})}`。\n")
++    add(f"真实模型 loss 对账状态：`{s['numerical_audit']['legacy_loss_status_counts']}`；源标签状态：`{s['numerical_audit']['source_mapping_status_counts']}`。\n")
++    add(_table(['实际 teacher 数值审计（跨状态最大绝对值）','值'],list(s['numerical_audit']['identity_max_abs'].items())))
++    add('浮点路径、oracle v=u 和实际 Yhat−Y−(1−t)epsilon 残差均保留。FP64 固定例与 BF16 前向/FP32 端点的误差分别记录，不把正常舍入差异直接解释成源标签错误。\n')
++    add('## 证据一：已存 32 份完整生成\n')
++    add('没有新采样、重跑距离矩阵或重判交。自由面始终是同一已存 N112/K12 的 100 面。以下 C−A 为同对象、同 seed 配对；误差负值为改善，coverage 正值为改善。所有 9501–9508 均保留。\n')
++    stats=s['saved_model_parent'];keys=('remaining_symmetric_RMS_bbox_pct','free_to_R12_RMS_bbox_pct','R12_to_free_RMS_bbox_pct','Gamma_RMS_bbox_pct','Gamma_p95_bbox_pct','Gamma_coverage_fraction','CF_affected_free_fraction','FF_intersections')
++    add(_table(['模型','对象','RMS均值','free→GT','GT→free','Gamma RMS','Gamma p95','Gamma coverage','CF fraction','FF_intersections'],
++        [[v['model'],v['parent']]+[v['metrics'].get(k,{}).get('mean') for k in keys] for v in stats]))
++    add(_table(['对象','seed','ΔRMS','Δfree→GT','ΔGT→free','ΔGamma RMS','ΔGamma p95','Δcoverage','ΔCF','ΔFF','面积 C/A','中心RMS C/A','bbox C/A'],
++        [[v['parent'],v['seed']]+[v['C_minus_A'].get(k) for k in keys]+[v['C_over_A_scale_ratios'].get(k) for k in ('free_total_area','centered_coordinate_RMS','bbox_diagonal')] for v in saved.get('paired',[])]))
++    for parent,value in saved.get('parents',{}).items():
++        add(f"P{parent} 配对类别：`{value['cross_classification']}`；Gamma RMS 改善 {value['Gamma_improved_count']}/8、恶化 {value['Gamma_worsened_count']}/8。\n")
++    add('自由生成没有可信 GT 面角身份；没有将 GT ID 套入输出槽位，也没有事后最近邻匹配。中心 RMS 使用 300 个自由角副本自身算术质心，不是面积质心；面积/尺度下降本身不证明整体坍缩，尺度不变也不能排除局部错误。\n')
++    add(_table(['对象','seed','面积q01 C/A','面积q05 C/A','面积中位 C/A','面积q95 C/A','Δnear-C','Δnear-C边界带','Δnear-C带外'],
++        [[v['parent'],v['seed']]+[v['C_over_A_independent_area_quantile_ratios'].get(k) for k in ('q01','q05','median','q95')]+[v['C_minus_A'].get(k) for k in ('near_C_area_fraction','near_C_boundary_band_area_fraction','near_C_outside_boundary_band_area_fraction')] for v in saved.get('paired',[])]))
++    add('面积分位比较各输出独立分布，未配对面 ID。near-C 沿用原固定 512 个面积均匀样本和 1e−3 L 阈值/边界带；这里只复用已存面积分配统计，near-C 不自动等于错误、重复面或接缝成功。逐面面积、窄角、q、退化、NaN/Inf 和缺失字段都在 JSON。\n')
++    add('## 证据二：固定 teacher 组中心与一致性\n')
++    add('以下主表在每个父对象、每个 t 分别池化 K4/8/12 × 两噪声的实际组观测。所有值为模型原坐标三坐标 MSE，未改为 bbox 百分比。teacher 有真实对应，不能代替自由生成状态分布。\n')
++    endpoint=[v for v in s['teacher_AC_pairs'] if v['additional_step']==500]
++    table=[]
++    for v in endpoint:
++        for subset in ('interface','free_only_shared'):
++            g=v['group_pool'][subset];a,c=g['endpoint']['A'],g['endpoint']['C']
++            table.append([v['parent'],v['t'],subset,g['group_observations'],a['Position'],c['Position'],a['Spread'],c['Spread'],g['endpoint']['C_minus_A']['EndpointError']])
++    add(_table(['对象','t','组','组观测数','Position A','Position C','Spread A','Spread C','ΔEndpointError'],table))
++    add(f"按 10 个 parent×t 单元描述的方向计数（不是显著性检验）：`{s['teacher_tradeoffs']}`。逐 K 配对方向另存 JSON。\n")
++    add('K12 单独列出，避免跨 K 池化掩盖条件规模差异。以下同样跨两个预注册噪声按实际组观测池化；K4/K8 的全部对应表在 JSON。\n')
++    table=[]
++    for v in s['teacher_per_K_AC_pairs']:
++        if v['additional_step']!=500 or v['K']!=12:continue
++        for subset in ('interface','free_only_shared'):
++            g=v['group_pool'][subset];a,c=g['endpoint']['A'],g['endpoint']['C']
++            table.append([v['parent'],v['t'],subset,g['group_observations'],a['Position'],c['Position'],a['Spread'],c['Spread']])
++    add(_table(['K12对象','t','组','组观测数','Position A','Position C','Spread A','Spread C'],table))
++    table=[]
++    for v in endpoint:
++        for model in ('A','C'):
++            q=v[model+'_losses'];table.append([model,v['parent'],v['t'],q['denominators']['FC_interface_groups'],q['denominators']['FF_shared_groups'],q['FC_position_component'],q['FC_spread_component'],q['endpoint']['FC'],q['FF_interface_contribution'],q['FF_free_only_contribution'],q['endpoint']['FF']])
++    add(_table(['模型','对象','t','FC组数','FF组数','FC位置','FC离散','FC','FF接口贡献','FF free-only贡献','FF'],table))
++    add('接口 m≥2 组的 Spread 同时进入 FC 与 FF 是公式事实；它是否造成不需要的权重偏移，不能只凭重叠结构下结论。各组 m、2m/(m−1)、实际全局分母贡献均保存在 JSON。\n')
++    add('## 显式时间系数与真实时间覆盖\n')
++    add(_table(['t','显式 (1−t)²'],zip(TIMES,(.81,.49,.25,.09,.01))))
++    add('下面 epsilon=v−u 直接计算；没有用端点数值除以接近零的 (1−t)²。显式系数 .81/.01=81 不代表实际参数梯度相差 81 倍。\n')
++    table=[]
++    for v in endpoint:
++        for subset in ('interface','free_only_shared'):
++            g=v['group_pool'][subset]['epsilon'];table.append([v['parent'],v['t'],subset,g['A']['Position'],g['C']['Position'],g['A']['Spread'],g['C']['Spread']])
++    add(_table(['对象','t','组','epsilon Position A','epsilon Position C','epsilon Spread A','epsilon Spread C'],table))
++    add(_table(['模型','对象','t','直接epsilon FM','直接epsilon FC','直接epsilon FF'],
++        [[model,v['parent'],v['t']]+[v[model+'_losses']['epsilon'][key] for key in ('FM','FC','FF')] for v in endpoint for model in ('A','C')]))
++    coverage=saved.get('training_time_coverage',{})
++    add(f"完整训练 t 日志：{coverage.get('status')}；使用 A 的 {coverage.get('updates')} 次更新、{coverage.get('samples')} 个样本。B/C 同流核对 `{coverage.get('other_arm_stream_checks',{})}`。\n")
++    all_samples=coverage.get('all_samples',{});edges=all_samples.get('histogram_edges',[]);hist=all_samples.get('histogram_counts',[])
++    add(_table(['实际 t 分箱','样本数','比例'],[(f'[{edges[i]}, {edges[i+1]}'+(']' if i==len(hist)-1 else ')'),count,all_samples.get('histogram_fractions',[None]*len(hist))[i]) for i,count in enumerate(hist)]))
++    add(f"实际 t 分布：`{all_samples.get('times',{})}`；实际显式权重分布：`{all_samples.get('explicit_weight',{})}`。五个固定 t 的等权结果不冒充原 logit-normal 训练期望。按父对象/K 的全部覆盖在 JSON。\n")
++    add('## 证据三：局部梯度\n')
++    add('仅 K12、每个父对象第一份固定噪声、五个 t；全模型统计按参数张量分块累积，不拼接巨向量。下表首先列未加权范数，再列实际 0.1 权重合成辅助范数与相对 FM 比率。比例接近零分母时按预注册规则置 UNDEFINED。\n')
++    grads=r.get('gradient_rows',[])
++    add(_table(['模型','对象','t','||FM||','||FC||','||FF||','||.1FC||','||.1FF||','||.1FC+.1FF||','.1FC/FM','.1FF/FM','aux/FM'],
++        [[v['model'],v['state']['parent'],_t(v)]+[v['parameter_space']['full_model']['unweighted_norms'][k] for k in ('FM','FC','FF')]+[v['parameter_space']['full_model']['weighted_norms'][k] for k in ('FC','FF','combined_aux')]+[v['parameter_space']['full_model']['ratios_to_FM'][k] for k in ('FC','FF','combined_aux')] for v in grads]))
++    add(_table(['模型','对象','t','cos FM/FC','dot FM/FC','cos FM/FF','dot FM/FF','cos FC/FF','dot FC/FF','cos FM/aux','dot FM/aux'],
++        [[v['model'],v['state']['parent'],_t(v)]+[v['parameter_space']['full_model']['directions'][k][quantity] for k in DIRECTIONS for quantity in ('cosine','dot')] for v in grads]))
++    add('本轮每个梯度状态是 batch1：FM 分母为该状态有效自由坐标数，FC/FF 分母为该状态有效源组数。旧训练 effective batch=8 跨 microbatch 汇总有效坐标/组后再归一化；因此这里是局部单状态诊断，不是重放一个原训练 batch，也不把单状态范数直接当作旧批次更新量。\n')
++    add('零范数 cosine 不填零；原 JSON 保存 UNDEFINED_ZERO_NORM、FM_near_zero、阈值及实际加权 FC/FF 范数。负参数 cosine 说明当前 Jacobian 下的局部方向竞争，不证明它导致整条生成轨迹退化；正 cosine 也不保证表面 RMS 改善。\n')
++    add(_table(['模型','参数范围','状态数','aux/FM中位','FM/FC负dot数','FM/FF负dot数','FM/aux负dot数','FM近零数'],
++        [[v['model'],v['scope'],v['states'],v['ratios_to_FM']['combined_aux']['median'],v['directions']['FM_vs_FC']['negative_dot_count'],v['directions']['FM_vs_FF']['negative_dot_count'],v['directions']['FM_vs_weighted_aux']['negative_dot_count'],v['FM_near_zero_count']] for v in s['gradient']['by_model_scope']]))
++    add('三个小参数分组只作补充，不能替代全模型。完整逐状态分组范数、内积、cosine 均在 JSON。\n')
++    add('输出速度空间的实际端点解析梯度逐状态如下。它们直接读取已存数值；理想线性误差参照继续在随后 PSD 表单列。\n')
++    add(_table(['模型','对象','t','输出cos FM/FC','输出dot FM/FC','输出cos FM/FF','输出dot FM/FF','输出cos FC/FF','输出dot FC/FF','输出cos FM/aux','输出dot FM/aux'],
++        [[v['model'],v['state']['parent'],_t(v)]+[v['output_space']['actual_endpoint_analytic']['directions'][k][quantity] for k in DIRECTIONS for quantity in ('cosine','dot')] for v in grads]))
++    add(_table(['输出速度空间','关系','检查数','显著负内积数','最小dot'],
++        [[space,key,value['checked'],value['significant_negative_count'],value['dot']['minimum']] for space,checks in s['gradient']['output_PSD'].items() for key,value in checks.items()]))
++    add('标签、锚点和归一化正确时，关系项在输出误差空间是半正定二次型，FM 与关系项的理论输出内积非负。实际 FP32 端点与理想线性误差参照分开；容差存在 JSON。显著负值必须先审计对应、mask、尺度和分母，不能立即解释成几何目标必然冲突。\n')
++    add('## step250 与 step500 的限定观察\n')
++    add('只读两中间 checkpoint 的同一 K12 bank；不选择最佳 checkpoint，不替代原固定 step500 结论。两个 checkpoint 不是完整学习曲线。下表 500−250，负值为对应项下降。\n')
++    add(_table(['模型','对象','t','Δ接口Position','Δ接口Spread','Δfree-only Position','Δfree-only Spread'],
++        [[v['model'],v['parent'],v['t']]+[v['step500_minus250'][sub][q] for sub in ('interface','free_only_shared') for q in ('Position','Spread')] for v in s['midpoint_K12_direction']]))
++    stages=s['checkpoint_AC_direction_changes']
++    add(f"另比较同一 K12 parent×t 格中 C−A 的方向：{stages['parent_time_cells']} 格在 step250→500 的严格符号反转计数为 `{stages['strict_sign_reversal_counts']}`。这说明相对差异依赖检查点，不代表延长训练必然改善；零值未计反转，原配对数值在 JSON。\n")
++    add('## 假设与唯一后续建议\n')
++    if interpretation.get('hypotheses'):
++        for key,text in interpretation['hypotheses'].items():add(f'**{key}**：{text}\n')
++    else:add('H1–H5 尚待最终固定数据解释；不以公式结构或梯度符号代替经验结论。\n')
++    next_step=interpretation.get('next_step',{})
++    add(f"唯一后续建议：{next_step.get('choice','NOT_SELECTED')}。{next_step.get('reason','尚未录入最终证据复核。')} 本轮没有执行该建议。\n")
++    add('三类证据的边界：已存自由生成说明实际几何/接口/相交取舍；固定 teacher 说明真实对应下的组中心与一致性；局部梯度说明当前参数化的方向和量级。它们不能拼接成未经干预验证的单一根因故事。\n')
++    add(f"本轮耗时分账（秒）：`{r.get('timing',{})}`。具体原始统计、固定 bank 身份、逐状态审计与所有 32 份旧端点索引保存在唯一 results.json；不复制大权重或旧 raw。\n")
++    add('完成后停止；没有扩大训练、改损失权重、增加 guidance 或启动下一阶段。\n')
++    # Presentation order only: preserve every already-rendered section verbatim.
++    intro=[];sections={};current=None
++    for piece in lines:
++        if piece.startswith('## '):
++            current=piece.split('\n',1)[0][3:]
++            sections[current]=[piece]
++        elif current is None:intro.append(piece)
++        else:sections[current].append(piece)
++    order=('要回答的五个问题','证据二：固定 teacher 组中心与一致性','显式时间系数与真实时间覆盖',
++           '证据三：局部梯度','证据一：已存 32 份完整生成','step250 与 step500 的限定观察',
++           '公式、分母与数值核对','执行边界与资产','假设与唯一后续建议')
++    ordered=intro[:]
++    for title in order:
++        ordered.extend(sections.pop(title,[]))
++    for pieces in sections.values():ordered.extend(pieces)
++    return '\n'.join(ordered)
+diff --git a/experiments/mf_h1_local0/c_relation_run.py b/experiments/mf_h1_local0/c_relation_run.py
+new file mode 100755
+index 0000000..d0c2897
+--- /dev/null
++++ b/experiments/mf_h1_local0/c_relation_run.py
+@@ -0,0 +1,330 @@
++"""Bounded zero-update C relation diagnostics; no optimizer or sampler path."""
++from native_t1.runtime import configure_stable_runtime
++from pathlib import Path
++import argparse, gc, hashlib, json, platform, subprocess, time, traceback
++import numpy as np
++import torch
++import yaml
++from models.equidit import DiT
++from models.utils import get_embedder
++from native_t1.model import NativeInpaintingModel, native_execution
++from native_t1.data import native_collate, model_inputs, array_hash
++from native_t1.artifacts import atomic_json, file_sha256, state_sha256
++from native_t1.training import masked_fm_loss
++from .t1_interface_relations import load_source_relations, prepare_relations, relation_sums, endpoint_from_velocity
++
++ROOT=Path(__file__).resolve().parents[2]
++PROJECT=Path(__file__).resolve().parent
++EXPECTED={
++ 'A500':'43e56e107b0c6d28766aebd8cf8a0a764d8d52ef62ba2ca6e756d881634f876b',
++ 'C500':'8a40651bcf54aebb2c48cd19a2433fb4e0679370c0da6e79e916cc727f067168',
++ 'A250':'aea34110ae1f75c108298a366e8b2668c28aa09ad8fc7d683890f5caa415e305',
++ 'C250':'a7b558451a3e733a5173f7a7a7a180df7358340418e4fe28b11d35f05a0f1ec2'}
++
++
++def seal(value):return hashlib.sha256(json.dumps(value,sort_keys=True,separators=(',',':')).encode()).hexdigest()
++def write(r,out):atomic_json(out/'results.json',r)
++def event(name,**kw):print(json.dumps(dict(event=name,**kw),allow_nan=False),flush=True)
++def record(path):
++ p=Path(path).resolve();return dict(path=str(p),bytes=p.stat().st_size,sha256=file_sha256(p))
++def release():gc.collect();torch.cuda.empty_cache()
++
++
++def discover_source():
++ matches=[]
++ for report in (PROJECT/'outputs').rglob('THREE_ARM_INTERFACE_REPORT.md'):
++  result=report.with_name('results.json')
++  if not result.is_file():continue
++  r=json.loads(result.read_text(encoding='utf-8-sig'))
++  try:
++   if r['protocol']['schema']!='t1_interface_3arm_v1':continue
++   if any(r['arms'][key[0]]['checkpoints'].get(key[1:],{}).get('sha256')!=sha for key,sha in EXPECTED.items() if key.endswith('500')):continue
++   if any(r['arms'][key[0]]['checkpoints'][key[1:]]['sha256']!=sha for key,sha in EXPECTED.items() if key.endswith('250') and key[1:] in r['arms'][key[0]]['checkpoints']):continue
++   if not all(Path(r['arms'][a]['checkpoints']['500']['path']).is_file() for a in 'AC'):continue
++  except (KeyError,TypeError):continue
++  matches.append((report.parent,r))
++ if len(matches)!=1:raise RuntimeError(f'Require unique report/checkpoint identity match, found{len(matches)}')
++ return matches[0]
++
++
++def protected_metadata(out):
++ paths=[p for p in (PROJECT/'outputs').rglob('*') if p.is_file() and not p.is_relative_to(out)]
++ paths += [p for p in PROJECT.glob('*.py') if not p.name.startswith('c_relation_')]
++ paths += list((ROOT/'native_t1').glob('*.py'))+list((ROOT/'models').glob('*.py'))+[ROOT/'utils/ot_utils.py',ROOT/'configs/snet/base-120m-ot-v-chair.yaml']
++ paths += list((PROJECT/'assets').rglob('*.npz'))
++ official=Path('/mnt/c/Users/warpwang/Downloads/last.pt')
++ if official.exists():paths.append(official)
++ return {str(p):dict(bytes=p.stat().st_size,mtime_ns=p.stat().st_mtime_ns) for p in sorted(set(paths))}
++
++
++def protocol():
++ return dict(schema='c_relation_zero_update_v1',models=EXPECTED,
++  teacher=dict(parents=[0,1],K=[4,8,12],CPU_base_seeds=[19601,19602],times=[.1,.3,.5,.7,.9],explicit_time_squares=[.81,.49,.25,.09,.01],
++   derivation='For each base seed create original NativeTrainingStream(Native_correct, seed=base). Call _sample once in P0K4,P0K8,P0K12,P1K4,P1K8,P1K12 order. Native noise RNG=base+10000, permutations=base+40000. Original sampled logit-normal t is unused. Replace with five fixed FP32 t; original free pre_OT coordinates, OT changes only Z, target final x2 after OT. Twelve original OT calls total.',
++   paired_cases=12,states=60,endpoint_forwards=120,midpoint_K12_forwards=40,gradient_forwards=20,midpoint_missing='Skip, never reconstruct'),
++  budget=dict(model_forward_cap=184,planned_model_forwards=180,parameter_gradient_backwards_cap=60,optimizer_updates=0,complete_generations=0,extra_model_gates_planned=0),
++  runtime=dict(CUBLAS_WORKSPACE_CONFIG=':4096:8',strict_deterministic=True,warn_only=False,TF32=False,SDPA='math',forward='BF16',parameters_states='FP32',eval=True,dropout=False),
++  losses=dict(FM='Original free coordinate mean',FC='Original equal interface source-group mean, group corner mean',FF='Original equal shared source-group unordered-pair MSE',weights=[1,.1,.1],diagnostic_normalization='Single batch1 state; historical effective8 total coordinate/group denominators audited separately'),
++  interpretation='Saved free-generation geometry has no GT corner correspondence. Teacher and local gradient evidence cannot establish trajectory causality. Five fixed t are not a logit-normal expectation.',
++  stop='Zero updates, zero complete new samples. One subsequent experiment recommendation only, not executed.')
++
++
++def initialize(out):
++ if out.exists():raise FileExistsError(out)
++ source,saved=discover_source()
++ out.mkdir(parents=True)
++ p=protocol()
++ r=dict(status='INITIALIZING',started_utc=time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),protocol=p,protocol_sha256=seal(p),source_run=str(source),
++  counts=dict(model_forward_attempts=0,model_forward_returns=0,forward_by_stage={},parameter_gradient_attempts=0,parameter_gradient_returns=0,
++   optimizer_updates=0,complete_generations=0,geometry_guidance_calls=0,geometry_repairs=0,OT_calls=0,output_gradient_analytic_evaluations=0,
++   formula_autograd_calls=0,formula_finite_difference_evaluations=0),teacher_rows=[],gradient_rows=[],models={},gates={},timing={},
++  active_stage='assets',assets={},protection=dict(before=protected_metadata(out)),
++  AGENTS='No applicable AGENTS.md found by repository and ancestor searches',
++  git_status_before=subprocess.run(['git','status','--short'],cwd=ROOT,capture_output=True,text=True).stdout,
++  environment=dict(python=platform.python_version(),torch=torch.__version__,numpy=np.__version__,cuda=torch.version.cuda))
++ write(r,out);tick=time.perf_counter()
++ r['assets']['source_report']=record(source/'THREE_ARM_INTERFACE_REPORT.md')
++ r['assets']['source_results']=record(source/'results.json')
++ r['assets']['old_T1_metadata_only']=saved['protocol']['initial']
++ r['assets']['parent_ids']=saved['assets']['parent_ids']
++ r['assets']['training_protocol']=saved['protocol']['training']
++ r['assets']['inputs']=record(saved['relations']['inputs']['path'])
++ if r['assets']['inputs']['sha256']!=saved['relations']['inputs']['sha256']:raise RuntimeError('Input identity mismatch')
++ r['assets']['source_manifest']=record(Path(saved['relations']['inputs']['path']).with_name('results.json'))
++ r['assets']['config']=record(saved['arms']['A']['load']['config'])
++ if r['assets']['config']['sha256']!=saved['arms']['A']['load']['config_sha256']:raise RuntimeError('Architecture config changed')
++ r['assets']['checkpoints']={}
++ for key,sha in EXPECTED.items():
++  entry=saved['arms'][key[0]]['checkpoints'].get(key[1:]);path=Path(entry['path']) if entry else source/key[0]/f'additional_step{key[1:]}_cumulative_step{500+int(key[1:])}.pt'
++  if not path.is_file():
++   if key.endswith('250'):r['assets']['checkpoints'][key]=dict(status='NOT_AVAILABLE',path=str(path));continue
++   raise FileNotFoundError(path)
++  actual=record(path)
++  if actual['sha256']!=sha:raise RuntimeError('Checkpoint file identity mismatch:'+key)
++  r['assets']['checkpoints'][key]=dict(**actual,status='PASS',state_sha256=entry['state_sha256'],backbone_state_sha256=entry['backbone_state_sha256'],additional_updates=int(key[1:]))
++ r['assets']['old_execution_sources']={str(p):record(p) for p in sorted(list((ROOT/'native_t1').glob('*.py'))+[PROJECT/'t1_interface_relations.py',PROJECT/'t1_interface_train.py',ROOT/'utils/ot_utils.py'])}
++ r['environment']['GPU']=subprocess.run(['nvidia-smi','--query-gpu=name,driver_version,memory.total,memory.used','--format=csv,noheader'],capture_output=True,text=True).stdout.strip()
++ r['timing']['assets_seconds']=time.perf_counter()-tick
++ r.update(status='ASSETS_PASS',active_stage='assets_complete');write(r,out);event('assets_pass',source=str(source),out=str(out))
++
++
++def prepare(r,out):
++ if r['status']!='ASSETS_PASS':raise RuntimeError('No automatic prepare retry')
++ from .c_relation_teacher import build_teacher_bank
++ from .c_relation_saved import analyze_saved
++ from .c_relation_math import run_cpu_tests
++ tick=time.perf_counter();r['active_stage']='CPU_formula_gates';write(r,out)
++ original_grad=torch.autograd.grad
++ def counted_formula_grad(*args,**kwargs):
++  r['counts']['formula_autograd_calls']+=1;write(r,out)
++  answer=original_grad(*args,**kwargs)
++  r['counts']['formula_autograd_returns']=r['counts'].get('formula_autograd_returns',0)+1
++  return answer
++ torch.autograd.grad=counted_formula_grad
++ try:gates=run_cpu_tests()
++ finally:torch.autograd.grad=original_grad;write(r,out)
++ r['gates']['CPU_formula']=gates
++ r['counts']['formula_finite_difference_evaluations']=gates.get('counts',{}).get('finite_difference_loss_evaluations',0)
++ if gates.get('counts',{}).get('CPU_autograd_grad_calls')!=r['counts']['formula_autograd_calls']:raise RuntimeError('Formula autograd ledger mismatch')
++ if gates.get('status')!='PASS':raise RuntimeError('CPU formula gate failed')
++ relations=load_source_relations(r['assets']['inputs']['path'],expected_sha256=r['assets']['inputs']['sha256'])
++ r['relations']=relations.audit
++ r['active_stage']='fixed_bank_registration';write(r,out)
++ from utils import ot_utils
++ original_OT=ot_utils.optimal_sum_numpy
++ def counted_OT(*args,**kwargs):
++  r['counts']['OT_calls']+=1;write(r,out)
++  answer=original_OT(*args,**kwargs)
++  r['counts']['OT_returns']=r['counts'].get('OT_returns',0)+1
++  return answer
++ ot_utils.optimal_sum_numpy=counted_OT
++ try:samples,bank=build_teacher_bank(Path(r['source_run']),out,relations)
++ finally:ot_utils.optimal_sum_numpy=original_OT;write(r,out)
++ r['bank']=bank
++ if r['counts']['OT_calls']!=12 or r['counts'].get('OT_returns')!=12:raise RuntimeError('OT actual count differs')
++ if len(samples)!=60:raise RuntimeError('Fixed teacher state count differs')
++ r['active_stage']='existing_generation_statistics';write(r,out)
++ r['saved_generation']=analyze_saved(Path(r['source_run']))
++ r['timing']['preparation_seconds']=time.perf_counter()-tick
++ r['execution_sources']={str(p):record(p) for p in PROJECT.glob('c_relation_*.py') if p.name!='c_relation_report.py'}
++ r.update(status='PREPARED',active_stage='prepared');write(r,out);event('prepared',states=len(samples),counts=r['counts'])
++
++
++def load_branch(r,key):
++ rec=r['assets']['checkpoints'][key];tick=time.perf_counter()
++ configure_stable_runtime()
++ if file_sha256(rec['path'])!=rec['sha256']:raise RuntimeError('Checkpoint changed since registration')
++ config=yaml.safe_load(Path(r['assets']['config']['path']).read_text(encoding='utf-8'))
++ mc=dict(config['model'])
++ if mc.pop('model_type')!='equidit':raise RuntimeError('Wrong model type')
++ expected=dict(version=3,hidden_dim=768,num_layers=12,num_heads=12,max_length=800,face_bin=20,pe_freq=20,use_qknorm=True,use_rmsnorm=True,use_coord_encoding=True,use_dit_like_pe=False,face_cond=True)
++ if any(mc.get(k)!=v for k,v in expected.items()) or config['transport']['prediction']!='velocity':raise RuntimeError('Architecture differs')
++ payload=torch.load(rec['path'],map_location='cpu',weights_only=True,mmap=True)
++ if payload.get('schema')!='t1_interface_branch_v1' or payload.get('arm')!=key[0] or payload.get('additional_updates')!=int(key[1:]):raise RuntimeError('Checkpoint payload identity differs')
++ with torch.device('meta'):model=NativeInpaintingModel(DiT(**mc),trainable=False)
++ model.backbone.x_embedder.embed_fn,_=get_embedder(mc['pe_freq'],input_dims=3)
++ incompatible=model.load_state_dict(payload['model'],strict=True,assign=True);del payload
++ model.set_trainable(False).eval().to('cuda')
++ before=state_sha256(model)
++ if before!=rec['state_sha256'] or state_sha256(model.backbone)!=rec['backbone_state_sha256']:raise RuntimeError('Strict tensor hash differs')
++ def pre(module,args):
++  c=r['counts'];stage=r['active_stage']
++  if c['model_forward_attempts']>=184:raise RuntimeError('Hard forward budget exhausted')
++  c['model_forward_attempts']+=1;c['forward_by_stage'][stage]=c['forward_by_stage'].get(stage,0)+1
++ def post(module,args,value):r['counts']['model_forward_returns']+=1
++ model.register_forward_pre_hook(pre);model.register_forward_hook(post)
++ r['models'][key]=dict(status='LOADED',file_sha256=rec['sha256'],state_before=before,parameters=sum(p.numel() for p in model.parameters()),strict_load=True,missing_keys=list(incompatible.missing_keys),unexpected_keys=list(incompatible.unexpected_keys),load_seconds=time.perf_counter()-tick,old_T1_tensor_load=False,official_EMA_load=False)
++ return model
++
++
++def state_info(sample,index):
++ return dict(state_id=sample.get('state_id',f'state{index:02d}'),bank_index=index,parent=int(sample['parent_index']),K=int(sample['K']),
++  noise_index=int(sample['noise_index']),noise_seed=int(sample.get('noise_seed',19601+int(sample['noise_index']))),time_index=int(sample['time_index']),registered_t=[.1,.3,.5,.7,.9][int(sample['time_index'])],t=float(np.asarray(sample['t']).item()))
++
++
++def actual_arrays(batch):return {k:v.detach().cpu().numpy() for k,v in batch.items() if torch.is_tensor(v)}
++
++def input_digest(batch,labels):
++ h=hashlib.sha256()
++ for key in ('xt','t','y','valid_mask','known_mask','context','u','x0','x1'):
++  h.update(key.encode());h.update(array_hash(batch[key].detach().cpu().numpy()).encode())
++ h.update(array_hash(labels['corner_source_vertex_ids']).encode())
++ return h.hexdigest()
++
++
++def loss_terms(batch,velocity,prepared):
++ fm=masked_fm_loss(velocity,batch['u'],batch['valid_mask'],batch['known_mask'])
++ endpoint=endpoint_from_velocity(batch['xt'],velocity,batch['t'],batch['known_mask'],batch['context'])
++ terms=relation_sums(endpoint,prepared)
++ fc=terms['FC_sum']/max(terms['FC_count'],1);ff=terms['FF_sum']/max(terms['FF_count'],1)
++ return (fm,fc,ff),endpoint
++
++
++def get_param_grads(loss,parameters,r,out,retain):
++ if r['counts']['parameter_gradient_attempts']>=60:raise RuntimeError('Hard parameter-gradient budget exhausted')
++ r['counts']['parameter_gradient_attempts']+=1;write(r,out)
++ values=torch.autograd.grad(loss,parameters,retain_graph=retain,create_graph=False,allow_unused=True)
++ r['counts']['parameter_gradient_returns']+=1
++ return values
++
++
++def measure(r,out):
++ if r['status']!='PREPARED':raise RuntimeError('No automatic model-stage retry')
++ for p,rec in r['execution_sources'].items():
++  if file_sha256(p)!=rec['sha256']:raise RuntimeError('Diagnostic execution source changed since prepare')
++ from .c_relation_teacher import load_teacher_bank
++ from .c_relation_math import analyze_teacher,output_gradient_diagnostics,gradient_norm_dot_statistics
++ relations=load_source_relations(r['assets']['inputs']['path'],expected_sha256=r['assets']['inputs']['sha256'])
++ samples,_=load_teacher_bank(out/'teacher_bank.npz',relations=relations,expected_sha256=r['bank']['bank_file']['sha256'])
++ labels=[relations.prepare_sample_labels(s) for s in samples]
++ paired_hashes={};tick_all=time.perf_counter()
++ for key in ('A500','C500','A250','C250'):
++  if r['assets']['checkpoints'][key]['status']!='PASS':continue
++  model=load_branch(r,key);reference={};start=time.perf_counter();torch.cuda.reset_peak_memory_stats()
++  selection=[i for i,s in enumerate(samples) if key.endswith('500') or s['K']==12]
++  try:
++   r['active_stage']='endpoint_teacher' if key.endswith('500') else 'midpoint_teacher'
++   with torch.no_grad():
++    for i in selection:
++     s=samples[i];label=labels[i];batch=native_collate([s],'cuda');pack=prepare_relations(label,'cuda')
++     digest=input_digest(batch,label)
++     if i in paired_hashes and paired_hashes[i]!=digest:raise RuntimeError('A/C teacher state or labels differ')
++     paired_hashes[i]=digest;write(r,out)
++     with native_execution(model,coordinates=batch['xt']) as runtime:
++      velocity=model(*model_inputs(batch)).float();terms,endpoint=loss_terms(batch,velocity,pack)
++     values={n:float(v) for n,v in zip(('FM','FC','FF'),terms)}
++     analysis=analyze_teacher(actual_arrays(batch),velocity.detach().cpu().numpy(),label,legacy_losses=values)
++     vhash=array_hash(velocity.detach().cpu().numpy());reference[i]=vhash
++     r['teacher_rows'].append(dict(model=key[0],additional_step=int(key[1:]),phase='endpoint' if key.endswith('500') else 'midpoint',state=state_info(s,i),losses=values,analysis=analysis,input_sha256=digest,velocity_sha256=vhash))
++     r['models'][key]['runtime_teacher']=runtime
++     if analysis['legacy_loss_reconciliation']['status']!='PASS':raise RuntimeError('Original FC/FF/FM definition reconciliation failed; preserve original C interpretation')
++     tolerance=1e-12+1e-10*max(values.values())
++     if any(abs(analysis['identities'][name])>tolerance for name in ('max_abs_endpoint_minus_Position_minus_Spread','max_abs_epsilon_endpoint_minus_Position_minus_Spread','FC_minus_Position_plus_Spread','FF_minus_global_partition_contributions')):raise RuntimeError('Group decomposition identity failed')
++     del batch,pack,velocity,terms,endpoint
++     if len(r['teacher_rows'])%10==0:write(r,out);event('teacher',model=key,total_teacher=len(r['teacher_rows']),forwards=r['counts']['model_forward_attempts'])
++   if key.endswith('500'):
++    model.set_trainable(True).eval();names=[n for n,p in model.named_parameters()];parameters=tuple(model.parameters())
++    groups={'coordinate_embedding':[j for j,n in enumerate(names) if n.startswith('backbone.x_embedder.')],
++     'first_QKV':[j for j,n in enumerate(names) if n.startswith('backbone.layers.0.attn.qkv_proj.')],
++     'final_output':[j for j,n in enumerate(names) if n.startswith('backbone.final_layer.linear.')]}
++    subset=[i for i,s in enumerate(samples) if s['K']==12 and int(s['noise_index'])==0]
++    if len(subset)!=10:raise RuntimeError('Require exactly ten gradient states per endpoint')
++    r['active_stage']='parameter_gradient_diagnosis'
++    for i in subset:
++     s=samples[i];label=labels[i];batch=native_collate([s],'cuda');pack=prepare_relations(label,'cuda')
++     if input_digest(batch,label)!=paired_hashes[i]:raise RuntimeError('Gradient input differs from teacher')
++     arrays=actual_arrays(batch);write(r,out);gtick=time.perf_counter()
++     with native_execution(model,coordinates=batch['xt']) as runtime:
++      velocity=model(*model_inputs(batch)).float();terms,endpoint=loss_terms(batch,velocity,pack)
++      v_numpy=velocity.detach().cpu().numpy();vhash=array_hash(v_numpy)
++      if vhash!=reference[i]:raise RuntimeError('Same teacher forward changed with parameter gradients enabled')
++      grads=[get_param_grads(loss,parameters,r,out,j<2) for j,loss in enumerate(terms)]
++     values={n:float(v.detach()) for n,v in zip(('FM','FC','FF'),terms)}
++     stat={'full_model':gradient_norm_dot_statistics(*grads,names=names)}
++     for name,indices in groups.items():stat[name]=gradient_norm_dot_statistics(*[tuple(g[j] for j in indices) for g in grads],names=[names[j] for j in indices])
++     r['counts']['output_gradient_analytic_evaluations']+=1
++     output=output_gradient_diagnostics(arrays,v_numpy,label)
++     r['gradient_rows'].append(dict(model=key[0],additional_step=500,state=state_info(s,i),losses=values,parameter_space=stat,output_space=output,
++      input_sha256=paired_hashes[i],teacher_velocity_bitwise_equal=True,runtime=runtime,seconds=time.perf_counter()-gtick))
++     if any(p.grad is not None for p in parameters):raise RuntimeError('autograd.grad unexpectedly populated parameter.grad')
++     if any(item['significant_negative'] for family in ('actual_endpoint_analytic','ideal_linear_error_reference') for item in output[family]['PSD_output_error_check'].values()):raise RuntimeError('Significantly negative output-space PSD check; inspect mapping/scale before causal interpretation')
++     del grads,stat,output,batch,pack,velocity,terms,endpoint,v_numpy
++     write(r,out);event('gradient',model=key,state=state_info(s,i),backwards=r['counts']['parameter_gradient_returns'])
++    del parameters;model.set_trainable(False).eval()
++   after=state_sha256(model)
++   r['models'][key].update(status='PASS',state_after=after,parameters_unchanged=(after==r['models'][key]['state_before']),diagnostics_seconds=time.perf_counter()-start,peak_cuda_allocated=torch.cuda.max_memory_allocated())
++   if after!=r['models'][key]['state_before']:raise RuntimeError('Read-only diagnostic changed model state')
++  finally:
++   model.zero_grad(set_to_none=True);del model;release();write(r,out)
++ r['timing']['model_diagnostics_seconds']=time.perf_counter()-tick_all
++ expected=120+20+20*sum(r['assets']['checkpoints'][key]['status']=='PASS' for key in ('A250','C250'))
++ if r['counts']['model_forward_attempts']!=expected or r['counts']['parameter_gradient_returns']!=60:raise RuntimeError('Actual diagnostic budget differs')
++ r.update(status='MEASURED',active_stage='measurements_complete');write(r,out);event('measured',counts=r['counts'])
++
++
++def finalize(r,out):
++ if r['status']!='MEASURED':raise RuntimeError('All fixed diagnostic states required')
++ from .c_relation_report import summarize_results,render_report
++ r['summary']=summarize_results(r)
++ now=protected_metadata(out);changed=[p for p,v in r['protection']['before'].items() if now.get(p)!=v]
++ r['protection']['after']=dict(status='PASS' if not changed else 'FAIL',files=len(r['protection']['before']),changed=changed)
++ critical={**r['assets']['old_execution_sources'],**r['execution_sources']}
++ critical.update({v['path']:v for v in r['assets']['checkpoints'].values() if v['status']=='PASS'})
++ for key in ('source_results','source_report','inputs','source_manifest','config'):critical[r['assets'][key]['path']]=r['assets'][key]
++ mismatch=[p for p,v in critical.items() if file_sha256(p)!=v['sha256']]
++ r['protection']['critical_hashes_after']=dict(status='PASS' if not mismatch else 'FAIL',checked=len(critical),changed=mismatch)
++ r['git_status_after']=subprocess.run(['git','status','--short'],cwd=ROOT,capture_output=True,text=True).stdout
++ if changed or mismatch or r['git_status_before']!=r['git_status_after']:raise RuntimeError('Protected assets or tracked worktree status changed')
++ r.update(status='PASS',active_stage='FINISHED',finished_utc=time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()))
++ dest=out/'C_RELATION_DIAGNOSIS_REPORT.md'
++ if dest.exists():raise FileExistsError(dest)
++ dest.write_text(render_report(r),encoding='utf-8')
++ r['delivery']=dict(report=record(dest),diagnostic_entrypoint=str(Path(__file__).resolve()),report_source=record(PROJECT/'c_relation_report.py'))
++ chunks=[]
++ for p in sorted(PROJECT.glob('c_relation_*.py')):
++  diff=subprocess.run(['git','diff','--no-index','--','/dev/null',str(p.relative_to(ROOT))],cwd=ROOT,capture_output=True)
++  if diff.returncode not in (0,1):raise RuntimeError(diff.stderr.decode())
++  chunks.append(diff.stdout)
++ patch=out/'code.diff';patch.write_bytes(b''.join(chunks))
++ check=subprocess.run(['git','apply','--reverse','--check',str(patch)],cwd=ROOT,capture_output=True)
++ if check.returncode:raise RuntimeError(check.stderr.decode())
++ r['delivery']['code_diff']=dict(**record(patch),reverse_apply_check='PASS')
++ write(r,out);event('complete',counts=r['counts'],out=str(out))
++
++
++def execute(out,stage):
++ if stage=='init':return initialize(out)
++ r=json.loads((out/'results.json').read_text())
++ try:
++  if seal(r['protocol'])!=r['protocol_sha256']:raise RuntimeError('Registered protocol changed')
++  configure_stable_runtime()
++  if stage=='prepare':prepare(r,out)
++  elif stage=='measure':measure(r,out)
++  elif stage=='report':finalize(r,out)
++ except BaseException as error:
++  r.update(status='STOPPED',failure=dict(stage=stage,error=repr(error),traceback=traceback.format_exc(),automatic_retry=False));write(r,out);event('stopped',error=repr(error),counts=r['counts']);raise
++
++
++if __name__=='__main__':
++ parser=argparse.ArgumentParser();parser.add_argument('--out',type=Path,required=True);parser.add_argument('--stage',choices=['init','prepare','measure','report'],required=True)
++ args=parser.parse_args();execute(args.out.resolve(),args.stage)
+diff --git a/experiments/mf_h1_local0/c_relation_saved.py b/experiments/mf_h1_local0/c_relation_saved.py
+new file mode 100755
+index 0000000..bc69163
+--- /dev/null
++++ b/experiments/mf_h1_local0/c_relation_saved.py
+@@ -0,0 +1,273 @@
++"""Read-only reuse of saved A/C generation evidence and full training t logs.
++
++No model, OT, autograd, distance matrix, intersection classifier, output-to-GT
++matching, or geometry modification is called. New measurements are only cheap
++triangle areas and coordinate moments/bounds of the archived raw free faces.
++"""
++from __future__ import annotations
++
++import hashlib
++import json
++from pathlib import Path
++import time
++
++import numpy as np
++
++SEEDS=tuple(range(9501,9509))
++CHECKPOINT_SHA={
++    ('A',500):'43e56e107b0c6d28766aebd8cf8a0a764d8d52ef62ba2ca6e756d881634f876b',
++    ('C',500):'8a40651bcf54aebb2c48cd19a2433fb4e0679370c0da6e79e916cc727f067168',
++    ('A',250):'aea34110ae1f75c108298a366e8b2668c28aa09ad8fc7d683890f5caa415e305',
++    ('C',250):'a7b558451a3e733a5173f7a7a7a180df7358340418e4fe28b11d35f05a0f1ec2',
++}
++TIME_EDGES=(0.,.2,.4,.6,.8,1.)
++
++
++def _get(value,*keys,default=None):
++    for key in keys:
++        if not isinstance(value,dict) or key not in value:return default
++        value=value[key]
++    return value
++
++
++def _sha(path):
++    digest=hashlib.sha256()
++    with Path(path).open('rb') as stream:
++        for chunk in iter(lambda:stream.read(4*1024*1024),b''):digest.update(chunk)
++    return digest.hexdigest()
++
++
++def _path(value):
++    path=Path(value)
++    if path.exists():return path.resolve()
++    text=str(value).replace('\\','/')
++    if text.startswith('/mnt/') and len(text)>7:
++        alternative=Path(text[5].upper()+':/'+text[7:])
++        if alternative.exists():return alternative.resolve()
++    if len(text)>2 and text[1]==':':
++        alternative=Path('/mnt/'+text[0].lower()+text[2:])
++        if alternative.exists():return alternative.resolve()
++    return path.resolve()
++
++
++def locate_source_run(outputs_root):
++    """Discover by actual report/results/checkpoint metadata, never timestamp.
++
++    This does not rehash multi-GB checkpoints. The root asset audit must verify
++    their actual bytes once; identities here are checked against saved records.
++    """
++    matches=[]
++    for report in sorted(Path(outputs_root).rglob('THREE_ARM_INTERFACE_REPORT.md')):
++        result_path=report.parent/'results.json'
++        if not result_path.is_file():continue
++        data=json.loads(result_path.read_text(encoding='utf-8-sig'))
++        valid=True
++        for (arm,step),expected in CHECKPOINT_SHA.items():
++            entry=_get(data,'arms',arm,'checkpoints',str(step))
++            filename=f'additional_step{step}_cumulative_step{500+step}.pt'
++            if not entry or entry.get('sha256')!=expected or not (report.parent/arm/filename).is_file():
++                # Intermediate weights are optional; endpoints identify a run.
++                if step==500:valid=False;break
++        if valid:matches.append(report.parent.resolve())
++    if len(matches)!=1:raise RuntimeError(f'Expected one report/checkpoint-identified run, found {len(matches)}: {matches}')
++    return matches[0]
++
++
++def _distribution(value):
++    a=np.asarray(value,dtype=np.float64).reshape(-1);finite=a[np.isfinite(a)]
++    return dict(count=len(a),finite_count=len(finite),minimum=float(finite.min()) if len(finite) else None,
++        q01=float(np.quantile(finite,.01)) if len(finite) else None,
++        q05=float(np.quantile(finite,.05)) if len(finite) else None,
++        q25=float(np.quantile(finite,.25)) if len(finite) else None,
++        median=float(np.median(finite)) if len(finite) else None,
++        q75=float(np.quantile(finite,.75)) if len(finite) else None,
++        q95=float(np.quantile(finite,.95)) if len(finite) else None,
++        q99=float(np.quantile(finite,.99)) if len(finite) else None,
++        maximum=float(finite.max()) if len(finite) else None,mean=float(finite.mean()) if len(finite) else None)
++
++
++def _cheap_geometry(raw,length):
++    full=np.asarray(raw)
++    if full.dtype!=np.float32 or full.shape not in ((112,9),(112,3,3)) or not np.isfinite(full).all():
++        raise ValueError('Require unchanged finite FP32 N112 output')
++    free=full.reshape(112,3,3)[12:].astype(np.float64)
++    corners=free.reshape(-1,3);centroid=corners.mean(axis=0);centered=corners-centroid
++    areas=.5*np.linalg.norm(np.cross(free[:,1]-free[:,0],free[:,2]-free[:,0]),axis=-1)
++    low,high=corners.min(axis=0),corners.max(axis=0);extent=high-low
++    return dict(status='PASS_CHEAP_READONLY_MOMENTS',total_faces=112,free_faces=100,
++        free_total_area=float(areas.sum()),free_total_area_over_target_L2=float(areas.sum()/(length*length)),
++        per_free_face_area=areas.tolist(),free_face_area_distribution=_distribution(areas),
++        normalized_face_area_distribution=_distribution(areas/(length*length)),
++        exact_zero_area_faces=int((areas==0).sum()),
++        free_corner_centroid=centroid.tolist(),centroid_definition='Arithmetic mean of all300 free corner copies; not surface-area weighted',
++        centered_coordinate_RMS=float(np.sqrt(np.mean(centered*centered))),
++        centered_coordinate_RMS_over_target_L=float(np.sqrt(np.mean(centered*centered))/length),
++        centered_radial_RMS=float(np.sqrt(np.mean(np.sum(centered*centered,axis=1)))),
++        centered_axis_RMS=np.sqrt(np.mean(centered*centered,axis=0)).tolist(),
++        bbox_min=low.tolist(),bbox_max=high.tolist(),bbox_extent=extent.tolist(),
++        bbox_diagonal=float(np.linalg.norm(extent)),bbox_diagonal_over_target_L=float(np.linalg.norm(extent)/length),
++        bbox_max_extent=float(extent.max()),target_bbox_L=float(length),
++        face_identity='Local archived output indices only; no cross-model or GT face/corner correspondence is assigned',
++        caveat='Area or scale decreases alone do not establish collapse; unchanged scale does not exclude local errors')
++
++
++def _saved_metrics(metrics):
++    g=metrics.get('guided_geometry_audit',{});own=_get(metrics,'remainder','own',default={})
++    cf=g.get('C_free',{});ff=g.get('free_free',{});boundary=g.get('boundary',{})
++    extra=metrics.get('t1_native_confirmation',{});quality=extra.get('free_shape_quality',{})
++    near=extra.get('near_C_area',{})
++    values=dict(
++        remaining_symmetric_RMS_bbox_pct=own.get('symmetric_rms_bbox_pct'),
++        free_to_R12_RMS_bbox_pct=own.get('predicted_to_target_rms_bbox_pct'),
++        R12_to_free_RMS_bbox_pct=own.get('target_to_predicted_rms_bbox_pct'),
++        whole_symmetric_RMS_bbox_pct=_get(metrics,'whole','surface','symmetric_rms_bbox_pct'),
++        fixed_R12_coverage_RMS_bbox_pct=_get(metrics,'common_unknown_R12','own','rms_bbox_pct'),
++        fixed_R12_coverage_within_1pct_fraction=_get(metrics,'common_unknown_R12','own','fraction_target_points_within_1pct_bbox'),
++        Gamma_RMS_bbox_pct=boundary.get('rms_bbox_pct'),Gamma_p95_bbox_pct=boundary.get('p95_bbox_pct'),Gamma_coverage_fraction=boundary.get('coverage_fraction'),
++        CF_affected_free_fraction=cf.get('proper_affected_face_fraction'),CF_proper_pairs=cf.get('proper_pair_count'),
++        FF_intersections=None if not ff else ff.get('proper_pair_count',0)+ff.get('coplanar_positive_area_pairs',0),
++        FF_proper_pairs=ff.get('proper_pair_count'),FF_coplanar_pairs=ff.get('coplanar_positive_area_pairs'),
++        CF_coplanar_pairs=cf.get('coplanar_positive_area_pairs'),
++        CF_unresolved_or_degenerate=cf.get('unresolved_or_degenerate_pairs'),FF_unresolved_or_degenerate=ff.get('unresolved_or_degenerate_pairs'),
++        narrow_fraction=quality.get('min_angle_lt5_fraction'),q_gt10_fraction=quality.get('q_actual_gt10_fraction'),
++        near_degenerate_count=quality.get('near_degenerate_area_count'),exact_zero_area_count=quality.get('exact_zero_area_count'),
++        nan_count=extra.get('nan_coordinate_count'),inf_count=extra.get('inf_coordinate_count'),
++        stored_free_total_area=quality.get('total_area'),
++        near_C_area_fraction=near.get('near_C_surface_sample_fraction'),
++        near_C_boundary_band_area_fraction=near.get('near_C_and_boundary_band_sample_fraction'),
++        near_C_outside_boundary_band_area_fraction=near.get('near_C_outside_boundary_band_sample_fraction'))
++    return dict(status='REUSED_SAVED_METRICS',values=values,
++        unavailable_fields=[key for key,value in values.items() if value is None],
++        near_C_distance_distribution=near.get('context_distance_bbox_pct',dict(status='NOT_AVAILABLE')),
++        near_C_sampling=dict(point_count=near.get('point_count'),seed=near.get('point_seed'),point_sha256=near.get('point_sha256'),protocol=near.get('protocol')),
++        distances_and_intersections_recomputed=False,FF_names='FF_intersections is a free-face collision count; L_FF is a different training consistency loss')
++
++
++def _sign(value):
++    return 'NOT_AVAILABLE' if value is None else 'DECREASED' if value<0 else 'INCREASED' if value>0 else 'UNCHANGED'
++
++
++def _difference(a,b):return None if a is None or b is None else b-a
++
++
++def _ratio(a,b):return None if a is None or b is None or a==0 else b/a
++
++
++def _training_time_coverage(results):
++    records=_get(results,'arms','A','stream_audits',default=[])
++    if len(records)!=500 or any(len(row.get('times',[]))!=8 for row in records):
++        return dict(status='INSUFFICIENT_FULL_TIME_LOG',available_batches=len(records),expected_batches=500,
++            training_expectation_from_five_teacher_times=False)
++    rows=[]
++    for index,row in enumerate(records):
++        if row.get('step',index+1)!=index+1:raise ValueError('Training time log update order differs')
++        for t,parent,K in zip(row['times'],row['parent_indices'],row['K']):
++            if not 0<=float(t)<=1:raise ValueError('Recorded training t is outside [0,1]')
++            rows.append(dict(t=float(t),parent=int(parent),K=int(K),explicit_endpoint_weight=(1-float(t))**2))
++    if len(rows)!=4000:raise AssertionError('Expected original4000 effective samples')
++    same={}
++    for arm in ('B','C'):
++        other=_get(results,'arms',arm,'stream_audits',default=[])
++        same[arm]=dict(compared_batches=min(len(records),len(other)),total_batches=len(other),
++            full_stream_identical=len(other)==len(records) and all(a==b for a,b in zip(records,other)))
++    def summarize(subset):
++        times=np.asarray([x['t'] for x in subset]);weights=np.asarray([x['explicit_endpoint_weight'] for x in subset])
++        counts,_=np.histogram(times,bins=TIME_EDGES)
++        return dict(samples=len(subset),times=_distribution(times),explicit_weight=_distribution(weights),
++            histogram_edges=list(TIME_EDGES),histogram_counts=counts.tolist(),histogram_fractions=(counts/max(len(subset),1)).tolist())
++    return dict(status='PASS_FULL500_UPDATE_TIME_LOG',source_arm='A',updates=500,samples=4000,
++        all_samples=summarize(rows),by_parent={str(p):summarize([x for x in rows if x['parent']==p]) for p in (0,1)},
++        by_K={str(K):summarize([x for x in rows if x['K']==K]) for K in (4,8,12)},
++        by_parent_K={f'P{p}_K{K}':summarize([x for x in rows if x['parent']==p and x['K']==K]) for p in (0,1) for K in (4,8,12)},
++        other_arm_stream_checks=same,distribution='Original actual logged logit-normal draws, not reconstructed or resampled',
++        histogram_rule='Fixed width0.2 bins [left,right), final bin includes1; descriptive coverage only, no weight modification',
++        fixed_teacher_times=[.1,.3,.5,.7,.9],fixed_teacher_explicit_weights=[.81,.49,.25,.09,.01],
++        equal_teacher_time_mean_is_training_expectation=False,
++        warning='Explicit(1-t)^2 is not the measured gradient norm; the five equal-time teacher states do not estimate this actual training distribution by an unweighted mean')
++
++
++def analyze_saved(source_run):
++    """Read the identified run once, return compact old-output evidence to root."""
++    started=time.perf_counter();run=Path(source_run).resolve();report=run/'THREE_ARM_INTERFACE_REPORT.md';result_path=run/'results.json'
++    if not report.is_file() or not result_path.is_file():raise FileNotFoundError('Source requires both the named report and results.json')
++    before={str(path):_sha(path) for path in (report,result_path)}
++    results=json.loads(result_path.read_text(encoding='utf-8-sig'));checkpoint_records=[]
++    for (arm,step),expected in CHECKPOINT_SHA.items():
++        info=_get(results,'arms',arm,'checkpoints',str(step));path=run/arm/f'additional_step{step}_cumulative_step{500+step}.pt'
++        if step==500 and (not info or not path.is_file()):raise FileNotFoundError(f'Missing required {arm} endpoint')
++        if info is not None and info.get('sha256')!=expected:raise RuntimeError(f'{arm}step{step} recorded identity mismatch')
++        checkpoint_records.append(dict(arm=arm,additional_step=step,path=str(path),expected_sha256=expected,
++            recorded_sha256=info.get('sha256') if info else None,available=path.is_file(),
++            identity_scope='Metadata and required endpoint file presence checked here; actual large checkpoint bytes must be verified in root asset audit'))
++    saved=[row for row in results.get('scores',[]) if row.get('model') in ('A','C') and row.get('K')==12 and int(row['seed']) in SEEDS]
++    index={(row['model'],int(row['parent']),int(row['seed'])):row for row in saved}
++    expected={(model,p,seed) for model in ('A','C') for p in (0,1) for seed in SEEDS}
++    if len(saved)!=32 or set(index)!=expected:raise ValueError('Require the existing complete32 A/C endpoint scoring matrix')
++    outputs=[];raw_index={};raw_bytes=0;raw_files=0
++    for model in ('A','C'):
++        for parent in (0,1):
++            for seed in SEEDS:
++                source=index[model,parent,seed];path=_path(source['raw_path']);metric=_saved_metrics(source['metrics'])
++                length=_get(source['metrics'],'remainder','own','target_full_bbox_diagonal')
++                geometry=dict(status='NOT_AVAILABLE',reason='Original raw endpoint array missing')
++                raw_record=dict(path=str(path),available=path.is_file())
++                if path.is_file():
++                    digest=_sha(path);matching=next((row for row in results.get('generated',[]) if row.get('model')==model and row.get('parent')==parent and row.get('seed')==seed),None)
++                    expected_hash=(matching or {}).get('raw_sha256')
++                    if expected_hash is not None and digest!=expected_hash:raise RuntimeError('Archived raw bytes changed')
++                    with np.load(path,allow_pickle=False) as archive:
++                        raw=archive['output'].copy() if 'output' in archive else None
++                    if raw is not None:
++                        if length is None:raise ValueError('Target L metadata missing; no inferred scale')
++                        geometry=_cheap_geometry(raw,float(length))
++                        raw_files+=1;raw_bytes+=path.stat().st_size
++                    raw_record.update(sha256=digest,matched_saved_hash=expected_hash is not None,bytes=path.stat().st_size)
++                row=dict(model=model,parent=parent,K=12,seed=seed,raw=raw_record,saved=metric,cheap_geometry=geometry)
++                outputs.append(row);raw_index[model,parent,seed]=row
++    pairs=[]
++    for parent in (0,1):
++        for seed in SEEDS:
++            a,c=raw_index['A',parent,seed],raw_index['C',parent,seed]
++            av,cv=a['saved']['values'],c['saved']['values']
++            delta={key:_difference(av[key],cv[key]) for key in av}
++            area_a,area_c=a['cheap_geometry'],c['cheap_geometry']
++            ratios={key:_ratio(area_a.get(key),area_c.get(key)) for key in ('free_total_area','centered_coordinate_RMS','bbox_diagonal','bbox_max_extent')}
++            area_quantile_ratios={key:_ratio(_get(area_a,'free_face_area_distribution',key),_get(area_c,'free_face_area_distribution',key)) for key in ('minimum','q01','q05','q25','median','q75','q95','maximum')}
++            ff,rms=_sign(delta['FF_intersections']),_sign(delta['remaining_symmetric_RMS_bbox_pct'])
++            pairs.append(dict(parent=parent,seed=seed,C_minus_A=delta,
++                FF_intersections_vs_remaining_RMS=f'FF_INTERSECTIONS_{ff}__REMAINING_RMS_{rms}',
++                intersection_decreased_and_RMS_improved=ff=='DECREASED' and rms=='DECREASED',
++                intersection_decreased_and_RMS_worsened=ff=='DECREASED' and rms=='INCREASED',
++                both_intersections_and_RMS_worsened=ff=='INCREASED' and rms=='INCREASED',
++                Gamma=dict(RMS_change=delta['Gamma_RMS_bbox_pct'],RMS_direction=_sign(delta['Gamma_RMS_bbox_pct']),
++                    p95_change=delta['Gamma_p95_bbox_pct'],p95_direction=_sign(delta['Gamma_p95_bbox_pct']),
++                    coverage_change=delta['Gamma_coverage_fraction'],coverage_direction=_sign(delta['Gamma_coverage_fraction'])),
++                C_over_A_scale_ratios=ratios,C_over_A_independent_area_quantile_ratios=area_quantile_ratios,
++                area_quantile_scope='Compare distributions, not paired face identities; no prediction-to-GT correspondence',
++                interpretation='Descriptive cross-classification only; no output excluded and no claim that L_FF equals FF_intersections'))
++    parents={}
++    for parent in (0,1):
++        subset=[row for row in pairs if row['parent']==parent]
++        groups={label:[row['seed'] for row in subset if row['FF_intersections_vs_remaining_RMS']==label] for label in sorted({row['FF_intersections_vs_remaining_RMS'] for row in subset})}
++        parents[str(parent)]=dict(seeds=list(SEEDS),cross_classification=groups,
++            C_minus_A_distributions={key:_distribution([row['C_minus_A'][key] for row in subset if row['C_minus_A'][key] is not None]) for key in subset[0]['C_minus_A']},
++            scale_ratio_distributions={key:_distribution([row['C_over_A_scale_ratios'][key] for row in subset if row['C_over_A_scale_ratios'][key] is not None]) for key in subset[0]['C_over_A_scale_ratios']},
++            Gamma_improved_count=sum(row['Gamma']['RMS_direction']=='DECREASED' for row in subset),
++            Gamma_worsened_count=sum(row['Gamma']['RMS_direction']=='INCREASED' for row in subset),
++            FF_intersections_decreased_count=sum(row['C_minus_A']['FF_intersections'] is not None and row['C_minus_A']['FF_intersections']<0 for row in subset))
++    after={str(path):_sha(path) for path in (report,result_path)}
++    if before!=after:raise RuntimeError('Source report or results changed during read-only analysis')
++    result=dict(schema='c_relation_saved_evidence_v1',status='PASS_SAVED_EVIDENCE_REUSE',source_run=str(run),
++        source_files=before,checkpoint_identity_records=checkpoint_records,
++        outputs=outputs,paired=pairs,parents=parents,training_time_coverage=_training_time_coverage(results),
++        scope=dict(models=['A','C'],seeds=list(SEEDS),parents=[0,1],K=12,old_generation_outputs=32,
++            FF_names='L_FF is training copy-consistency loss; FF_intersections is saved free/free illegal pair count',
++            no_GT_ids_assigned_to_generated_outputs=True,no_nearest_neighbor_assignment=True,
++            saved_distance_and_intersection_metrics_reused=True,all_seeds_retained=True),
++        ledger=dict(raw_endpoints_read=raw_files,raw_archive_compressed_bytes=raw_bytes,
++            cheap_area_and_coordinate_statistics=raw_files,old_saved_metrics_reused=32,
++            new_distance_matrix_evaluations=0,new_intersection_tests=0,model_forwards=0,
++            model_backwards=0,OT_calls=0,autograd_calls=0,optimizer_updates=0,geometry_changes=0),
++        seconds=time.perf_counter()-started)
++    json.dumps(result,allow_nan=False)
++    return result
+diff --git a/experiments/mf_h1_local0/c_relation_teacher.py b/experiments/mf_h1_local0/c_relation_teacher.py
+new file mode 100755
+index 0000000..c7eb8f8
+--- /dev/null
++++ b/experiments/mf_h1_local0/c_relation_teacher.py
+@@ -0,0 +1,261 @@
++﻿"""Fixed teacher inputs for zero-update C-relation diagnosis.
++
++Only build_teacher_bank performs OT: exactly one original free-only assignment
++for each of12 pairings. Reloading saved inputs performs no OT and no model call.
++No target, source ID, or relation group is added to Native model arguments.
++"""
++from __future__ import annotations
++import copy
++import hashlib
++import json
++from pathlib import Path
++import time
++import numpy as np
++from native_t1.data import (NativeTrainingStream, array_hash, file_sha256,
++                            load_archive, shared_sample_hash)
++
++TIMES=(.1,.3,.5,.7,.9)
++BASE_SEEDS=(19601,19602)
++TRAIN_K=(4,8,12)
++SCHEMA='c_relation_fixed_teacher_v1'
++EXPECTED_CHECKPOINTS={
++    'A':{'250':'aea34110ae1f75c108298a366e8b2668c28aa09ad8fc7d683890f5caa415e305',
++         '500':'43e56e107b0c6d28766aebd8cf8a0a764d8d52ef62ba2ca6e756d881634f876b'},
++    'C':{'250':'a7b558451a3e733a5173f7a7a7a180df7358340418e4fe28b11d35f05a0f1ec2',
++         '500':'8a40651bcf54aebb2c48cd19a2433fb4e0679370c0da6e79e916cc727f067168'},
++}
++PAIR_ARRAY_FIELDS=('x0','x1','u','y','known_mask','valid_mask','context',
++    'known_target_ids','source_face_ids','corner_permutations','face_permutation',
++    'free_gaussian_before_OT','free_noise_after_OT','free_target_before_OT')
++STATE_HASH_FIELDS=('xt','t','x0','x1','u','context','known_mask','valid_mask','y',
++                   'source_face_ids','corner_permutations')
++TEACHER_PROTOCOL=dict(base_CPU_seeds=list(BASE_SEEDS),
++    constructor='native_t1.data.NativeTrainingStream(archive, arm=Native_correct, seed=base_seed)',
++    noise_RandomState_seed='base_seed+10000',time_RandomState_seed='base_seed+30000 (draw retained but unused)',
++    permutation_RandomState_seed='base_seed+40000',order_RandomState_seed='base_seed+60000 (not drawn by _sample)',
++    donor_RandomState_seed='base_seed+70000 (not drawn for correct-context arm)',
++    per_stream_pair_order=[[p,K] for p in (0,1) for K in TRAIN_K],
++    pair_construction='For each base seed, call original _sample(parent,K) once in fixed order; never use next_effective_batch.',
++    target_scale='Read genuine pre_ot_free; cyclic/face target ordering occurs first; official nested OT reorders only raw Gaussian Z against pre-scale target; multiply target by2 and cast toFP32 after OT.',
++    gaussian_scale='Original float64 RandomState.randn(nfree,3,3), nested-OT reordered and then cast toFP32; no x2 multiplier on noise.',
++    teacher_times=list(TIMES),random_stream_time='Each _sample draws one original logit-normal t; record it as unused, then replace with the five fixed FP32 times.',
++    paired_noise_reused_for_all_five_times=True,expected_OT_calls=12,teacher_states=60,
++    uses_GT_for_sampling=False,complete_generations=0,optimizer_updates=0)
++
++
++def _record(path):
++    path=Path(path)
++    return dict(path=str(path.resolve()),bytes=path.stat().st_size,sha256=file_sha256(path))
++
++
++def _same(a,b):
++    a=np.asarray(a);b=np.asarray(b)
++    return a.dtype==b.dtype and a.shape==b.shape and a.tobytes()==b.tobytes()
++
++
++def _source_metadata(source_run):
++    """Resolve by the already located report; no timestamp inference or PT load."""
++    run=Path(source_run).resolve();report=run/'THREE_ARM_INTERFACE_REPORT.md';results=run/'results.json'
++    if not report.is_file() or not results.is_file():
++        raise ValueError('Source must be identified by THREE_ARM_INTERFACE_REPORT.md and results.json.')
++    if 'THREE_ARM_INTERFACE_REPORT' not in report.read_text(encoding='utf-8-sig'):
++        raise ValueError('Unexpected source report identity.')
++    old=json.loads(results.read_text(encoding='utf-8-sig'))
++    if old.get('status')!='PASS_EXECUTION':
++        raise ValueError('Three-arm source experiment is not complete.')
++    models={}
++    for arm,steps in EXPECTED_CHECKPOINTS.items():
++        models[arm]={}
++        for step,expected in steps.items():
++            path=run/arm/f'additional_step{step}_cumulative_step{500+int(step)}.pt'
++            record=old['arms'][arm]['checkpoints'].get(step)
++            if record is None or record.get('sha256')!=expected:
++                if step=='250' and not path.exists():
++                    models[arm][step]=dict(status='MISSING_OPTIONAL_INTERMEDIATE',path=str(path));continue
++                raise RuntimeError('Source checkpoint metadata does not match authorized identity.')
++            if step=='500' and not path.is_file():
++                raise FileNotFoundError(path)
++            models[arm][step]=dict(path=str(path),metadata_sha256=expected,
++                status='PRESENT_METADATA_MATCH' if path.is_file() else 'MISSING_OPTIONAL_INTERMEDIATE',
++                actual_large_file_hash_recomputed_here=False)
++    source_input=old['assets']['source_inputs']
++    if old['relations']['inputs']['sha256']!=source_input['sha256']:
++        raise RuntimeError('Three-arm data and relation identity disagree.')
++    # The source run contains no persisted teacher protocol. Never assume an
++    # initial sampling Gaussian is an already-OT-matched training/teacher pair.
++    roots=[run,Path(source_input['path']).resolve().parent]
++    candidates=sorted({str(p) for directory in roots for p in directory.rglob('*')
++                       if p.is_file() and ('teacher' in p.name.lower() or 'bank' in p.name.lower())
++                       and p.suffix.lower() in ('.npz','.pt','.json')})
++    if candidates:
++        raise RuntimeError('Potential saved teacher pairing found; inspect before constructing a replacement: '+repr(candidates))
++    return old,dict(report=_record(report),results=_record(results),checkpoint_metadata=models,
++        source_inputs=copy.deepcopy(source_input),prior_teacher_pairing_search=dict(
++            roots=[str(p) for p in roots],matching_teacher_or_bank_files=candidates,
++            available_exact_matching_pairings=0,
++            reason='No saved teacher/paired-bank artifact in identified source run or its frozen patch-input source. Training logs preserve hashes, not the12 required paired arrays; old NPZ sampling noises are unpaired.'),
++        checkpoint_hash_scope='Metadata identity check only here; root asset gate checks actual large checkpoint hashes once.')
++
++
++def _hash_state(sample):
++    digest=hashlib.sha256()
++    for name in STATE_HASH_FIELDS:
++        digest.update(name.encode());digest.update(array_hash(np.asarray(sample[name])).encode())
++    digest.update(array_hash(sample['labels']['corner_source_vertex_ids']).encode())
++    return digest.hexdigest()
++
++
++def _states_from_pairs(pairs):
++    states=[]
++    for pair in sorted(pairs,key=lambda s:(s['parent_index'],s['K'],s['noise_index'])):
++        for time_index,value in enumerate(TIMES):
++            sample=copy.deepcopy(pair)
++            t=np.asarray(value,dtype=np.float32)
++            sample['t']=t
++            sample['xt']=(np.float32(1)-t)*sample['x0']+t*sample['x1']
++            sample['xt'][sample['known_mask']]=sample['context'][sample['known_mask']]
++            sample['time_index']=time_index
++            sample['state_id']=f"P{sample['parent_index']}_K{sample['K']}_seed{sample['noise_seed']}_t{value:.1f}"
++            sample['shared_input_sha256']=shared_sample_hash(sample)
++            sample['context_sha256']=array_hash(sample['context'])
++            sample['state_sha256']=_hash_state(sample)
++            states.append(sample)
++    if len(states)!=60 or len({s['state_id'] for s in states})!=60:
++        raise RuntimeError('Expected exactly60 unique fixed teacher states.')
++    return states
++
++
++def _rebuild_labels(pair,corner_ids,relations=None):
++    """Use persisted trusted identities; a provided source mapper rechecks them."""
++    from .t1_interface_relations import build_relation_labels
++    ids=np.asarray(corner_ids,dtype=np.int64)
++    if ids.shape!=(112,3):
++        raise ValueError('Persisted source-corner labels must be [112,3].')
++    if relations is not None:
++        # Mapping validation does not depend on t; create a disposable t=0.5
++        # representation solely to satisfy the normal stream sample interface.
++        original=copy.deepcopy(pair);original['t']=np.asarray(.5,dtype=np.float32)
++        original['xt']=(np.float32(1)-original['t'])*original['x0']+original['t']*original['x1']
++        original['xt'][original['known_mask']]=original['context'][original['known_mask']]
++        labels=relations.prepare_sample_labels(original)
++        if not _same(labels['corner_source_vertex_ids'],ids):
++            raise RuntimeError('Persisted teacher source identities disagree with frozen source mapper.')
++        return labels
++    # No proximity matching: rebuild source-ID groups directly from saved labels.
++    labels=build_relation_labels(ids,pair['known_mask'],pair['context'],pair['valid_mask'])
++    labels.update(corner_source_vertex_ids=ids.copy(),parent=pair['parent_index'],K=pair['K'])
++    return labels
++
++
++def build_teacher_bank(source_run,out,relations):
++    """Build12 pairings once, persist, then return60 states and JSON-safe audit.
++
++    No model invocation occurs. A failure is never retried. The small progress
++    record embedded in a partial NPZ preserves the number of OT attempts/returns.
++    """
++    started=time.perf_counter();out=Path(out).resolve()
++    if not out.is_dir():
++        raise ValueError('Root must create and preregister the diagnosis output directory first.')
++    destination=out/'teacher_bank.npz'
++    if destination.exists() or (out/'teacher_bank_partial.npz').exists():
++        raise FileExistsError('Teacher bank already exists; reload it without another OT call.')
++    old,source=_source_metadata(source_run)
++    source_input=source['source_inputs']
++    if relations.audit['inputs']['sha256']!=source_input['sha256']:
++        raise RuntimeError('Relation mapper and teacher target archive differ.')
++    archive=load_archive(source_input['path'],expected_sha256=source_input['sha256'])
++    arrays={};pairs=[];pair_records=[]
++    audit=dict(schema=SCHEMA,status='BUILDING',protocol=copy.deepcopy(TEACHER_PROTOCOL),source=source,
++        source_relation_audit_sha256=hashlib.sha256(json.dumps(relations.audit,sort_keys=True,separators=(',',':')).encode()).hexdigest(),
++        OT_attempts=0,OT_calls=0,model_forwards=0,model_backwards=0,optimizer_updates=0,complete_generations=0,
++        paired_array_reuse=False,loaded_without_OT=False,pairs=pair_records)
++    try:
++        for noise_index,seed in enumerate(BASE_SEEDS):
++            stream=NativeTrainingStream(archive,'Native_correct',seed=seed)
++            for parent in (0,1):
++                for K in TRAIN_K:
++                    # _sample performs exactly one original nested OT; all other
++                    # operations follow the existing official scale/order path.
++                    audit['OT_attempts']+=1
++                    sample=stream._sample(parent,K)
++                    audit['OT_calls']+=1
++                    labels=relations.prepare_sample_labels(sample)
++                    pair_id=f'P{parent}_K{K}_seed{seed}'
++                    pair={name:np.asarray(sample[name]).copy() for name in PAIR_ARRAY_FIELDS}
++                    pair.update(parent_index=parent,donor_index=parent,K=K,noise_index=noise_index,
++                        noise_seed=seed,pair_id=pair_id,unused_stream_time=float(sample['t']),labels=labels)
++                    prefix=f'pair{len(pairs):02d}_'
++                    hashes={}
++                    for name in PAIR_ARRAY_FIELDS:
++                        arrays[prefix+name]=pair[name];hashes[name]=array_hash(pair[name])
++                    arrays[prefix+'corner_source_vertex_ids']=labels['corner_source_vertex_ids'].copy()
++                    hashes['corner_source_vertex_ids']=array_hash(labels['corner_source_vertex_ids'])
++                    pair_records.append(dict(pair_id=pair_id,array_prefix=prefix,parent_index=parent,K=K,
++                        noise_index=noise_index,noise_seed=seed,actual_noise_RandomState_seed=seed+10000,
++                        actual_permutation_RandomState_seed=seed+40000,unused_stream_time=float(sample['t']),
++                        array_hashes=hashes,FC_count=labels['FC_count'],FF_count=labels['FF_count'],
++                        source_mapping_audit=copy.deepcopy(labels['source_mapping_audit']),OT_calls=1))
++                    pairs.append(pair)
++        states=_states_from_pairs(pairs)
++        audit.update(status='PASS',pair_count=len(pairs),state_count=len(states),
++            state_records=[dict(state_id=s['state_id'],parent_index=s['parent_index'],K=s['K'],noise_index=s['noise_index'],
++                noise_seed=s['noise_seed'],t=float(s['t']),state_sha256=s['state_sha256'],shared_input_sha256=s['shared_input_sha256']) for s in states],
++            pair_order='Stored in base_seed,parent,K generation order; states returned in parent,K,noise,t order.',
++            reconstruction='Five FP32 Xt values from the same saved x0/x1; known slots replaced with exact saved C. No new Gaussian or OT while changing t.',
++            input_scope='Source IDs and GT are labels/supervision only. Native model inputs remain xt,t,y,valid_mask,known_mask.',
++            seconds=time.perf_counter()-started)
++        arrays['metadata_json']=np.asarray(json.dumps(audit,sort_keys=True,separators=(',',':'),allow_nan=False))
++        with destination.open('xb') as stream:
++            np.savez_compressed(stream,**arrays)
++        saved=_record(destination)
++        # This read verifies byte preservation and reconstruction, never samples.
++        reloaded,check=load_teacher_bank(destination,relations=relations,expected_sha256=saved['sha256'])
++        if [s['state_sha256'] for s in states]!=[s['state_sha256'] for s in reloaded]:
++            raise RuntimeError('Teacher bank round-trip changed actual state bytes.')
++        audit.update(bank_file=saved,roundtrip_verified=True,reload_OT_calls=0)
++        return reloaded,audit
++    except BaseException as error:
++        audit.update(status='FAILED_NO_AUTOMATIC_RETRY',error=repr(error),pair_count=len(pairs),seconds=time.perf_counter()-started)
++        if not destination.exists():
++            arrays['metadata_json']=np.asarray(json.dumps(audit,sort_keys=True,separators=(',',':'),allow_nan=False))
++            with (out/'teacher_bank_partial.npz').open('xb') as stream:
++                np.savez_compressed(stream,**arrays)
++        raise
++
++
++def load_teacher_bank(path,relations=None,expected_sha256=None):
++    """Return the exact same60 states from a persisted bank, with zero OT."""
++    started=time.perf_counter();path=Path(path).resolve();digest=file_sha256(path)
++    if expected_sha256 is not None and digest!=expected_sha256:
++        raise RuntimeError('Teacher bank file hash differs.')
++    pairs=[]
++    with np.load(path,allow_pickle=False) as archive:
++        metadata=json.loads(str(archive['metadata_json'].item()))
++        if metadata.get('schema')!=SCHEMA or metadata.get('status')!='PASS' or metadata.get('pair_count')!=12 or metadata.get('state_count')!=60:
++            raise ValueError('Only a completed fixed12-pair/60-state bank can be reloaded.')
++        if metadata['protocol']!=TEACHER_PROTOCOL:
++            raise RuntimeError('Saved teacher protocol differs from frozen seed/order/time rule.')
++        if relations is not None and relations.audit['inputs']['sha256']!=metadata['source']['source_inputs']['sha256']:
++            raise RuntimeError('Reload mapper points to a different target archive.')
++        for record in metadata['pairs']:
++            prefix=record['array_prefix'];pair={name:archive[prefix+name].copy() for name in PAIR_ARRAY_FIELDS}
++            ids=archive[prefix+'corner_source_vertex_ids'].copy()
++            for name,value in dict(pair,corner_source_vertex_ids=ids).items():
++                if array_hash(value)!=record['array_hashes'][name]:
++                    raise RuntimeError('Saved pairing array changed: '+prefix+name)
++            pair.update({name:record[name] for name in ('parent_index','K','noise_index','noise_seed','pair_id','unused_stream_time')})
++            pair['donor_index']=pair['parent_index']
++            pair['labels']=_rebuild_labels(pair,ids,relations)
++            if pair['labels']['FC_count']!=record['FC_count'] or pair['labels']['FF_count']!=record['FF_count']:
++                raise RuntimeError('Reloaded source relation groups differ.')
++            pairs.append(pair)
++    states=_states_from_pairs(pairs)
++    actual={s['state_id']:(s['state_sha256'],s['shared_input_sha256']) for s in states}
++    expected={s['state_id']:(s['state_sha256'],s['shared_input_sha256']) for s in metadata['state_records']}
++    if actual!=expected:
++        raise RuntimeError('Reconstructed fixed teacher states changed.')
++    audit=copy.deepcopy(metadata)
++    audit.update(bank_file=dict(path=str(path),bytes=path.stat().st_size,sha256=digest),
++        loaded_without_OT=True,OT_attempts=0,OT_calls=0,original_build_OT_attempts=metadata['OT_attempts'],
++        original_build_OT_calls=metadata['OT_calls'],reload_seconds=time.perf_counter()-started)
++    return states,audit

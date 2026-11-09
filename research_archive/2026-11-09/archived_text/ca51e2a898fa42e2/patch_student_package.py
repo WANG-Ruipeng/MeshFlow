@@ -1,0 +1,8 @@
+﻿from pathlib import Path
+p=Path('/mnt/e/MeshFlow/.worktrees/a-layout-value-20260924/experiments/a_radial/layout_student/package_results.py')
+s=p.read_text(encoding='utf-8-sig')
+s=s.replace("require(file_hash(ASSETS/'original_A_10.pt')==protocol['hashes']['original_a_sha256'],'Original A changed')", "require(file_hash(ASSETS/'original_A_10.pt')==protocol['hashes']['original_a_sha256'],'Original A changed')\n    for rel,expected in protocol['fixed_source_hashes'].items():\n        require(file_hash(inside(ASSETS.parent,rel))==expected,'Frozen source changed: '+rel)")
+s=s.replace("support=RadialSupport();meshes={};fallback_count=0", "support=RadialSupport();meshes={};fallback_count=0;unchanged_baseline_count=0")
+s=s.replace("if row['model']=='fixed':\n                require", "if row['policy']=='raw' and row['model'] in ('fixed','original_a'):\n                old_arm='fixed' if row['model']=='fixed' else 'a'\n                old_row=read_json(old/'attempts'/uid/old_arm/'result.json')\n                require(old_row['mesh_hash']==row['mesh_hash'],'Frozen baseline output changed from original experiment')\n                unchanged_baseline_count+=1\n            if row['model']=='fixed':\n                require")
+s=s.replace("'gpu_resume_smoke':'PASS','original_A_hash_unchanged':True,'upstream':identity,", "'gpu_resume_smoke':'PASS','original_A_hash_unchanged':True,\n        'fixed_and_original_A_mesh_hashes_unchanged_from_previous_run':unchanged_baseline_count,\n        'frozen_source_files_checked':len(protocol['fixed_source_hashes']),'upstream':identity,")
+p.write_text(s,encoding='utf-8')

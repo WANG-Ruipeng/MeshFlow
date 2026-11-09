@@ -1,0 +1,98 @@
+--- attempt1/audit_final_ledger.py
++++ audit_final_ledger.py
+@@ -143,13 +143,57 @@
+     return {'require_run_complete': require_complete, 'RUN_COMPLETE_exists': complete_path.exists()}
+ 
+ 
++def classify_ledger_row(row, path):
++    """Recognize exact observed CPU scoring metadata; never hide a CALL row."""
++    if not isinstance(row, dict):
++        raise ValueError('Ledger record is not an object')
++    event = row.get('event')
++    if event in ('CALL_BEGIN', 'CALL_RETURN', 'CALL_FAILED'):
++        required = {'event', 'call_id', 'kind', 'stage', 'context'}
++        if event != 'CALL_BEGIN':
++            required |= {'error', 'wall_seconds'}
++        if not required <= set(row) or not isinstance(row['context'], dict):
++            raise ValueError('Malformed known CALL record: '+repr(row))
++        if any(not isinstance(row[key], str) or not row[key] for key in ('call_id','kind','stage')):
++            raise ValueError('Invalid CALL identity fields')
++        return 'CALL'
++    # A missing/unknown CALL event or call identity is an error, even if its
++    # kind happens to resemble the recognized CPU metadata below.
++    if 'event' in row or any(key in row for key in ('call_id','stage','context','wall_seconds','error')):
++        raise ValueError('Unknown or malformed CALL/event record: '+repr(row))
++    common = {'kind','pid','time_unix','checkpoint_label'}
++    schemas = {
++        'score_attempt': common | {'case_id'},
++        'score_return': common | {'case_id','elapsed_seconds','historical_cache','status'},
++        'width_group_attempt': common | {'uid','noise_index'},
++        'width_group_return': common | {'uid','noise_index','elapsed_seconds','model_forwards','surface_distance_calls'},
++    }
++    kind = row.get('kind')
++    if Path(path).name != 'cpu_scoring.jsonl' or kind not in schemas or set(row) != schemas[kind]:
++        raise ValueError('Unrecognized non-CALL metadata schema: '+repr(row))
++    if row['checkpoint_label'] not in ('START','OT_BASE','OT_HYBRID'):
++        raise ValueError('Unknown CPU scoring checkpoint label')
++    if 'model_forwards' in row and row['model_forwards'] != 0:
++        raise ValueError('CPU metadata claims a model forward; cannot exclude from call audit')
++    if 'elapsed_seconds' in row and (not math.isfinite(float(row['elapsed_seconds'])) or row['elapsed_seconds'] < 0):
++        raise ValueError('Invalid CPU scoring metadata duration')
++    return 'CPU_SCORING_METADATA'
++
++
+ def audit_calls(a, protocol):
+     attempts, returns, failed, seconds = Counter(), Counter(), Counter(), Counter()
+     begins, terminals, pending = {}, {}, {}
++    metadata_rows = []; metadata_counts = Counter()
+     paths = sorted((a.out/'ledger').glob('*.jsonl'))
+     a.require(bool(paths), 'actual_call_ledgers_present')
+     for path in paths:
+-        for row in a.jsonl(path):
++        for record_index, row in enumerate(a.jsonl(path), 1):
++            classification = classify_ledger_row(row, path)
++            if classification == 'CPU_SCORING_METADATA':
++                metadata_counts[row['kind']] += 1
++                metadata_rows.append(dict(source_file=str(path), nonblank_record_index=record_index,
++                    classification=classification, excluded_from_model_CALL_counts=True, original_record=row))
++                continue
+             event, cid, kind = row['event'], row['call_id'], row['kind']
+             a.require(kind in protocol['budget'], 'registered_call_kind', {'call_id': cid, 'kind': kind})
+             a.require(row['stage'] == path.stem, 'call_stage_matches_file', cid)
+@@ -171,6 +215,10 @@
+                 a.require((row.get('error') is None) == (event == 'CALL_RETURN'), 'terminal_error_semantics', cid)
+             else:
+                 a.require(False, 'known_call_event', row)
++    metadata_summary = dict(total_rows=len(metadata_rows), kinds=dict(metadata_counts),
++        scope='Exact recognized cpu_scoring.jsonl attempt/return metadata; preserved explicitly and excluded only from actual model CALL_* counters. Unknown CALL/non-CALL schemas fail.')
++    dump_json(a.dest/'non_call_metadata_rows.json',metadata_rows)
++    dump_json(a.dest/'non_call_metadata_summary.json',metadata_summary)
+     a.require(not pending, 'no_unresolved_actual_calls', list(pending)[:10])
+     a.require(not sum(failed.values()), 'no_failed_actual_calls', dict(failed))
+     accounting = a.json(a.out/'accounting.json')
+@@ -219,7 +267,7 @@
+                        accounting_returns=accounting['returns'].get(k, 0), limit=protocol['budget'][k],
+                        call_wall_seconds=seconds[k]) for k in protocol['budget']]
+     dump_csv(a.dest/'call_count_audit.csv', count_rows)
+-    return dict(begins=begins, terminals=terminals, summary=summary)
++    return dict(begins=begins, terminals=terminals, summary=summary, non_call_metadata=metadata_summary)
+ 
+ 
+ def audit_training(a, protocol, calls):
+@@ -418,6 +466,7 @@
+     result=dict(status='BLOCKED' if a.failures else 'PASS',readiness=ready,sections=a.sections,
+         check_counts=dict(a.checks),failed_checks=dict(a.failures),failure_examples=a.examples,
+         reconstructed_accounting=calls['summary'] if calls else None,training=training,
++        non_call_metadata=calls['non_call_metadata'] if calls else None,
+         endpoint_files_checked=len(endpoints) if endpoints else 0,
+         input_files_checked=len(a.inputs),wall_seconds=time.perf_counter()-started,
+         script_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+@@ -430,7 +479,7 @@
+            f"Actual optimizer returns: {summary.get('optimizer_updates','BLOCKED')}; training forwards: {summary.get('training_microbatch_forwards','BLOCKED')}; training backwards: {summary.get('training_backwards','BLOCKED')}.",
+            f"Failed actual calls: {summary.get('failed_actual_calls','BLOCKED')}; unresolved calls: {summary.get('unresolved_calls','BLOCKED')}.",'',
+            'Checks reconstruct CALL_BEGIN/RETURN/FAILED counts from durable ledgers, compare accounting.json, require 1000 UPDATE_DONE and 8000 exposure rows per arm, compare paired sample input hashes, enforce 32 parents × 250 exposures and four alpha=1 slots per batch, and compare the full batch free-coordinate denominator with logs and per-sample FM contributions.',
+-           '', 'Endpoint identity checks use actual PT bytes and their metadata sidecars: pilot_step=1000, conditional_total_step=5000, original Geo4000 source, full AdamW/RNG/stream identity, and the frozen protocol. PT files are never deserialized.',
++           '', 'Recognized non-CALL CPU scoring metadata are listed in non_call_metadata_rows.json and counted in non_call_metadata_summary.json. They do not count as model forwards; unknown or malformed CALL/event records remain audit errors. Endpoint identity checks use actual PT bytes and their metadata sidecars: pilot_step=1000, conditional_total_step=5000, original Geo4000 source, full AdamW/RNG/stream identity, and the frozen protocol. PT files are never deserialized.',
+            '', 'Missing, failed, duplicated or inconsistent evidence is BLOCKED. This audit does not modify training, model weights, protocol, frozen code or data, and does not repair missing rows.',
+            '', 'Artifacts: audit_result.json; call_count_audit.csv; paired_input_audit.csv; parent_exposure_audit.csv; batch_normalization_audit.csv; endpoint_identity_audit.json; audited_input_sha256.json.']
+     if a.failures:

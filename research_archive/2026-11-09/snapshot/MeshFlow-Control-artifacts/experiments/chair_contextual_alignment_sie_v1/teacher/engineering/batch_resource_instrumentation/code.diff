@@ -1,0 +1,68 @@
+--- siglip_targets.before.py
++++ siglip_targets.py
+@@ -156,6 +156,7 @@
+ 
+ def encode_targets(out,budget,device="cuda",batch_size=16):
+     import torch
++    from ..accounting import resource_snapshot
+     out=Path(out);folder=out/"teacher";manifest=read(folder/"render_manifest.json")
+     if str(device)!="cuda":raise ValueError("Actual teacher forwards require root-owned GPU worker")
+     review=read(folder/"render_review.json")
+@@ -194,7 +195,8 @@
+     if pending:
+         model,processor,info=load_teacher(folder/"assets",device)
+         save(folder/"teacher_loading.json",info)
+-        torch.cuda.synchronize();torch.cuda.reset_peak_memory_stats()
++        torch.cuda.synchronize()
++        save(folder/"resources_after_teacher_load.json",resource_snapshot())
+         versions_before={name:int(p._version) for name,p in model.named_parameters()}
+         for i,chunk,stem in pending:
+             images=[]
+@@ -205,9 +207,21 @@
+             contexts=[dict(teacher=MODEL_ID,revision=REVISION,geometry_sha256=r["geometry_sha256"],view_index=r["view_index"],batch=i) for r in chunk]
+             freeze(stem.with_suffix(".attempt.json"),dict(plan_sha256=digest(folder/"encoding_plan.json"),images=chunk))
+             for ctx in contexts:budget.reserve("teacher_image",context=ctx)
++            measurement={}
++            def actual_teacher_forward():
++                # Synchronization stays inside the actual budgeted call. No probe forward.
++                torch.cuda.synchronize();torch.cuda.reset_peak_memory_stats()
++                tick=time.perf_counter()
++                value=model(pixel_values=pixels,return_dict=True)
++                torch.cuda.synchronize()
++                measurement.update(seconds=time.perf_counter()-tick,
++                    allocated_bytes=torch.cuda.max_memory_allocated(),
++                    reserved_bytes=torch.cuda.max_memory_reserved(),
++                    scope="One real teacher forward, synchronized; resident weights and input tensor included; no backward")
++                return value
+             try:
+                 with torch.inference_mode(),torch.autocast(device_type="cuda",enabled=False):
+-                    result=budget.call("teacher_forward",lambda:model(pixel_values=pixels,return_dict=True),
++                    result=budget.call("teacher_forward",actual_teacher_forward,
+                         context=dict(batch=i,image_count=len(chunk),teacher=MODEL_ID,revision=REVISION))
+                 pooler=result.pooler_output
+                 if pooler.dtype!=torch.float32 or pooler.shape!=(len(chunk),768) or not torch.isfinite(pooler).all():
+@@ -219,13 +233,20 @@
+                 raise
+             npz_save(stem.with_suffix(".npz"),pooler=value)
+             save(stem.with_suffix(".json"),dict(status="PASS",plan_sha256=digest(folder/"encoding_plan.json"),
+-                npz_sha256=digest(stem.with_suffix(".npz")),images=len(chunk),pooler_shape=list(value.shape),pooler_dtype=str(value.dtype)))
++                npz_sha256=digest(stem.with_suffix(".npz")),images=len(chunk),pooler_shape=list(value.shape),pooler_dtype=str(value.dtype),measurement=measurement))
+             loaded.append((i,value));del result,pooler,pixels
+         if any(int(p._version)!=versions_before[name] for name,p in model.named_parameters()):raise ValueError("Frozen teacher parameters changed")
+         torch.cuda.synchronize()
+-        save(folder/"encoding_resource_peak.json",dict(allocated_bytes=torch.cuda.max_memory_allocated(),
+-            reserved_bytes=torch.cuda.max_memory_reserved(),scope="All encoded batches after teacher load; resident vision weights included"))
+-        del model,processor;torch.cuda.empty_cache()
++        measurements=[read((folder/"encoding_batches"/str(i).zfill(4)).with_suffix(".json"))["measurement"] for i in range(len(chunks))]
++        save(folder/"encoding_resource_peak.json",dict(
++            allocated_bytes=max(m["allocated_bytes"] for m in measurements),
++            reserved_bytes=max(m["reserved_bytes"] for m in measurements),
++            synchronized_forward_seconds=sum(m["seconds"] for m in measurements),
++            actual_batches=len(measurements),
++            scope="Maximum across individually reset real forward batches; resident teacher/input included. PyTorch process allocator only, not total process VRAM"))
++        save(folder/"resources_after_encoding_before_unload.json",resource_snapshot())
++        del model,processor;torch.cuda.empty_cache();torch.cuda.synchronize()
++        save(folder/"resources_after_teacher_unload.json",resource_snapshot())
+     else:info=read(folder/"teacher_loading.json")
+     all_poolers=np.concatenate([v for _,v in sorted(loaded)],axis=0)
+     features=[];rows=[]

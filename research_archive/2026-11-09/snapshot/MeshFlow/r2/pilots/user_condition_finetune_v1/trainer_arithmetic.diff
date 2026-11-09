@@ -1,0 +1,108 @@
+--- frozen_schedule40.py:update_COMMON_source
++++ trainer.py:update_FM_only_continuation
+@@ -1,67 +1,44 @@
+-def update(model, head, optimizer, samples, targets, ledger, segment, step):
+-    if len(samples) != 8 or len({s['object_id'] for s in samples}) != 8 or sum(s['alpha'] == 1. for s in samples) != 4:
+-        raise ValueError('Require eight distinct parents and four exact clean samples')
+-    validate_optimizer(model, head, optimizer, segment, step - 1)
++def update(model, optimizer, samples, ledger, arm, local_step, expected_hyperparameters):
++    """Arithmetic adapted from frozen schedule40.update COMMON; no head path."""
++    global_step = 6000 + local_step
++    denominator = validate_samples(samples, arm, local_step)
++    validate_optimizer(model, optimizer, global_step - 1, expected_hyperparameters)
+     device = next(model.parameters()).device
+-    if device.type != 'cuda': raise ValueError('Formal training requires an owned CUDA worker')
+-    active = active_alignment(segment, step)
+-    if active and (head is None or targets is None): raise ValueError('Active schedule requires registered head and cached teacher')
+-    denominator = sum(s['free_coordinate_count'] for s in samples)
+-    if denominator != 9 * sum(int((s['valid_mask'] & ~s['known_mask']).sum()) for s in samples):
+-        raise ValueError('Whole-batch FM denominator differs')
+-    torch.cuda.reset_peak_memory_stats(device); optimizer.zero_grad(set_to_none=True)
++    if device.type != "cuda":
++        raise ValueError("Formal training requires controller-owned CUDA")
++    torch.cuda.reset_peak_memory_stats(device)
++    optimizer.zero_grad(set_to_none=True)
+     start = time.perf_counter()
+-    result = dict(FM=0., raw_align=0., weighted_align=0., total_loss=0.,
+-        alignment_active=active, aligned_samples=0, free_coordinate_denominator=denominator,
+-        alignment_denominator=4, forward_seconds=0., aligner_forward_seconds=0.,
+-        backward_seconds=0., optimizer_seconds=0., sample_losses=[])
++    result = dict(FM=0., total_loss=0., free_coordinate_denominator=denominator,
++        forward_seconds=0., backward_seconds=0., optimizer_seconds=0., sample_losses=[])
+     for micro, sample in enumerate(samples):
+         batch = collate([sample], device)
+-        context = dict(step=step, microbatch=micro, sample_index=sample['sample_index'],
+-            input_bytehash=sample['input_bytehash'], label_bytehash=sample['label_bytehash'])
+-        eligible = active and sample['alpha'] == 1.
+-        capture = AttentionCapture(model) if eligible else nullcontext(None)
+-        with capture as captured, native_execution(model, coordinates=(batch['xt'], batch['t']), autocast=True):
+-            velocity, seconds = ledger.call('train_forward', lambda: model(*model_inputs(batch)).float(), context)
+-            result['forward_seconds'] += seconds
+-            fm = masked_fm_loss(velocity, batch['u'], batch['valid_mask'], batch['known_mask'], denominator=denominator)
+-            raw, statistics = None, {}
+-            if eligible:
+-                messages = captured.get()
+-                tokens, selected = select_messages(messages, batch['known_mask'], batch['valid_mask'], 'free')
+-                teacher = torch.as_tensor(targets.for_sample(sample), dtype=torch.float32, device=device)
+-                prediction, seconds = ledger.call('aligner_forward', lambda: head(tokens[0]), context)
+-                result['aligner_forward_seconds'] += seconds
+-                raw, statistics = alignment_loss(prediction, teacher)
+-                total = fm + (.1 / 4.) * raw
+-                result['aligned_samples'] += 1
+-                result['raw_align'] += float(raw.detach()) / 4.
+-                result['weighted_align'] += .025 * float(raw.detach())
+-            else: total = fm
+-            if not bool(torch.isfinite(total)): raise FloatingPointError('Nonfinite combined training loss')
+-            fm_value, total_value = float(fm.detach()), float(total.detach())
+-            _, seconds = ledger.call('train_backward', total.backward, dict(context, combined_alignment_backward=eligible))
+-            result['backward_seconds'] += seconds
+-        result['FM'] += fm_value; result['total_loss'] += total_value
+-        result['sample_losses'].append(dict(sample_index=sample['sample_index'], alpha=sample['alpha'],
+-            FM_contribution=fm_value, raw_align=None if raw is None else float(raw.detach()),
+-            alignment_eligible=eligible, batch_free_denominator=denominator, **statistics))
+-        if eligible: del messages, tokens, selected, teacher, prediction, raw
+-        del velocity, fm, total, batch
+-    if result['aligned_samples'] != (4 if active else 0): raise AssertionError('Auxiliary eligible count differs')
+-    generators = list(model.parameters())
+-    if any(p.grad is None for p in generators): raise RuntimeError('Unused generator parameter')
+-    if head is not None and any((p.grad is None) != (not active) for p in head.parameters()):
+-        raise RuntimeError('Head gradients do not match active schedule')
+-    result['generator_gradient_norm'] = float(torch.nn.utils.clip_grad_norm_(generators, 1., error_if_nonfinite=True))
+-    result['aligner_gradient_norm'] = float(torch.nn.utils.clip_grad_norm_(list(head.parameters()), 1., error_if_nonfinite=True)) if active else 0.
+-    _, result['optimizer_seconds'] = ledger.call('optimizer_update', optimizer.step,
+-        dict(step=step, alignment_active=active, expected_generator_adamw_step=step, expected_head_adamw_step=head_steps(segment, step)))
+-    if any(not bool(torch.isfinite(p).all()) for p in generators): raise FloatingPointError('Nonfinite generator after update')
+-    if head is not None and any(not bool(torch.isfinite(p).all()) for p in head.parameters()):
+-        raise FloatingPointError('Nonfinite head after update')
+-    validate_optimizer(model, head, optimizer, segment, step)
+-    result.update(generator_adamw_step=step, head_adamw_step=head_steps(segment, step),
+-        update_seconds=time.perf_counter() - start, cuda_peak_allocated_bytes=torch.cuda.max_memory_allocated(device),
++        context = dict(local_step=local_step, global_step=global_step, microbatch=micro,
++            sample_index=int(sample["sample_index"]), input_bytehash=sample["input_bytehash"], label_bytehash=sample["label_bytehash"])
++        with native_execution(model, coordinates=(batch["xt"], batch["t"]), autocast=True):
++            velocity, seconds = ledger.call("train_forward", lambda: model(*model_inputs(batch)).float(), context)
++            result["forward_seconds"] += seconds
++            fm = masked_fm_loss(velocity, batch["u"], batch["valid_mask"], batch["known_mask"], denominator=denominator)
++            if not bool(torch.isfinite(fm)):
++                raise FloatingPointError("Nonfinite FM loss")
++            fm_value = float(fm.detach())
++            _, seconds = ledger.call("train_backward", fm.backward, context)
++            result["backward_seconds"] += seconds
++        result["FM"] += fm_value
++        result["total_loss"] += fm_value
++        result["sample_losses"].append(dict(sample_index=int(sample["sample_index"]),
++            FM_contribution=fm_value, batch_free_denominator=denominator))
++        del velocity, fm, batch
++    parameters = list(model.parameters())
++    if any(p.grad is None for p in parameters):
++        raise RuntimeError("Unused generator parameter")
++    result["generator_gradient_norm"] = float(torch.nn.utils.clip_grad_norm_(parameters, 1., error_if_nonfinite=True))
++    _, result["optimizer_seconds"] = ledger.call("optimizer_update", optimizer.step,
++        dict(local_step=local_step, global_step=global_step, expected_generator_adamw_step=global_step))
++    if any(not bool(torch.isfinite(p).all()) for p in parameters):
++        raise FloatingPointError("Nonfinite generator after update")
++    validate_optimizer(model, optimizer, global_step, expected_hyperparameters)
++    result.update(generator_adamw_step=global_step, update_seconds=time.perf_counter() - start,
++        cuda_peak_allocated_bytes=torch.cuda.max_memory_allocated(device),
+         cuda_peak_reserved_bytes=torch.cuda.max_memory_reserved(device))
+     return result

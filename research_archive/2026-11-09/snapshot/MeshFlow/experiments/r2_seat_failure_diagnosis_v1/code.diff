@@ -1,0 +1,2030 @@
+--- /dev/null
++++ r2/pilots/seat_failure_diagnosis_v1/common.py
+@@ -0,0 +1,148 @@
++"""Bounded helpers for the frozen EXP67 width-response diagnostic.
++
++Old artifacts are read-only. Every helper that writes checks the new OUT root.
++This module imports no model and makes no model calls.
++"""
++from pathlib import Path
++import csv, datetime, hashlib, importlib.util, io, json, os, re, subprocess, sys
++import numpy as np
++
++ROOT = Path(__file__).resolve().parents[3]
++CODE = ROOT / 'r2/pilots/seat_failure_diagnosis_v1'
++OUT = ROOT / 'experiments/r2_seat_failure_diagnosis_v1'
++OLD = ROOT / 'experiments/r2_user_data_scaling_32_67_v1'
++VERSION = 'r2_seat_failure_diagnosis_v1'
++L = float(np.sqrt(3.) * 2 / .3762)
++
++def resolve(path):
++    s = str(path).replace('\\', '/')
++    if os.name != 'nt' and re.match(r'^[A-Za-z]:/', s):
++        s = '/mnt/' + s[0].lower() + s[2:]
++    elif os.name == 'nt' and re.match(r'^/mnt/[a-z]/', s):
++        s = s[5].upper() + ':/' + s[7:]
++    p = Path(s)
++    return p if p.is_absolute() else ROOT / p
++
++def checked(path):
++    p = resolve(path).resolve()
++    if not p.is_relative_to(OUT.resolve()):
++        raise ValueError('Write outside this diagnostic OUT: ' + str(p))
++    return p
++
++def clean(value):
++    if isinstance(value, dict): return {str(k): clean(v) for k, v in value.items()}
++    if isinstance(value, (tuple, list)): return [clean(v) for v in value]
++    if isinstance(value, np.ndarray): return clean(value.tolist())
++    if isinstance(value, np.generic): return clean(value.item())
++    if isinstance(value, Path): return str(value)
++    return value
++
++def read(path): return json.loads(resolve(path).read_text(encoding='utf-8-sig'))
++def arrays(path):
++    with np.load(resolve(path), allow_pickle=False) as z:
++        return {key: z[key].copy() for key in z.files}
++
++def sha(path):
++    h = hashlib.sha256()
++    with resolve(path).open('rb') as f:
++        for part in iter(lambda: f.read(1024 * 1024), b''): h.update(part)
++    return h.hexdigest()
++
++def array_sha(a):
++    a = np.ascontiguousarray(a)
++    return hashlib.sha256(str(a.dtype).encode() + str(a.shape).encode() + a.tobytes()).hexdigest()
++
++def same(a, b):
++    a, b = np.asarray(a), np.asarray(b)
++    return a.shape == b.shape and a.dtype == b.dtype and a.tobytes() == b.tobytes()
++
++def _write_bytes(path, payload, replace=False):
++    p = checked(path); p.parent.mkdir(parents=True, exist_ok=True)
++    if p.exists() and not replace:
++        if p.read_bytes() != payload: raise ValueError('Frozen file differs: ' + str(p))
++        return p
++    temp = checked(p.with_name(p.name + '.tmp'))
++    with temp.open('xb') as f: f.write(payload); f.flush(); os.fsync(f.fileno())
++    os.replace(temp, p)
++    return p
++
++def write(path, value, replace=False):
++    value = clean(value)
++    if checked(path).exists() and not replace:
++        if read(path) != value: raise ValueError('Frozen JSON differs: ' + str(path))
++        return checked(path)
++    text = json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False) + '\n'
++    return _write_bytes(path, text.encode('utf-8'), replace=replace)
++
++def frozen_npz(path, value=None, **kwargs):
++    data = value if value is not None else kwargs
++    if value is not None and kwargs: raise ValueError('Use either mapping or keywords')
++    data = {k: np.asarray(v) for k, v in data.items()}
++    p = checked(path)
++    if p.exists():
++        old = arrays(p)
++        if set(old) != set(data) or any(not same(old[k], data[k]) for k in data):
++            raise ValueError('Frozen NPZ differs: ' + str(p))
++        return p
++    buffer = io.BytesIO(); np.savez_compressed(buffer, **data)
++    return _write_bytes(p, buffer.getvalue())
++
++save_npz = frozen_npz
++
++def csvwrite(path, rows, replace=False):
++    rows = clean(list(rows)); keys = list(dict.fromkeys(k for row in rows for k in row)) or ['status']
++    stream = io.StringIO(newline=''); writer = csv.DictWriter(stream, fieldnames=keys)
++    writer.writeheader()
++    for row in rows:
++        writer.writerow({k: json.dumps(v, ensure_ascii=False, sort_keys=True) if isinstance(v, (dict, list)) else v for k, v in row.items()})
++    return _write_bytes(path, stream.getvalue().encode('utf-8-sig'), replace=replace)
++
++def package():
++    for p in (ROOT/'r2/src', ROOT, CODE):
++        s = str(p)
++        if s not in sys.path: sys.path.insert(0, s)
++
++def module(name, path):
++    if name in sys.modules: return sys.modules[name]
++    env = os.environ.copy()
++    spec = importlib.util.spec_from_file_location(name, resolve(path))
++    m = importlib.util.module_from_spec(spec); sys.modules[name] = m
++    try: spec.loader.exec_module(m)
++    except BaseException:
++        sys.modules.pop(name, None); raise
++    finally:
++        os.environ.clear(); os.environ.update(env)
++    return m
++
++def old():
++    return module('_seat_original_eval', ROOT/'r2/pilots/user_condition_finetune_v1/evaluation.py')
++
++def utc(): return datetime.datetime.now(datetime.timezone.utc).isoformat()
++
++def event(event_name, **fields):
++    p = checked(OUT/'ledger.jsonl'); p.parent.mkdir(parents=True, exist_ok=True)
++    with p.open('a', encoding='utf-8') as f:
++        f.write(json.dumps(clean(dict(event=event_name, utc=utc(), **fields)), ensure_ascii=False, allow_nan=False)+'\n')
++        f.flush(); os.fsync(f.fileno())
++
++def resources(path=None):
++    def command(args):
++        try:
++            p = subprocess.run(args, capture_output=True, text=True, timeout=20)
++            return dict(returncode=p.returncode, stdout=p.stdout, stderr=p.stderr)
++        except Exception as e: return dict(returncode=-1, stdout='', stderr=repr(e))
++    value = dict(utc=utc(), cpu_logical=os.cpu_count(),
++        gpu=command(['nvidia-smi','--query-gpu=name,memory.total,memory.used,memory.free,utilization.gpu','--format=csv,noheader,nounits']),
++        processes=command(['nvidia-smi','--query-compute-apps=pid,process_name,used_gpu_memory','--format=csv']),
++        loadavg=list(os.getloadavg()) if hasattr(os,'getloadavg') else None,
++        memory=Path('/proc/meminfo').read_text() if Path('/proc/meminfo').is_file() else None)
++    if path is not None: write(path, value)
++    return value
++
++LABEL = 'EXP67_FROZEN'
++def load_registration():
++    r = read(OUT/'registration.json')
++    if r['status'] != 'FROZEN' or r['labels'] != [LABEL]: raise ValueError('Unfrozen diagnostic')
++    for p,h in r['preparation_source_hashes'].items():
++        if sha(p)!=h: raise ValueError('Preparation source changed: '+p)
++    return r--- /dev/null
++++ r2/pilots/seat_failure_diagnosis_v1/coverage_audit.py
+@@ -0,0 +1,237 @@
++"""CPU-only C coverage/exposure audit. No torch, scoring, generated geometry reads.
++
++Only the new experiment coverage_audit directory is writable. Matching uses C
++and requested N only; source M appears solely in descriptive coverage columns.
++"""
++from __future__ import annotations
++import os
++for key in ('OMP_NUM_THREADS','OPENBLAS_NUM_THREADS','MKL_NUM_THREADS'):
++    os.environ.setdefault(key,'2')
++from pathlib import Path
++import csv, json, hashlib, time, math
++from collections import Counter, defaultdict
++import numpy as np
++from scipy.optimize import linear_sum_assignment
++
++ROOT=Path('/mnt/e/MeshFlow')
++OLD=ROOT/'experiments/r2_user_data_scaling_32_67_v1'
++WIDTH=ROOT/'experiments/r2_condition_width_response_v1'
++OUT=ROOT/'experiments/r2_seat_failure_diagnosis_v1/coverage_audit'
++L=9.208138264587333
++MODEL_SHA='2e2a40bcacda7e5ee04a5754018f71986ef5d378345058075ba412bec808f925'
++FEATURES=['center_x_L','center_y_L','center_z_L','span_x_L','span_y_L','span_z_L',
++          'sqrt_area_L','inclination_to_horizontal_90','K_over_N','N_over_256']
++DEFINITION=dict(schema='r2_seat_failure_C_coverage_v1',fixed_length=L,
++    coordinate_frame='Existing model XYZ; Y is vertical. No recenter, rotation, per-shape rescale or ICP.',
++    centroid='Triangle-area-weighted triangle centroids, FP64',
++    area='Sum triangle areas, not union area; duplicates would count with multiplicity.',
++    inclination='Area-weighted arccos(abs(unit_normal_y)) in degrees; winding invariant, 0 horizontal / 90 vertical.',
++    matching_features=FEATURES,matching_distance='sqrt(mean((a-b)^2)) over the ten listed dimensionless features; equal weights, no fitted scales.',
++    area_context='C/M and C/R source-area ratios descriptive only; full M/Y, generated output and quality never enter matching.',
++    parent_relative_height='(C area-centroid y - source M ymin)/(source M ymax-ymin), descriptive only.',
++    selection='Retain width8 HALF at original selection_order 0,2,3 (K=1,4,13), both FULL and two BACK; add lower median K of remaining DEV SEAT_FULL with unused parent, sort K,parent,condition.',
++    assignment='Within exact condition type, minimum total squared feature distance over distinct TRAIN67 parents using linear_sum_assignment; best condition per parent chosen input-only, lexicographic tie order.',
++    coverage='For each DEV condition and same-type train pool, descriptive nearest distance and per-feature train min/max inclusion. Marginal inclusion is not joint coverage or IID.',
++    exposure='Recount completed formal sample records; each arm exactly48000, unique sample_index0..47999 and step1..6000. No FM fixture is a generated mesh.',
++    generation_inventory='Identity-only scan existing experiments/*/evaluation/raw_index.json and post_index.json, excluding this new run; count only pinned EXP67 or explicit USER_EXPANDED_67 label, verify paths. Not a claim about unindexed/unidentifiable files.',
++    rng_recommendation='Reuse registered DEV Gaussian. For matched TRAIN use the same MT19937 seed, randn(Ntrain-Ktrain,3,3).astype(float32); check shared prefix exactly against saved DEV. Preserve each request own N and K. Different sizes are not identical full arrays.',
++    limitation='Input matching neither equalizes task difficulty nor proves IID; source parent seen in conditional training differs intentionally. No training, model forward, generation or quality scoring in this script.')
++
++def sha(p):
++    h=hashlib.sha256()
++    with Path(p).open('rb') as f:
++        for b in iter(lambda:f.read(1024*1024),b''):h.update(b)
++    return h.hexdigest()
++
++PROTECTED={}
++def protect(p,expected=None):
++    p=Path(p).resolve(); h=sha(p)
++    if expected and h!=expected:raise ValueError('Source hash differs '+str(p))
++    if str(p) in PROTECTED and PROTECTED[str(p)]!=h:raise ValueError('Source changed')
++    PROTECTED[str(p)]=h
++    return p
++
++def read_json(p):return json.loads(protect(p).read_text(encoding='utf-8-sig'))
++def read_csv(p):
++    with protect(p).open(encoding='utf-8-sig',newline='') as f:return list(csv.DictReader(f))
++
++def write_json(name,value):
++    p=OUT/name; p.parent.mkdir(parents=True,exist_ok=True)
++    text=json.dumps(value,indent=2,ensure_ascii=False,allow_nan=False,sort_keys=True)+'\n'
++    if p.exists():
++        if p.read_text(encoding='utf8')!=text:raise ValueError('Refuse to overwrite different audit '+str(p))
++    else:p.write_text(text,encoding='utf8')
++
++def write_csv(name,rows):
++    if not rows:raise ValueError('Empty expected table '+name)
++    fields=list(dict.fromkeys(k for r in rows for k in r))
++    import io
++    buf=io.StringIO(newline=''); writer=csv.DictWriter(buf,fields,lineterminator='\n');writer.writeheader();writer.writerows(rows)
++    p=OUT/name;text=buf.getvalue()
++    if p.exists():
++        if p.read_text(encoding='utf8')!=text:raise ValueError('Refuse different CSV '+str(p))
++    else:p.write_text(text,encoding='utf8',newline='')
++
++def areas(tri):return np.linalg.norm(np.cross(tri[:,1]-tri[:,0],tri[:,2]-tri[:,0]),axis=1)/2
++
++def descriptor(t,parent,split,pool):
++    cp=protect(t['condition_source'],t['condition_source_sha256'])
++    pp=protect(parent['npz'],parent['sha256'])
++    with np.load(cp,allow_pickle=False) as z:
++        C=z['C'].astype(np.float64); ids=z['source_face_ids']; rid=z['region_source_face_ids']; N=int(z['N']);K=int(z['K'])
++        assert (K,N)==(int(t['K']),int(t['N']))
++    with np.load(pp,allow_pickle=False) as z: M=z['full_target'].reshape(N,3,3).astype(np.float64)
++    assert np.array_equal(C,M[ids]) and len(np.unique(ids))==K
++    A=areas(C); total=float(A.sum()); MA=areas(M); Rarea=float(MA[rid].sum())
++    center=np.average(C.mean(1),axis=0,weights=A); low=C.min(axis=(0,1));high=C.max(axis=(0,1));span=high-low
++    cross=np.cross(C[:,1]-C[:,0],C[:,2]-C[:,0]); normals=cross/(2*A[:,None])
++    tilt=float(np.average(np.degrees(np.arccos(np.clip(np.abs(normals[:,1]),0,1))),weights=A))
++    mlo=M.min(axis=(0,1));mhi=M.max(axis=(0,1));height=float(mhi[1]-mlo[1]);area_fraction=total/float(MA.sum())
++    if not math.isclose(area_fraction,float(t['area_C_over_M']),rel_tol=1e-9,abs_tol=1e-11):
++        raise ValueError('Saved area ratio differs '+t['condition_id'])
++    row=dict(split=split,pool_membership=pool,parent_id=t['uid'],group_uid=t.get('group_uid',t['uid']),condition_id=t['condition_id'],condition_type=t['condition_type'],N=N,K=K,free_faces=N-K,K_over_N=K/N,
++        area_C=total,area_M=float(MA.sum()),area_region=Rarea,area_C_over_M=area_fraction,area_C_over_region=total/Rarea,
++        C_centroid_height_y=float(center[1]),C_centroid_height_source_fraction=float((center[1]-mlo[1])/height),source_M_height=height,
++        C_inclination_to_horizontal_deg=tilt,source_quality=t['source_quality'],source_FF_illegal=t['CC_CF_FF']['FF']['illegal'],source_FF_unknown=t['CC_CF_FF']['FF']['unknown'],
++        C_source=str(cp),C_sha256=PROTECTED[str(cp)],parent_source=str(pp),parent_sha256=PROTECTED[str(pp)],
++        sqrt_area_L=math.sqrt(total)/L,inclination_to_horizontal_90=tilt/90,N_over_256=N/256)
++    for j,axis in enumerate('xyz'):
++        row.update({f'C_centroid_{axis}':float(center[j]),f'C_span_{axis}':float(span[j]),f'center_{axis}_L':float(center[j]/L),f'span_{axis}_L':float(span[j]/L),f'area_mean_abs_normal_{axis}':float(np.average(np.abs(normals[:,j]),weights=A))})
++    return row,dict(areas=A,normals=normals)
++
++def vec(r):return np.array([r[k] for k in FEATURES],dtype=np.float64)
++
++def main():
++    start=time.time();OUT.mkdir(parents=True,exist_ok=True)
++    if (OUT/'completion.json').exists():
++        done=json.loads((OUT/'completion.json').read_text())
++        assert all(sha(OUT/p)==h for p,h in done['output_hashes'].items())
++        print(json.dumps(dict(status='REUSED',source=done['schema'])));return
++    write_json('definition.json',DEFINITION)
++    train=read_json(OLD/'data/train_manifest.json'); dev=read_json(OLD/'data/panel_manifest.json')
++    small=set(train['pools']['USER_SMALL']); big=set(train['pools']['USER_EXPANDED_67'])
++    assert len(small)==32 and len(big)==67 and small<big
++    devp={p['uid']:p for p in dev['dev_parents']}; assert len(devp)==32 and not big&set(devp)
++    rows=[];geometries={}
++    for t in sorted(train['tasks'].values(),key=lambda x:x['condition_id']):
++        r,g=descriptor(t,train['parents'][t['uid']],'TRAIN','SMALL32+EXP67' if t['uid'] in small else 'EXP67_ONLY');rows.append(r);geometries[r['condition_id']]=g
++    for t in sorted(dev['conditions'],key=lambda x:x['condition_id']):
++        r,g=descriptor(t,devp[t['uid']],'DEV','NEW32');rows.append(r);geometries[r['condition_id']]=g
++    assert len(rows)==258 and len({r['condition_id'] for r in rows})==258
++    byid={r['condition_id']:r for r in rows};write_csv('condition_geometry.csv',rows)
++    exposures=read_csv(OLD/'training_analysis/final/exposures.csv')
++    counts=defaultdict(Counter);parents=defaultdict(Counter);clean=defaultdict(Counter);free=Counter();alpha_area=defaultdict(list)
++    for arm in ('USER_SMALL','USER_EXPANDED_67'):
++        ex=[r for r in exposures if r['arm']==arm]
++        assert len(ex)==48000 and {int(r['sample_index']) for r in ex}==set(range(48000))
++        assert Counter(int(r['step']) for r in ex)==Counter({k:8 for k in range(1,6001)})
++        for e in ex:
++            assert e['optimizer_update_completed']=='True'
++            r=byid[e['task_id']]; assert r['parent_id']==e['uid'] and (int(e['N']),int(e['K']))==(r['N'],r['K'])
++            assert e['uid'] in train['pools'][arm]
++            counts[arm][e['task_id']]+=1;parents[arm][e['uid']]+=1;alpha=float(e['alpha']);clean[arm][e['task_id']]+=int(alpha==1)
++            free[arm]+=int(e['free_coordinate_count']); assert int(e['free_coordinate_count'])==9*(r['N']-r['K'])
++            g=geometries[e['task_id']];n=g['normals'];a=g['areas']
++            changed_area=float(np.sum(a*np.sqrt(n[:,0]**2+alpha**2*(n[:,1]**2+n[:,2]**2))))
++            alpha_area[(arm,e['task_id'])].append(changed_area)
++    exrows=[];parentrows=[];summaries=[]
++    for arm,pool in train['pools'].items():
++        poolrows=[r for r in rows if r['split']=='TRAIN' and r['parent_id'] in pool]
++        for r in poolrows:
++            cid=r['condition_id'];n=counts[arm][cid]
++            exrows.append(dict(arm=arm,parent_id=r['parent_id'],condition_id=cid,condition_type=r['condition_type'],N=r['N'],K=r['K'],K_over_N=r['K_over_N'],area_C_over_M=r['area_C_over_M'],source_area_C=r['area_C'],completed_exposures=n,clean_exposures=clean[arm][cid],width_exposures=n-clean[arm][cid],mean_actual_augmented_C_area=float(np.mean(alpha_area[(arm,cid)]))))
++        for uid in sorted(pool):
++            pr=[r for r in poolrows if r['parent_id']==uid]
++            parentrows.append(dict(arm=arm,parent_id=uid,conditions=len(pr),completed_exposures=parents[arm][uid],N=pr[0]['N'],K_min=min(r['K'] for r in pr),K_max=max(r['K'] for r in pr)))
++        for typ in ['ALL']+sorted({r['condition_type'] for r in poolrows}):
++            pr=[r for r in poolrows if typ=='ALL' or r['condition_type']==typ];n=sum(counts[arm][r['condition_id']] for r in pr)
++            d=dict(pool=arm,condition_type=typ,parents=len({r['parent_id'] for r in pr}),conditions=len(pr),completed_exposures=n,exposure_fraction=n/48000)
++            for k in ['N','K','K_over_N','area_C_over_M','C_centroid_height_y','C_inclination_to_horizontal_deg']:
++                vals=[r[k] for r in pr];d.update({k+'_min':min(vals),k+'_median':float(np.median(vals)),k+'_max':max(vals),k+'_condition_mean':float(np.mean(vals)),k+'_exposure_mean':sum(r[k]*counts[arm][r['condition_id']] for r in pr)/n})
++            summaries.append(d)
++    for typ in ['ALL']+sorted({r['condition_type'] for r in rows if r['split']=='DEV'}):
++        pr=[r for r in rows if r['split']=='DEV' and (typ=='ALL' or r['condition_type']==typ)]
++        d=dict(pool='DEV32',condition_type=typ,parents=len({r['parent_id'] for r in pr}),conditions=len(pr),completed_exposures=0,exposure_fraction=0)
++        for k in ['N','K','K_over_N','area_C_over_M','C_centroid_height_y','C_inclination_to_horizontal_deg']:
++            vals=[r[k] for r in pr];d.update({k+'_min':min(vals),k+'_median':float(np.median(vals)),k+'_max':max(vals),k+'_condition_mean':float(np.mean(vals)),k+'_exposure_mean':''})
++        summaries.append(d)
++    write_csv('exposure_per_condition.csv',exrows);write_csv('exposure_per_parent.csv',parentrows);write_csv('coverage_summary.csv',summaries)
++    ranges=[];nearest=[];pairdist=[]
++    for arm,pool in train['pools'].items():
++        for d in [r for r in rows if r['split']=='DEV']:
++            opts=[r for r in rows if r['split']=='TRAIN' and r['parent_id'] in pool and r['condition_type']==d['condition_type']]
++            distances=[float(np.sqrt(np.mean((vec(d)-vec(t))**2))) for t in opts];order=sorted(range(len(opts)),key=lambda i:(distances[i],opts[i]['condition_id']))
++            lo=np.min([vec(t) for t in opts],axis=0);hi=np.max([vec(t) for t in opts],axis=0)
++            bad=[]
++            for j,f in enumerate(FEATURES):
++                inside=bool(lo[j]<=d[f]<=hi[j]);
++                if not inside:bad.append(f)
++                ranges.append(dict(pool=arm,condition_id=d['condition_id'],condition_type=d['condition_type'],feature=f,value=d[f],train_min=float(lo[j]),train_max=float(hi[j]),within_marginal_range=inside,below_by=max(0.,float(lo[j]-d[f])),above_by=max(0.,float(d[f]-hi[j]))))
++            best=opts[order[0]];nearest.append(dict(pool=arm,dev_condition_id=d['condition_id'],condition_type=d['condition_type'],nearest_train_condition_id=best['condition_id'],nearest_train_parent=best['parent_id'],distance=distances[order[0]],train_conditions=len(opts),outside_feature_count=len(bad),outside_features=';'.join(bad),all_marginal_ranges=not bad))
++            if arm=='USER_EXPANDED_67':
++                for i in order:pairdist.append(dict(dev_condition_id=d['condition_id'],train_condition_id=opts[i]['condition_id'],train_parent=opts[i]['parent_id'],condition_type=d['condition_type'],distance=distances[i]))
++    write_csv('dev_train_nearest.csv',nearest);write_csv('dev_train_feature_ranges.csv',ranges);write_csv('dev_train_all_same_type_distances.csv',pairdist)
++    original=read_csv(WIDTH/'selected_conditions.csv'); chosen=[]
++    for x in original:
++        if x['condition_type']!='SEAT_HALF' or int(x['selection_order']) in (0,2,3):chosen.append(byid[x['condition_id']])
++    used={r['parent_id'] for r in chosen};options=sorted([r for r in rows if r['split']=='DEV' and r['condition_type']=='SEAT_FULL' and r['parent_id'] not in used],key=lambda r:(r['K'],r['parent_id'],r['condition_id']))
++    extra=options[(len(options)-1)//2];chosen.append(extra)
++    chosen=sorted(chosen,key=lambda r:({'SEAT_HALF':0,'SEAT_FULL':1,'BACK_HALF':2,'BACK_FULL':3}[r['condition_type']],r['K'],r['condition_id']))
++    assert len(chosen)==8 and len({r['parent_id'] for r in chosen})==8
++    orderedparents=sorted(big);cost=np.full((8,len(orderedparents)),1e8);candidates={}
++    for i,d in enumerate(chosen):
++        for j,pid in enumerate(orderedparents):
++            ts=[r for r in rows if r['split']=='TRAIN' and r['parent_id']==pid and r['condition_type']==d['condition_type']]
++            if ts:
++                t=min(ts,key=lambda t:(float(np.mean((vec(d)-vec(t))**2)),t['condition_id']));cost[i,j]=float(np.mean((vec(d)-vec(t))**2));candidates[(i,j)]=t
++    ii,jj=linear_sum_assignment(cost);pairs=[]
++    for i,j in zip(ii,jj):
++        assert cost[i,j]<1e8;d=chosen[i];t=candidates[(i,j)]
++        row=dict(pair_id=f'PAIR{i:02d}',condition_type=d['condition_type'],dev_parent_id=d['parent_id'],dev_condition_id=d['condition_id'],train_parent_id=t['parent_id'],train_condition_id=t['condition_id'],distance=math.sqrt(cost[i,j]),dev_N=d['N'],dev_K=d['K'],train_N=t['N'],train_K=t['K'],dev_free=d['N']-d['K'],train_free=t['N']-t['K'],train_exposures=counts['USER_EXPANDED_67'][t['condition_id']],dev_was_width8=any(x['condition_id']==d['condition_id'] for x in original),dev_condition_source=d['C_source'],train_condition_source=t['C_source'],dev_condition_sha256=d['C_sha256'],train_condition_sha256=t['C_sha256'])
++        for f in FEATURES:row['dev_'+f]=d[f];row['train_'+f]=t[f];row['delta_'+f]=t[f]-d[f]
++        pairs.append(row)
++    assert len({r['train_parent_id'] for r in pairs})==8;write_csv('selected_train_dev_pairs.csv',pairs)
++    write_json('selected_train_dev_manifest.json',dict(definition_sha256=sha(OUT/'definition.json'),pairs=pairs,extra_dev_FULL_candidates=[r['condition_id'] for r in options],selected_extra_full=extra['condition_id'],selection_used_generated_quality=False,assignment_total_squared_cost=float(sum(cost[i,j] for i,j in zip(ii,jj)))))
++    # Inventory is deliberately after selection; only identity fields are used.
++    inventory=[];scan=[]
++    for stage in ('raw','post'):
++        for p in sorted((ROOT/'experiments').glob('*/evaluation/'+stage+'_index.json')):
++            if p.is_relative_to(OUT.parent):continue
++            obj=read_json(p);rs=obj.get('rows',[]) if isinstance(obj,dict) else obj
++            if not isinstance(rs,list):continue
++            hits=[]
++            for r in rs:
++                if r.get('checkpoint_sha256')!=MODEL_SHA and r.get('label')!='USER_EXPANDED_67':continue
++                pid=r.get('parent_id','');paths=[(k,v) for k,v in r.items() if k in ('raw_path','post_path','ply_path','result_path','canonical_path') and isinstance(v,str)]
++                hit=dict(index_path=str(p),stage=stage,request_id=r.get('request_id',''),parent_id=pid,condition_id=r.get('condition_id',''),label=r.get('label',''),checkpoint_sha256=r.get('checkpoint_sha256',''),is_EXP67_train_parent=pid in big,is_DEV32_parent=pid in devp,geometry_paths=json.dumps(dict(paths),sort_keys=True),all_indexed_geometry_paths_exist=bool(paths) and all(Path(v).is_file() for _,v in paths))
++                inventory.append(hit);hits.append(hit)
++            scan.append(dict(index_path=str(p),stage=stage,rows=len(rs),EXP67_rows=len(hits),EXP67_train_parent_rows=sum(r['is_EXP67_train_parent'] for r in hits)))
++    write_csv('existing_generation_inventory.csv',inventory);write_csv('generation_index_search.csv',scan)
++    requests=read_csv(OLD/'evaluation/requests.csv');reqby={(r['condition_id'],int(r['candidate'])):r for r in requests}
++    reqs=[]
++    for p in pairs:
++        for noise in (0,1):
++            r=reqby[(p['dev_condition_id'],noise)]
++            reqs.append(dict(pair_id=p['pair_id'],candidate=noise,dev_request_id=r['request_id'],noise_seed=r['noise_seed'],dev_input_path=r['input_path'],dev_input_sha256=r['input_sha256'],dev_Gaussian_sha256=r['Gaussian_sha256'],train_N=p['train_N'],train_K=p['train_K'],train_free_faces=p['train_free'],dev_free_faces=p['dev_free'],rng_rule='same stored seed / NumPy RandomState.randn(count,3,3).astype(float32); assert shared prefix against DEV; no force N equality'))
++    write_csv('paired_request_reuse_and_rng.csv',reqs)
++    for p,h in PROTECTED.items():
++        if sha(p)!=h:raise ValueError('Protected source modified '+p)
++    write_json('source_hashes.json',PROTECTED)
++    stats=dict(source_conditions=len(rows),source_parents=len(big|set(devp)),formal_exposures={a:sum(c.values()) for a,c in counts.items()},free_scalars=dict(free),selected_pairs=len(pairs),selected_types=dict(Counter(r['condition_type'] for r in pairs)),selected_dev_width8=sum(r['dev_was_width8'] for r in pairs),EXP67_indexed_train_RAW=sum(r['stage']=='raw' and r['is_EXP67_train_parent'] for r in inventory),EXP67_indexed_train_POST=sum(r['stage']=='post' and r['is_EXP67_train_parent'] for r in inventory),marginal_outside_counts={arm:sum(r['outside_feature_count']>0 for r in nearest if r['pool']==arm) for arm in train['pools']},zero_model_calls=True,source_hashes_unchanged=True)
++    write_json('summary.json',stats)
++    lines=['# Condition coverage and exposure audit','',
++        'All source files are read-only. This stage used CPU arrays and identity metadata only; zero model forwards, new meshes, quality rescoring or training.',
++        '',f'Unique inputs: {len(rows)} conditions / {len(big|set(devp))} parents. TRAIN67=194, SMALL32=91 nested, DEV32=64. Completed formal exposures: {dict(stats["formal_exposures"])}.',
++        '',f'Within the scanned EXP67 RAW/POST indices, training-parent generated outputs found: RAW={stats["EXP67_indexed_train_RAW"]}, POST={stats["EXP67_indexed_train_POST"]}. Fixed FM diagnostic fixtures are velocity regression, not rollout or qualitative generation. Unindexed unidentified files remain outside this claim.',
++        '',f'DEV conditions outside at least one same-type marginal TRAIN feature range: {stats["marginal_outside_counts"]}. A condition inside all scalar ranges is not thereby jointly covered, equally difficult or IID.',
++        '', 'Matching is fixed before any generated-quality inspection: 3 SEAT_HALF + 3 SEAT_FULL + 2 BACK, eight unique DEV and TRAIN parents. Seven DEV inputs reuse width8; one extra FULL comes from input-only lower-median K and also has frozen original EXP67 outputs.',
++        '', 'Model Y is the vertical axis. Centroids are area weighted; tilt is unsigned inclination from the horizontal plane. The fixed L is inherited, not estimated from outputs. C/M and source-relative heights are descriptive and do not enter matching.',
++        '', 'Use each request own N/K. Reuse DEV saved Gaussian arrays. The old sampler uses NumPy MT19937; the same seed at TRAIN free count should share the exact prefix, which the execution owner must assert. Different free counts prevent claiming the full noise arrays are identical.',
++        '', 'Matching does not equalize training exposure, complete-chair structure, semantic ambiguity, topology or expected completion. A small TRAIN-vs-DEV result supports diagnosis only, not a generalization benchmark or causal architecture conclusion.',
++        '', 'Files: condition_geometry.csv; exposure_per_condition.csv; exposure_per_parent.csv; coverage_summary.csv; dev_train_nearest.csv; dev_train_feature_ranges.csv; dev_train_all_same_type_distances.csv; selected_train_dev_pairs.csv; paired_request_reuse_and_rng.csv; generation_index_search.csv; existing_generation_inventory.csv; definition.json; source_hashes.json.']
++    (OUT/'REPORT.md').write_text('\n'.join(lines)+'\n',encoding='utf8')
++    outputs={str(p.relative_to(OUT)):sha(p) for p in sorted(OUT.rglob('*')) if p.is_file() and p.name!='completion.json'}
++    write_json('completion.json',dict(schema=DEFINITION['schema'],status='COMPLETE',wall_seconds=time.time()-start,source_count=len(PROTECTED),source_hashes_unchanged=True,script_sha256=sha(__file__),output_hashes=outputs,stats=stats))
++    print(json.dumps(stats,indent=2))
++
++if __name__=='__main__':main()
+--- /dev/null
++++ r2/pilots/seat_failure_diagnosis_v1/coverage_followup.py
+@@ -0,0 +1,89 @@
++"""Supplement base-C audit with recorded augmentation ranges and pair near-duplicate checks.
++
++CPU arrays only. This does not change the frozen input-only matching.
++"""
++from pathlib import Path
++import csv,json,hashlib,math,time
++from collections import defaultdict,Counter
++import numpy as np
++from scipy.spatial import cKDTree
++from coverage_audit import ROOT,OLD,OUT,L,FEATURES,sha
++DEST=OUT/'supplement_v1'
++TOL=1e-12
++
++def rows(p):
++    with Path(p).open(encoding='utf-8-sig',newline='') as f:return list(csv.DictReader(f))
++def dump(name,rs):
++    with (DEST/name).open('x',encoding='utf8',newline='') as f:
++        w=csv.DictWriter(f,list(dict.fromkeys(k for r in rs for k in r)),lineterminator='\n');w.writeheader();w.writerows(rs)
++def jdump(name,obj):
++    with (DEST/name).open('x',encoding='utf8') as f:json.dump(obj,f,indent=2,sort_keys=True,allow_nan=False);f.write('\n')
++def canon(t):
++    return np.array([x[np.lexsort((x[:,2],x[:,1],x[:,0]))] for x in t]).reshape(len(t),9)
++def main():
++    DEST.mkdir(parents=True,exist_ok=True)
++    definition=dict(schema='actual_augmentation_and_input_similarity_v1',fixed_L=L,range_tolerance=TOL,
++        tolerance_reason='dimensionless arithmetic-edge tolerance; base audit used literal comparisons and is preserved. This is not geometry acceptance slack.',
++        coverage='min/max of actual logged augmentation values applied to fixed C for each arm and type, no new random draws; compare DEV to marginal ranges only.',
++        similarity='Read source C and M only for all eight selected pairs. Identity, X reflection, Z reflection, XZ reflection around model origin; no optimized alignment. Report symmetric vertex/face distances; descriptive, not identity adjudication.',
++        pairing='Unchanged frozen base input assignment. Similarity follow-up cannot exclude or replace a pair.',
++        zero_model_forward=True,zero_generated_geometry_read=True)
++    jdump('definition.json',definition)
++    geom=rows(OUT/'condition_geometry.csv');byid={r['condition_id']:r for r in geom};pairs=rows(OUT/'selected_train_dev_pairs.csv')
++    exposures=rows(OLD/'training_analysis/final/exposures.csv');data={};mins={};maxs={};counter=Counter()
++    for r in geom:
++        if r['split']!='TRAIN':continue
++        with np.load(r['C_source'],allow_pickle=False) as z:c=z['C'].astype(float)
++        cr=np.cross(c[:,1]-c[:,0],c[:,2]-c[:,0]);a=np.linalg.norm(cr,axis=1)/2;n=cr/(2*a[:,None]);data[r['condition_id']]=(a,n)
++    for e in exposures:
++        cid=e['task_id'];r=byid[cid];a,n=data[cid];alpha=float(e['alpha']);key=(e['arm'],cid)
++        if key not in mins:mins[key]=np.full(len(FEATURES),np.inf);maxs[key]=np.full(len(FEATURES),-np.inf)
++        factor=np.sqrt(n[:,0]**2+alpha**2*(n[:,1]**2+n[:,2]**2));area=a*factor
++        normal_y=np.clip(np.abs(alpha*n[:,1]/factor),0.,1.)
++        tilt=float(np.average(np.arccos(normal_y),weights=area))/(np.pi/2)
++        v=np.array([float(r[k]) for k in FEATURES]);v[0]*=alpha;v[3]*=alpha;v[6]=math.sqrt(float(area.sum()))/L;v[7]=tilt
++        mins[key]=np.minimum(mins[key],v);maxs[key]=np.maximum(maxs[key],v);counter[key]+=1
++    rr=[]
++    for key in sorted(mins):
++        arm,cid=key
++        for j,f in enumerate(FEATURES):rr.append(dict(arm=arm,condition_id=cid,condition_type=byid[cid]['condition_type'],feature=f,actual_min=float(mins[key][j]),actual_max=float(maxs[key][j]),completed_exposures=counter[key]))
++    dump('actual_exposure_feature_ranges_per_condition.csv',rr)
++    coverage=[]
++    for d in [r for r in geom if r['split']=='DEV']:
++        for arm in ('USER_SMALL','USER_EXPANDED_67'):
++            ids=[key for key in mins if key[0]==arm and byid[key[1]]['condition_type']==d['condition_type']]
++            low=np.min([mins[k] for k in ids],axis=0);high=np.max([maxs[k] for k in ids],axis=0)
++            for j,f in enumerate(FEATURES):
++                x=float(d[f]);coverage.append(dict(arm=arm,dev_condition_id=d['condition_id'],condition_type=d['condition_type'],feature=f,value=x,actual_train_min=float(low[j]),actual_train_max=float(high[j]),within_range_tol=bool(low[j]-TOL<=x<=high[j]+TOL),below_by=max(0.,float(low[j]-x)),above_by=max(0.,float(x-high[j]))))
++    dump('dev_actual_training_range_coverage.csv',coverage)
++    base=rows(OUT/'dev_train_feature_ranges.csv');countbase={};countactual={}
++    for arm in ('USER_SMALL','USER_EXPANDED_67'):
++        countbase[arm]=len({r['condition_id'] for r in base if r['pool']==arm and not float(r['train_min'])-TOL<=float(r['value'])<=float(r['train_max'])+TOL})
++        countactual[arm]=len({r['dev_condition_id'] for r in coverage if r['arm']==arm and not r['within_range_tol']})
++    checks=[]
++    for pair in pairs:
++        dr=byid[pair['dev_condition_id']];tr=byid[pair['train_condition_id']]
++        for domain in ('C','M'):
++            key='C' if domain=='C' else 'full_target';paths=[r['C_source'] if domain=='C' else r['parent_source'] for r in (dr,tr)]
++            arrays=[]
++            for p in paths:
++                with np.load(p,allow_pickle=False) as z:arrays.append(z[key].reshape(-1,3,3).astype(np.float64))
++            dt,tt=arrays
++            for name,sign in [('IDENTITY',[1,1,1]),('MIRROR_X',[-1,1,1]),('MIRROR_Z',[1,1,-1]),('MIRROR_XZ',[-1,1,-1])]:
++                transform=tt*np.array(sign);dv=dt.reshape(-1,3);tv=transform.reshape(-1,3)
++                d1=cKDTree(tv).query(dv)[0]/L;d2=cKDTree(dv).query(tv)[0]/L
++                dc=canon(dt);tc=canon(transform);f1=cKDTree(tc).query(dc)[0]/(3*L);f2=cKDTree(dc).query(tc)[0]/(3*L)
++                checks.append(dict(pair_id=pair['pair_id'],domain=domain,transform=name,dev_parent=dr['parent_id'],train_parent=tr['parent_id'],dev_group=dr['group_uid'],train_group=tr['group_uid'],known_groups_equal=dr['group_uid']==tr['group_uid'],dev_faces=len(dt),train_faces=len(tt),vertex_sym_mean_L=float((d1.mean()+d2.mean())/2),vertex_sym_p95_L=float(max(np.quantile(d1,.95),np.quantile(d2,.95))),vertex_sym_max_L=float(max(d1.max(),d2.max())),face_corner_rms_sym_mean_L=float((f1.mean()+f2.mean())/2),face_corner_rms_sym_max_L=float(max(f1.max(),f2.max())),dev_faces_with_nearest_rms_below_1e_5_L=int((f1<1e-5).sum()),train_faces_with_nearest_rms_below_1e_5_L=int((f2<1e-5).sum())))
++    dump('selected_pair_source_geometry_similarity.csv',checks)
++    best=[]
++    for pair in pairs:
++        for domain in ('C','M'):
++            x=min([r for r in checks if r['pair_id']==pair['pair_id'] and r['domain']==domain],key=lambda r:r['face_corner_rms_sym_mean_L']);best.append(x)
++    dump('selected_pair_best_fixed_reflection.csv',best)
++    jdump('summary.json',dict(base_C_outside_with_tolerance=countbase,actual_exposure_outside_with_tolerance=countactual,all_scales_fixed=True,pairing_unchanged=True,near_pair04=[r for r in best if r['pair_id']=='PAIR04'],source_data_hashes_unchanged=all(sha(p)==h for p,h in json.loads((OUT/'source_hashes.json').read_text()).items())))
++    text=['# Supplement: actual augmentation coverage and source similarity','',f'Numerical range comparisons allow only {TOL} in dimensionless features. The base audit literal-comparison tables are preserved.',f'Base C outside one or more same-type marginal ranges: {countbase}. Actual logged training augmentations: {countactual}. These are marginal range diagnostics, not IID tests.',
++        '', 'The original assignment is unchanged. All eight pairs were checked on source C and M under four fixed reflections; no generated geometry or quality was read. Review PAIR04 separately: similar or duplicate source geometry can weaken any claim of independent new-shape generalization. Known parent/group IDs are metadata, not a complete near-duplicate detector.']
++    (DEST/'REPORT.md').write_text('\n'.join(text)+'\n',encoding='utf8')
++    jdump('completion.json',dict(status='COMPLETE',script_sha256=sha(__file__),output_hashes={p.name:sha(p) for p in sorted(DEST.iterdir()) if p.is_file()}))
++    print(json.dumps(dict(base=countbase,actual=countactual,best04=[r for r in best if r['pair_id']=='PAIR04']),indent=2))
++if __name__=='__main__':main()
+--- /dev/null
++++ r2/pilots/seat_failure_diagnosis_v1/coverage_inspect.py
+@@ -0,0 +1,15 @@
++import json
++import numpy as np
++from pathlib import Path
++b=Path('/mnt/e/MeshFlow/experiments/r2_user_data_scaling_32_67_v1')
++m=json.loads((b/'data/train_manifest.json').read_text())
++p=json.loads((b/'data/panel_manifest.json').read_text())
++print('PANELKEYS',list(p))
++print('TRAINPARENT',{k:v for k,v in next(iter(m['parents'].values())).items() if k != 'lineage'})
++print('TASK',{k:v for k,v in next(iter(m['tasks'].values())).items() if k not in ['source_face_ids','free_source_ids','original_source_face_ids','original_vertex_ids','region_source_face_ids']})
++print('PANEL NONCONDITION',{k:v for k,v in p.items() if k not in ['conditions','parents','requests']})
++print('PARENTS',str(p.get('parents'))[:800])
++c=Path(p['conditions'][0]['condition_source']); z=np.load(c,allow_pickle=False)
++print('CONDITION KEYS',[(k,z[k].shape,str(z[k].dtype)) for k in z.files])
++ri=json.loads((b/'evaluation/raw_index.json').read_text())['rows']
++print('RAWKEYS',list(ri[-1])); print('RAW ROW',{k:v for k,v in ri[-1].items() if k in ['model','arm','generator','raw_path','path','request_id','parent_id','output_dir']})
+--- /dev/null
++++ r2/pilots/seat_failure_diagnosis_v1/deliver.py
+@@ -0,0 +1,52 @@
++"""Snapshot exact small sources and package completed evidence; no model loading."""
++import difflib, json, zipfile
++from pathlib import Path
++from . import common as E
++
++def run():
++    definition=E.read(E.OUT/'scoringlogs/definition.json');sources=[]
++    for name,h in definition['score_hashes'].items():
++        p=E.resolve(name)
++        if E.sha(p)!=h:raise ValueError('Executed scoring source changed '+name)
++        rel=Path('workspace')/p.relative_to(E.ROOT) if p.is_relative_to(E.ROOT) else Path('MeshFlow-Control')/p.relative_to(E.ROOT.parent/'MeshFlow-Control')
++        target=E.OUT/'scoring_source'/rel;E._write_bytes(target,p.read_bytes())
++        sources.append(dict(original_path=str(p),copied_path=str(target),sha256=h,bytes=p.stat().st_size,origin='ACTUAL_EXECUTED_SCORING_DEFINITION'))
++    new=[];diff=[]
++    for p in sorted(E.CODE.glob('*.py')):
++        target=E.OUT/'code_snapshot'/p.name;E._write_bytes(target,p.read_bytes())
++        new.append(dict(original_path=str(p),copied_path=str(target),sha256=E.sha(p),bytes=p.stat().st_size,origin='NEW_ISOLATED_CODE'))
++        lines=p.read_text(encoding='utf-8-sig').splitlines(keepends=True)
++        diff.extend(difflib.unified_diff([],lines,fromfile='/dev/null',tofile=str(p.relative_to(E.ROOT))))
++    E.write(E.OUT/'source_file_hashes.json',dict(scoring=sources,new_code=new,old_code_modified=False))
++    E._write_bytes(E.OUT/'code.diff',''.join(diff).encode('utf8'))
++    # This intentionally packages analysis evidence, not bulky trajectories or weights.
++    roots=['code_snapshot','scoring_source','statistics','coverage_audit','scoringlogs','independent_audit','resources','execution','evaluation/gallery']
++    include=set()
++    for sub in roots:
++        for p in (E.OUT/sub).rglob('*'):
++            if p.is_file() and p.suffix.lower() in ('.json','.jsonl','.csv','.md','.txt','.py','.diff','.jpg','.html'):
++                include.add(p)
++    for p in (E.OUT/'source_audit').iterdir():
++        if p.is_file() and p.suffix.lower() in ('.json','.csv','.md','.py'):include.add(p)
++    for p in (E.OUT/'source_audit/engineering').rglob('*'):
++        if p.is_file():include.add(p)
++    for name in ['REPORT.md','registration.json','requests.csv','conditions.csv','subdivision_audit.json','dispatch_plan.json','resources_windows_before_dispatch.json','resources_before_generator_worker1.json','resources_before_D0_worker1.json','source_file_hashes.json','code.diff','ledger.jsonl','evaluation/raw_index.json','evaluation/post_index.json']:
++        include.add(E.OUT/name)
++    rows=[dict(path=str(p.relative_to(E.OUT)),sha256=E.sha(p),bytes=p.stat().st_size) for p in sorted(include)]
++    manifest=dict(status='COMPLETE_EVIDENCE_PACKAGE',files=rows,omissions=['large weights','RAW/POST mesh arrays and full Euler trajectories','per-face pair JSON/vectors available locally under evaluation/scores','source parent NPZ assets'],scope='Recomputable aggregation and evidence review; full geometry rescoring uses retained local arrays bound by hashes',size_limit_bytes=10_000_000)
++    E.write(E.OUT/'package_manifest.json',manifest);include.add(E.OUT/'package_manifest.json')
++    zip_path=E.OUT/'R2_SEAT_FAILURE_DIAGNOSIS_REVIEW.zip'
++    if zip_path.exists():raise ValueError('Do not overwrite completed package')
++    with zipfile.ZipFile(zip_path,'x',zipfile.ZIP_DEFLATED,compresslevel=9) as z:
++        for p in sorted(include):z.write(p,str(p.relative_to(E.OUT)))
++    if zip_path.stat().st_size>=10_000_000:raise ValueError('Evidence package exceeds10MB; preserve and explicitly revise manifest, not silent delete')
++    with zipfile.ZipFile(zip_path) as z:
++        if z.testzip() is not None:raise ValueError('Bad archive CRC')
++        assert len(z.namelist())==len(include)
++        for row in rows:
++            import hashlib
++            if hashlib.sha256(z.read(row['path'])).hexdigest()!=row['sha256']:raise ValueError('Archive payload mismatch')
++    r=E.load_registration();reviews=E.read(E.OUT/'evaluation/gallery/review_completion.json');assert reviews['unique_output_stage_rows']==80
++    complete=dict(status='COMPLETE',utc=E.utc(),new_rollouts=24,generator_forwards=1200,D0_forwards=24,training_updates=0,backwards=0,logical_RAW=40,logical_POST=40,scored_stages=80,reviewed_stages=80,actual_review_pages=24,resume_through_render_executed=True,resume_new_forwards=0,code_or_model_default_changed=False,git_commit_or_push=False,package_path=str(zip_path),package_bytes=zip_path.stat().st_size,package_sha256=E.sha(zip_path),report_sha256=E.sha(E.OUT/'REPORT.md'),package_files=len(include),registration_sha256=E.sha(E.OUT/'registration.json'))
++    E.write(E.OUT/'COMPLETE.json',complete);print(json.dumps(complete,ensure_ascii=False))
++if __name__=='__main__':run()--- /dev/null
++++ r2/pilots/seat_failure_diagnosis_v1/endpoint.py
+@@ -0,0 +1,25 @@
++"""Secondary descriptive endpoint sensitivity; no inferred success threshold."""
++import json
++import numpy as np
++from . import common as E
++
++def run():
++    r=E.load_registration();idx=E.read(E.OUT/'evaluation/raw_index.json');byid={x['request_id']:x for x in idx['rows']}
++    bases={(q['split'],q['base_condition_id'],q['candidate']):q for q in r['requests'] if q['variant']=='base'}
++    definition=dict(status='SECONDARY_DESCRIPTIVE_ANALYSIS',registered_after_generation=True,used_for_selection=False,
++        quantity='RMS of corresponding free corner coordinates, RAW sub4 minus RAW base, divided by inherited L',
++        same_Gaussian_required=True,free_slots_correspond=True,POST_excluded='GEO_C may delete/reorder free faces',success_threshold=None,
++        inference_limit='Changing K also changes N and face boundaries; not an isolated estimate of attention dilution')
++    E.write(E.OUT/'statistics/endpoint_definition.json',definition);out=[]
++    for q in r['requests']:
++        if q['variant']!='sub4':continue
++        b=bases[q['split'],q['base_condition_id'],q['candidate']]
++        aa=E.arrays(byid[q['request_id']]['raw_path']);bb=E.arrays(byid[b['request_id']]['raw_path'])
++        a=np.asarray(aa['raw']).reshape(q['N'],3,3)[q['K']:];z=np.asarray(bb['raw']).reshape(b['N'],3,3)[b['K']:]
++        assert a.shape==z.shape and q['free_Gaussian_sha256']==b['free_Gaussian_sha256']
++        delta=a.astype(float)-z.astype(float);dist=np.linalg.norm(delta,axis=-1)
++        out.append(dict(pair_id=q['pair_id'],split=q['split'],condition_type=q['condition_type'],candidate=q['candidate'],base_request_id=b['request_id'],sub4_request_id=q['request_id'],base_N=b['N'],sub4_N=q['N'],base_K=b['K'],sub4_K=q['K'],free_faces=len(a),RMS_coordinate_delta_over_L=float(np.sqrt(np.mean(delta**2))/E.L),mean_corner_displacement_over_L=float(dist.mean()/E.L),p95_corner_displacement_over_L=float(np.quantile(dist,.95)/E.L),max_corner_displacement_over_L=float(dist.max()/E.L),exact_equal=E.same(a,z),base_raw_sha256=byid[b['request_id']]['raw_sha256'],sub4_raw_sha256=byid[q['request_id']]['raw_sha256']))
++    E.csvwrite(E.OUT/'statistics/sub4_RAW_endpoint_sensitivity.csv',out)
++    summary=dict(status='COMPLETE',pairs=len(out),nonzero_pairs=sum(not q['exact_equal'] for q in out),RMS_coordinate_delta_over_L_mean=float(np.mean([q['RMS_coordinate_delta_over_L'] for q in out])),RMS_coordinate_delta_over_L_min=float(min(q['RMS_coordinate_delta_over_L'] for q in out)),RMS_coordinate_delta_over_L_max=float(max(q['RMS_coordinate_delta_over_L'] for q in out)),model_calls=0)
++    E.write(E.OUT/'statistics/endpoint_summary.json',summary);print(json.dumps(summary))
++if __name__=='__main__':run()--- /dev/null
++++ r2/pilots/seat_failure_diagnosis_v1/evaluate.py
+@@ -0,0 +1,197 @@
++"""Frozen EXP67 seat diagnostic: inherit original CPU scores, isolate new outputs."""
++from __future__ import annotations
++import os
++for _k in ('OMP_NUM_THREADS','MKL_NUM_THREADS','OPENBLAS_NUM_THREADS','NUMEXPR_NUM_THREADS'):os.environ[_k]='2'
++os.environ['CUDA_VISIBLE_DEVICES']=''
++import argparse,collections,concurrent.futures,csv,json,multiprocessing,time
++from fractions import Fraction
++from pathlib import Path
++import numpy as np
++from . import common as E
++from r2.pilots.condition_width_response_v1 import evaluate as W
++
++VERSION='r2_seat_diagnosis_original_metrics_adapter_v1'
++LABEL='EXP67_FROZEN'
++META=(*W.META,'pair_id','split','condition_type')
++INHERITED_HASHES=W.definition_hashes
++W.E=E
++W.VERSION=VERSION
++W.META=META
++LOG=E.OUT/'scoringlogs'
++STATS=E.OUT/'statistics'
++
++def hashes():
++    return {**INHERITED_HASHES(),str(Path(__file__)):E.sha(__file__),
++            str(E.CODE/'prepare.py'):E.sha(E.CODE/'prepare.py')}
++W.definition_hashes=hashes
++
++def registration():
++    r=E.load_registration()
++    assert len(r['requests'])==40 and len({q['request_id'] for q in r['requests']})==40
++    assert len(r['queries'])==20 and len({q['condition_id'] for q in r['queries']})==20
++    assert {q['variant'] for q in r['requests']}=={'base','sub4'}
++    for q in r['requests']:
++        for k in META:assert k in q,k
++    sub=[q for q in r['requests'] if q['variant']=='sub4'];assert len(sub)==8
++    base={q['base_request_id']:q for q in r['requests'] if q['variant']=='base'}
++    for q in sub:
++        b=base[q['base_request_id']]
++        assert q['free_Gaussian_sha256']==b['free_Gaussian_sha256']
++        assert q['N']-q['K']==b['N']-b['K'] and q['K']==4*b['K'] and q['N']==b['N']+3*b['K']
++    return r
++
++def freeze():
++    r=registration();definition={
++        'version':VERSION,'status':'FROZEN','registration_sha256':E.sha(E.OUT/'registration.json'),
++        'score_hashes':hashes(),'score_one_inherited_unchanged_from':str(E.ROOT/'r2/pilots/condition_width_response_v1/evaluate.py'),
++        'logical_scores':80,'raw':40,'post':40,'max_quality_scans':80,'GPU':0,'new_queries':0,
++        'interpretation':'TRAIN minus DEV is an input-matched observational comparison; different parents/N/K/free counts; same seed free-prefix only, not point correspondence.',
++        'subdivision':'sub4 minus base fixes C physical surface and complete free Gaussian; changes C tessellation, K and total N. Not isolated token multiplicity causality.',
++        'AVMR':'All eight inherited thresholds and actual boundary denominators retained. Subdivision adds boundary vertices so VMR/PMR and uniform-vertex distances are not tessellation invariant.',
++        'queries':'Physical C2048 points and weights are byte-identical for base/sub4; point ownership, normals and borders adapted by frozen preparation.',
++        'metrics':'All 96 inherited scalar fields plus four existing finite-edge/surface descriptive distances. S/E/unique GT remain NA.',
++        'aggregation':'Two noises averaged per condition before condition/pair averages. Separate TRAIN/DEV, type and RAW/POST. No score determines which images are reviewed.'}
++    E.write(LOG/'definition.json',definition)
++    return definition
++
++def indices(r):
++    expected={q['request_id'] for q in r['requests']};out=[]
++    for name,field in [('raw_index.json','raw'),('post_index.json','post')]:
++        p=E.OUT/'evaluation'/name
++        if not p.exists():raise RuntimeError('BLOCKED: all RAW and POST must finish before scoring: '+str(p))
++        z=E.read(p);rr=z['rows']
++        assert z['status']=='COMPLETE' and len(rr)==40 and {q['request_id'] for q in rr}==expected
++        for q in rr:
++            assert q['label']==LABEL;W.verify({q[field+'_path']:q[field+'_sha256']})
++        out.append({q['request_id']:q for q in rr})
++    return out
++
++def score_one(job):
++    q,raw,post,query,stage,rh=job
++    query=dict(query,transform_audit={'method':'FROZEN_SEAT_CONDITION_QUERY','variant':q['variant'],
++        'physical_points_and_weights':'base/sub4 preserved bytewise by preparation','preparation_audit':str(E.OUT/'subdivision_audit.json')})
++    result=W.score_one((q,raw,post,query,stage,rh))
++    p=Path(result['path']);s=E.read(p)
++    if not result['reused']:
++        s['query_measure']='FROZEN_BASE_AREA_QUERIES; sub4 same physical points and weights, child-face ownership remapped'
++        s['quality_C_orientation']='Canonical input C and registered queries; same unordered final source-oriented C surface'
++        s['representation_caveat']='sub4 changes N/K and source boundary vertex denominator; TRAIN/DEV different parents and free counts'
++        s['free_Gaussian_sha256']=q['free_Gaussian_sha256']
++        s['noise_provenance']=q['noise_provenance']
++        E.write(p,s,replace=True)
++    else:
++        assert s['free_Gaussian_sha256']==q['free_Gaussian_sha256']
++    return result
++
++def run(max_workers=2):
++    r=registration();definition=freeze();raw,post=indices(r);rh=E.sha(E.OUT/'registration.json')
++    final=LOG/'score_completion.json'
++    if final.exists():
++        z=E.read(final);assert z['status']=='COMPLETE' and z['stages']==80 and z['definition_hashes']==hashes()
++        for a in z['receipts']:W.verify({a['path']:a['sha256']});W.verify(E.read(a['path'])['files'])
++        return z
++    queries={q['condition_id']:q for q in r['queries']}
++    jobs=[(q,raw[q['request_id']],post[q['request_id']],queries[q['condition_id']],stage,rh) for q in r['requests'] for stage in ['RAW','POST']]
++    assert len(jobs)==80
++    resources=E.resources();E.write(LOG/('resources_before_'+str(time.time_ns())+'.json'),resources)
++    start=time.perf_counter();first=score_one(jobs[0]);resources=E.resources()
++    mem={x.split(':')[0]:int(x.split()[1])*1024 for x in (resources.get('memory') or '').splitlines() if len(x.split())>1 and x.split()[1].isdigit()}
++    parallel=(os.cpu_count() or 1)>=4 and mem.get('MemAvailable',0)>max(4<<30,3*first['peak_RSS_KiB']*1024)
++    parallel=parallel and (resources.get('loadavg') or [999])[0]<(os.cpu_count() or 1)-2
++    workers=2 if max_workers==2 and parallel else 1
++    E.write(LOG/('dispatch_'+str(time.time_ns())+'.json'),{'workers':workers,'threads_per_worker':2,'first_registered_task':first,'resources':resources,'reason':'Real first score RSS, RAM and CPU guard; no unbudgeted probe'})
++    receipts=[first];results={}
++    with concurrent.futures.ProcessPoolExecutor(max_workers=workers,mp_context=multiprocessing.get_context('spawn')) as pool:
++        futs={pool.submit(score_one,j):i for i,j in enumerate(jobs[1:],1)}
++        try:
++            for fut in concurrent.futures.as_completed(futs):
++                results[futs[fut]]=fut.result();receipts.append(results[futs[fut]])
++                E.write(LOG/'progress.json',{'status':'RUNNING','completed':len(receipts),'expected':80},replace=True)
++                print(json.dumps({'stage':'SCORE','completed':len(receipts),'expected':80}),flush=True)
++        except BaseException:
++            for f in futs:f.cancel()
++            raise
++    receipts=[first,*[results[i] for i in sorted(results)]]
++    for a in receipts:a['sha256']=E.sha(a['path'])
++    z={'status':'COMPLETE','stages':80,'receipts':receipts,'seconds':time.perf_counter()-start,'workers':workers,
++       'definition_hashes':hashes(),'new_queries':0,'model_calls':0,'scientific_definition':'Inherited score_one and helper computations unchanged; metadata adapted only.'}
++    E.write(final,z);E.write(LOG/'progress.json',{'status':'COMPLETE','completed':80,'expected':80},replace=True)
++    return z
++
++def avg(rows,keys):
++    return W.average(rows,keys)
++
++def aggregate():
++    r=registration();done=E.read(LOG/'score_completion.json');assert done['status']=='COMPLETE' and done['stages']==80 and done['definition_hashes']==hashes()
++    final=STATS/'completion.json'
++    if final.exists():
++        z=E.read(final);W.verify(z['files']);return z
++    outputs=[];quality=[];topology=[];boundary=[];vertices=[];distances=[];names=set();exact={};qs={q['request_id']:q for q in r['requests']}
++    for rec in done['receipts']:
++        W.verify({rec['path']:rec['sha256']});s=E.read(rec['path']);W.verify(s['files'])
++        meta={k:s[k] for k in (*META,'label','stage')};key=(s['request_id'],s['stage'])
++        vals={**s['metrics'],**{k:v for k,v in s['topology'].items() if W.numeric(v) or v is None},**s['distance']}
++        quality.append(dict(meta,**s['metrics'],free_face_denominator=s['free_face_denominator'],C_query_weight_denominator=s['C_query_weight_denominator'],I_status=s['status_by_metric']['I']))
++        topology.append(dict(meta,**{k:v for k,v in s['topology'].items() if not isinstance(v,(dict,list))}))
++        for b in s['boundary']:
++            boundary.append(dict(meta,**b));vm='A_VMR__'+b['setting'];pm='PMR__'+b['setting'];vals[vm]=b['VMR'];vals[pm]=b['perfect']
++            if b['status']=='PASS' and b['boundary_vertex_count']:
++                exact[key,vm]=Fraction(b['matched_count'],b['boundary_vertex_count']);exact[key,pm]=Fraction(b['perfect'])
++        names.update(k for k,v in vals.items() if W.numeric(v) or v is None);names.add('C_preserved_exact')
++        desc=s['descriptive_boundary_distance'];distances.append(dict(meta,**desc['metrics'],status=desc['status'],boundary_vertex_denominator=desc['boundary_vertex_denominator']))
++        vals.update({'DESC__'+k:v for k,v in desc['metrics'].items()})
++        vals.update(C_preserved_exact=s['C_preserved_exact'],source_C_connectivity_status=s['source_C_connectivity_status'],I_status=s['status_by_metric']['I'],
++                    free_face_denominator=s['free_face_denominator'],C_query_weight_denominator=s['C_query_weight_denominator'],C_query_count=s['C_query_count'],
++                    boundary_vertex_denominator=s['boundary'][0]['boundary_vertex_count'],CF_tested_pair_denominator=s['CF_tested_pair_denominator'],FF_tested_pair_denominator=s['FF_tested_pair_denominator'],
++                    free_Gaussian_sha256=s['free_Gaussian_sha256'],noise_provenance=s['noise_provenance'],score_path=rec['path'],score_sha256=rec['sha256'])
++        outputs.append(dict(meta,**vals));vertices.extend(dict(meta,**x) for x in W.read_csv(Path(rec['path']).parent/'boundary_vertices.csv'))
++    assert len(outputs)==80 and len({(x['request_id'],x['stage']) for x in outputs})==80
++    assert names==set(W.ORIGINAL_SCALARS),{'missing':sorted(set(W.ORIGINAL_SCALARS)-names),'extra':sorted(names-set(W.ORIGINAL_SCALARS))}
++    descnames=sorted(k for k in outputs[0] if k.startswith('DESC__'));allnames=sorted(names|set(descnames))
++    def compare(base,cand,kind):
++        out=[]
++        for k in allnames:
++            a,b=base.get(k),cand.get(k);valid=W.numeric(a) and W.numeric(b)
++            keya=((base['request_id'],base['stage']),k);keyb=((cand['request_id'],cand['stage']),k)
++            delta=exact[keyb]-exact[keya] if keya in exact and keyb in exact else None
++            out.append({'comparison':kind,'stage':cand['stage'],'pair_id':cand['pair_id'],'candidate':cand['candidate'],'condition_type':cand['condition_type'],'split':cand['split'],
++                        'baseline_request_id':base['request_id'],'candidate_request_id':cand['request_id'],'baseline_parent':base['parent_id'],'candidate_parent':cand['parent_id'],
++                        'baseline_N':base['N'],'candidate_N':cand['N'],'baseline_K':base['K'],'candidate_K':cand['K'],
++                        'baseline_boundary_vertices':base['boundary_vertex_denominator'],'candidate_boundary_vertices':cand['boundary_vertex_denominator'],
++                        'metric':k,'metric_origin':'INHERITED_DESCRIPTIVE_DISTANCE' if k.startswith('DESC__') else 'INHERITED_ORIGINAL',
++                        'baseline_value':a,'candidate_value':b,'delta':b-a if valid else None,'status':'PASS' if valid else 'NA_OR_MISSING',
++                        'delta_fraction':str(delta) if delta is not None else None,'delta_sign_exact':int(delta>0)-int(delta<0) if delta is not None else None})
++        return out
++    baseby={(x['split'],x['pair_id'],x['candidate'],x['stage']):x for x in outputs if x['variant']=='base'}
++    td=[];sub=[]
++    for x in outputs:
++        if x['variant']=='base' and x['split']=='TRAIN':td+=compare(baseby['DEV',x['pair_id'],x['candidate'],x['stage']],x,'TRAIN-minus-DEV')
++        elif x['variant']=='sub4':
++            b=baseby[x['split'],x['pair_id'],x['candidate'],x['stage']]
++            assert b['free_Gaussian_sha256']==x['free_Gaussian_sha256'];sub+=compare(b,x,'sub4-minus-base')
++    tp=avg(td,('comparison','stage','pair_id','condition_type','metric','metric_origin'))
++    sp=avg(sub,('comparison','stage','pair_id','condition_type','split','metric','metric_origin'))
++    tsum=avg(tp,('comparison','stage','condition_type','metric','metric_origin'))
++    ssum=avg(sp,('comparison','stage','condition_type','split','metric','metric_origin'))
++    absolute=[]
++    for x in outputs:
++        for k in allnames:
++            val=x.get(k);absolute.append({'split':x['split'],'variant':x['variant'],'stage':x['stage'],'pair_id':x['pair_id'],'parent_id':x['parent_id'],'condition_type':x['condition_type'],'metric':k,
++                'baseline_value':val,'candidate_value':val,'delta':0 if W.numeric(val) else None,'status':'PASS' if W.numeric(val) else 'NA_OR_MISSING'})
++    ap=avg(absolute,('split','variant','stage','pair_id','parent_id','condition_type','metric'))
++    asum=avg(ap,('split','variant','stage','condition_type','metric'))
++    tables={'per_output':outputs,'quality_per_output':quality,'topology_per_output':topology,'AVMR_PMR_all8':boundary,'boundary_vertices':vertices,'descriptive_distances':distances,
++            'TRAIN_DEV_per_pair_noise':td,'TRAIN_DEV_per_pair':tp,'TRAIN_DEV_by_type':tsum,'sub4_base_per_noise':sub,'sub4_base_per_condition':sp,'sub4_base_by_type_split':ssum,
++            'absolute_per_condition':ap,'absolute_by_type_split':asum}
++    files={}
++    for name,rr in tables.items():
++        p=STATS/(name+'.csv');E.csvwrite(p,rr);files[str(p)]=E.sha(p)
++    result={'status':'COMPLETE','stage_rows':80,'inherited_metrics':len(names),'descriptive_metrics':len(descnames),'TRAIN_DEV_noise_metric_rows':len(td),'sub4_base_noise_metric_rows':len(sub),
++            'metric_names':allnames,'definition_hashes':hashes(),'files':files,'model_calls':0,'geometry_rescored':0,'visual_review':'Separate actual image review; no automated semantic inference',
++            'caveats':['TRAIN/DEV is observational across distinct parents; same noise prefix does not create geometry correspondence.','sub4 changes N/K and source boundary vertex denominator; surface queries stay fixed.','Raw numeric deltas are not all higher-is-better; retain contradictory costs.']}
++    E.write(final,result);return result
++
++if __name__=='__main__':
++    a=argparse.ArgumentParser();a.add_argument('--stage',choices=['freeze','score','aggregate'],required=True);a.add_argument('--max-workers',type=int,choices=[1,2],default=2);args=a.parse_args()
++    result=freeze() if args.stage=='freeze' else run(args.max_workers) if args.stage=='score' else aggregate()
++    print(json.dumps({k:v for k,v in result.items() if k not in ('receipts','definition_hashes','score_hashes','files','metric_names')},ensure_ascii=False),flush=True)--- /dev/null
++++ r2/pilots/seat_failure_diagnosis_v1/gpu.py
+@@ -0,0 +1,475 @@
++"""Frozen EXP67 inference and single D0 for the seat diagnosis.
++
++Only generate/post may load a model. Worker partitions own disjoint cells;
++reuse and collect are CPU-only, single-writer operations. A reserved model
++call without its completed cell is never replayed automatically.
++"""
++from __future__ import annotations
++import argparse
++from contextlib import contextmanager
++import datetime
++import json
++import os
++from pathlib import Path
++import time
++import traceback
++
++for _key in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
++    os.environ.setdefault(_key, "2")
++os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
++import numpy as np
++from . import common as C
++
++LABEL = "EXP67_FROZEN"
++CHECKPOINT_SHA = "2e2a40bcacda7e5ee04a5754018f71986ef5d378345058075ba412bec808f925"
++
++
++def old():
++    return C.module("_seat_diagnosis_original_evaluation", C.ROOT / "r2/pilots/user_condition_finetune_v1/evaluation.py")
++
++
++def event(name, worker=None, workers=None, **fields):
++    suffix = "controller" if worker is None else f"worker_{worker}_of_{workers}"
++    path = C.checked(C.OUT / "execution" / (suffix + "_events.jsonl"))
++    path.parent.mkdir(parents=True, exist_ok=True)
++    value = dict(event=name, utc=datetime.datetime.now(datetime.timezone.utc).isoformat(), **fields)
++    with path.open("a", encoding="utf8") as f:
++        f.write(json.dumps(value, allow_nan=False) + "\n")
++        f.flush()
++        os.fsync(f.fileno())
++
++
++def registration():
++    r = C.load_registration()
++    if r.get("status") != "FROZEN" or r["checkpoint"]["sha256"] != CHECKPOINT_SHA:
++        raise ValueError("Unfrozen registration or wrong EXP67 endpoint")
++    requests = r["requests"]
++    if len({q["request_id"] for q in requests}) != len(requests):
++        raise ValueError("Duplicate request identity")
++    if any(q.get("action") not in ("NEW", "CACHE") for q in requests):
++        raise ValueError("Each request needs an explicit NEW/CACHE action")
++    count = sum(q["action"] == "NEW" for q in requests)
++    b = r["budget"]
++    # The registration owns the final count; no diagnostic forward is added.
++    if b.get("rollouts", b.get("new_rollouts")) != count:
++        raise ValueError("Registered rollout budget differs from NEW cells")
++    if b.get("generator_forwards_max", b.get("generator_sampling_forwards")) != 50 * count:
++        raise ValueError("Registered generator forward budget differs from Euler50")
++    if b.get("D0_forwards_max") != count:
++        raise ValueError("Registered D0 budget differs from NEW cells")
++    if b.get("training_updates", 0) != 0 or b.get("backwards", 0) != 0:
++        raise ValueError("This is a zero-training diagnostic")
++    return r
++
++
++def record_path(q, stage):
++    return C.OUT / "evaluation" / stage / LABEL / q["request_id"] / "receipt.json"
++
++
++def source(q, condition):
++    if C.sha(q["condition_source"]) != q["condition_source_sha256"]:
++        raise ValueError("Frozen source metadata changed")
++    C.package()
++    from meshflow_control.source_winding import validate_source
++    arrays = C.arrays(q["condition_source"])
++    validate_source(arrays, condition)
++    return arrays
++
++
++def verify_ledger(path):
++    events = [json.loads(line) for line in C.resolve(path).read_text(encoding="utf-8-sig").splitlines()]
++    if len(events) != 103 or events[0].get("event") != "CELL_REGISTERED":
++        raise ValueError("Incomplete or extra Euler call ledger")
++    if events[1].get("event") != "RESERVE" or events[1].get("kind") != "rollout_attempt":
++        raise ValueError("Missing rollout reservation")
++    for step in range(50):
++        a, b = events[2 + 2 * step:4 + 2 * step]
++        if (a.get("event"), a.get("kind"), a.get("ordinal"), a.get("context", {}).get("euler_step")) != ("RESERVE", "sampling_forward", step + 1, step):
++            raise ValueError("Sampling reservation mismatch")
++        if (b.get("event"), b.get("kind")) != ("RETURN", "sampling_forward"):
++            raise ValueError("Reserved sampling call has no return; no replay")
++    if events[-1].get("event") != "ROLLOUT_COMPLETE" or events[-1].get("nfe") != 50:
++        raise ValueError("Missing rollout completion")
++    return dict(sampling_reserved=50, sampling_returned=50, unresolved=0, sha256=C.sha(path))
++
++
++def read_raw(q, binding):
++    rec = C.read(record_path(q, "raw"))
++    if rec["request_id"] != q["request_id"] or rec["input_sha256"] != q["input_sha256"]:
++        raise ValueError("RAW receipt request/input identity mismatch")
++    arrays, _ = old().verify_output(q, rec, binding["sha256"])
++    source(q, arrays["C"])
++    if q["action"] == "NEW":
++        if rec.get("new_rollouts") != 1:
++            raise ValueError("NEW cell has no rollout")
++        verify_ledger(record_path(q, "raw").parent / "calls.jsonl")
++        if C.sha(rec["velocities_path"]) != rec["velocities_sha256"]:
++            raise ValueError("Saved velocities changed")
++        v = C.arrays(rec["velocities_path"])["velocity"]
++        n, k = q["N"], q["K"]
++        path = arrays["trajectory"].reshape(51, n, 9)
++        if v.shape != (50, n, 9) or v.dtype != np.float32 or not np.isfinite(v).all():
++            raise ValueError("Invalid saved BF16 velocities in FP32 storage")
++        if np.any(v.view(np.uint32) & 0xffff):
++            raise ValueError("Velocity values are not lossless BF16")
++        if not all(C.same(path[s + 1, k:], path[s, k:] + v[s, k:] * np.float32(1 / 50)) for s in range(50)):
++            raise ValueError("Euler recurrence mismatch")
++    else:
++        if rec.get("new_rollouts") != 0 or C.sha(q["cache_raw_receipt"]) != q["cache_raw_receipt_sha256"]:
++            raise ValueError("CACHE receipt changed")
++    return rec
++
++
++def read_post(q, raw):
++    rec = C.read(record_path(q, "post"))
++    if rec.get("status") != "COMPLETE" or rec["raw_sha256"] != raw["raw_sha256"]:
++        raise ValueError("POST completion/RAW identity mismatch")
++    if rec["source_sha256"] != q["condition_source_sha256"]:
++        raise ValueError("POST source metadata identity mismatch")
++    for path, digest in rec["files"].items():
++        if C.sha(path) != digest:
++            raise ValueError("POST artifact changed: " + str(path))
++    if C.sha(rec["post_path"]) != rec["post_sha256"]:
++        raise ValueError("POST geometry changed")
++    if q["action"] == "CACHE" and C.sha(q["cache_post_receipt"]) != q["cache_post_receipt_sha256"]:
++        raise ValueError("Historical POST receipt changed")
++    return rec
++
++
++def all_raw(r):
++    return [read_raw(q, r["checkpoint"]) for q in r["requests"]]
++
++
++def reuse():
++    """Bind verified old artifacts without changing/copying their geometry."""
++    check_code()
++    r = registration()
++    reused = []
++    for q in r["requests"]:
++        if q["action"] != "CACHE":
++            continue
++        for stage in ("raw", "post"):
++            if C.sha(q[f"cache_{stage}_receipt"]) != q[f"cache_{stage}_receipt_sha256"]:
++                raise ValueError("Historical receipt hash mismatch")
++        prior = C.read(q["cache_raw_receipt"])
++        arrays, facts = old().verify_output(q, prior, r["checkpoint"]["sha256"])
++        new_source = source(q, arrays["C"])
++        original_source = source(prior, arrays["C"])
++        # Original winding/connectivity identities are part of POST cache validity.
++        for key in ("C", "C_original", "C_source_corner_permutations", "C_source_vertex_ids", "C_original_source_vertex_ids"):
++            if (key in new_source) != (key in original_source) or (key in new_source and not C.same(new_source[key], original_source[key])):
++                raise ValueError("Source mapping changed; cannot reuse historical POST: " + key)
++        rawrec = dict(prior)
++        rawrec.update(q)
++        rawrec.update(status="COMPLETE", label=LABEL, new_rollouts=0, new_sampling_F=0,
++                      generation_status="VERIFIED_HISTORICAL_RAW_REUSE", contracts=facts,
++                      historical_receipt=q["cache_raw_receipt"], historical_receipt_sha256=q["cache_raw_receipt_sha256"])
++        C.write(record_path(q, "raw"), rawrec)
++        historical = C.read(q["cache_post_receipt"])
++        if historical["raw_sha256"] != prior["raw_sha256"] or historical["source_sha256"] != prior["condition_source_sha256"]:
++            raise ValueError("Historical POST provenance mismatch")
++        for path, digest in historical["files"].items():
++            if C.sha(path) != digest:
++                raise ValueError("Historical POST artifact changed")
++        proposal = C.read(historical["proposal_receipt"])
++        if proposal["checkpoint_sha256"] != r["d0_checkpoint"]["sha256"] or proposal["model_forwards"] != 1:
++            raise ValueError("Historical POST is not the registered single official D0")
++        postrec = dict(historical)
++        postrec.update(q)
++        postrec.update(status="COMPLETE", label=LABEL, source_sha256=q["condition_source_sha256"],
++                       new_D0_F=0, GEO_calls=0, post_status="VERIFIED_HISTORICAL_POST_REUSE",
++                       historical_receipt=q["cache_post_receipt"], historical_receipt_sha256=q["cache_post_receipt_sha256"])
++        C.write(record_path(q, "post"), postrec)
++        read_raw(q, r["checkpoint"])
++        read_post(q, rawrec)
++        reused.append(q["request_id"])
++    value = dict(status="COMPLETE", reused=len(reused), request_ids=reused, model_forwards=0, geometry_calls=0)
++    C.write(C.OUT / "execution/cache_reuse.json", value)
++    return value
++
++
++def code_identity():
++    paths = [Path(__file__), C.CODE / "common.py", C.CODE / "prepare.py",
++             C.ROOT / "r2/pilots/user_condition_finetune_v1/evaluation.py",
++             C.ROOT / "r2/pilots/user_data_scaling_32_67_v1/training.py",
++             C.ROOT / "r2/pilots/user_data_scaling_32_67_v1/training_data.py"]
++    paths += list((C.ROOT / "r2/src/meshflow_control").rglob("*.py"))
++    return {str(path): C.sha(path) for path in sorted(set(paths))}
++
++
++def freeze_code():
++    registration()
++    value = dict(registration_sha256=C.sha(C.OUT / "registration.json"), files=code_identity())
++    C.write(C.OUT / "execution/gpu_code_freeze.json", value)
++    return dict(status="FROZEN", files=len(value["files"]))
++
++
++def check_code():
++    frozen = C.read(C.OUT / "execution/gpu_code_freeze.json")
++    if frozen["registration_sha256"] != C.sha(C.OUT / "registration.json") or frozen["files"] != code_identity():
++        raise ValueError("GPU implementation/registration changed after freeze")
++
++
++def partition(r, worker, workers):
++    if workers < 1 or not 0 <= worker < workers:
++        raise ValueError("Invalid worker partition")
++    return [q for i, q in enumerate(q for q in r["requests"] if q["action"] == "NEW") if i % workers == worker]
++
++
++@contextmanager
++def owner(stage, worker, workers):
++    import fcntl
++    path = C.checked(C.OUT / "execution" / f"{stage}_worker_{worker}_of_{workers}.lock")
++    path.parent.mkdir(parents=True, exist_ok=True)
++    with path.open("a+") as handle:
++        try:
++            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
++        except BlockingIOError:
++            raise RuntimeError("This worker partition already has an owner")
++        try:
++            yield
++        finally:
++            fcntl.flock(handle, fcntl.LOCK_UN)
++
++
++def worker_path(stage, worker, workers, name):
++    return C.OUT / "execution" / f"{stage}_worker_{worker}_of_{workers}_{name}.json"
++
++
++def snap(tag, worker, workers, need_mib=0):
++    value = C.resources()
++    C.write(C.OUT / "resources" / f"{tag}_worker_{worker}_of_{workers}_{time.time_ns()}.json", value)
++    if value["gpu"]["returncode"] != 0:
++        raise RuntimeError("Resource observation failed")
++    data = value["gpu"]["stdout"].strip().splitlines()[0].split(",")
++    total, free = float(data[1]), float(data[3])
++    if free - max(2048., .1 * total) < need_mib:
++        raise RuntimeError("Insufficient VRAM headroom; no model call attempted")
++    return value
++
++
++def generate(worker, workers):
++    check_code()
++    r = registration()
++    requests = partition(r, worker, workers)
++    pending = []
++    for q in requests:
++        if record_path(q, "raw").exists():
++            read_raw(q, r["checkpoint"])
++        elif record_path(q, "raw").parent.exists():
++            raise RuntimeError("Incomplete RAW cell; no silent replay: " + q["request_id"])
++        else:
++            old().read_input(q)
++            pending.append(q)
++    if not pending:
++        return dict(status="COMPLETE", worker=worker, workers=workers, new_rollouts=0, assigned=len(requests))
++    C.package()
++    from meshflow_control import runtime
++    from meshflow_control.sampling import sample
++    import torch
++    runtime.configure_stable_runtime()
++    torch.set_num_threads(2)
++    snap("generator_before_load", worker, workers, 2600.)
++    loader = C.module("_seat_diagnosis_generator_loader", C.ROOT / "r2/pilots/user_data_scaling_32_67_v1/training.py")
++    model, identity = loader.load_generator(C.resolve(r["checkpoint"]["path"]), device="cuda", expected_sha256=r["checkpoint"]["sha256"])
++    if identity["arm"] != "USER_EXPANDED_67" or identity["global_step"] != 6000:
++        raise ValueError("Wrong generator endpoint")
++    C.write(worker_path("generator", worker, workers, "identity"), identity)
++    model.eval()
++    for parameter in model.parameters():
++        parameter.requires_grad_(False)
++    snap("generator_resident", worker, workers)
++    count = 0
++    tick = time.perf_counter()
++
++    class Budget(old().CellBudget):
++        def __init__(self, *args, **kwargs):
++            super().__init__(*args, **kwargs)
++            self.velocities = []
++
++        def call(self, kind, fn, context=None):
++            value = super().call(kind, fn, context)
++            if kind == "sampling_forward":
++                self.velocities.append(value.detach().float().cpu().numpy()[0])
++            return value
++
++    try:
++        for q in pending:
++            arrays = old().read_input(q)
++            source(q, arrays["C"])
++            dest = C.checked(record_path(q, "raw").parent)
++            dest.mkdir(parents=True, exist_ok=False)
++            context = dict(label=LABEL, request_id=q["request_id"], input_sha256=q["input_sha256"], checkpoint_sha256=r["checkpoint"]["sha256"])
++            budget = Budget(dest / "calls.jsonl", context)
++            _, trajectory, audit = sample(model, arrays["C"], int(q["N"]), seed=q["noise_seed"], z=arrays["z"], budget=budget, out=dest, context=context)
++            velocities = np.stack(budget.velocities)
++            C.frozen_npz(dest / "velocities.npz", dict(velocity=velocities, source_dtype=np.array("torch.bfloat16")))
++            rec = dict(q, **context, status="COMPLETE", new_rollouts=1, generation_status="NEW_EULER50",
++                       velocities_path=str(dest / "velocities.npz"), velocities_sha256=C.sha(dest / "velocities.npz"), worker=worker, workers=workers)
++            for field, name in (("raw", "raw.npz"), ("ply", "raw.ply"), ("result", "run.json")):
++                rec[field + "_path"] = str(dest / name)
++                rec[field + "_sha256"] = C.sha(dest / name)
++            _, rec["contracts"] = old().verify_output(q, rec, r["checkpoint"]["sha256"])
++            C.write(dest / "receipt.json", rec)
++            read_raw(q, r["checkpoint"])
++            count += 1
++            if count == 1 or count % 8 == 0:
++                snap("generator_after_rollout_" + str(count), worker, workers)
++            C.write(worker_path("generator", worker, workers, "progress"), dict(stage="RAW", completed=sum(record_path(v, "raw").exists() for v in requests), registered=len(requests), seconds=time.perf_counter()-tick, last_sampling=audit), replace=True)
++            print(json.dumps(dict(stage="RAW", worker=worker, completed=count, request_id=q["request_id"], seconds=audit["seconds"])), flush=True)
++        state_hash = loader.state_hash(model.state_dict())
++        if state_hash != identity["generator_state_sha256"]:
++            raise ValueError("Frozen generator changed")
++        snap("generator_finish", worker, workers)
++        result = dict(status="COMPLETE", worker=worker, workers=workers, assigned=len(requests), new_rollouts=count, new_sampling_F=50*count,
++                      seconds=time.perf_counter()-tick, generator_state_sha256=state_hash, training=0, backward=0)
++        C.write(worker_path("generator", worker, workers, "complete"), result)
++        return result
++    except BaseException as exc:
++        event("GENERATOR_STOPPED", worker, workers, error=repr(exc), traceback=traceback.format_exc(), returned_rollouts=count)
++        raise
++    finally:
++        del model
++        torch.cuda.empty_cache()
++
++
++def postprocess(worker, workers):
++    check_code()
++    r = registration()
++    raw_by_id = {row["request_id"]: row for row in all_raw(r)}
++    # This barrier checks ALL logical RAW, including cache, before any D0 load.
++    requests = partition(r, worker, workers)
++    C.package()
++    from meshflow_control import runtime, denoise, denoise_model, geo_c, geo_io, source_winding
++    import torch
++    runtime.configure_stable_runtime()
++    torch.set_num_threads(2)
++    model = None
++    calls = 0
++    tick = time.perf_counter()
++    rows = []
++    try:
++        for q in requests:
++            rawrec = raw_by_id[q["request_id"]]
++            dest = C.checked(record_path(q, "post").parent)
++            if record_path(q, "post").exists():
++                rows.append(read_post(q, rawrec))
++                continue
++            raw = C.arrays(rawrec["raw_path"])["raw"].reshape(-1, 3, 3)
++            k = q["K"]
++            src = source(q, raw[:k])
++            proposal_path, proposal_receipt = dest / "proposal.npz", dest / "proposal_receipt.json"
++            if (dest / "geometry_started.json").exists():
++                raise RuntimeError("Incomplete geometry; recorded engineering recovery required")
++            if proposal_receipt.exists():
++                saved = C.read(proposal_receipt)
++                if saved["checkpoint_sha256"] != r["d0_checkpoint"]["sha256"]:
++                    raise ValueError("Cached D0 identity changed")
++                proposal = denoise.cached_proposal(proposal_path, proposal_receipt, raw, rawrec["raw_sha256"])
++                newcall = 0
++            elif dest.exists():
++                raise RuntimeError("Unresolved D0 attempt; no silent retry")
++            else:
++                if model is None:
++                    snap("D0_before_load", worker, workers, 3000.)
++                    binding = r["d0_checkpoint"]
++                    model, identity = denoise_model.load_denoiser(C.resolve(binding["path"]), device="cuda", expected_sha256=binding["sha256"])
++                    C.write(worker_path("D0", worker, workers, "identity"), identity)
++                    snap("D0_resident", worker, workers)
++                dest.mkdir(parents=True, exist_ok=False)
++                C.write(dest / "D0_started.json", dict(status="RESERVED", raw_sha256=rawrec["raw_sha256"], checkpoint_sha256=r["d0_checkpoint"]["sha256"]))
++                event("D0_FORWARD_RESERVED", worker, workers, request_id=q["request_id"])
++                torch.cuda.synchronize()
++                torch.cuda.reset_peak_memory_stats()
++                start = time.perf_counter()
++                proposal = denoise_model.predict_proposal(model, raw)
++                torch.cuda.synchronize()
++                calls += 1
++                newcall = 1
++                C.frozen_npz(proposal_path, dict(official_unconstrained_proposal=proposal))
++                C.write(proposal_receipt, dict(status="PASS", raw_sha256=rawrec["raw_sha256"], checkpoint_sha256=r["d0_checkpoint"]["sha256"], output_sha256=C.sha(proposal_path), model_forwards=1,
++                        seconds=time.perf_counter()-start, peak_allocated_bytes=torch.cuda.max_memory_allocated(), peak_reserved_bytes=torch.cuda.max_memory_reserved()))
++                event("D0_FORWARD_RETURNED", worker, workers, request_id=q["request_id"])
++                if calls == 1:
++                    snap("D0_first_actual_forward", worker, workers)
++            denoise.validate_proposal(proposal, raw)
++            C.write(dest / "geometry_started.json", dict(status="STARTED", new_D0_F=newcall))
++            den = proposal.copy()
++            den[:k] = raw[:k]
++            C.frozen_npz(dest / "pre_geo.npz", dict(output=den, C=raw[:k], known_faces=np.asarray(k)))
++            geometry = geo_c.process(den, k)
++            canonical = geo_io._validate_result(den, k, geometry)
++            C.frozen_npz(dest / "post_canonical.npz", canonical)
++            result = source_winding.export_source_winding(canonical, src)
++            post = result["oriented_arrays"]
++            C.frozen_npz(dest / "post.npz", post)
++            geo_io.write_indexed_ply(dest / "post.ply", post["vertices"], post["faces"])
++            vertices, faces = geo_io.read_indexed_ply(dest / "post.ply")
++            if not C.same(vertices, post["vertices"]) or not C.same(faces, post["faces"]):
++                raise ValueError("POST PLY readback mismatch")
++            C.write(dest / "geometry.json", {key: value for key, value in geometry.items() if not isinstance(value, np.ndarray)})
++            C.write(dest / "source_restoration.json", result["restoration_summary"])
++            C.write(dest / "orientation.json", {key: value for key, value in result["orientation_result"].items() if not isinstance(value, np.ndarray)})
++            rec = {key: value for key, value in rawrec.items() if key not in ("files", "contracts")}
++            rec.update(status="COMPLETE", source_sha256=q["condition_source_sha256"], proposal_path=str(proposal_path), proposal_receipt=str(proposal_receipt),
++                       post_path=str(dest / "post.npz"), post_sha256=C.sha(dest / "post.npz"), canonical_path=str(dest / "post_canonical.npz"), pre_geo_path=str(dest / "pre_geo.npz"),
++                       source_restoration=result["restoration_summary"], orientation=result["orientation_result"]["summary"], new_D0_F=newcall, GEO_calls=1,
++                       files={str(path): C.sha(path) for path in dest.iterdir() if path.is_file()})
++            C.write(record_path(q, "post"), rec)
++            rows.append(read_post(q, rawrec))
++            C.write(worker_path("D0", worker, workers, "progress"), dict(completed=len(rows), registered=len(requests), new_D0_F=calls, seconds=time.perf_counter()-tick), replace=True)
++            print(json.dumps(dict(stage="POST", worker=worker, completed=len(rows), request_id=q["request_id"])), flush=True)
++        snap("D0_finish", worker, workers)
++        value = dict(status="COMPLETE", worker=worker, workers=workers, POST=len(rows), new_D0_F=calls, seconds=time.perf_counter()-tick)
++        complete = worker_path("D0", worker, workers, "complete")
++        if not complete.exists():
++            C.write(complete, value)
++        return value
++    except BaseException as exc:
++        event("POST_STOPPED", worker, workers, error=repr(exc), traceback=traceback.format_exc(), completed=len(rows), D0_returned=calls)
++        raise
++    finally:
++        if model is not None:
++            del model
++            torch.cuda.empty_cache()
++
++
++def collect():
++    check_code()
++    r = registration()
++    rows = all_raw(r)
++    C.write(C.OUT / "evaluation/raw_index.json", dict(status="COMPLETE", rows=rows))
++    post_complete = all(record_path(q, "post").exists() for q in r["requests"])
++    if post_complete:
++        post = [read_post(q, raw) for q, raw in zip(r["requests"], rows)]
++        C.write(C.OUT / "evaluation/post_index.json", dict(status="COMPLETE", rows=post))
++    return dict(status="COMPLETE", RAW=len(rows), POST=len(rows) if post_complete else "PENDING", model_forwards=0)
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--stage", choices=("freeze-code", "reuse", "generate", "post", "collect", "check"), required=True)
++    parser.add_argument("--worker", type=int, default=0)
++    parser.add_argument("--workers", type=int, default=1)
++    args = parser.parse_args()
++    if args.stage == "freeze-code":
++        value = freeze_code()
++    elif args.stage == "reuse":
++        value = reuse()
++    elif args.stage == "collect":
++        value = collect()
++    elif args.stage == "check":
++        check_code()
++        r = registration()
++        for q in r["requests"]:
++            arrays = old().read_input(q)
++            source(q, arrays["C"])
++        value = dict(status="PASS", requests=len(r["requests"]), model_forwards=0)
++    else:
++        with owner(args.stage, args.worker, args.workers):
++            value = generate(args.worker, args.workers) if args.stage == "generate" else postprocess(args.worker, args.workers)
++    print(json.dumps(dict(stage=args.stage, result=value), allow_nan=False), flush=True)
++
++
++if __name__ == "__main__":
++    main()
+--- /dev/null
++++ r2/pilots/seat_failure_diagnosis_v1/prepare.py
+@@ -0,0 +1,127 @@
++"""Frozen CPU preparation for TRAIN/DEV and same-surface subdivision diagnosis."""
++import csv, json
++import numpy as np
++from .common import *
++
++
++def verify(path,h):
++    if sha(path)!=h: raise ValueError('Frozen asset mismatch: '+str(path))
++
++
++def subdivide(src):
++    package()
++    from meshflow_control.source_winding import validate_source, capture_source
++    v=validate_source(src,src['C']); C=v['C']; ids=v['C_source_vertex_ids']
++    nextid=int(ids.max())+1; mid={}; verts=[]; vi=[]; parents=[]; bary=[]
++    B=np.eye(3); templates=((0,3,5),(3,1,4),(5,4,2),(3,4,5))
++    for f,(t,ii) in enumerate(zip(C,ids)):
++        xyz=[*t]; jj=[*map(int,ii)]; bb=[*B]
++        for a,b in ((0,1),(1,2),(2,0)):
++            key=tuple(sorted((int(ii[a]),int(ii[b]))))
++            if key not in mid:
++                # float64 arithmetic rounded once; edge order independent.
++                mid[key]=((t[a].astype(float)+t[b].astype(float)).astype(np.float64).__mul__(.5).astype(np.float32),nextid)
++                nextid+=1
++            xyz.append(mid[key][0]);jj.append(mid[key][1]);bb.append((B[a]+B[b])*.5)
++        p=v['P'][f];odd=sum(p[a]>p[b] for a in range(3) for b in range(a+1,3))%2
++        for inds in templates:
++            inds=list(inds)
++            if odd:inds[1],inds[2]=inds[2],inds[1]
++            verts.append(np.asarray(xyz)[inds]);vi.append(np.asarray(jj)[inds]);parents.append(f);bary.append(np.asarray(bb)[inds])
++    original=np.asarray(verts,np.float32); vid=np.asarray(vi,np.int64); parent=np.asarray(parents,np.int64)
++    perm=np.asarray([np.lexsort((t[:,2],t[:,1],t[:,0])) for t in original],np.int64)
++    result=capture_source(original,vid,perm,np.arange(len(original),dtype=np.int64))
++    bary=np.take_along_axis(np.asarray(bary),perm[...,None],axis=1)
++    result.update(subdivision_parent_C_row=parent,subdivision_parent_original_face_id=np.repeat(v['C_original_source_face_ids'],4),child_vertices_in_parent_canonical_barycentric=bary)
++    rebuilt=np.einsum('nij,njk->nik',bary,C.astype(float)[parent])
++    tol=float(np.max(np.abs(rebuilt-result['C'])))
++    area=lambda x: np.linalg.norm(np.cross(x[:,1].astype(float)-x[:,0],x[:,2].astype(float)-x[:,0]),axis=1)/2
++    err=float(abs(area(C).sum()-area(result['C']).sum())/area(C).sum())
++    if tol>1e-6*L or err>1e-5:raise ValueError('Subdivision changes surface beyond frozen rounding tolerance')
++    return result,dict(method='each triangle into four via shared source-ID edge midpoints',max_corner_rounding_model=tol,relative_area_rounding=err,surface_identity='within FP32 midpoint rounding; not bitwise identical tessellation',same_source_surface=True,K_before=len(C),K_after=len(result['C']))
++
++
++def child_queries(oldq,src,legacy):
++    q={k:v.copy() for k,v in oldq.items()};faces=[];bs=[]
++    for f,b in zip(q['C_point_faces'],q['C_barycentric']):
++        j=next((i for i in range(3) if b[i]>=.5),3);child=int(f)*4+j
++        mat=src['child_vertices_in_parent_canonical_barycentric'][child]
++        x=np.linalg.solve(mat.T,b);faces.append(child);bs.append(x)
++    q['C_point_faces']=np.asarray(faces,np.int64);q['C_barycentric']=np.asarray(bs)
++    ctl=legacy.cpu_math()['control'];norm,valid,_=ctl.normals(src['C'],L)
++    q['C_point_normals']=norm[q['C_point_faces']];q['C_point_normal_valid']=valid[q['C_point_faces']]
++    q['C_open_edges'],_=ctl.open_edges(src['C'])
++    q['C_border_distance']=np.sqrt(legacy.cpu_math()['seams'].nearest_segments(q['C_points'],q['C_open_edges'])[0])
++    rebuilt=np.einsum('ni,nij->nj',q['C_barycentric'],src['C'].astype(float)[q['C_point_faces']])
++    if np.max(np.abs(rebuilt-q['C_points']))>1e-6*L:raise ValueError('Retessellation query owner mismatch')
++    if not same(q['C_points'],oldq['C_points']) or not same(q['C_weights'],oldq['C_weights']):raise ValueError('Paired physical queries changed')
++    return q
++
++
++def prepare():
++    dest=OUT/'registration.json'
++    if dest.exists():
++        r=load_registration()
++        for q in r['requests']:verify(q['input_path'],q['input_sha256']);verify(q['condition_source'],q['condition_source_sha256'])
++        for q in r['queries']:verify(q['path'],q['sha256'])
++        return r
++    event('PREPARE_BEGIN',model_calls=0,training_updates=0)
++    matching=OUT/'coverage_audit/selected_train_dev_manifest.json'; pairs=read(matching)['pairs']
++    oldreg=read(OLD/'evaluation/registration.json');oq={q['condition_id']:q for q in oldreg['queries'] if q['panel']=='NEW32'}
++    legacy=old();package()
++    from meshflow_control.source_winding import validate_source
++    retess_pairs=[]
++    for typ in ('SEAT_HALF','SEAT_FULL'):
++        eligible=[p for p in pairs if p['condition_type']==typ and all(int(p[s+'_N'])+3*int(p[s+'_K'])<=256 for s in ('train','dev'))]
++        if not eligible:raise ValueError('No within-N-contract subdivision pair '+typ)
++        retess_pairs.append(eligible[0]['pair_id'])
++    requests=[];queries=[];conditions=[];audits=[]
++    for order,p in enumerate(pairs):
++        for split in ('DEV','TRAIN'):
++            s=split.lower();cid=p[s+'_condition_id'];pid=p[s+'_parent_id'];N=int(p[s+'_N']);K=int(p[s+'_K'])
++            sp=resolve(p[s+'_condition_source']);src=arrays(sp);C=src['C'];validate_source(src,C)
++            devrs=sorted([x for x in oldreg['requests'] if x['condition_id']==p['dev_condition_id'] and x['panel']=='NEW32'],key=lambda x:x['candidate'])
++            assert len(devrs)==2
++            if split=='DEV':
++                qr0=oq[cid];verify(qr0['path'],qr0['sha256']);qa0=arrays(qr0['path']);seed=qr0['identity']['C_seed']
++            else:qa0,seed=legacy.query_bank(C,cid)
++            variants=['base','sub4'] if p['pair_id'] in retess_pairs else ['base']
++            for variant in variants:
++                vcid=cid+'__'+variant
++                if variant=='base':vsrc=src;qa=qa0;vsp=sp;vN=N;vK=K;audit={'method':'unchanged frozen C'}
++                else:
++                    vsrc,audit=subdivide(src);vsp=OUT/'sources'/(vcid+'.npz');frozen_npz(vsp,vsrc);vK=4*K;vN=N+3*K;qa=child_queries(qa0,vsrc,legacy)
++                vC=vsrc['C'];validate_source(vsrc,vC);qp=OUT/'queries'/(vcid+'.npz');frozen_npz(qp,qa)
++                queries.append(dict(condition_id=vcid,base_condition_id=cid,parent_id=pid,panel=split,path=str(qp),sha256=sha(qp),query_count=2048,weight_denominator=float(qa['C_weights'].sum()),array_sha256={k:array_sha(v) for k,v in qa.items()},identity=dict(condition_id=vcid,C_seed=seed,C_sha256=array_sha(vC),L0=L)))
++                region,tier=p['condition_type'].split('_')
++                meta=dict(pair_id=p['pair_id'],condition_id=vcid,base_condition_id=cid,parent_id=pid,group_uid=pid,panel=split,split=split,condition_type=p['condition_type'],region_type=region,tier=tier,N=vN,K=vK,ratio=vK/vN,variant=variant,alpha=1.,condition_source=str(vsp),condition_source_sha256=sha(vsp),C_sha256=array_sha(vC),selection_order=order)
++                conditions.append(meta);audits.append(dict(condition_id=vcid,**audit,N_before=N,N_after=vN,free_count_fixed=vN-vK==N-K,query_points_byte_preserved=same(qa['C_points'],qa0['C_points']),query_weights_byte_preserved=same(qa['C_weights'],qa0['C_weights'])))
++                for dr in devrs:
++                    verify(dr['input_path'],dr['input_sha256']);db=arrays(dr['input_path']);seedn=int(dr['noise_seed'])
++                    # Original registration drew only free variables with MT19937.
++                    free=np.random.RandomState(seedn).randn(N-K,3,3).astype(np.float32)
++                    df=db['z'][:,int(dr['K']):].reshape(-1,3,3);m=min(len(free),len(df))
++                    if not same(free[:m],df[:m]):raise ValueError('Original noise algorithm/prefix mismatch')
++                    if split=='DEV' and not same(free,df):raise ValueError('Cached DEV free noise differs')
++                    z=np.zeros((1,vN,9),np.float32);z[:,vK:]=free.reshape(1,-1,9)
++                    rid='SEATDIAG__'+split+'__'+vcid+'__n'+str(dr['candidate']);ip=OUT/'inputs'/(rid+'.npz');frozen_npz(ip,C=vC,z=z,N=np.asarray(vN,np.int64),K=np.asarray(vK,np.int64))
++                    action='CACHE' if split=='DEV' and variant=='base' else 'NEW'
++                    q=dict(**meta,request_id=rid,base_request_id=split+'__'+cid+'__n'+str(dr['candidate']),candidate=dr['candidate'],action=action,input_path=str(ip),input_sha256=sha(ip),Gaussian_sha256=array_sha(z),free_Gaussian_sha256=array_sha(free),noise_seed=seedn,noise_provenance='original MT19937 free stream; TRAIN/DEV common prefix only when free counts differ; sub4 full free array identical',dev_request_id=dr['request_id'],common_train_dev_free_prefix=min(int(p['dev_free']),int(p['train_free'])),source_quality='SOURCE_AUDIT_SEPARATE_NO_UNIQUE_GT_RANKING')
++                    if action=='CACHE':
++                        for st in ('raw','post'):
++                            rp=OLD/'evaluation'/st/'USER_EXPANDED_67'/dr['request_id']/'receipt.json'
++                            q['cache_'+st+'_receipt']=str(rp);q['cache_'+st+'_receipt_sha256']=sha(rp)
++                    requests.append(q)
++    assert len(requests)==40 and sum(q['action']=='NEW' for q in requests)==24 and len(conditions)==20
++    cp=read(OLD/'evaluation/checkpoints/USER_EXPANDED_67.json');d=read(OLD/'evaluation/D0/identity.json')
++    cp['bytes']=resolve(cp['path']).stat().st_size
++    d0=dict(path=d['checkpoint_path'],sha256=d['checkpoint_sha256'],bytes=d['checkpoint_bytes'])
++    sources={str(p):sha(p) for p in [CODE/'common.py',CODE/'prepare.py',ROOT/'r2/src/meshflow_control/sampling.py',ROOT/'r2/src/meshflow_control/source_winding.py',ROOT/'r2/pilots/user_condition_finetune_v1/evaluation.py']}
++    protocol=dict(training=0,backwards=0,model='EXP67 completed step6000, one fixed generator',sampling='Euler50 BF16 forward FP32 integration, all RAW then single D0 GEO_C source-winding export',matching='eight pairs selected from input geometry only; observational TRAIN/DEV comparison not causal generalization estimate',noise='two original DEV seeds; exact MT19937 free-prefix pairing; same complete free noise for sub4',subdivision='two earliest eligible matched pairs, HALF and FULL; each C face split4; N increases by3K with same free count; operational representation sensitivity not isolated token-attention causality',subdivision_pairs=retess_pairs,source_comparison='no unique source-chair GT scoring',selection_no_result_changes=True,visual_review='all RAW/POST; blue C/gray F; full views plus local side views; YES/NO/UNCERTAIN with notes; nonblind AI_PROXY',quality='unchanged full old quality CF FF I, AVMR PMR all thresholds, legal shared edges; no selecting favorable metrics',query='same physical2048 points and weights for base/sub4, point ownership remapped, normals/borders recomputed; vertex-based AVMR denominator changes and is not retess-invariant',failure='stop on reserved missing-return; no hidden retry; engineering recovery logged without extra forwards',do_not_train_commit_push_or_change_default=True)
++    reg=dict(version=VERSION,status='FROZEN',created_utc=utc(),labels=[LABEL],checkpoint=cp,d0_checkpoint=d0,D0=d0,L=L,requests=requests,queries=queries,conditions=conditions,definition=protocol,budget=dict(RAW=40,POST=40,rollouts=24,generator_forwards_max=1200,generator_sampling_forwards=1200,D0_forwards_max=24,training_updates=0,backwards=0),preparation_source_hashes=sources,source_documents={str(p):sha(p) for p in (matching,OLD/'evaluation/registration.json')})
++    write(OUT/'subdivision_audit.json',audits);csvwrite(OUT/'requests.csv',requests);csvwrite(OUT/'conditions.csv',conditions);write(dest,reg)
++    event('PREPARE_COMPLETE',registration_sha256=sha(dest),logical_requests=40,new_rollouts=24,generator_F_max=1200,D0_F_max=24,models_loaded=0)
++    return reg
++
++if __name__=='__main__':
++    r=prepare();print(json.dumps(dict(status=r['status'],requests=len(r['requests']),budget=r['budget']),ensure_ascii=False))--- /dev/null
++++ r2/pilots/seat_failure_diagnosis_v1/rendering.py
+@@ -0,0 +1,200 @@
++"""Fixed 24-page CPU gallery: complete meshes plus C-centered exact cross sections.
++
++Reads only frozen registration and RAW/POST indices, never quality rankings.
++The 80-row review template remains NOT_REVIEWED until actual visual inspection.
++"""
++from __future__ import annotations
++import os
++for _key in ('OMP_NUM_THREADS','MKL_NUM_THREADS','OPENBLAS_NUM_THREADS','NUMEXPR_NUM_THREADS'):
++    os.environ.setdefault(_key,'2')
++os.environ['CUDA_VISIBLE_DEVICES']=''
++import argparse,collections,html,json,time
++from pathlib import Path
++import numpy as np
++from . import common as C
++
++GALLERY=C.OUT/'evaluation/gallery'
++REVIEW_FIELDS=('C_adoption','C_floating','C_replaced_by_other_surface','C_wrong_layer',
++               'whole_body_complete','support_missing','fragments_or_folded_layers','visible_join')
++META=('request_id','pair_id','condition_id','base_condition_id','parent_id','panel','split',
++      'condition_type','region_type','tier','N','K','variant','candidate')
++SCHEMA='r2_seat_failure_fixed_sections_v1'
++CAMERA=(22.,-60.)
++SECTION_EPS=1e-12*C.L
++DEFINITION=dict(schema=SCHEMA,expected_pages=24,expected_review_rows=80,
++    base_pages='8 pairs x 2 noises; TRAIN and DEV groups, RAW/POST rows',
++    retessellation_pages='4 conditions x 2 noises; base and sub4 groups, RAW/POST rows',
++    each_group_views=['whole mesh orthographic oblique','front XY section at area-weighted C center Z','side ZY section at area-weighted C center X'],
++    global_bounds='Union of all displayed meshes on page, including every fragment; identical RAW/POST and both columns.',
++    local_bounds='Union C bbox on page plus .075L X/Z margin, .10L Y margin; fixed from C only, never fitted to free outputs.',
++    sections='Triangle/plane intersection segments, all triangles considered; coplanar triangles contribute edges. Thin pale blue projected C outlines show its overall extent, thick blue segments are actual section intersections. Gray segments are F intersections.',
++    coordinate_frame='Model Y up, plot whole=(X,Z,Y). Local 2D axes explicitly model coordinates.',
++    slice_plane='Per-condition area-weighted C centroid; same RAW/POST. Base and exact-surface sub4 centroid should coincide to floating precision.',
++    no_geometry_change=True,no_smoothing=True,no_quality_ranking=True,
++    limitations='A central slice can miss off-plane parts or attachments; whole view retains them. Rendering cannot certify actual index connectivity. Labels disclose TRAIN/DEV and variants; review nonblind AI_PROXY.')
++
++def verify(hashes):
++    for p,h in hashes.items():
++        if C.sha(p)!=h:raise ValueError('Render source changed: '+p)
++
++def layout(reg):
++    req=reg['requests'];assert len(req)==40 and len({q['request_id'] for q in req})==40
++    base=collections.defaultdict(dict);extra=collections.defaultdict(dict)
++    for q in req:
++        if q['variant']=='base':base[q['pair_id'],int(q['candidate'])][q['split']]=q
++    for q in req:
++        if q['variant']!='base':
++            assert q['variant']=='sub4'
++            key=(q['pair_id'],q['split'],int(q['candidate']))
++            extra[key]['sub4']=q;extra[key]['base']=base[q['pair_id'],int(q['candidate'])][q['split']]
++    pages=[]
++    for (pair,n),qs in sorted(base.items()):
++        assert set(qs)=={'TRAIN','DEV'}
++        pages.append(dict(page_id=f'{pair}__n{n}__TRAIN_DEV',kind='TRAIN_DEV',pair_id=pair,candidate=n,
++                          titles=['TRAIN','DEV'],requests=[qs['TRAIN'],qs['DEV']]))
++    for (pair,split,n),qs in sorted(extra.items()):
++        assert set(qs)=={'base','sub4'}
++        pages.append(dict(page_id=f'{pair}__{split}__n{n}__BASE_SUB4',kind='BASE_SUB4',pair_id=pair,candidate=n,
++                          titles=[split+' base',split+' sub4'],requests=[qs['base'],qs['sub4']]))
++    assert len(pages)==24
++    return pages
++
++def get_indices(reg):
++    result={}
++    for stage in ('raw','post'):
++        obj=C.read(C.OUT/'evaluation'/f'{stage}_index.json');rs=obj['rows']
++        if obj.get('status')!='COMPLETE' or len(rs)!=40:raise ValueError('Incomplete '+stage+' index')
++        mapping={r['request_id']:r for r in rs}
++        if set(mapping)!={q['request_id'] for q in reg['requests']}:raise ValueError('Index request set differs')
++        result[stage.upper()]=mapping
++    return result
++
++def center_of_c(tri):
++    a=np.linalg.norm(np.cross(tri[:,1]-tri[:,0],tri[:,2]-tri[:,0]),axis=1)
++    return np.average(tri.mean(1),axis=0,weights=a)
++
++def section_segments(tri,axis,value):
++    result=[]
++    for face in np.asarray(tri,dtype=np.float64):
++        delta=face[:,axis]-value
++        if np.all(np.abs(delta)<=SECTION_EPS):
++            result.extend([face[[a,b]] for a,b in ((0,1),(1,2),(2,0))]);continue
++        points=[]
++        for a,b in ((0,1),(1,2),(2,0)):
++            if abs(delta[a])<=SECTION_EPS:points.append(face[a])
++            if delta[a]*delta[b]<0:points.append(face[a]+(face[b]-face[a])*(-delta[a]/(delta[b]-delta[a])))
++        unique=[]
++        for p in points:
++            if not any(np.linalg.norm(p-v)<=SECTION_EPS for v in unique):unique.append(p)
++        if len(unique)>=2:
++            best=max(((a,b) for a in range(len(unique)) for b in range(a+1,len(unique))),key=lambda ab:np.linalg.norm(unique[ab[0]]-unique[ab[1]]))
++            result.append(np.array([unique[best[0]],unique[best[1]]]))
++    return np.asarray(result,dtype=float).reshape(-1,2,3)
++
++def section_plot(ax,mesh,k,center,bounds,view):
++    from matplotlib.collections import LineCollection
++    axis,project=(2,(0,1)) if view=='front' else (0,(2,1))
++    horizontal='X' if view=='front' else 'Z';cut='Z' if view=='front' else 'X'
++    # Projected C edge outline is contextual, not a claim the full C lies in cut.
++    edges=np.concatenate([mesh[:k,[a,b]] for a,b in ((0,1),(1,2),(2,0))])
++    ax.add_collection(LineCollection(edges[:,:,project],colors='#a6d9ef',linewidths=.6,alpha=.65,zorder=1))
++    for tri,color,lw,z in ((mesh[k:],'#52585d',.75,2),(mesh[:k],'#057bbd',2.,3)):
++        segments=section_segments(tri,axis,float(center[axis]))
++        if len(segments):ax.add_collection(LineCollection(segments[:,:,project],colors=color,linewidths=lw,alpha=1,zorder=z))
++    lo=np.array(bounds['local_low']);hi=np.array(bounds['local_high'])
++    ax.set_xlim(lo[project[0]],hi[project[0]]);ax.set_ylim(lo[1],hi[1]);ax.set_aspect('equal',adjustable='box')
++    ax.grid(alpha=.14,linewidth=.5);ax.tick_params(labelsize=6,length=2)
++    ax.set_xlabel(horizontal+' (model)',fontsize=7);ax.set_ylabel('Y height',fontsize=7)
++    ax.set_title(f'{view} local cut {cut}={center[axis]:.3f}',fontsize=8)
++
++def definitions():
++    paths=[Path(__file__),C.CODE/'common.py',C.ROOT/'r2/tools/student_multistep_denoise_v1/gallery.py']
++    return {str(p):C.sha(p) for p in paths}
++
++def render():
++    reg=C.load_registration();pages=layout(reg);indices=get_indices(reg);defs=definitions()
++    frozen=dict(registration_sha256=C.sha(C.OUT/'registration.json'),index_hashes={str(C.OUT/'evaluation'/f'{s}_index.json'):C.sha(C.OUT/'evaluation'/f'{s}_index.json') for s in ('raw','post')},definition_hashes=defs,definition=DEFINITION)
++    manifest=GALLERY/'manifest.json'
++    if manifest.exists():
++        prior=C.read(manifest)
++        if prior['identity']!=frozen:raise ValueError('Frozen gallery identity changed')
++        verify(prior['output_hashes']);return prior
++    C.write(GALLERY/'definition.json',DEFINITION)
++    if not (GALLERY/'resources_before.json').exists():C.resources(GALLERY/'resources_before.json')
++    G=C.module('_seat_old_draw',C.ROOT/'r2/tools/student_multistep_denoise_v1/gallery.py')
++    import matplotlib.pyplot as plt
++    from PIL import Image
++    receipts=[];reviews={};images=[];cards=[];tick=time.perf_counter()
++    for page in pages:
++        meshes={};Cs={};centers={};hashes={};items=page['requests']
++        for q in items:
++            rid=q['request_id'];k=int(q['K']);inp=C.arrays(q['input_path']);src=C.arrays(q['condition_source'])
++            # Inputs are frozen; C key has no hidden source completion.
++            cc=inp['C'].reshape(k,3,3);original=src['C_original'].reshape(k,3,3)
++            Cs[rid]=cc;centers[rid]=center_of_c(cc.astype(float))
++            hashes[q['input_path']]=q['input_sha256'];hashes[q['condition_source']]=q['condition_source_sha256']
++            for stage in ('RAW','POST'):
++                r=indices[stage][rid];pk='raw_path' if stage=='RAW' else 'post_path';hk='raw_sha256' if stage=='RAW' else 'post_sha256'
++                p=r[pk];arrays=C.arrays(p);mesh=arrays['raw' if stage=='RAW' else 'output'].reshape(-1,3,3)
++                if mesh.dtype!=np.float32 or not np.isfinite(mesh).all():raise ValueError('Bad render array')
++                if not C.same(mesh[:k],cc if stage=='RAW' else original):raise ValueError('Rendered C identity differs')
++                if stage=='POST' and not C.same(arrays['vertices'][arrays['faces']],mesh):raise ValueError('POST indices differ')
++                meshes[rid,stage]=mesh;hashes[p]=r[hk]
++        verify(hashes)
++        allxyz=np.concatenate([m.reshape(-1,3) for m in meshes.values()]).astype(float);lo=allxyz.min(0);hi=allxyz.max(0)
++        allc=np.concatenate([x.reshape(-1,3) for x in Cs.values()]).astype(float);clo=allc.min(0);chi=allc.max(0)
++        margins=np.array([.075,.10,.075])*C.L
++        bounds=dict(center_model_xyz=((lo+hi)/2).tolist(),span=float((hi-lo).max()*1.10),local_low=(clo-margins).tolist(),local_high=(chi+margins).tolist(),C_section_centers={k:v.tolist() for k,v in centers.items()})
++        ident=C.clean(dict(**page,hashes=hashes,bounds=bounds,identity=frozen,dimensions=[1950,980]))
++        dest=GALLERY/'images'/(page['page_id']+'.jpg');side=dest.with_suffix('.json')
++        if side.exists():
++            receipt=C.read(side)
++            if receipt['identity']!=ident or C.sha(dest)!=receipt['image_sha256']:raise ValueError('Existing page differs')
++        else:
++            if dest.exists():raise RuntimeError('Incomplete image requires explicit engineering recovery')
++            fig=plt.figure(figsize=(15,7.538461538461538),dpi=130,facecolor='white')
++            for i,stage in enumerate(('RAW','POST')):
++                for j,q in enumerate(items):
++                    rid=q['request_id'];k=int(q['K']);m=meshes[rid,stage]
++                    ax=fig.add_subplot(2,6,i*6+j*3+1,projection='3d');G.draw(ax,m,k,bounds,CAMERA)
++                    ax.set_title(page['titles'][j]+' | '+stage+f' | K={k} F={len(m)-k}\n'+q['parent_id'][:8],fontsize=8)
++                    for v,view in enumerate(('front','side'),2):
++                        ax=fig.add_subplot(2,6,i*6+j*3+v);section_plot(ax,m,k,centers[rid],bounds,view)
++            warning=' | PAIR04: source geometry near-duplicate caution' if page['pair_id']=='PAIR04' else ''
++            fig.suptitle(page['page_id']+' | '+items[0]['condition_type']+' | EXP67 frozen'+warning,fontsize=12)
++            fig.text(.5,.039,'BLUE: C. GRAY: free. Whole views include all faces; local cuts intentionally show only plane intersections.',ha='center',fontsize=9)
++            fig.text(.5,.020,'Pale blue: projected C edges. Thick blue: cut intersects C. Y is vertical. Fixed C-only local bounds; same whole scale per page.',ha='center',fontsize=8)
++            fig.text(.5,.004,'Nonblind AI_PROXY review; images and slice contacts do not certify shared-edge topology. No smoothing or mesh edits.',ha='center',fontsize=8)
++            fig.subplots_adjust(left=.015,right=.99,top=.88,bottom=.115,wspace=.27,hspace=.33)
++            dest=C.checked(dest);dest.parent.mkdir(parents=True,exist_ok=True);tmp=C.checked(dest.with_name(dest.name+'.tmp'))
++            with tmp.open('xb') as f:fig.savefig(f,format='jpg',dpi=130,pil_kwargs={'quality':91,'optimize':True})
++            plt.close(fig);os.replace(tmp,dest)
++            with Image.open(dest) as im:im.verify()
++            verify(hashes);receipt=dict(status='RENDERED_NOT_REVIEWED',identity=ident,image_path=str(dest),image_sha256=C.sha(dest));C.write(side,receipt)
++        receipts.append(receipt);images.append(dict(page_id=page['page_id'],kind=page['kind'],pair_id=page['pair_id'],candidate=page['candidate'],image_path=str(dest),image_sha256=receipt['image_sha256'],requests=[q['request_id'] for q in items]))
++        for q in items:
++            for stage in ('RAW','POST'):
++                key=(q['request_id'],stage)
++                if key not in reviews:reviews[key]=dict(**{k:q[k] for k in META},stage=stage,label='EXP67_FROZEN',review_status='NOT_REVIEWED',reviewer='AI_PROXY',blind=False,image_paths=[],image_sha256s=[],reviewed_image_sha256='',**{k:'UNKNOWN' for k in REVIEW_FIELDS},notes='')
++                reviews[key]['image_paths'].append(str(dest));reviews[key]['image_sha256s'].append(receipt['image_sha256'])
++        relative='images/'+dest.name
++        cards.append('<section><h2>'+html.escape(page['page_id'])+'</h2><a href="'+relative+'"><img style="width:100%;max-width:1950px" loading="lazy" src="'+relative+'"></a></section>')
++        C.write(GALLERY/'progress.json',dict(status='RENDERING',images=len(receipts),expected=24),replace=True)
++        print(json.dumps(dict(page=page['page_id'],images=len(receipts),expected=24)),flush=True)
++    assert len(reviews)==80 and len(receipts)==24
++    template=GALLERY/'AI_PROXY_review_template.csv';C.csvwrite(template,[reviews[k] for k in sorted(reviews)])
++    C.csvwrite(GALLERY/'images.csv',images)
++    text='<!doctype html><meta charset="utf-8"><title>EXP67 seat failure diagnosis</title><h1>TRAIN / DEV and exact-surface subdivision</h1><p>24 fixed pages. Whole orthographic view plus two C-centered cross sections, RAW above POST. Do not interpret cut-plane contact as exact topology. PAIR04 source shapes are highly similar; assess separately for generalization.</p>'+''.join(cards)
++    C._write_bytes(GALLERY/'index.html',text.encode('utf8'))
++    outputhash={str(p):C.sha(p) for p in sorted(GALLERY.rglob('*')) if p.is_file() and p.name not in ('manifest.json','progress.json')}
++    result=dict(status='RENDERED_NOT_REVIEWED',identity=frozen,images=24,review_rows=80,seconds=time.perf_counter()-tick,receipts=receipts,output_hashes=outputhash,actual_visual_review='NOT_RUN_BY_RENDERER',model_calls=0,quality_calls=0)
++    C.write(manifest,result);C.write(GALLERY/'progress.json',dict(status='RENDERED_NOT_REVIEWED',images=24,expected=24),replace=True)
++    return result
++
++def main():
++    parser=argparse.ArgumentParser();parser.add_argument('--check-only',action='store_true');args=parser.parse_args()
++    if args.check_only:
++        r=C.load_registration();p=layout(r);print(json.dumps(dict(status='RENDER_LAYOUT_CHECK_PASS',requests=len(r['requests']),pages=len(p),expected_review_rows=80,actual_renders=0,model_calls=0)))
++    else:
++        result=render();print(json.dumps({k:v for k,v in result.items() if k not in ('receipts','output_hashes','identity')}))
++if __name__=='__main__':main()
+--- /dev/null
++++ r2/pilots/seat_failure_diagnosis_v1/resume.py
+@@ -0,0 +1,30 @@
++"""Conservative resumable controller: no extra calls; finished stages verify only."""
++import argparse, subprocess, sys, json
++from . import common as E
++
++def call(module,*args):
++    command=[sys.executable,'-B','-m','r2.pilots.seat_failure_diagnosis_v1.'+module,*map(str,args)]
++    E.event('CONTROLLER_SUBPROCESS',argv=command)
++    subprocess.run(command,check=True,cwd=E.ROOT)
++
++def main():
++    p=argparse.ArgumentParser();p.add_argument('--through',choices=('check','generate','post','score','render'),default='check');a=p.parse_args()
++    call('prepare');call('gpu','--stage','freeze-code');call('gpu','--stage','reuse');call('gpu','--stage','check')
++    levels=['check','generate','post','score','render'];rank=levels.index(a.through)
++    # Preserves the measured two-way partition. On resume dispatch sequentially;
++    # each GPU entry measures resources and checks unresolved calls itself.
++    if rank>=1:
++        for worker in (0,1):call('gpu','--stage','generate','--worker',worker,'--workers',2)
++    if rank>=2:
++        for worker in (0,1):call('gpu','--stage','post','--worker',worker,'--workers',2)
++        call('gpu','--stage','collect')
++    if rank>=3:
++        call('evaluate','--stage','score','--max-workers','2')
++        call('evaluate','--stage','aggregate')
++    if rank>=4:
++        call('rendering')
++        call('endpoint')
++        if (E.OUT/'evaluation/gallery/root_visual_observations.json').exists():call('review')
++    E.event('CONTROLLER_COMPLETE',through=a.through)
++    print(json.dumps(dict(status='COMPLETE',through=a.through,training=0)))
++if __name__=='__main__':main()--- /dev/null
++++ r2/pilots/seat_failure_diagnosis_v1/review.py
+@@ -0,0 +1,45 @@
++"""Compile recorded image observations; never infer review labels from scores."""
++import csv, json, collections
++from . import common as E
++
++G=E.OUT/'evaluation/gallery'
++def readcsv(p):
++    with E.resolve(p).open(encoding='utf-8-sig',newline='') as f:return list(csv.DictReader(f))
++def run():
++    obs=E.read(G/'root_visual_observations.json'); reg=E.load_registration();tmpl=readcsv(G/'AI_PROXY_review_template.csv'); indep=readcsv(G/'review_sub4/review_sub4.csv')
++    fields=['C_adoption','C_floating','C_replaced_by_other_surface','C_wrong_layer','whole_body_complete','support_missing','fragments_or_folded_layers','visible_join']
++    ob={(x['pair'],x['split'],x['n']):x for x in obs};root=[]
++    for t in tmpl:
++        if t['variant']!='base':continue
++        o=ob[t['pair_id'],t['split'],int(t['candidate'])];t=dict(t)
++        image=G/'images'/(t['pair_id']+'__n'+t['candidate']+'__TRAIN_DEV.jpg');h=E.sha(image)
++        if str(image) not in json.loads(t['image_paths']) or h not in json.loads(t['image_sha256s']):raise ValueError('Review image identity changed')
++        t.update(review_status='REVIEWED',reviewer='/root',review_kind='AI_PROXY',blind=False,reviewed_image_sha256=h,actual_review_image_path=str(image),
++          C_adoption=o['a'],C_floating=o['floating'],C_replaced_by_other_surface=o['replacement'],C_wrong_layer=o['wrong'],whole_body_complete=o['whole'],support_missing='NO',
++          fragments_or_folded_layers='UNCERTAIN',visible_join='UNCERTAIN',notes=o['notes'],review_scope='Whole oblique view and two fixed central cross sections; same-stage labels independently inspected; not a topology, watertightness or no-overlap certificate.')
++        root.append(t)
++    assert len(root)==64
++    rootby={(r['request_id'],r['stage']):r for r in root};differences=[]
++    for i in indep:
++        if E.sha(i['image_path'])!=i['reviewed_image_sha256']:raise ValueError('Independent review image changed')
++        k=i['request_id'],i['stage']
++        if k in rootby:
++            b=rootby[k]
++            for f in fields:
++                if b[f]!=i[f]:differences.append(dict(request_id=k[0],stage=k[1],field=f,root_value=b[f],independent_value=i[f],resolution='BOTH_RETAINED_NO_VOTE',root_image=b['actual_review_image_path'],independent_image=i['image_path']))
++    main=root+[i for i in indep if i['variant']=='sub4']
++    assert len(main)==80 and len({(r['request_id'],r['stage']) for r in main})==80
++    for r in main:
++        r['has_independent_adoption_disagreement']=any(d['request_id']==r['request_id'] and d['stage']==r['stage'] and d['field']=='C_adoption' for d in differences)
++    E.csvwrite(G/'AI_PROXY_root_base_review.csv',root);E.csvwrite(G/'AI_PROXY_review_disagreements.csv',differences);E.csvwrite(G/'AI_PROXY_review_completed.csv',main)
++    summary=[]
++    for stage in ('RAW','POST'):
++      for split in ('TRAIN','DEV'):
++       for region in ('SEAT','BACK'):
++        for exclusion in (False,True):
++         rr=[r for r in main if r['stage']==stage and r['split']==split and r['region_type']==region and r['variant']=='base' and (not exclusion or r['pair_id']!='PAIR04')]
++         summary.append(dict(stage=stage,split=split,region=region,exclude_near_duplicate_PAIR04=exclusion,count=len(rr),**dict(collections.Counter(r['C_adoption'] for r in rr)),definition='Primary nonblind AI_PROXY judgment; disagreements saved separately; do not treat as human or general benchmark'))
++    E.csvwrite(G/'AI_PROXY_review_summary.csv',summary)
++    E.write(G/'review_completion.json',dict(status='ACTUALLY_REVIEWED',unique_output_stage_rows=80,pages_actually_reviewed=24,root_rows=64,independent_rows=32,independent_duplicate_base_rows=16,sub4_primary_rows=16,all_primary_rows_have_notes_and_image_hash=True,adoption_disagreement_rows=sum(d['field']=='C_adoption' for d in differences),all_field_disagreements=len(differences),human_review=False,blind=False,metric_defined_semantic_labels=False))
++    print(json.dumps(dict(status='COMPLETE',primary_rows=80,adoption_disagreements=sum(d['field']=='C_adoption' for d in differences),summary=summary),ensure_ascii=False))
++if __name__=='__main__':run()--- /dev/null
++++ r2/pilots/seat_failure_diagnosis_v1/save_sub4_visual_review.py
+@@ -0,0 +1,88 @@
++"""Persist the agent's actual eight-page visual reading; no scoring inference.
++
++The judgments below were written after the displayed JPEGs were inspected.
++All comparison labels were visible. Base rows are an independent second view,
++not an inter-rater agreement estimate or a replacement for the root review.
++"""
++import json
++from pathlib import Path
++from . import common as C
++from .rendering import REVIEW_FIELDS,GALLERY
++
++# Field order: adoption, floating, replaced, wrong layer, complete, missing support,
++# fragments/folded layers, visible join. U remains uncertain, never converted.
++OBSERVATIONS=[
++('PAIR01','DEV',0,'base','NUYYYNNU',
++ '蓝色半座面在灰色独立座面下方；正面切线灰座面约Y=0.25、C约Y=-0.45，侧截面也有明显间隔。四腿和靠背存在，C还伸出框架。',
++ 'D0后灰座面与蓝C仍明显上下分层；框架与四腿保留。是否在未切中的位置碰到支架无法从这两刀确认。'),
++('PAIR01','DEV',0,'sub4','UUUNYNNU',
++ '整体变为圆柱底座加圆背形态，切线灰座面接近蓝C高度；但蓝片明显超出圆形主体轮廓，不能仅凭同层确认合理采用。',
++ '圆柱底座形态保留，局部灰线与蓝片更同层，但突出主体的蓝片仍在，接缝及实际用途保留不确定。'),
++('PAIR01','DEV',1,'base','NUYYYNNU',
++ '箱式椅主体包围蓝片；切面灰色横向座层约Y=0.2而C约Y=-0.45，输入落在座面下方。箱式支撑可作为合法形态，不按缺四腿判坏。',
++ '箱式形态和灰座层仍在C上方；蓝片被外壳遮挡但切面显示错层，未看到后处理修复其坐面用途。'),
++('PAIR01','DEV',1,'sub4','NUYYYNNU',
++ '形状转为细四腿椅，灰色座层明显高于蓝C；蓝片向侧方伸出，改变形态没有解决该噪声的错层。',
++ '四腿椅保留，正面与侧面切线仍见蓝C低于灰色座层；无法把同一表面细分理解成这一例采用改善。'),
++('PAIR01','TRAIN',0,'base','NUYYYNNU',
++ '圆柱底座座面位于约Y=-0.45，蓝C约Y=0，灰座面另行形成。完整底座和背部存在，但蓝片处于偏高位置。',
++ '灰色圆形座层仍低于蓝C，形态和错层基本保留；可见接合不足以判定，不能从一个投影的线相遇推出共边。'),
++('PAIR01','TRAIN',0,'sub4','NUYYUNYU',
++ '生成物变为带过长竖杆和层叠框架的椅形，切面出现灰色上层约Y=0.5、C约Y=0；蓝片更像座块下层，整体合理性不确定。',
++ '灰色上层与蓝C之间仍有高度差，异常高竖杆和框架层保留；支撑存在但完整合理椅形无法确定。'),
++('PAIR01','TRAIN',1,'base','NUYYYNNU',
++ '四腿椅整体存在；正侧切面有灰色上座层高于C，蓝线夹在上下灰层之间，作为用户要求坐面的用途不能认定成立。',
++ '后处理把灰色厚座轮廓整理得更清楚，蓝C仍处于其内部高度；没有消除输入被独立座层替代的迹象。'),
++('PAIR01','TRAIN',1,'sub4','UUUUUUYU',
++ '整体变为低矮箱式/折叠层外观，蓝面在中间露出，周围灰层与扶手折叠明显；用途和支撑结构均难以确定。',
++ '低矮箱式外观和上缘折叠保持，蓝面用途仍不确定；不能因为没有原四腿就自动判支撑缺失，也不能据此称改善。'),
++('PAIR03','DEV',0,'base','UUUUYNNU',
++ '箱式椅包围输入，中央切面主要是蓝C而未见明显平行灰座层，存在合理座面解释；但全图遮挡较强，采用保留不确定。',
++ '箱式椅及中央蓝C保留，切面没有明显大错层；蓝灰边界被侧壁遮挡，不把缺少反证当作已经采用或接上。'),
++('PAIR03','DEV',0,'sub4','UUUUYNNU',
++ '仍为箱式椅；蓝C上方出现很近的灰横线，可能是相邻厚度面或替代层，单凭当前截面不能区分。',
++ '近邻灰层与蓝C仍并列，主体存在；没有足够证据将这条比base更明确地认定采用，也不能据薄层断定失败。'),
++('PAIR03','DEV',1,'base','UUUUYNNU',
++ '四腿椅中蓝C在座位高度并向右伸出，截面有上下邻近灰线；难区分合法厚度、局部支架与重复座面。',
++ '四腿与靠背完整，蓝C与灰层近邻且略向外伸，接合和是否被其他层替代均保留不确定。'),
++('PAIR03','DEV',1,'sub4','UUUUYNNU',
++ '四腿椅仍成立，蓝片在座位上方/附近较明显地伸出；侧截面蓝线与下方灰线接近，不能把靠近直接当采用。',
++ '灰线与蓝C之间的近层关系仍在，右侧突出蓝片可见；没有形成两噪声一致的更好采用证据。'),
++('PAIR03','TRAIN',0,'base','YNNNYNNU',
++ '大块蓝C清楚构成箱式椅的内侧坐面，靠背与扶手在其上方，中央截面未见另造的灰坐面覆盖；箱式支撑完整。',
++ '蓝面继续作为箱式椅坐面，完整主体保留；图像支持用途但无法认证精确共享边，因此接合仍不确定。'),
++('PAIR03','TRAIN',0,'sub4','NUYYYNYU',
++ '变为四腿椅，灰色实际座层约Y=0.2而蓝C在约Y=0.8，蓝片明显悬高并超出椅背侧方；细分后用途反而变差。',
++ '灰座层与高处蓝C仍明显分离，四腿和靠背在但高蓝片未纳入坐面；这是一条明确反向结果。'),
++('PAIR03','TRAIN',1,'base','NUYYYNYU',
++ '支撑和背部存在但灰背上缘折叠拥挤；蓝面高于独立灰坐面并大幅伸出，坐面用途失败，不能用主体存在掩盖。',
++ '后处理后灰色实际座层仍远低于蓝C，背部折片仍可见；输入高悬关系未修复。'),
++('PAIR03','TRAIN',1,'sub4','NUYYYNNU',
++ '灰色四腿椅较规则，但蓝C仍在靠背上部高度并向外突出，另造灰座面明显更低；整体更整齐不等于控制成功。',
++ '规则椅形与高悬蓝C同时保留，未见坐面采用改善；局部投影可能相遇但不认证真实接缝。'),
++]
++
++def main():
++    reg=C.load_registration();mapping={(q['pair_id'],q['split'],int(q['candidate']),q['variant']):q for q in reg['requests']}
++    dest=GALLERY/'review_sub4';dest.mkdir(parents=True,exist_ok=True)
++    values=[];visited={}
++    for pair,split,noise,variant,codes,nraw,npost in OBSERVATIONS:
++        assert len(codes)==8,(pair,split,noise,variant,codes)
++        q=mapping[(pair,split,noise,variant)];path=GALLERY/'images'/f'{pair}__{split}__n{noise}__BASE_SUB4.jpg';digest=C.sha(path);visited[str(path)]=digest
++        for stage,note in [('RAW',nraw),('POST',npost)]:
++            labels={key:{'Y':'YES','N':'NO','U':'UNCERTAIN'}[code] for key,code in zip(REVIEW_FIELDS,codes)}
++            # Correct explicit completeness/support tuple for TRAIN sub4 n0.
++            if (pair,split,noise,variant)==('PAIR03','TRAIN',0,'sub4'):
++                labels.update(whole_body_complete='YES',support_missing='NO',fragments_or_folded_layers='YES')
++            values.append(dict(**{k:q[k] for k in ('request_id','pair_id','condition_id','base_condition_id','parent_id','split','condition_type','region_type','tier','N','K','variant','candidate')},stage=stage,label='EXP67_FROZEN',reviewer='/root/local_scope_review',review_kind='AI_PROXY',review_status='REVIEWED',blind=False,image_path=str(path),image_sha256=digest,reviewed_image_sha256=digest,**labels,notes=note,
++                review_scope='Actual whole view and both fixed central sections; source GT and new metric values not read. Central cuts may miss off-plane contacts.'))
++    assert len(values)==32 and len(visited)==8 and len({(r['request_id'],r['stage']) for r in values})==32
++    C.csvwrite(dest/'review_sub4.csv',values)
++    C.write(dest/'review_sub4.json',dict(status='REVIEWED',rows=values,image_hashes=visited,images_actually_viewed=8,independent_base_rows=16,new_sub4_rows=16,
++        independent_review_caution='Root reviews base TRAIN/DEV pages; retain disagreements, do not claim inter-rater reliability or vote by metrics.',
++        intervention_caution='Same C surface and same free Gaussian, but K and total N change. Shape differences do not isolate token count.',
++        summary='No consistent subdivision adoption benefit. PAIR01 DEV n0 changes from obvious wrong layer to closer same-level geometry but still uncertain use. PAIR03 TRAIN n0 loses a plausible adopted seat and generates a lower separate seat beneath C. Other cases retain failure or thin-layer uncertainty. RAW/POST judgments in these views agree.'))
++    first=GALLERY/'images/PAIR00__n0__TRAIN_DEV.jpg'
++    C.write(dest/'layout_QA.json',dict(status='PASS',actual_first_image_viewed=str(first),image_sha256=C.sha(first),all_sub4_pages_viewed=list(visited),title_and_panel_labels_readable=True,whole_and_local_views_readable=True,axis_contract='Y vertical',no_visible_label_clipping=True,judgments_are_not_topology_certificates=True))
++    print(json.dumps(dict(status='REVIEWED',images=8,rows=32,rows_path=str(dest/'review_sub4.csv'))))
++if __name__=='__main__':main()
+--- /dev/null
++++ r2/pilots/seat_failure_diagnosis_v1/source_audit.py
+@@ -0,0 +1,267 @@
++"""CPU-only source-target localization; old meshes, scorers and reports stay read-only."""
++from __future__ import annotations
++import argparse, collections, csv, hashlib, json, os, time, traceback
++from pathlib import Path
++import numpy as np
++
++ROOT = Path('/mnt/e/MeshFlow')
++OLD = ROOT / 'experiments/r2_user_data_scaling_32_67_v1'
++AUDIT = ROOT / 'experiments/r2_source_interface_audit_v1'
++OUT = ROOT / 'experiments/r2_seat_failure_diagnosis_v1/source_audit'
++TAUS = (0.005, 0.01, 0.02)
++
++def sha(path):
++    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
++
++def js(path, obj):
++    Path(path).write_text(json.dumps(obj, indent=2, ensure_ascii=False, allow_nan=False)+'\n', encoding='utf-8')
++
++def rows(path):
++    return list(csv.DictReader(Path(path).open(encoding='utf-8-sig', newline='')))
++
++def csvout(path, data):
++    keys=list(dict.fromkeys(k for row in data for k in row))
++    with Path(path).open('w', encoding='utf-8-sig', newline='') as f:
++        w=csv.DictWriter(f,fieldnames=keys);w.writeheader();w.writerows(data)
++
++def compact(v):
++    return json.dumps(v,separators=(',',':'))
++
++def triangle_key(t):
++    # Exact numeric FP32 equality, unordered corners; +0 and -0 normalized.
++    z=np.array(t,dtype=np.float32,copy=True);z[z==0]=0
++    return tuple(sorted(tuple(float(q) for q in p) for p in z))
++
++def frame(triangles):
++    t=np.asarray(triangles,dtype=np.float64)
++    cross=np.cross(t[:,1]-t[:,0],t[:,2]-t[:,0]); areas=np.linalg.norm(cross,axis=1)/2
++    total=areas.sum(); center=np.sum(areas[:,None]*t.mean(1),axis=0)/total
++    second=np.zeros((3,3))
++    for a,tt in zip(areas,t):
++        s=tt.sum(0);second+=a*(np.outer(s,s)+tt.T@tt)/12
++    cov=second/total-np.outer(center,center)
++    vals,vecs=np.linalg.eigh(cov); n=vecs[:,0]
++    # Model Y is the inherited Chair vertical axis; do not use source winding.
++    if n[1]<0:n=-n
++    axis=np.eye(3)[np.argmin(np.abs(n))];u=np.cross(n,axis);u/=np.linalg.norm(u);v=np.cross(n,u)
++    basis=np.stack([u,v],axis=1)
++    return center,n,basis,areas,vals
++
++def point_surface_distance(points,triangles):
++    p=np.asarray(points,dtype=np.float64)[:,None,:];t=np.asarray(triangles,dtype=np.float64)
++    a=t[None,:,0,:];b=t[None,:,1,:];c=t[None,:,2,:]
++    ab=b-a;ac=c-a;n=np.cross(ab,ac);nn=(n*n).sum(-1)
++    signed=((p-a)*n).sum(-1);proj=p-n*(signed/np.maximum(nn,1e-30))[...,None]
++    v=proj-a;d00=(ab*ab).sum(-1);d01=(ab*ac).sum(-1);d11=(ac*ac).sum(-1)
++    d20=(v*ab).sum(-1);d21=(v*ac).sum(-1);den=d00*d11-d01*d01
++    s=(d11*d20-d01*d21)/np.maximum(den,1e-30);q=(d00*d21-d01*d20)/np.maximum(den,1e-30)
++    inside=(s>=-1e-12)&(q>=-1e-12)&(s+q<=1+1e-12)&(nn>0)
++    best=np.where(inside,signed*signed/np.maximum(nn,1e-30),np.inf)
++    for x,y in ((a,b),(b,c),(c,a)):
++        e=y-x;frac=np.clip(((p-x)*e).sum(-1)/np.maximum((e*e).sum(-1),1e-30),0,1)
++        d=((p-(x+frac[...,None]*e))**2).sum(-1);best=np.minimum(best,d)
++    return np.sqrt(np.min(best,axis=1))
++
++def cross2(a,b):return float(a[0]*b[1]-a[1]*b[0])
++
++def area2(poly):
++    if len(poly)<3:return 0.0
++    x=np.asarray(poly);return abs(float(np.sum(x[:,0]*np.roll(x[:,1],-1)-x[:,1]*np.roll(x[:,0],-1))))/2
++
++def clip_area(subject,clip):
++    if np.any(np.max(subject,axis=0)<np.min(clip,axis=0)) or np.any(np.max(clip,axis=0)<np.min(subject,axis=0)):return 0.0
++    c=np.array(clip);sgn=cross2(c[1]-c[0],c[2]-c[0]);
++    if abs(sgn)<1e-20:return 0.0
++    if sgn<0:c=c[::-1]
++    p=list(np.array(subject))
++    for a,b in zip(c,np.roll(c,-1,axis=0)):
++        if not p:break
++        new=[];last=p[-1];dl=cross2(b-a,last-a)
++        for cur in p:
++            dc=cross2(b-a,cur-a)
++            if (dc>=0)!=(dl>=0):
++                new.append(last+(cur-last)*(dl/(dl-dc)))
++            if dc>=0:new.append(cur)
++            last=cur;dl=dc
++        p=new
++    return area2(p)
++
++def projection_stats(tri,region,center,basis,L):
++    p=(tri-center)@basis;rr=(region-center)@basis
++    ar=area2(p);over=[clip_area(p,r) for r in rr]
++    # Sum is intentionally pairwise, not a union; curved projections may overlap.
++    return {'projected_area':ar,'projection_pairwise_overlap_sum':sum(over),
++            'projection_max_single_triangle_overlap':max(over,default=0),
++            'projection_any_positive':max(over,default=0)>1e-12*L*L,
++            'projection_pairwise_overlap_over_Y_projection':sum(over)/ar if ar>1e-16*L*L else 'NA_ZERO_PROJECTED_AREA'}
++
++def resources():
++    import psutil,subprocess
++    r={'cpu_count':os.cpu_count(),'memory_available':psutil.virtual_memory().available,'loadavg':os.getloadavg(),
++       'workers':1,'threads':1,'GPU_calls':0,'dispatch':'One CPU analysis worker; independent of controller GPU tasks.'}
++    for key,args in [('gpu',['--query-gpu=name,memory.total,memory.used,memory.free,utilization.gpu','--format=csv,noheader']),
++                     ('processes',['--query-compute-apps=pid,process_name,used_memory','--format=csv,noheader'])]:
++        try:r[key]=subprocess.check_output(['nvidia-smi',*args],text=True,stderr=subprocess.STDOUT)
++        except Exception as e:r[key]='NA_'+str(e)
++    return r
++
++def prepare():
++    OUT.mkdir(parents=True,exist_ok=True)
++    m=json.loads((OLD/'data/train_manifest.json').read_text())
++    tasks={k:v for k,v in m['tasks'].items() if v['condition_type'].startswith('SEAT') and v['uid'] in m['pools']['USER_EXPANDED_67']}
++    assert len(tasks)==98
++    L=json.loads((OLD/'evaluation/registration.json').read_text())['definition']['L']
++    paths={Path(__file__),ROOT/'AGENTS.md',ROOT/'WORKSPACE.md',ROOT/'native_t1/docs/control_metrics.md',
++           OLD/'data/train_manifest.json',OLD/'evaluation/registration.json',AUDIT/'statistics/per_condition.csv',
++           AUDIT/'statistics/exposure_association.csv',AUDIT/'source_interfaces.csv',AUDIT/'C_Y_edge_details.csv'}
++    for t in tasks.values():paths.update([Path(t['npz']),Path(t['quality_path']),Path(m['parents'][t['uid']]['npz'])])
++    hashes=[{'path':str(p),'exists':p.exists(),'sha256':sha(p) if p.exists() else None,'bytes':p.stat().st_size if p.exists() else None} for p in sorted(paths)]
++    rule={'version':'seat_source_localization_v1','created_unix':time.time(),'conditions':sorted(tasks),'count':98,'L':L,'tau_over_L':list(TAUS),
++          'target':'EXP67 frozen 50 SEAT_FULL + 48 SEAT_HALF; source geometry diagnostic, not generated success score.',
++          'identity':'Read original indexed model_vertices/source_faces plus condition source_face_ids and free_source_ids; require exact C_original match and saved file hashes.',
++          'duplicate':'Exact unordered FP32 numeric coordinate triangle groups wholly inside Y; independently recomputed and compared with saved audit. Coincident winding is ignored, +/-0 numerically identical.',
++          'seat_region':'R is frozen region_source_face_ids, C is frozen source_face_ids. HALF C differs from R. Never infer a new seat label.',
++          'local_frame':'Area-integrated least-squares plane of C or R independently; normal points toward model +Y; record planarity and abs normal Y. Not a new semantic label.',
++          'distance':'Exact centroid-to-union-of-finite-triangles nearest distance, and vertex/mid-edge/centroid 7-point finite-surface sampled min/max. Sampled minimum is NOT exact triangle-triangle minimum.',
++          'projection':'Orthogonally project Y face and each C/R triangle onto that region plane, clip convex triangles; record any positive projected overlap >1e-12 L^2, max per-triangle and pairwise summed overlap. Pairwise sum is NOT a union area.',
++          'near':'Centroid finite-surface distance <= tau L, tau=0.005/0.01/0.02; separately record 7-point sampled minimum <= tau L; no success/failure threshold.',
++          'local_duplicate':'Y has exact duplicate group, representative has positive footprint overlap with C/R and centroid distance <= tau L. Descriptive localization, does not prove causal repeated-seat generation.',
++          'bottom_candidate':'Nonduplicate Y face, abs(normal dot C plane normal)>=0.9, positive projection overlap, whole face signed coordinate below min C signed coordinate by >1e-7 L, C plane abs(Y normal)>=0.7. This is a plausible lower layer, NOT certified reasonable or illegal. Record all distances, no automatic removal.',
++          'legality':'Reuse frozen whole-source facepair classification only. Near, parallel or projected-overlapping alone never means illegal. Missing classification retained as NO_RECORDED_CONTACT or NA.',
++          'interface':'Reconstruct indexed C/Y edge incidence from true source arrays, verify inherited SOURCE_INDEX edge endpoints and source face IDs. Inherit legal status; do not rerun all triangle-pair intersections.',
++          'budget':{'models':0,'training':0,'new_generation':0,'new_noise':0,'new_triangle_intersection_tests':0,'geometry_conditions':98}}
++    if (OUT/'rules.json').exists():
++        old=json.loads((OUT/'rules.json').read_text());assert old['conditions']==rule['conditions'] and old['version']==rule['version']
++        return
++    js(OUT/'rules.json',rule);js(OUT/'protected_before.json',hashes);js(OUT/'resources_before.json',resources())
++    print(json.dumps({'prepared':98,'rules_sha256':sha(OUT/'rules.json'),'protected_files':len(hashes)}),flush=True)
++
++def run():
++    start=time.time();rule=json.loads((OUT/'rules.json').read_text());L=rule['L']
++    before=json.loads((OUT/'protected_before.json').read_text())
++    for r in before:
++        if r['exists']:assert sha(r['path'])==r['sha256'],r['path']
++    m=json.loads((OLD/'data/train_manifest.json').read_text());oldstats={r['condition_id']:r for r in rows(AUDIT/'statistics/per_condition.csv')}
++    exps={r['condition_id']:r for r in rows(AUDIT/'statistics/exposure_association.csv') if r['arm']=='USER_EXPANDED_67'}
++    inter={r['condition_id']:r for r in rows(AUDIT/'source_interfaces.csv') if r['topology_domain']=='SOURCE_INDEX' and r['direction']=='AS_STORED_SOURCE'}
++    edges=collections.defaultdict(list)
++    for r in rows(AUDIT/'C_Y_edge_details.csv'):
++        if r['topology_domain']=='SOURCE_INDEX':edges[r['condition_id']].append(r)
++    allc=[];allg=[];allf=[];alle=[];blocked=[]
++    for ix,cid in enumerate(rule['conditions']):
++        cell=OUT/'conditions'/cid;cell.mkdir(parents=True,exist_ok=True)
++        if (cell/'complete.json').exists():
++            z=json.loads((cell/'complete.json').read_text());allc.append(z['condition']);allg+=z['groups'];allf+=z['faces'];alle+=z['interfaces'];continue
++        try:
++            t=m['tasks'][cid];parent=m['parents'][t['uid']]
++            assert sha(parent['npz'])==parent['sha256'];assert sha(t['npz'])==t['sha256'];assert sha(t['quality_path'])==t['quality_sha256']
++            with np.load(parent['npz'],allow_pickle=False) as a:v=a['model_vertices'].copy();f=a['source_faces'].copy()
++            with np.load(t['npz'],allow_pickle=False) as q:
++                ci=q['source_face_ids'].copy();yi=q['free_source_ids'].copy();ri=q['region_source_face_ids'].copy();co=q['C_original'].copy()
++            assert sorted(np.r_[ci,yi].tolist())==list(range(len(f))) and not set(ci)&set(yi)
++            triangles=v[f];C=triangles[ci].astype(np.float64);R=triangles[ri].astype(np.float64)
++            assert np.array_equal(co,triangles[ci]);assert np.array_equal(ci,np.array(t['source_face_ids']));assert np.array_equal(yi,np.array(t['free_source_ids']))
++            quality=json.loads(Path(t['quality_path']).read_text());assert quality['input_npz_sha256']==sha(parent['npz'])
++            qpair={tuple(sorted(x['pair'])):x for x in quality['pair_contacts']}
++            dupmap=collections.defaultdict(list)
++            for j in yi:dupmap[triangle_key(triangles[j])].append(int(j))
++            groups=sorted(sorted(g) for g in dupmap.values() if len(g)>1)
++            assert groups==sorted(sorted(g) for g in json.loads(oldstats[cid]['Y_exact_duplicate_groups'])),cid
++            duplicate_ids={j for g in groups for j in g};group_id={j:gix for gix,g in enumerate(groups) for j in g}
++            c0,cn,cb,ca,ce=frame(C);r0,rn,rb,ra,re=frame(R)
++            ee=collections.defaultdict(list)
++            for j,ff in enumerate(f):
++                for aa,bb in zip(ff,np.roll(ff,-1)):ee[tuple(sorted([int(aa),int(bb)]))].append(j)
++            cic=set(map(int,ci));yic=set(map(int,yi));truecf={key:ids for key,ids in ee.items() if set(ids)&cic and set(ids)&yic}
++            inherited=inter[cid];assert len(truecf)==int(inherited['C_F_shared_edge_count'])
++            eout=[]
++            for e in edges[cid]:
++                key=tuple(sorted([int(e['vertex_u']),int(e['vertex_v'])]));sids=json.loads(e['source_face_ids'])
++                assert key in truecf and sorted(sids)==sorted(truecf[key])
++                eout.append({'condition_id':cid,'source_vertex_u':key[0],'source_vertex_v':key[1],
++                             'source_face_ids':compact(sids),'actual_source_incidence_verified':True,'inherited_valid_edge':e['valid_edge'],
++                             'inherited_pair_classification':e['pair_classification'],'inherited_rejected_reasons':e['rejected_reasons']})
++            assert sum(e['inherited_valid_edge']=='True' for e in eout)==int(inherited['C_F_valid_edge_count'])
++            faceout=[]
++            for j in yi:
++                tt=triangles[j].astype(np.float64);centroid=tt.mean(0);samples=np.vstack([tt,(tt+np.roll(tt,-1,axis=0))/2,centroid])
++                dc=point_surface_distance(samples,C);dr=point_surface_distance(samples,R)
++                nn=np.cross(tt[1]-tt[0],tt[2]-tt[0]);norm=float(np.linalg.norm(nn));unit=nn/norm if norm else np.zeros(3)
++                pc=projection_stats(tt,C,c0,cb,L);pr=projection_stats(tt,R,r0,rb,L)
++                signed=(tt-c0)@cn;sc=(C-c0)@cn
++                relc=[qpair.get(tuple(sorted([int(j),int(k)]))) for k in ci]
++                contacts=[x for x in relc if x]
++                lower=bool(int(j) not in duplicate_ids and abs(unit@cn)>=0.9 and pc['projection_any_positive'] and max(signed)<float(sc.min())-1e-7*L and abs(cn[1])>=0.7)
++                row={'condition_id':cid,'parent_uid':t['uid'],'condition_type':t['condition_type'],'source_face_id':int(j),'exact_duplicate_group_id':group_id.get(int(j),'NA_NOT_DUPLICATE'),
++                     'centroid':compact(centroid.tolist()),'Y_area':norm/2,'C_centroid_distance_over_L':float(dc[-1]/L),'C_sample7_min_distance_over_L':float(dc.min()/L),'C_sample7_max_distance_over_L':float(dc.max()/L),
++                     'R_centroid_distance_over_L':float(dr[-1]/L),'R_sample7_min_distance_over_L':float(dr.min()/L),'R_sample7_max_distance_over_L':float(dr.max()/L),
++                     'abs_normal_dot_C_plane':float(abs(unit@cn)),'abs_normal_dot_R_plane':float(abs(unit@rn)),
++                     'signed_C_plane_min_over_L':float(min(signed)/L),'signed_C_plane_max_over_L':float(max(signed)/L),
++                     'Y_y_min':float(tt[:,1].min()),'Y_y_max':float(tt[:,1].max()),'possible_lower_layer_not_certified':lower,
++                     'C_contact_categories':compact(sorted(set(x['category'] for x in contacts))) if contacts else 'NO_RECORDED_CONTACT',
++                     'C_contact_classifications':compact(sorted(set(x['classification'] for x in contacts))) if contacts else 'NO_RECORDED_CONTACT',
++                     'interpretation':'EXACT_DUPLICATE_IN_Y' if int(j) in duplicate_ids else ('POSSIBLE_LOWER_LAYER_NOT_CERTIFIED' if lower else 'OTHER_SOURCE_FACE')}
++                row.update({'C_'+k:v for k,v in pc.items()});row.update({'R_'+k:v for k,v in pr.items()})
++                for tau in TAUS:
++                    tag=str(tau);row['C_centroid_near_'+tag]=bool(dc[-1]<=tau*L);row['R_centroid_near_'+tag]=bool(dr[-1]<=tau*L)
++                    row['C_sample7_near_'+tag]=bool(dc.min()<=tau*L);row['R_sample7_near_'+tag]=bool(dr.min()<=tau*L)
++                faceout.append(row)
++            byface={r['source_face_id']:r for r in faceout};groupout=[]
++            for gix,g in enumerate(groups):
++                r=dict(byface[g[0]]);r.update({'duplicate_group_id':gix,'duplicate_source_face_ids':compact(g),'multiplicity':len(g),'extra_face_count':len(g)-1,
++                        'original_saved_group_verified':True,'exact_numeric_geometry_verified':True,
++                        'duplicate_internal_pair_categories':compact(sorted(set(qpair.get(tuple(sorted([a,b])),{}).get('category','NO_RECORDED_CONTACT') for i,a in enumerate(g) for b in g[i+1:])))})
++                for tau in TAUS:
++                    tag=str(tau)
++                    for region in ['C','R']:r[region+'_local_duplicate_'+tag]=bool(r[region+'_projection_any_positive'] and r[region+'_centroid_near_'+tag])
++                groupout.append(r)
++            c={'condition_id':cid,'parent_uid':t['uid'],'condition_type':t['condition_type'],'N':len(f),'K':len(ci),'R_faces':len(ri),'Y_faces':len(yi),
++               'condition_source_face_ids':compact(ci.tolist()),'region_source_face_ids':compact(ri.tolist()),'C_original_match':True,'duplicate_groups_match_saved':True,
++               'actual_exposures':int(exps[cid]['actual_exposures']),'Y_duplicate_groups':len(groups),'Y_duplicate_faces':len(duplicate_ids),
++               'C_plane_normal':compact(cn.tolist()),'C_plane_abs_normal_Y':float(abs(cn[1])),'C_area_integrated_plane_RMS_over_L':float(np.sqrt(max(0,ce[0]))/L),
++               'R_plane_normal':compact(rn.tolist()),'R_area_integrated_plane_RMS_over_L':float(np.sqrt(max(0,re[0]))/L),
++               'C_y_min':float(C[:,:,1].min()),'C_y_max':float(C[:,:,1].max()),'source_interface_actual_shared_edges':len(truecf),
++               'source_interface_inherited_valid_edges':int(inherited['C_F_valid_edge_count']),'source_interface_ids_verified':True,
++               'source_interface_boundary_fraction_inherited':float(inherited['valid_interface_boundary_length_fraction']),
++               'possible_lower_layer_faces_not_certified':sum(x['possible_lower_layer_not_certified'] for x in faceout),'status':'PASS'}
++            for tau in TAUS:
++                tag=str(tau)
++                for region in ['C','R']:
++                    c[region+'_local_duplicate_groups_'+tag]=sum(x[region+'_local_duplicate_'+tag] for x in groupout)
++                    c[region+'_any_duplicate_centroid_near_'+tag]=sum(x[region+'_centroid_near_'+tag] for x in groupout)
++                    c[region+'_any_duplicate_sample7_near_'+tag]=sum(x[region+'_sample7_near_'+tag] for x in groupout)
++            js(cell/'complete.json',{'condition':c,'groups':groupout,'faces':faceout,'interfaces':eout,'rules_sha256':sha(OUT/'rules.json')})
++            allc.append(c);allg+=groupout;allf+=faceout;alle+=eout
++        except Exception as e:
++            b={'condition_id':cid,'status':'BLOCKED','reason':str(e),'traceback':traceback.format_exc()};blocked.append(b);js(cell/'blocked.json',b)
++        if (ix+1)%10==0:print(json.dumps({'completed':ix+1,'passed':len(allc),'blocked':len(blocked)}),flush=True)
++    csvout(OUT/'per_condition.csv',allc);csvout(OUT/'per_duplicate_group.csv',allg);csvout(OUT/'per_Y_face.csv',allf);csvout(OUT/'source_interface_verification.csv',alle);csvout(OUT/'blocked.csv',blocked)
++    summary=[]
++    for kind in ['ALL','SEAT_FULL','SEAT_HALF']:
++        cc=[r for r in allc if kind=='ALL' or r['condition_type']==kind];gg=[r for r in allg if kind=='ALL' or r['condition_type']==kind]
++        s={'type':kind,'conditions':len(cc),'parents':len(set(r['parent_uid'] for r in cc)),'actual_exposures':sum(r['actual_exposures'] for r in cc),
++           'conditions_with_any_Y_duplicate':sum(r['Y_duplicate_groups']>0 for r in cc),'duplicate_groups_counted_per_condition':len(gg),
++           'exposures_with_any_Y_duplicate':sum(r['actual_exposures'] for r in cc if r['Y_duplicate_groups']>0),
++           'conditions_with_possible_lower_layer_not_certified':sum(r['possible_lower_layer_faces_not_certified']>0 for r in cc),
++           'conditions_with_verified_legal_source_interface':sum(r['source_interface_inherited_valid_edges']>0 for r in cc)}
++        for tau in TAUS:
++            tag=str(tau)
++            for region in ['C','R']:
++                key=region+'_local_duplicate_groups_'+tag
++                s[region+'_conditions_with_local_duplicate_'+tag]=sum(r[key]>0 for r in cc)
++                s[region+'_exposures_with_local_duplicate_'+tag]=sum(r['actual_exposures'] for r in cc if r[key]>0)
++                s[region+'_local_duplicate_groups_'+tag]=sum(r[key] for r in cc)
++        summary.append(s)
++    csvout(OUT/'summary.csv',summary)
++    after=[dict(r,after_sha256=sha(r['path']) if Path(r['path']).exists() else None) for r in before]
++    unchanged=all(r['sha256']==r['after_sha256'] for r in after);js(OUT/'protected_after.json',after)
++    js(OUT/'source_hashes.json',{'entry':str(Path(__file__)),'sha256':sha(__file__),'rules_sha256':sha(OUT/'rules.json')})
++    result={'status':'COMPLETE' if not blocked and len(allc)==98 and unchanged else 'COMPLETE_WITH_BLOCKED','elapsed_seconds':time.time()-start,'conditions':len(allc),
++            'group_rows':len(allg),'Y_face_rows':len(allf),'interface_rows':len(alle),'blocked':len(blocked),'protected_files':len(before),'protected_unchanged':unchanged,
++            'model_calls':0,'new_intersection_tests':0,'summary':summary}
++    js(OUT/'COMPLETE.json',result);js(OUT/'resources_after.json',resources());print(json.dumps(result),flush=True)
++
++if __name__=='__main__':
++    p=argparse.ArgumentParser();p.add_argument('--stage',choices=['prepare','run'],required=True);a=p.parse_args()
++    if a.stage=='prepare':prepare()
++    else:run()

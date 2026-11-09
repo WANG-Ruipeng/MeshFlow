@@ -1,0 +1,1364 @@
+--- /dev/null
++++ b/r2/tools/source_winding_export_v1/common.py
+@@ -0,0 +1,62 @@
++"""Independent CPU-only continuation; historical sources and results are read-only."""
++from pathlib import Path
++import csv, hashlib, json, os, subprocess, time
++ROOT=Path(__file__).resolve().parents[3]
++CODE=Path(__file__).parent
++OUT=ROOT/'experiments/r2_source_winding_export_v1'
++OLD=ROOT/'experiments/r2_c_restore_bounded_v1'
++VERSION='R2_SOURCE_WINDING_EXPORT_V1'
++
++def sha(p):
++ h=hashlib.sha256()
++ with Path(p).open('rb') as f:
++  for b in iter(lambda:f.read(8<<20),b''):h.update(b)
++ return h.hexdigest()
++def read(p):return json.loads(Path(p).read_text(encoding='utf-8-sig'))
++def rows(p):
++ with Path(p).open(encoding='utf-8-sig',newline='') as f:return list(csv.DictReader(f))
++def checked(p):
++ p=Path(p).absolute()
++ if any(q.is_symlink() for q in (p,*p.parents)):raise ValueError('Symlink output')
++ p=p.resolve()
++ if not p.is_relative_to(OUT.resolve()) or p==OUT.resolve():raise ValueError('Write outside experiment: '+str(p))
++ return p
++def atomic(p,fn,binary=False):
++ p=checked(p);p.parent.mkdir(parents=True,exist_ok=True);tmp=p.with_name(p.name+'.tmp')
++ with tmp.open('wb' if binary else 'w',**({} if binary else {'encoding':'utf-8','newline':''})) as f:
++  fn(f);f.flush();os.fsync(f.fileno())
++ tmp.replace(p)
++def clean(v):
++ import numpy as np
++ if isinstance(v,dict):return {str(k):clean(a) for k,a in v.items()}
++ if isinstance(v,(tuple,list)):return [clean(a) for a in v]
++ if isinstance(v,np.ndarray):return clean(v.tolist())
++ if isinstance(v,np.generic):return clean(v.item())
++ if isinstance(v,float) and not np.isfinite(v):return None
++ return v
++def write(p,obj):atomic(p,lambda f:json.dump(clean(obj),f,indent=2,ensure_ascii=False,allow_nan=False))
++def textfile(p,s):atomic(p,lambda f:f.write(s))
++def save_npz(p,**arrays):
++ import numpy as np
++ atomic(p,lambda f:np.savez_compressed(f,**arrays),True)
++def csvwrite(p,data):
++ data=clean(data);fields=list(dict.fromkeys(k for r in data for k in r)) or ['status']
++ def dump(f):
++  w=csv.DictWriter(f,fields);w.writeheader();w.writerows(data)
++ atomic(p,dump)
++def payload(p):
++ import numpy as np
++ with np.load(p,allow_pickle=False) as a:return {k:a[k].copy() for k in a.files}
++def same(a,b):return a.shape==b.shape and a.dtype==b.dtype and a.tobytes()==b.tobytes()
++def event(kind,**kw):
++ p=checked(OUT/'ledger.jsonl');p.parent.mkdir(parents=True,exist_ok=True)
++ with p.open('a',encoding='utf-8') as f:
++  f.write(json.dumps(clean(dict(utc=time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),event=kind,**kw)),allow_nan=False)+'\n');f.flush();os.fsync(f.fileno())
++def resources():
++ def call(args):
++  r=subprocess.run(args,text=True,capture_output=True,timeout=20);return dict(code=r.returncode,stdout=r.stdout,stderr=r.stderr)
++ return dict(gpu=call(['nvidia-smi','--query-gpu=name,memory.total,memory.used,memory.free,utilization.gpu','--format=csv,noheader,nounits']),gpu_processes=call(['nvidia-smi','--query-compute-apps=pid,process_name,used_memory','--format=csv']),cpu_cores=os.cpu_count(),loadavg=list(os.getloadavg()),memory=Path('/proc/meminfo').read_text(),cpu_processes=call(['ps','-eo','pid,pcpu,pmem,comm','--sort=-pcpu']))
++def verify(mapping):
++ for p,h in mapping.items():
++  if sha(p)!=h:raise ValueError('Protected input/source changed: '+p)
++ return len(mapping)
+--- /dev/null
++++ b/r2/tools/source_winding_export_v1/independent_audit.py
+@@ -0,0 +1,291 @@
++"""Independent saved-artifact verification; NumPy only, no model/GEO/scorer calls."""
++from __future__ import annotations
++import argparse, collections, csv, hashlib, json, os, time
++from pathlib import Path
++for _k in ('OMP_NUM_THREADS','OPENBLAS_NUM_THREADS','MKL_NUM_THREADS','NUMEXPR_NUM_THREADS'):
++    os.environ[_k]='1'
++os.environ['CUDA_VISIBLE_DEVICES']=''
++import numpy as np
++
++ROOT=Path(__file__).resolve().parents[3]
++OUT=ROOT/'experiments/r2_source_winding_export_v1'
++AUDIT=OUT/'independent_audit'
++
++def sha(path):
++    h=hashlib.sha256()
++    with Path(path).open('rb') as f:
++        for b in iter(lambda:f.read(8<<20),b''):h.update(b)
++    return h.hexdigest()
++def read(p):return json.loads(Path(p).read_text(encoding='utf-8-sig'))
++def rows(p):
++    with Path(p).open(encoding='utf-8-sig',newline='') as f:return list(csv.DictReader(f))
++def arrays(p):
++    with np.load(p,allow_pickle=False) as z:return {k:z[k].copy() for k in z.files}
++def same(a,b):return a.shape==b.shape and a.dtype==b.dtype and a.tobytes()==b.tobytes()
++def norm(a):return np.sqrt(np.sum(np.asarray(a,dtype=np.float64)**2,axis=-1))
++def near(a,b,atol=2e-12,rtol=2e-11):
++    assert np.shape(a)==np.shape(b) and np.allclose(a,b,atol=atol,rtol=rtol,equal_nan=False),'Numerical mismatch'
++def checked(p):
++    p=Path(p).absolute()
++    assert not any(q.is_symlink() for q in (p,*p.parents)),'Symlink output'
++    p=p.resolve();assert p!=AUDIT.resolve() and p.is_relative_to(AUDIT.resolve()),'Outside owned audit'
++    return p
++def atomic(p,fn):
++    p=checked(p);p.parent.mkdir(parents=True,exist_ok=True);temp=checked(p.with_name(p.name+'.tmp'))
++    with temp.open('w',encoding='utf-8',newline='') as f:fn(f);f.flush();os.fsync(f.fileno())
++    temp.replace(p)
++def write(p,obj):atomic(p,lambda f:json.dump(obj,f,ensure_ascii=False,indent=2,allow_nan=False))
++def csvwrite(p,data):
++    def emit(f):
++        fields=list(dict.fromkeys(k for r in data for k in r)) or ['status']
++        w=csv.DictWriter(f,fields);w.writeheader();w.writerows(data)
++    atomic(p,emit)
++def verify(mapping):
++    for p,h in mapping.items():assert sha(p)==h,p
++    return len(mapping)
++
++
++def permute(a,p):
++    a=np.asarray(a);p=np.asarray(p,dtype=np.int64)
++    assert a.shape[:2]==p.shape and p.shape[1]==3
++    idx=p.reshape(p.shape+(1,)*(a.ndim-2))
++    return np.take_along_axis(a,idx,axis=1)
++
++def check_source_restoration(condition,parent,model,restored,K):
++    """Derive the inverse without calling restoration or orientation code."""
++    cp=condition['C_source_corner_permutations'];ids=condition['C_source_vertex_ids']
++    retained=condition['source_face_ids'].astype(np.int64)
++    original=condition['original_source_face_ids'].astype(np.int64)
++    assert cp.shape==(K,3) and np.array_equal(np.sort(cp,axis=1),np.tile(np.arange(3),(K,1)))
++    # Explicit inverse map (rather than the production argsort implementation).
++    inverse=np.empty((K,3),dtype=np.int64)
++    for face in range(K):
++        for old_slot,source_slot in enumerate(cp[face]):
++            inverse[face,int(source_slot)]=old_slot
++    assert np.array_equal(permute(cp,inverse),np.tile(np.arange(3),(K,1)))
++    assert np.array_equal(parent['retained_to_original_face'][retained],original)
++    assert np.array_equal(parent['source_corner_permutations'][retained],cp)
++    assert np.array_equal(parent['source_face_vertex_ids'][retained],ids)
++    original_ids=parent['original_source_faces'][original]
++    assert np.array_equal(permute(original_ids,cp),ids)
++    C=condition['C'];source_C=parent['model_vertices'][original_ids]
++    assert same(parent['full_target'][retained].reshape(K,3,3),C)
++    assert same(parent['model_vertices'][ids],C) and same(permute(source_C,cp),C)
++    assert same(permute(C,inverse),source_C)
++    assert same(model['output'][:K],C)
++    n=len(model['faces']);allperm=np.tile(np.arange(3,dtype=np.int64),(n,1));allperm[:K]=inverse
++    expected_faces=permute(model['faces'],allperm)
++    assert same(restored['vertices'],model['vertices']) and same(restored['faces'],expected_faces)
++    assert same(restored['output'],permute(model['output'],allperm))
++    assert same(restored['C'],source_C) and same(restored['output'][:K],source_C)
++    assert same(restored['output'][K:],model['output'][K:])
++    assert same(restored['source_face_ids'],model['source_face_ids'])
++    assert same(restored['source_corner_ids'],permute(model['source_corner_ids'],allperm))
++    assert same(restored['vertices'][restored['faces']],restored['output'])
++    assert np.array_equal(np.sort(restored['faces'],axis=1),np.sort(model['faces'],axis=1))
++    assert same(restored['free'],model['output'][K:])
++    changed=np.any(inverse!=np.arange(3),axis=1)
++    odd=np.asarray([sum(int(p[i])>int(p[j]) for i in range(3) for j in range(i+1,3))%2 for p in inverse])
++    return allperm,dict(C_faces=K,source_original_face_ids_verified=True,source_vertex_ids_verified=True,
++        source_C_exact_coordinates_and_corner_order=True,source_C_changed_corner_order_faces=int(changed.sum()),
++        source_C_odd_permutation_faces=int(odd.sum()),source_C_even_nonidentity_permutation_faces=int((changed&(odd==0)).sum()),
++        free_bitwise_unchanged=True,vertex_array_bytes_unchanged=True,
++        unordered_index_triangles_unchanged=True,source_face_ids_unchanged=True)
++
++def check_corner_attributes(original,output,final_permutation):
++    """Check output-corner gathers from the retained original-input audit domain."""
++    mapping={
++        'corner_displacement':'output_corner_displacement',
++        'corner_displacement_vector':'output_corner_displacement_vector',
++        'corner_target_input_ids':'output_corner_target_input_ids',
++        'corner_vertex_ids':'output_corner_vertex_ids',
++        'corner_status':'output_corner_status',
++        'corner_C_candidate_count':'output_corner_C_candidate_count',
++    }
++    # The final source_corner_ids remain identifiers in the original input
++    # triangle's canonical order. Scalar target IDs likewise stay original.
++    sf=original['source_face_ids'];sc=permute(original['source_corner_ids'],final_permutation)
++    assert same(output['source_face_ids'],sf) and same(output['source_corner_ids'],sc)
++    checked_count=0
++    for source,target in mapping.items():
++        if source not in original:continue
++        preserved='input_'+source
++        assert preserved in output and target in output,(preserved,target)
++        assert same(output[preserved],original[source])
++        expected=original[source][sf[:,None],sc]
++        assert same(output[target],expected),(source,target)
++        checked_count+=1
++    if 'vertex_source_input_corner_ids' in output:
++        assert same(output['vertex_source_input_corner_ids'],original['vertex_source_input_corner_ids'])
++    return checked_count
++
++def direction_checks(faces,K):
++    def count(part):
++        inc=collections.defaultdict(list)
++        for fi,f in enumerate(part):
++            for j in range(3):
++                u,v=map(int,(f[j],f[(j+1)%3]));inc[tuple(sorted((u,v)))].append((fi,u,v))
++        eligible=[v for v in inc.values() if len(v)==2 and v[0][0]!=v[1][0]]
++        return len(eligible),sum(e[0][1:]==e[1][1:] for e in eligible),sum(len(e)>2 for e in inc.values())
++    c=count(faces[:K]);whole=count(faces)
++    return dict(C_C_local_two_face_edges=c[0],C_C_local_same_direction_edges=c[1],
++        C_C_local_nonmanifold_edges=c[2],whole_two_face_same_direction_edges=whole[1])
++
++def ply_read(path):
++    data=Path(path).read_bytes();marker=b'end_header\n';end=data.index(marker)+len(marker)
++    header=data[:end].decode('ascii').splitlines();assert header[0]=='ply'
++    n=int(next(x for x in header if x.startswith('element vertex ')).split()[-1])
++    m=int(next(x for x in header if x.startswith('element face ')).split()[-1])
++    assert [x for x in header if x.startswith('property ')]==['property float x','property float y','property float z','property list uchar int vertex_indices']
++    if header[1]=='format binary_little_endian 1.0':
++        assert len(data)-end==n*12+m*13
++        v=np.frombuffer(data,dtype='<f4',count=n*3,offset=end).reshape(n,3).copy()
++        face_dtype=np.dtype([('count','u1'),('ids','<i4',(3,))],align=False)
++        records=np.frombuffer(data,dtype=face_dtype,count=m,offset=end+n*12)
++        assert np.all(records['count']==3);f=records['ids'].astype(np.int64)
++    else:
++        assert header[1]=='format ascii 1.0';lines=data[end:].decode('ascii').splitlines()
++        assert len(lines)==n+m
++        v=np.asarray([[float(x) for x in line.split()] for line in lines[:n]],dtype=np.float32)
++        f=np.asarray([[int(x) for x in line.split()[1:]] for line in lines[n:]],dtype=np.int64)
++        assert all(line.split()[0]=='3' for line in lines[n:])
++    return v,f
++
++
++def audit():
++    from r2.tools.c_restore_bounded_v1.independent_audit import check_orientation
++    from r2.tools.c_restore_coupling_v1.independent_audit import graph_audit,eq,num
++    t=time.monotonic();reg=read(OUT/'registration.json');done=read(OUT/'execution_completion.json')
++    assert done['status']=='PASS' and done['outputs']==done['source_C_restorations']==done['orientation_solves']==36
++    for k in ['model_loads','model_forwards','training_updates','new_GEO_C','new_full_quality_scores','new_images']:assert done[k]==0
++    assert done['frozen_sources_unchanged'] and done['scientific_stage_stopped']
++    assert reg['stages']==['MODEL_POST','RESTORED_C_ONLY','ORIENTED']
++    records=reg['records'];assert len(records)==36 and len({r['condition_id'] for r in records})==6
++    assert collections.Counter(r['method'] for r in records)=={'D0_BASE':12,'RBF':12,'BLEND':12}
++    verify(reg['runner_hashes']);assert sha(reg['orientation_solver_path'])==reg['orientation_solver_sha256']
++    small={p:h for p,h in reg['protected'].items() if Path(p).suffix.lower() not in {'.pt','.pth','.ckpt'}}
++    weights={p:h for p,h in reg['protected'].items() if p not in small};verify(small)
++    assert done['protected_files_unchanged']==len(reg['protected'])
++    assert len(list((OUT/'events').glob('*/*_started.json')))==len(list((OUT/'events').glob('*/*_complete.json')))==36
++    assert len(list((OUT/'outputs').glob('*/*/orientation_started.json')))==36
++    controls=read(OUT/'restoration_checks/completion.json');assert controls['status']=='PASS'
++    verify(controls.get('source_hashes',{}));verify(controls.get('files',{}))
++    case_rows=[];graph_checks=0;attribute_checks=0;boundary_checks=0;metric_checks=0;pair_checks=0
++    top_table={(r['method'],r['request_id'],r['stage']):r for r in rows(OUT/'topology_per_output.csv')}
++    qtable={(r['method'],r['request_id'],r['stage']):r for r in rows(OUT/'quality_inherited_per_output.csv')}
++    pairtable={(r['method'],r['request_id']):r for r in rows(OUT/'paired_per_parent_noise.csv')}
++    vmrows=rows(OUT/'AVMR_PMR_per_output.csv');vtable={(r['method'],r['request_id'],r['stage'],r['setting']):r for r in vmrows}
++    assert len(top_table)==len(qtable)==108 and len(vtable)==864 and len(pairtable)==36
++    for r in records:
++        rid=r['request_id'];method=r['method'];K=int(r['K']);folder=OUT/'outputs'/method/rid
++        a=arrays(r['post_path']);condition=arrays(r['condition_source']);parent=arrays(r['parent_prepared_path'])
++        assert sha(r['post_path'])==r['post_sha256'] and sha(r['parent_prepared_path'])==r['parent_prepared_sha256']
++        q=read(folder/'receipt.json');d=read(r['diagnostic_path']);verify(q['files']);verify(d['quality']['files'])
++        assert q['status']=='PASS' and q['identity']['post_sha256']==sha(r['post_path'])
++        assert q['identity']['condition_sha256']==sha(r['condition_source']) and q['identity']['parent_sha256']==sha(r['parent_prepared_path'])
++        assert q['identity']['registration_sha256']==sha(OUT/'registration.json')
++        assert q['quality_reference']==d['quality'] and q['original_metrics']==d['metrics'] and q['original_boundary_vertices']==d['vertices']
++        assert q['orientation_solves']==1 and q['model_forwards']==q['new_full_quality_scores']==q['new_GEO_C']==0
++        restored=arrays(folder/'restored_C.npz');final=arrays(folder/'oriented.npz')
++        first_perm,rest_result=check_source_restoration(condition,parent,a,restored,K)
++        assert np.array_equal(restored['corner_permutation_to_MODEL_POST'],first_perm) and not restored['free_face_flips'].any()
++        relperm=np.tile(np.arange(3,dtype=np.int64),(len(a['faces']),1));relperm[final['free_face_flips']]=[0,2,1]
++        composed=permute(first_perm,relperm)
++        assert np.array_equal(final['corner_permutation_to_MODEL_POST'],composed)
++        adapter=dict(final,flips=final['free_face_flips'],corner_permutation=relperm)
++        details=read(folder/'orientation_details.json');assert details['summary']==q['orientation']
++        or_result=check_orientation(a['vertices'],restored['faces'],K,adapter,details['components'],details['edges'],details['summary'])
++        assert same(final['C'],restored['C']) and same(final['faces'][:K],restored['faces'][:K])
++        for name,state,p in [('restored_C',restored,first_perm),('oriented',final,composed)]:
++            attribute_checks+=check_corner_attributes(a,state,p)
++            assert same(state['input_faces'],a['input_faces']) and int(state['known_faces'])==K
++            for key in ['vertex_source_input_corner_ids','source_face_kept','source_face_reason','duplicate_of_source_face']:
++                assert same(state[key],a[key]),key
++            assert same(state['faces'],state['output_corner_vertex_ids'])
++            assert np.array_equal(state['C_original_source_vertex_ids'],parent['original_source_faces'][condition['original_source_face_ids']])
++            assert same(state['C_original_source_face_ids'],condition['original_source_face_ids'])
++            assert same(state['C_canonical_source_vertex_ids'],condition['C_source_vertex_ids'])
++            assert same(state['C_source_corner_permutation'],condition['C_source_corner_permutations'])
++            assert np.array_equal(state['C_inverse_corner_permutation'],first_perm[:K])
++            v,f=ply_read(folder/(name+'.ply'));assert same(v,state['vertices']) and same(f,state['faces'])
++        pairdata=read(d['quality']['pair_audit_path'])
++        bv=rows(folder/'boundary_vertices.csv');vv={(x['stage'],int(x['source_vertex_id'])):x for x in bv}
++        percasevm={(x['stage'],x['setting']):x for x in rows(folder/'AVMR_PMR.csv')}
++        stage_data=[('MODEL_POST',a,np.tile(np.arange(3,dtype=np.int64),(len(a['faces']),1))),('RESTORED_C_ONLY',restored,first_perm),('ORIENTED',final,composed)]
++        for stage,state,p in stage_data:
++            top=q['topology'][stage]
++            graph_checks+=graph_audit(state['output'],state['vertices'],state['faces'],K,rows(folder/('valid_edges_'+stage+'.csv')),top,pairdata)
++            for key,value in direction_checks(state['faces'],K).items():eq(top[key],value)
++            for key,value in top.items():
++                if isinstance(value,(int,float)) or value is None:eq(top_table[method,rid,stage].get(key),value)
++            if stage!='MODEL_POST':assert top['C_C_local_same_direction_edges']==0
++            assert qtable[method,rid,stage]['value_status']=='INHERITED_GEOMETRY_EQUIVALENCE'
++            for key,value in d['quality']['metrics'].items():
++                if isinstance(value,(int,float)) or value is None:eq(qtable[method,rid,stage].get(key),value)
++                else:assert qtable[method,rid,stage][key]==str(value)
++            eq(qtable[method,rid,stage]['free_face_denominator'],len(a['faces'])-K)
++            for old in d['vertices']:
++                new=vv[stage,int(old['source_vertex_id'])]
++                for field in ['source_vertex_id','x','y','z','distance_model','distance_L_fraction','nearest_free_face']:eq(new[field],old[field])
++                j=old['nearest_free_face'];corner=old['nearest_free_corner']
++                mapped=next(k for k in range(3) if int(p[K+j,k])==corner)
++                assert int(new['nearest_free_corner'])==mapped and int(new['original_MODEL_POST_nearest_free_corner'])==corner
++                assert new['witness_status']=='REMAP_OF_ORIGINAL_CHOSEN_WITNESS_NOT_NEW_SEARCH'
++                assert same(state['output'][K+j,mapped],a['output'][K+j,corner])
++                point=np.array([old['x'],old['y'],old['z']],float)
++                eq(float(norm(point-state['output'][K+j,mapped])),old['distance_model'])
++                boundary_checks+=10
++            for metric in d['metrics']:
++                for table in [percasevm[stage,metric['setting']],vtable[method,rid,stage,metric['setting']]]:
++                    for key,value in metric.items():
++                        if isinstance(value,(int,float)) or value is None:eq(table[key],value)
++                        else:assert table[key]==str(value)
++                    assert table['value_status']=='INHERITED_AFTER_GEOMETRY_EQUIVALENCE';metric_checks+=1
++        t0,t1,t2=(q['topology'][stage] for stage in reg['stages'])
++        expected=dict(C_C_same_before=t0['C_C_local_same_direction_edges'],C_C_same_after=t2['C_C_local_same_direction_edges'],
++            valid_edges_unchanged=t2['C_F_valid_edge_count'],opposed_MODEL_POST=t0['C_F_valid_opposite_winding_edge_count'],
++            opposed_RESTORED_C_ONLY=t1['C_F_valid_opposite_winding_edge_count'],opposed_ORIENTED=t2['C_F_valid_opposite_winding_edge_count'],
++            unoriented_reach=t0['reached_free_area_fraction'],opposed_reach_MODEL_POST=t0['opposite_winding_reached_free_area_fraction'],
++            opposed_reach_RESTORED_C_ONLY=t1['opposite_winding_reached_free_area_fraction'],opposed_reach_ORIENTED=t2['opposite_winding_reached_free_area_fraction'],
++            reach_gain=t2['opposite_winding_reached_free_area_fraction']-t0['opposite_winding_reached_free_area_fraction'],
++            parity_conflict_components=q['orientation']['parity_conflict_components'],fixed_source_C_conflict_components=q['orientation']['fixed_C_anchor_conflict_components'],
++            flipped_free_faces=q['orientation']['flipped_free_faces'],nonmanifold_edges=q['orientation']['nonmanifold_edges'])
++        for key,value in expected.items():eq(pairtable[method,rid][key],value);pair_checks+=1
++        eq(q['restoration']['C_rows_reordered'],rest_result['source_C_changed_corner_order_faces'])
++        eq(q['restoration']['C_winding_reversed_from_canonical'],rest_result['source_C_odd_permutation_faces'])
++        case_rows.append(dict(method=method,request_id=rid,status='PASS',**rest_result,**or_result))
++    summary_checks=0;alltop=list(top_table.values())
++    for s in rows(OUT/'topology_summary.csv'):
++        field={'REGION':'region_type','PARENT':'parent_id','NOISE':'candidate'}.get(s['group'])
++        sub=[x for x in alltop if x['method']==s['method'] and x['stage']==s['stage'] and (field is None or x[field]==s['value'])]
++        eq(s['n'],len(sub))
++        for key,value in s.items():
++            if key.endswith('_mean'):eq(value,float(np.mean([num(x[key[:-5]]) for x in sub])));summary_checks+=1
++        for name,key in [('outputs_with_valid_edges','C_F_valid_edge_count'),('outputs_with_opposed_edges','C_F_valid_opposite_winding_edge_count')]:
++            eq(s[name],sum(num(x[key])>0 for x in sub));summary_checks+=1
++        for name,key in [('valid_edge_total','C_F_valid_edge_count'),('opposed_edge_total','C_F_valid_opposite_winding_edge_count')]:
++            eq(s[name],sum(num(x[key]) for x in sub));summary_checks+=1
++    csvwrite(AUDIT/'source_restoration_and_orientation_per_output.csv',case_rows)
++    result=dict(status='PASS',outputs=36,stages=3,stage_topology_rows=108,old_method_cached_POST_counts={'D0_BASE':12,'RBF':12,'BLEND':12},
++        inherited_quality_source_outputs=36,inherited_quality_stage_rows=108,formal_source_restorations=36,formal_orientation_solves=36,source_restoration_independent_inverse='PASS',
++        fixed_restored_C_orientation_independent_union_find='PASS',source_face_corner_attribute_mapping='PASS',
++        actual_PLY_roundtrips=72,corner_attribute_fields_checked=attribute_checks,actual_legal_graph_edges_checked=graph_checks,
++        inherited_AVMR_rows=len(vtable),AVMR_inheritance_comparisons=metric_checks,nearest_corner_witness_checks=boundary_checks,
++        paired_checks=pair_checks,summary_stat_checks=summary_checks,protected_nonweight_files_rehashed=len(small),
++        protected_weights_inherited_execution_hashes=weights,weight_hash_verification_basis=dict(path=str(OUT/'execution_completion.json'),sha256=sha(OUT/'execution_completion.json'),protected_count=done['protected_files_unchanged']),
++        coordinate_and_connectivity_equivalence_all=True,source_C_order_fixed_after_restoration=True,
++        no_geometry_benefit_claim_from_winding=True,quality_status='INHERITED_ORIGINAL_UNORIENTED_EVIDENCE_NOT_RERUN',
++        audit_source_sha256=sha(__file__),registration_sha256=sha(OUT/'registration.json'),
++        source_dependencies={str(ROOT/'r2/tools/c_restore_bounded_v1/independent_audit.py'):sha(ROOT/'r2/tools/c_restore_bounded_v1/independent_audit.py'),str(ROOT/'r2/tools/c_restore_coupling_v1/independent_audit.py'):sha(ROOT/'r2/tools/c_restore_coupling_v1/independent_audit.py')},
++        seconds=time.monotonic()-t,model_loads=0,model_forwards=0,training_updates=0,new_GEO=0,new_quality_scans=0,formal_orientation_solver_calls=0)
++    write(AUDIT/'completion.json',result);return result
++
++def main():
++    p=argparse.ArgumentParser();p.add_argument('--check-only',action='store_true');a=p.parse_args()
++    for target in [ROOT/'WORKSPACE.md',OUT/'registration.json',ROOT/'experiments/r2_c_restore_bounded_v1/REPORT.md']:
++        try:checked(target)
++        except AssertionError:pass
++        else:raise AssertionError('Negative output guard failed')
++    if a.check_only:print(json.dumps(dict(status='PASS',negative_output_guards=3,model_calls=0)));return
++    print(json.dumps(audit(),ensure_ascii=False))
++if __name__=='__main__':main()
+--- /dev/null
++++ b/r2/tools/source_winding_export_v1/pack.py
+@@ -0,0 +1,218 @@
++"""CPU-only complete evidence archive. No imports of model or scientific runners."""
++from __future__ import annotations
++import argparse,csv,difflib,hashlib,html,json,os,posixpath,re,time,zipfile
++from pathlib import Path
++
++ROOT=Path(__file__).resolve().parents[3]
++CODE=Path(__file__).resolve().parent
++OUT=ROOT/'experiments/r2_source_winding_export_v1'
++ZIP=OUT/'R2_SOURCE_WINDING_EXPORT_REVIEW.zip'
++FINAL=OUT/'packaging'
++
++def sha(p):
++ h=hashlib.sha256()
++ with Path(p).open('rb') as f:
++  for b in iter(lambda:f.read(1<<20),b''):h.update(b)
++ return h.hexdigest()
++def read(p):return json.loads(Path(p).read_text(encoding='utf-8-sig'))
++def rows(p):
++ with Path(p).open(encoding='utf-8-sig',newline='') as f:return list(csv.DictReader(f))
++def checked(p):
++ p=Path(p).absolute()
++ if any(q.is_symlink() for q in (p,*p.parents)):raise ValueError('Symlink output')
++ p=p.resolve()
++ if p==OUT.resolve() or not p.is_relative_to(OUT.resolve()):raise ValueError('Write outside new output')
++ return p
++def atomic(p,fn,binary=False):
++ p=checked(p);p.parent.mkdir(parents=True,exist_ok=True);tmp=checked(p.with_name(p.name+'.tmp'))
++ with tmp.open('wb' if binary else 'w',**({} if binary else {'encoding':'utf-8','newline':''})) as f:
++  fn(f);f.flush();os.fsync(f.fileno())
++ tmp.replace(p)
++def write(p,obj):atomic(p,lambda f:json.dump(obj,f,ensure_ascii=False,indent=2,allow_nan=False))
++def textfile(p,s):atomic(p,lambda f:f.write(s))
++def immutable_copy(src,dst):
++ src=Path(src);dst=checked(dst)
++ if dst.exists():
++  if sha(src)!=sha(dst):raise RuntimeError('Existing snapshot differs: '+str(dst))
++ else:atomic(dst,lambda f:f.write(src.read_bytes()),True)
++def assert_hash(p,h):
++ if sha(p)!=h:raise ValueError('Hash mismatch: '+str(p))
++
++
++def prerequisite_check():
++ required=['REPORT.md','README_RESUME.md','USER_REQUEST.md','completion.json','registration.json','execution_completion.json',
++  'aggregate_completion.json','restoration_checks/completion.json','independent_audit/completion.json',
++  'paired_per_parent_noise.csv','AVMR_PMR_per_output.csv','quality_inherited_per_output.csv',
++  'topology_per_output.csv','topology_summary.csv','source_C_face_mapping.csv',
++  'review/source_restoration_summary.csv','review/source_restoration_contract_audit.json']
++ for name in required:
++  if not (OUT/name).is_file():raise RuntimeError('BLOCKED_MISSING '+name)
++ done=read(OUT/'execution_completion.json')
++ assert done['status']=='PASS' and done['outputs']==done['source_C_restorations']==done['orientation_solves']==36
++ assert done['scientific_stage_stopped'] and done['frozen_sources_unchanged']
++ for key in ['model_loads','model_forwards','training_updates','new_GEO_C','new_full_quality_scores','new_images']:assert done[key]==0
++ assert read(OUT/'completion.json')['status'] in ('PASS','COMPLETE')
++ for name in ['independent_audit/completion.json','restoration_checks/completion.json','review/source_restoration_contract_audit.json']:
++  assert read(OUT/name)['status'] in ('PASS','COMPLETE')
++ audit=read(OUT/'independent_audit/completion.json')
++ assert audit['audit_source_sha256']==sha(CODE/'independent_audit.py')
++ assert audit['outputs']==36 and audit['actual_PLY_roundtrips']==72 and audit['stage_topology_rows']==108
++ assert len(read(OUT/'restoration_checks/completion.json')['cases'])==8
++ reg=read(OUT/'registration.json');assert len(reg['records'])==36 and len(reg['conditions'])==6
++ assert len(rows(OUT/'AVMR_PMR_per_output.csv'))==864 and len(rows(OUT/'quality_inherited_per_output.csv'))==108
++ for p,h in reg['runner_hashes'].items():assert_hash(p,h)
++ assert_hash(reg['orientation_solver_path'],reg['orientation_solver_sha256'])
++ for r in reg['records']:
++  folder=OUT/'outputs'/r['method']/r['request_id'];q=read(folder/'receipt.json');assert q['status']=='PASS'
++  for path,h in q['files'].items():assert_hash(path,h)
++  for stage in ['restored_C','oriented']:
++   for ext in ['npz','ply']:assert (folder/(stage+'.'+ext)).is_file()
++ return {str(OUT/n):sha(OUT/n) for n in required}
++
++def source_snapshot():
++ reg=read(OUT/'registration.json');protected=dict(reg['protected']);selected={}
++ review=OUT/'review/source_restoration_contract_audit.json'
++ if review.exists():
++  rd=read(review);assert rd['status']=='PASS';protected.update(rd.get('protected_before',{}))
++ for p,h in {**protected,**reg['runner_hashes']}.items():
++  if p.endswith('.py') and not any(s in p for s in ['/source_snapshot/','/scoring_code/']):
++   assert_hash(p,h);selected[p]=h
++ new={str(p):sha(p) for p in CODE.glob('*.py')};selected.update(new)
++ for rel in ['LICENSE','r2/LICENSE','r2/THIRD_PARTY_NOTICES.md','requirements.txt']:
++  p=ROOT/rel
++  if p.exists():selected[str(p)]=sha(p)
++ for p in [Path('/mnt/e/MeshFlow-Control/LICENSE'),Path('/mnt/e/MeshFlow-Control/requirements.txt')]:
++  if p.exists():selected[str(p)]=sha(p)
++ records=[]
++ for name,h in sorted(selected.items()):
++  p=Path(name);rel=('repository/'+p.relative_to(ROOT).as_posix()) if p.is_relative_to(ROOT) else ('external/'+p.relative_to('/mnt/e').as_posix())
++  target=OUT/'source_snapshot'/rel;immutable_copy(p,target);assert_hash(target,h)
++  records.append(dict(source_path=name,snapshot_path=target.relative_to(OUT).as_posix(),sha256=h,bytes=p.stat().st_size,new_this_experiment=name in new,registered_before_execution=name in protected or name in reg['runner_hashes']))
++ textfile(OUT/'code.diff',''.join(line for name in sorted(new) for line in difflib.unified_diff([],Path(name).read_text().splitlines(keepends=True),fromfile='/dev/null',tofile='b/'+Path(name).relative_to(ROOT).as_posix())))
++ textfile(OUT/'old_source.diff','')
++ write(OUT/'source_hashes.json',dict(schema='actual_sources_v1',sources=records,
++  old_source_diff='empty; all copied old sources match frozen protected hashes',new_diff='All new .py files including audit and assembler are additions from /dev/null.'))
++ return records
++
++def baseline_copies():
++ reg=read(OUT/'registration.json');copied=[];mesh_rows=[];seen=set()
++ def copy(p,target,expected=None):
++  p=Path(p);target=checked(target)
++  if expected:assert_hash(p,expected)
++  immutable_copy(p,target)
++  if str(target) not in seen:
++   copied.append(dict(source_path=str(p),archive_path=target.relative_to(OUT).as_posix(),sha256=sha(p),bytes=p.stat().st_size));seen.add(str(target))
++  return target.relative_to(OUT).as_posix()
++ for r in reg['records']:
++  folder=OUT/'baseline_MODEL_POST'/r['method']/r['request_id']
++  npz=copy(r['post_path'],folder/'model_post.npz',r['post_sha256']);ply=copy(r['post_ply'],folder/'model_post.ply')
++  copy(r['diagnostic_path'],folder/'diagnostic.json')
++  cond=copy(r['condition_source'],OUT/'source_conditions'/(r['condition_id']+'.npz'),r['condition_source_sha256'])
++  parent=copy(r['parent_prepared_path'],OUT/'source_parents'/(r['parent_id']+'.npz'),r['parent_prepared_sha256'])
++  for stage in ['MODEL_POST','RESTORED_C_ONLY','ORIENTED']:
++   name={'RESTORED_C_ONLY':'restored_C','ORIENTED':'oriented'}.get(stage)
++   row=dict(method=r['method'],request_id=r['request_id'],parent_id=r['parent_id'],condition_id=r['condition_id'],candidate=r['candidate'],stage=stage,
++     NPZ_path=npz if stage=='MODEL_POST' else f"outputs/{r['method']}/{r['request_id']}/{name}.npz",
++     PLY_path=ply if stage=='MODEL_POST' else f"outputs/{r['method']}/{r['request_id']}/{name}.ply",condition_path=cond,prepared_parent_path=parent)
++   for ext in ['NPZ','PLY']:row[ext+'_sha256']=sha(OUT/row[ext+'_path'])
++   mesh_rows.append(row)
++ old=ROOT/'experiments/r2_c_restore_bounded_v1'
++ for p in sorted((old/'review').glob('source_C_orientation*')):
++  if p.is_file():copy(p,OUT/'prior_source_C_evidence'/p.name)
++ copy(old/'registration.json',OUT/'prior_source_C_evidence/parent_registration.json',reg['parent_registration_sha256'])
++ cols=list(mesh_rows[0]);atomic(OUT/'mesh_export_index.csv',lambda f:(lambda w:(w.writeheader(),w.writerows(mesh_rows)))(csv.DictWriter(f,fieldnames=cols)))
++ write(OUT/'baseline_MODEL_POST/source_index.json',dict(status='PASS',outputs=36,conditions=6,prepared_parents=6,files=copied,
++  policy='Original MODEL_POST NPZ/PLY and diagnostics copied byte-for-byte. Absolute provenance paths remain original. Current package paths are in mesh_export_index.csv. Prior source-C evidence is historical source lineage, not a new experiment result.'))
++ return copied
++
++def omit_reason(p):
++ if p.suffix.lower() in {'.pt','.pth','.ckpt','.npy','.png'}:return 'External model/large raw evidence or image; this winding-only task makes no model call or new image.'
++ if p.name=='pairs.json':return 'Original full pair detector JSON retained locally; original classifications are not re-scored, all new CSVs and code are included.'
++ if p.name.endswith('.tmp'):return 'Retained incomplete engineering artifact, not a completed result.'
++ return None
++
++def select_files():
++ selected=[];omitted=[]
++ for p in sorted(OUT.rglob('*')):
++  if not p.is_file() or p.is_relative_to(FINAL) or p.name in {ZIP.name} or p.name.endswith('.zip.tmp'):continue
++  reason=omit_reason(p)
++  if reason:omitted.append(dict(path=str(p),relative_path=p.relative_to(OUT).as_posix(),bytes=p.stat().st_size,sha256=sha(p),hash_basis='Current archive CPU hash',reason=reason))
++  else:selected.append(p)
++ protected=dict(read(OUT/'registration.json')['protected'])
++ review=OUT/'review/source_restoration_contract_audit.json'
++ if review.exists():protected.update(read(review).get('protected_before',{}))
++ for name,h in protected.items():
++  p=Path(name)
++  if not p.is_relative_to(OUT):
++   omitted.append(dict(path=name,bytes=p.stat().st_size,sha256=h,hash_basis='Frozen registration; root complete before/after protection verification and independent nonweight audit',reason='External retained read-only evidence. Relevant actual source and diagnostic copies are separately indexed.'))
++ write(FINAL/'omitted_local_assets.json',dict(files=omitted,deleted_files=0,policy='Omission is only from portable ZIP. Local evidence remains at original paths.'))
++ return selected
++
++def verify():
++ complete=read(FINAL/'archive_completion.json');assert complete['status']=='COMPLETE';assert_hash(ZIP,complete['zip_sha256'])
++ manifest=read(FINAL/'package_manifest.json');names={r['path'] for r in manifest['files']}
++ with zipfile.ZipFile(ZIP) as z:
++  assert z.testzip() is None and len(z.namelist())==len(set(z.namelist()))
++  assert set(z.namelist())==names|{'packaging/package_manifest.json'}
++  for row in manifest['files']:
++   assert hashlib.sha256(z.read(row['path'])).hexdigest()==row['sha256'];assert_hash(OUT/row.get('source_relative_path',row['path']),row['sha256'])
++  assert hashlib.sha256(z.read('packaging/package_manifest.json')).hexdigest()==sha(FINAL/'package_manifest.json')
++  source=read(OUT/'source_hashes.json')
++  for row in source['sources']:assert row['snapshot_path'] in names and sha(row['source_path'])==row['sha256']
++  assert sum(n.endswith('.ply') for n in names)==108
++  assert sum(n.endswith('.npz') for n in names)==120
++  assert not any(Path(n).suffix in {'.pt','.pth','.ckpt','.png'} for n in names)
++  index=rows(OUT/'mesh_export_index.csv');assert len(index)==108
++  for row in index:
++   for ext in ['NPZ','PLY']:
++    assert row[ext+'_path'] in names and hashlib.sha256(z.read(row[ext+'_path'])).hexdigest()==row[ext+'_sha256']
++  csvs={p.relative_to(OUT).as_posix() for p in OUT.rglob('*.csv') if not p.is_relative_to(FINAL)}
++  assert csvs<=names
++  checked_links=0
++  for name in names:
++   if Path(name).suffix.lower() not in {'.html','.md'}:continue
++   body=z.read(name).decode('utf-8-sig')
++   links=re.findall(r'(?:href|src)=["\']([^"\']+)',body) if name.endswith('.html') else re.findall(r'\[[^\]]*\]\(([^)]+)\)',body)
++   for link in links:
++    link=html.unescape(link).strip().split(' "')[0].strip('<>');link=link.split('#')[0]
++    if not link or re.match(r'^[A-Za-z][A-Za-z0-9+.-]*:',link) or link.startswith('/'):continue
++    target=posixpath.normpath(posixpath.join(posixpath.dirname(name),link))
++    assert target in names or any(n.startswith(target.rstrip('/')+'/') for n in names),(name,target,'missing relative document link')
++    checked_links+=1
++  methods=sorted({i.compress_type for i in z.infolist()});assert methods==[zipfile.ZIP_DEFLATED]
++  assert ZIP.stat().st_size<10000000,'Archive exceeds 10 MB; retain package, report size before changing contents'
++  return dict(status='PASS',zip_path=str(ZIP),bytes=ZIP.stat().st_size,sha256=sha(ZIP),members=len(z.namelist()),CSV_count=len(csvs),
++   NPZ_count=120,PLY_count=108,mesh_stages=108,source_files=len(source['sources']),CRC='PASS',all_member_hashes='PASS',all_CSV_present=True,
++   checked_relative_links=checked_links,compression='DEFLATE',under_10MB=True,model_forwards=0,training_updates=0,new_scoring=0,new_orientation_solves=0)
++
++def main():
++ ap=argparse.ArgumentParser();ap.add_argument('--check-only',action='store_true');ap.add_argument('--verify',action='store_true');a=ap.parse_args()
++ for path in [ROOT/'REPORT.md',ROOT/'experiments/r2_c_restore_bounded_v1/REPORT.md',OUT.parent/'outside']:
++  try:checked(path)
++  except ValueError:pass
++  else:raise AssertionError('Negative output guard failed')
++ if a.verify or (FINAL/'archive_completion.json').exists():print(json.dumps(verify(),ensure_ascii=False));return
++ prereqs=prerequisite_check()
++ if a.check_only:print(json.dumps(dict(status='PASS',prerequisites=len(prereqs),negative_output_guards=3,scientific_calls=0)));return
++ before={str(p):sha(p) for p in OUT.rglob('*') if p.is_file() and not p.is_relative_to(FINAL) and not any(x in p.parts for x in ['source_snapshot','baseline_MODEL_POST','source_conditions','source_parents','prior_source_C_evidence']) and p.name not in {'code.diff','old_source.diff','source_hashes.json','mesh_export_index.csv',ZIP.name}}
++ sources=source_snapshot();baselines=baseline_copies();selected=select_files()
++ write(FINAL/'prerequisites.json',dict(status='PASS',hashes=prereqs,preexisting_evidence_hashes=before))
++ textfile(FINAL/'README_PACKAGE.md','# Source-winding export review package\n\nOpen ../REPORT.md. All new per-output, per-source-face, per-corner witness, edge-constraint, component, pairing and full-threshold CSVs are included. See ../mesh_export_index.csv for all 108 mesh stages: 36 original MODEL_POST, 36 restored C, and 36 final free-oriented outputs, each in NPZ and PLY. The six original condition NPZ and six prepared parent NPZ are included for source lineage. No coordinates or connectivity were changed, and inherited geometric quality is not a new scoring result.\n\nOriginal MODEL_POST diagnostics and prior source-C orientation evidence are copied unchanged and separately indexed. All actual new and original solver/scorer source snapshots, diffs, hashes, registrations, receipts and independent audits are retained. Weights and large unrelated earlier assets remain local, listed with source path/hash in omitted_local_assets.json. No new images were requested or made.\n\nStandard ZIP DEFLATE. Source code.diff lists new files as additions; old_source.diff is empty after frozen hash verification. Archive hash/verification receipts are stored locally after assembly to avoid a self-hash cycle. Absolute references inside historical receipts are provenance, while mesh_export_index.csv supplies portable mesh paths. The historical WORKSPACE.before.md backup is included byte-for-byte as WORKSPACE.before.md.txt; the manifest records its original path so old local links are preserved as text, not presented as portable navigation.\n')
++ selected.extend([FINAL/'omitted_local_assets.json',FINAL/'prerequisites.json',FINAL/'README_PACKAGE.md'])
++ members=[]
++ for p in sorted(set(selected)):
++  rel=p.relative_to(OUT).as_posix();archived=rel+'.txt' if p.name=='WORKSPACE.before.md' else rel
++  members.append(dict(path=archived,source_relative_path=rel,bytes=p.stat().st_size,sha256=sha(p),adaptation='Historical Markdown backup presented as plain text; bytes unchanged' if archived!=rel else 'none'))
++ write(FINAL/'package_manifest.json',dict(schema='source_winding_export_review_v1',files=members,source_files=len(sources),baseline_cache_files=len(baselines),scientific_calls=0))
++ temp=checked(ZIP.with_name(ZIP.name+'.tmp'))
++ with zipfile.ZipFile(temp,'w',compression=zipfile.ZIP_DEFLATED,compresslevel=9) as z:
++  for r in members:z.write(OUT/r['source_relative_path'],r['path'])
++  z.write(FINAL/'package_manifest.json','packaging/package_manifest.json');assert z.testzip() is None
++ temp.replace(checked(ZIP))
++ assert before=={p:sha(p) for p in before},'Preexisting scientific/documentation evidence changed during archive'
++ write(FINAL/'archive_completion.json',dict(status='COMPLETE',task='R2_SOURCE_WINDING_EXPORT_V1',zip_path=str(ZIP),zip_bytes=ZIP.stat().st_size,zip_sha256=sha(ZIP),
++  source_restorations=36,orientation_outputs=36,NPZ_exports=108,PLY_exports=108,source_condition_and_parent_NPZ=12,
++  new_images=0,no_default_change=True,no_git=True,packaging_model_forwards=0,packaging_training_updates=0,packaging_new_scores=0,packaging_orientation_solves=0))
++ result=verify();write(FINAL/'verification.json',dict(**result,all_preexisting_evidence_hashes_unchanged=True,compared_files=len(before)))
++ print(json.dumps(result,ensure_ascii=False))
++if __name__=='__main__':main()
+--- /dev/null
++++ b/r2/tools/source_winding_export_v1/prepare.py
+@@ -0,0 +1,57 @@
++"""Freeze only a source-order export diagnostic on the already saved36 POSTs."""
++from pathlib import Path
++from . import common as C
++
++def registration():
++ reg=C.read(C.OUT/'registration.json');C.verify(reg['runner_hashes']);return reg
++
++def prepare():
++ target=C.OUT/'registration.json'
++ if target.exists():
++  reg=registration();C.verify(reg['protected']);return reg
++ from . import restoration
++ old=C.read(C.OLD/'registration.json');prior=C.read(C.OLD/'review/source_C_orientation_receipt.json')
++ protected=dict(old['protected']);protected.update(old['runner_hashes']);protected.update(prior['protected_before'])
++ C.verify(protected)
++ for base in (C.OLD,C.ROOT/'r2/tools/c_restore_bounded_v1'):
++  for p in base.rglob('*'):
++   if p.is_file() and '__pycache__' not in str(p):protected[str(p)]=C.sha(p)
++ refs={x['condition_id']:x for x in C.rows(C.OLD/'review/source_C_orientation_conditions.csv')}
++ records=C.read(C.OLD/'post_index.json');assert len(records)==36
++ for r in records:
++  cr=refs[r['condition_id']];r['parent_prepared_path']=cr['parent_prepared_path'];r['parent_prepared_sha256']=cr['parent_prepared_sha256']
++  assert C.sha(r['condition_source'])==cr['condition_source_sha256']
++  assert C.sha(r['parent_prepared_path'])==r['parent_prepared_sha256']
++  diag=C.read(r['diagnostic_path']);assert diag['status']=='PASS'
++  assert diag['quality']['identity']['processed_sha256']==C.sha(r['post_path'])
++  C.verify(diag['quality']['files'])
++  for p in (r['post_path'],r['diagnostic_path'],r['condition_source'],r['parent_prepared_path'],r['denoised_path'],*diag['quality']['files']):protected[str(p)]=C.sha(p)
++ source=C.ROOT/'r2/tools/c_restore_bounded_v1/orientation.py'
++ assert C.sha(source)==old['runner_hashes'][str(source)]
++ request=Path('/mnt/c/Users/warpwang/.codex/attachments/d6dcfba3-a619-4f05-9ff9-6417cb3bab06/Pasted text.txt')
++ protected[str(request)]=C.sha(request)
++ C.OUT.mkdir(parents=True,exist_ok=True)
++ C.textfile(C.OUT/'USER_REQUEST.md',request.read_text(encoding='utf-8-sig'))
++ reg=dict(version=C.VERSION,status='REGISTERED',records=records,conditions=list(refs.values()),
++  protected=protected,runner_hashes={str(C.CODE/n):C.sha(C.CODE/n) for n in ('common.py','prepare.py','run.py','restoration.py','restoration_checks.py')},
++  orientation_solver_path=str(source),orientation_solver_sha256=C.sha(source),restoration_definition=restoration.definition(),
++  parent_registration_sha256=C.sha(C.OLD/'registration.json'),settings=old['settings'],fixed_L=old['fixed_L'],
++  budget=dict(existing_POST_outputs=36,source_C_restorations=36,free_orientation_solves=36,CPU_synthetic_fixtures=8,
++   model_loads=0,model_forwards=0,training_updates=0,new_noise=0,new_generation=0,new_GEO_C=0,new_full_quality_scores=0,new_images=0),
++  stages=['MODEL_POST','RESTORED_C_ONLY','ORIENTED'],
++  protocol=dict(methods=['D0_BASE','RBF','BLEND'],identical_mapping_for_all=True,
++   C_target='Original source face corner order in the SAME model-coordinate FP32 values; inverse of saved normalization permutation; source selection face order retained',
++   solver='Existing full indexed two-incidence nondegenerate XOR solver; freeze restored C. Satisfiable components repaired; conflict components unchanged; no deletion/splitting/tuning',
++   geometry='All vertex bytes, unordered indexed triangles, vertex IDs, face IDs/count, connectivity, free vertex sets unchanged',
++   attributes='Output corner mappings permuted; old input-domain N-corner audit arrays retained under input_ names, gathered output_ views by source_face_ids/final source_corner_ids. No UV/normal/color attributes present in this panel.',
++   old_contract='Canonical C ordered bytes preserved at MODEL_POST only; new exports obey separate source-order C contract',
++   quality='All full CF/FF/I/angle/AVMR/PMR/distance values inherited only after geometry equivalence; cached pair witnesses remain in original corner domain; chosen nearest corner witness remapped explicitly',
++   partials='Nonmanifold/degenerate/parity/fixed-source-C conflicts reported; no automatic repair beyond registered reversal',
++   replay='Completed receipt hashes reused; incomplete attempted solve blocks automatic replay',
++   concurrency='Measure first authorized complete case, then resource-based at most2 CPU workers, two threads per worker; GPU0',
++   interpretation='Export representation correction, not a new model or new geometric connection',
++   stop='Fixed36 export/audit/report/package; D0 default unchanged, no automatic commit/push'))
++ C.write(C.OUT/'resources_before_experiment.json',C.resources())
++ C.write(target,reg);C.event('REGISTERED',registration_sha256=C.sha(target),budget=reg['budget'])
++ C.textfile(C.OUT/'README_RESUME.md','CPU only, from WSL /mnt/e/MeshFlow:\n\n`/mnt/e/MeshFlow-Control-artifacts/venv/bin/python -B -m r2.tools.source_winding_export_v1.run`\n\nSuccessful receipt/hash matches are reused; an incomplete attempted case blocks implicit replay. Source mapping is frozen independently of the generated result. No model, GEO, original full-quality scoring or default changes. Raw scientific stages and final independent audit/report/package have separate receipts.\n')
++ return reg
+--- /dev/null
++++ b/r2/tools/source_winding_export_v1/report.py
+@@ -0,0 +1,164 @@
++"""Read completed CPU exports and write a report; no scientific replay."""
++from pathlib import Path
++import statistics
++from . import common as C
++
++
++def table(headers, rows):
++    return '\n'.join(['|'+'|'.join(headers)+'|', '|'+'|'.join(['---']*len(headers))+'|',
++                      *('|'+'|'.join(map(str,r))+'|' for r in rows)])
++
++
++def main():
++    done=C.read(C.OUT/'execution_completion.json')
++    assert done['status']=='PASS' and done['scientific_stage_stopped']
++    independent=C.read(C.OUT/'independent_audit/completion.json')
++    assert independent['status']=='PASS' and independent['outputs']==36
++    totals=C.rows(C.OUT/'topology_summary.csv')
++    pairs=C.rows(C.OUT/'paired_per_parent_noise.csv')
++    ori=C.rows(C.OUT/'orientation_per_output.csv')
++    quality=C.rows(C.OUT/'quality_inherited_per_output.csv')
++    vm=C.rows(C.OUT/'AVMR_PMR_per_output.csv')
++    methods=('D0_BASE','RBF','BLEND')
++    stages=('MODEL_POST','RESTORED_C_ONLY','ORIENTED')
++    direction=[]
++    for method in methods:
++        for stage in stages:
++            r=next(r for r in totals if r['group']=='ALL' and r['method']==method and r['stage']==stage)
++            direction.append([method,stage,r['valid_edge_total'],r['opposed_edge_total'],r['outputs_with_opposed_edges']+'/12',
++                              f"{100*float(r['opposite_winding_reached_free_area_fraction_mean']):.4f}%",
++                              f"{100*float(r['reached_free_area_fraction_mean']):.4f}%"])
++    examples=[]
++    for r in pairs:
++        if int(r['valid_edges_unchanged']):
++            examples.append([r['method'],r['parent_id'][:4]+' n'+r['candidate'],r['valid_edges_unchanged'],
++                             ' → '.join(r['opposed_'+s] for s in stages),
++                             ' → '.join(f"{100*float(r['opposed_reach_'+s]):.3f}%" for s in stages)])
++    inherited=[]; summary_rows=[]
++    for method in methods:
++        q=[r for r in quality if r['method']==method and r['stage']=='MODEL_POST']
++        v=[r for r in vm if r['method']==method and r['stage']=='MODEL_POST' and r['setting']=='raw_tau_1e-6']
++        cols=['CF_illegal_affected_free_fraction','FF_illegal_affected_free_fraction','ConflictCov_C','free_minimum_angle_lt5_fraction']
++        means={k:statistics.mean(float(r[k]) for r in q) for k in cols}
++        means['AVMR_strict_model_1e-6']=statistics.mean(float(r['VMR']) for r in v)
++        means['PMR_strict_model_1e-6']=statistics.mean(float(r['perfect']) for r in v)
++        summary_rows.append(dict(method=method,n=12,value_status='INHERITED_AFTER_GEOMETRY_EQUIVALENCE',**means))
++        inherited.append([method,*[f'{100*x:.3f}%' for x in means.values()]])
++    C.csvwrite(C.OUT/'review/quality_inherited_summary.csv',summary_rows)
++    conflicts=[]
++    for method in methods:
++        sub=[r for r in ori if r['method']==method]
++        conflicts.append([method,
++            str(sum(r['fixed_C_constraints_satisfiable_on_eligible_graph']=='True' for r in sub))+'/12',
++            sum(int(r['fixed_C_anchor_conflict_components']) for r in sub),
++            sum(int(r['parity_conflict_components']) for r in sub),
++            sum(int(r['nonmanifold_edges']) for r in sub),
++            str(sum(int(r['nonmanifold_edges'])>0 for r in sub))+'/12',
++            sum(int(r['flipped_free_faces']) for r in sub)])
++    report=f'''# 来源C角序恢复与free定向导出实验
++
++版本：{C.VERSION}；日期：2026-10-11；状态：实际执行完成，科学阶段已停止。
++
++**附件提出的表示问题得到验证和修正。恢复来源C角序、再固定C整理free后，RBF原有9条合法C/F共边全部获得一致方向，三份输出的方向可达面积恢复到各自无方向上限。没有新增几何连接，也没有改善座面错层或相交代价。** D0仍为比较基准，RBF保留为局部协调候选，BLEND不替代；没有修改正式默认流程。
++
++## 1. 本轮实际做了什么
++
++固定上一轮36份POST：同6条USER条件×2噪声×D0_BASE/RBF/BLEND。所有方法使用同一规则；不选图、不改面板。按每个条件保存的来源角点排列取逆，恢复来源C，再运行一次原固定C定向求解器。保存三阶段：
++
++|阶段|含义|
++|---|---|
++|MODEL_POST|只读原规范化C的缓存POST|
++|RESTORED_C_ONLY|仅用已保存来源映射恢复C，free原样|
++|ORIENTED|固定恢复后的C，仅对可解分量重排free角点|
++
++模型加载、前向、训练更新、新采样、新噪声、GEO_C、完整质量评分、新图均为0。实际36次来源恢复、36次方向求解；工程合成检查8项。72份新NPZ及72份配套PLY已落盘，原POST保留。
++
++## 2. 新的C导出合同
++
++保存映射满足 `canonical_corner[j] = original_corner[P[j]]`，因此恢复使用 `P_inverse = argsort(P)`。循环置换与反向置换分开登记，不用生成结果或得分决定C朝向。
++
++这里恢复的是**原来源顶点ID及角序在现有模型坐标系中的表达**，没有反归一化坐标、没有加载原几何替换现有POST。原顶点坐标字节、面行身份、每张面的无序顶点ID集合、共享顶点/边关系及面数均不变。恢复后的C有序数组精确等于来源映射对应的模型坐标；它与旧规范化C有序数组不同，所以另设导出版本。模型输入及旧“规范化C逐位保持”结果未修改。
++
++六条唯一条件原C有45条双面共享边，方向原本全部相反；规范化后28条同向，涉及5/6条件。36份实例重复计算为168条同向C/C边，恢复后全部为0。完整逐面来源ID、正逆排列和反向标志见 [source_C_face_mapping.csv](source_C_face_mapping.csv)，去重条件统计见 [来源恢复清单](review/source_restoration_summary.csv)。
++
++逐角追溯采用两个明确索引域：`input_corner_*`保存旧处理前N面记录；`output_corner_*`按最终保留面及角序映射。`source_face_ids`不变，`source_corner_ids`与最终角序同步。边界最近点保留原先选中的几何见证并重映射角点编号，没有重新做最近点搜索或改变并列最小值的选择。本批没有UV、颜色或逐角法线，相关项NA；不宣称已支持任意未登记属性。
++
++## 3. 方向结果：已有连接终于可以正确表达
++
++下表每组12份。可达面积以每份保留free总面积为分母、再作输出宏平均；不是接合成功率，也不是全部网格都已定向。合法图沿实际索引共边传播，排除原检测器标记的非法面对；方向图额外要求共享边两侧绕序相反。C面作为已知起点。
++
++{table(['方法','阶段','合法C/F边数','方向一致C/F边数','有方向一致接口的输出','方向路径可达free面积','无方向可达free面积'],direction)}
++
++RBF宏平均方向可达面积 **0.2643% → 19.9459%**，BLEND **0.1584% → 6.8409%**；D0维持0.0137%。最终36/36输出的方向可达面积都等于各自原无方向可达面积，其中很多输出两者均为0，不能读成36份都接合成功。
++
++**只恢复C还不够。** RBF在RESTORED_C_ONLY阶段，方向一致接口从3条降到2条、方向可达面积降到0.0958%；随后固定正确来源C整理free才达到9条和19.9459%。这解释了为何不能单独翻回C后就评价最终效果。
++
++全部已有合法接口的逐例结果如下，箭头顺序为 MODEL_POST → RESTORED_C_ONLY → ORIENTED：
++
++{table(['方法','父/噪声','合法接口边数（不变）','方向一致接口边数','方向路径可达面积'],examples)}
++
++RBF的86ec n0从3.047%到85.333%，n1从0.124%到77.262%；bdd2 n0从0到76.756%。这些大幅变化说明**此前被方向合同遮蔽的是已有连接的可传播性**。RBF的合法接口依然只存在于3/12输出、2/6父；BLEND为2/12输出、1/6父，D0为1/12输出、1/6父。没有新顶点合并、添面或接缝生成。
++
++## 4. 剩余冲突没有隐藏或修掉
++
++求解器沿全部合格双面索引边建立异或约束，和用于评价的“排除非法面对”图不是同一个图。恢复后的所有C方向固定；可解分量按确定规则定向，冲突分量整体保持，不删面、拆点或放开C。
++
++{table(['方法','合格双面约束全可解输出','已判定固定C冲突分量','奇偶环冲突分量','非流形边总数','含非流形边输出','翻转free面总数'],conflicts)}
++
++旧合同每组10/12输出含直接固定C方向矛盾；来源恢复后，这类C/C矛盾消失。三组各剩同一个 **f596 n0** 的177面纯free分量，213条合格边约束含奇偶环矛盾。该分量不含C，所以不能再归因于C锚点；求解器将其锚点兼容性记为 `NA_PARITY_CONFLICT`，而非通过。整分量未翻，仍有101条合格边同向；101是保守保留后的未满足边数，不是最少要改的边数。
++
++非流形边不纳入两面异或求解，三组原80/84/80条全部保留；每组10/12输出存在。全体还保留开放边界。无C分量的全局正反选择只是确定性约定，**没有认证外向法线、水密、流形或实体体积**。原输出均未发现精确退化面或索引完全重复面，但这不否定近退化、近重叠及原非法相交。
++
++## 5. 几何质量原值继承，不冒称重新评分
++
++36/36通过逐位顶点、无序索引面、来源面ID及角点追溯检查，72新NPZ与PLY互相一致。方向之外的几何等价成立后，以下原指标按原定义和分母继承；108阶段行及864条A-VMR/PMR记录均有 `INHERITED` 标签及原评分身份。本轮完整scorer调用为0，不宣称重新运算后浮点值逐位相同。
++
++{table(['方法','CF非法影响free比例','FF非法影响free比例','I冲突覆盖','free小角<5°','严格A-VMR','严格PMR'],inherited)}
++
++A-VMR/PMR严格档为模型单位1e-6，边界域仍是全部来源C开放边界，不是预先指定的必接接口，不能混作论文原尺度复现。8档全部保留，PMR始终0。逐顶点距离、无方向合法共边/图、面积、小角及删面情况未变。
++
++**每组四份座面仍无合法C/F共边。** 固定2%L容差下，RBF仅866e n0有1/4边界顶点匹配（该例VMR25%，四份座面宏均6.25%）；其余RBF座面及D0/BLEND座面均为0。这个原有的单点接近不等于共边接合，三阶段数值不变。 来源恢复不解决主座面错层、生成另一层座面或背板并存；这些视觉观察引用上一轮同一几何的图审，本轮未生成新图、也未做新的视觉评分。RBF相对D0的FF约+0.530pp、I约+0.704pp代价仍在；BLEND的FF约+1.391pp仍在。
++
++## 6. 执行与独立审计
++
++入口：`r2/tools/source_winding_export_v1/run.py`。登记、逐例started/complete、文件hash和总账均保存；恢复只读复用完整PASS收据，遇到不完整已尝试例不会自动重放。科学实现冻结后未改。
++
++实际Windows/WSL资源检查已记录：RTX5080共16303MiB，WSL派发前使用2600MiB、空闲13380MiB、利用率2%，无CUDA计算进程；24逻辑CPU，WSL可用内存约61.4GiB。先执行1个已授权真实例，完整峰值RSS58256KiB、耗时0.537秒，再派发2个CPU worker，每个最多2线程；没有GPU worker或模型探针。
++
++记录的执行阶段墙钟 **{done['phase_seconds']:.3f}秒**，包含末尾保护文件hash复核，未包含最初准备和首次保护核验；36例任务内部耗时之和 **{sum(r['seconds'] for r in done['receipts']):.3f}秒**，不是并行墙钟。单worker观测最大RSS **{max(r['peak_RSS_KiB'] for r in done['receipts'])/1024:.2f}MiB**。未以并发时间作隔离性能比较。
++
++2314份原数据、资产、权重、旧代码、结果和报告前后SHA256一致。源恢复8项合成正反检查通过，另有独立审计直接逆映射来源并用不同的异或并查集校验定向结果；审计回执见 [independent_audit/completion.json](independent_audit/completion.json)，实际源码随包快照保留。审计对36例、72NPZ/PLY、108图状态及864继承VM行逐项核验，不调用本轮恢复函数或求解器，也不重跑质量评分。实际通过432个逐角属性字段、11160个最近角点见证、540项配对和990项汇总检查。独立审计首次因只支持ASCII的读取器遇到二进制PLY而停止；失败版本、原因与修正diff保存在 independent_audit/engineering_001/，增加独立二进制读取后CPU审计通过，未重跑任何来源恢复、定向、GEO或模型步骤。
++
++## 7. 下一步优先项与检验假说
++
++**优先把“来源C恢复→固定来源C整理free”的独立导出合同接入维护流程，作为可选、可追溯的导出路径。** 本轮只完成独立实验，并未自动改默认入口。检验假说：只要保留正确来源映射且相应分量可定向，此导出能消除规范化带来的方向矛盾，并让已有合法连接的方向可达性达到无方向上限，同时逐位保持顶点和无序连接；无来源映射或存在奇偶环/非流形时必须明确标记，不能猜方向或默默修拓扑。
++
++模型研究的未解问题仍是座面等条件的真实几何接续及RBF相交代价；不能因本轮方向指标变好晋级RBF、追加loss/训练或扩大搜索。本固定任务完成后停止，未commit/push。
++
++## 8. 交付索引
++
++|文件|内容|
++|---|---|
++|[逐父噪声配对](paired_per_parent_noise.csv)|36例三阶段方向变化及几何上限|
++|[三阶段逐输出](topology_per_output.csv)|108行实际共边/方向/可达与非流形结果|
++|[完整方向约束](orientation_constraints.csv)|逐边约束、排除原因和修复后满足情况|
++|[分量分类](orientation_components.csv)|792分量的固定C/奇偶冲突与翻转记录|
++|[几何等价](geometry_equivalence.csv)|36例原几何和缓存评分身份|
++|[逐顶点距离](boundary_vertices.csv)|三阶段距离继承与角点见证重映射|
++|[完整A-VMR/PMR](AVMR_PMR_per_output.csv)|8阈值×36例×3阶段，864行|
++|[原质量继承](quality_inherited_per_output.csv)|原CF/FF/I/角度/面积与分母，108行|
++|[执行收据](execution_completion.json)|实际预算、时间、hash和停止状态|
++|outputs/方法/请求ID/|restored_C、oriented的NPZ/PLY和完整逐例账本|
++|independent_audit/ 与 review/|独立审计、来源清单、实际源码、code.diff和hash|
++|R2_SOURCE_WINDING_EXPORT_REVIEW.zip|小于10MB审阅包；没有大权重|
++
++本报告中的变化仅适用于这6条件、2份噪声及三套既有POST，不外推为全体用户输入或未见对象的验证。
++'''
++    C.textfile(C.OUT/'REPORT.md','\ufeff'+report)
++    C.write(C.OUT/'review/report_receipt.json',dict(status='PASS',report_sha256=C.sha(C.OUT/'REPORT.md'),
++        source_inputs={str(C.OUT/n):C.sha(C.OUT/n) for n in ['execution_completion.json','topology_summary.csv','paired_per_parent_noise.csv','orientation_per_output.csv','quality_inherited_per_output.csv','AVMR_PMR_per_output.csv','independent_audit/completion.json']},
++        scientific_calls=0))
++    print('REPORT_WRITTEN',flush=True)
++
++
++if __name__=='__main__':main()
+--- /dev/null
++++ b/r2/tools/source_winding_export_v1/restoration.py
+@@ -0,0 +1,203 @@
++"""Restore saved source corner order at export, without changing any geometry.
++
++P[i,j] is the original corner selected by canonical model corner j:
++    canonical[i,j] = original[i,P[i,j]].
++The export therefore uses argsort(P), including inverse cyclic permutations.
++No model, mesh repair, source lookup, I/O, or orientation solver is called here.
++"""
++from __future__ import annotations
++import numpy as np
++
++VERSION = 'saved_source_corner_inverse_export_v1'
++
++
++def definition():
++    return dict(version=VERSION,
++        source='Explicit saved original face IDs, original_source_faces, and C_source_corner_permutations; no score-based C direction selection',
++        mapping='canonical_corner[j]=original_corner[P[j]]; restored_corner[j]=canonical_corner[argsort(P)[j]]',
++        changes='Only first K face rows receive their exact per-face inverse corner permutation; all free face rows unchanged at this stage',
++        identity='Source face row order and source vertex IDs are explicitly checked, not inferred from coincident coordinates',
++        coordinates='All vertex-array bytes unchanged; original source C order in existing model coordinates restored exactly',
++        corner_attributes='Apply the same output-slot-to-input-slot permutation to every saved per-corner attribute; compose subsequent free reversals',
++        limitations='Changes the old ordered-canonical-C export contract; does not move vertices, certify outward normals/manifoldness, or improve geometric attachment',
++        model_calls=0, GEO_calls=0, quality_calls=0)
++
++
++def _require(ok, message):
++    if not ok:
++        raise ValueError(message)
++
++
++def _integer(a, shape, name):
++    a = np.asarray(a)
++    _require(a.shape == shape and np.issubdtype(a.dtype, np.integer),
++             name + ' must be an integer array of shape ' + str(shape))
++    return a
++
++
++def _bits(a, b):
++    a, b = np.asarray(a), np.asarray(b)
++    return a.shape == b.shape and a.dtype == b.dtype and a.tobytes() == b.tobytes()
++
++
++def _permutation(p, n, name='corner permutation'):
++    p = _integer(p, (n, 3), name)
++    _require(np.array_equal(np.sort(p, axis=1), np.tile(np.arange(3), (n, 1))),
++             name + ' must contain each of 0,1,2 exactly once per face')
++    return p
++
++
++def permutation_parity(p):
++    """Return one Boolean per face: True means a reversal, False a cyclic order."""
++    p = np.asarray(p)
++    _require(p.ndim == 2, 'Permutation must be N by 3')
++    p = _permutation(p, len(p))
++    return (((p[:, 0] > p[:, 1]).astype(np.int8)
++             + (p[:, 0] > p[:, 2]).astype(np.int8)
++             + (p[:, 1] > p[:, 2]).astype(np.int8)) % 2).astype(bool)
++
++
++def permute_corner_data(data, output_to_input):
++    """Reindex axis 1 of (N,3,...) without arithmetic, preserving exact values."""
++    a = np.asarray(data)
++    _require(a.ndim >= 2 and a.shape[1] == 3, 'Per-corner data must have shape (N,3,...)')
++    p = _permutation(output_to_input, len(a))
++    return a[np.arange(len(a))[:, None], p].copy()
++
++
++def compose_corner_permutations(first, second):
++    """Map final slots to original slots after applying first and then second."""
++    first = np.asarray(first)
++    _require(first.ndim == 2, 'First permutation must have shape (N,3)')
++    first = _permutation(first, len(first), 'first permutation')
++    second = _permutation(second, len(first), 'second permutation')
++    return permute_corner_data(first, second)
++
++
++def validate_source_lineage(condition, parent):
++    """Validate every mapping against the original faces retained in the parent.
++
++    Inputs are read-only mappings of already-loaded NPZ arrays. File identity and
++    official-original-asset hashes are the caller's separate registration duty.
++    """
++    needed = ('C', 'source_face_ids', 'original_source_face_ids',
++              'C_source_vertex_ids', 'C_source_corner_permutations')
++    parent_needed = ('full_target', 'model_vertices', 'original_source_faces',
++                     'retained_to_original_face', 'source_faces',
++                     'source_face_vertex_ids', 'source_corner_permutations')
++    _require(all(k in condition for k in needed), 'Missing condition lineage array')
++    _require(all(k in parent for k in parent_needed), 'Missing parent lineage array')
++    C = np.asarray(condition['C'])
++    _require(C.ndim == 3 and C.shape[1:] == (3, 3) and C.dtype == np.float32
++             and len(C) > 0 and np.isfinite(C).all(), 'C must be finite FP32 (K,3,3)')
++    K = len(C)
++    model = np.asarray(parent['full_target'])
++    _require(model.ndim in (2, 3) and model.shape[1:] in ((9,), (3, 3))
++             and model.dtype == np.float32, 'Parent full_target must be FP32 (N,9) or (N,3,3)')
++    model = model.reshape(-1, 3, 3); n = len(model)
++    pvertices = np.asarray(parent['model_vertices'])
++    _require(pvertices.ndim == 2 and pvertices.shape[1] == 3 and pvertices.dtype == np.float32
++             and np.isfinite(pvertices).all(), 'Parent model_vertices must be finite FP32 (V,3)')
++    original = np.asarray(parent['original_source_faces'])
++    _require(original.ndim == 2 and original.shape[1] == 3
++             and np.issubdtype(original.dtype, np.integer)
++             and np.all((original >= 0) & (original < len(pvertices))), 'Invalid original source vertex IDs')
++    retained = _integer(parent['retained_to_original_face'], (n,), 'retained_to_original_face')
++    _require(len(np.unique(retained)) == n and np.all((retained >= 0) & (retained < len(original))),
++             'Retained original face IDs must be a valid injective map')
++    source_faces = _integer(parent['source_faces'], (n, 3), 'parent source_faces')
++    pids = _integer(parent['source_face_vertex_ids'], (n, 3), 'parent canonical source vertex IDs')
++    pp = _permutation(parent['source_corner_permutations'], n, 'parent source corner permutations')
++    _require(np.array_equal(source_faces, original[retained]), 'Parent retained face lineage mismatch')
++    _require(np.array_equal(permute_corner_data(source_faces, pp), pids),
++             'Parent canonical source vertex IDs disagree with saved permutation')
++    _require(_bits(pvertices[pids], model), 'Parent model coordinates disagree with source vertex IDs')
++    selected = _integer(condition['source_face_ids'], (K,), 'condition source_face_ids')
++    _require(len(np.unique(selected)) == K and np.all((selected >= 0) & (selected < n)),
++             'Condition source face IDs must be a valid injective map')
++    ofids = _integer(condition['original_source_face_ids'], (K,), 'condition original face IDs')
++    ids = _integer(condition['C_source_vertex_ids'], (K, 3), 'condition canonical source vertex IDs')
++    P = _permutation(condition['C_source_corner_permutations'], K, 'condition source corner permutations')
++    _require(np.array_equal(ofids, retained[selected]), 'Condition original face ID lineage mismatch')
++    _require(np.array_equal(P, pp[selected]), 'Condition corner permutation differs from parent lineage')
++    _require(np.array_equal(ids, pids[selected]), 'Condition source vertex ID mismatch')
++    _require(_bits(C, model[selected]) and _bits(C, pvertices[ids]), 'Condition C bytes differ from parent model order')
++    if 'K' in condition:
++        _require(np.asarray(condition['K']).shape == () and int(condition['K']) == K, 'Condition K mismatch')
++    if 'N' in condition:
++        _require(np.asarray(condition['N']).shape == () and int(condition['N']) == n, 'Condition N mismatch')
++    inverse = np.argsort(P, axis=1)
++    original_ids = original[ofids]
++    recovered_ids = permute_corner_data(ids, inverse)
++    _require(np.array_equal(recovered_ids, original_ids), 'Inverse must recover actual original source vertex IDs')
++    original_C = permute_corner_data(C, inverse)
++    _require(_bits(original_C, pvertices[original_ids]), 'Recovered original source C coordinates do not match exactly')
++    parity = permutation_parity(P)
++    rows = [dict(C_face_row=i, parent_prepared_face_id=int(selected[i]),
++                 original_source_face_id=int(ofids[i]),
++                 canonical_source_vertex_ids=ids[i].tolist(), original_source_vertex_ids=original_ids[i].tolist(),
++                 canonical_to_original_corner_ids=P[i].tolist(), restored_to_canonical_corner_ids=inverse[i].tolist(),
++                 corner_row_changes=bool(np.any(inverse[i] != np.arange(3))),
++                 winding_reversed_from_canonical=bool(parity[i])) for i in range(K)]
++    return dict(C_original=original_C, C_original_source_vertex_ids=original_ids.copy(),
++                C_original_source_face_ids=ofids.copy(), C_source_vertex_ids=ids.copy(),
++                P=P.copy(), P_inverse=inverse, parity=parity, face_rows=rows,
++                summary=dict(K=K, parent_N=n, source_face_order_preserved=True,
++                    original_source_vertex_IDs_exact=True, original_C_model_coordinate_bytes_exact=True,
++                    C_rows_reordered=sum(r['corner_row_changes'] for r in rows),
++                    C_winding_reversed_from_canonical=int(parity.sum()),
++                    C_cyclic_only_reordered=sum(r['corner_row_changes'] and not r['winding_reversed_from_canonical'] for r in rows)))
++
++
++def restore_source_order(vertices, faces, K, condition, parent, *,
++                         source_face_ids=None, source_corner_ids=None):
++    """Restore original C order in one cached canonical POST; do not orient free.
++
++    The canonical POST must retain C as its first K faces in the registered
++    order. source_corner_ids, if supplied, maps output corners into the former
++    input and is composed rather than regenerated. Other per-corner fields use
++    the returned face_corner_permutation and permute_corner_data().
++    """
++    v, f = np.asarray(vertices), np.asarray(faces)
++    _require(v.ndim == 2 and v.shape[1] == 3 and v.dtype == np.float32 and np.isfinite(v).all(),
++             'POST vertices must be finite FP32 (V,3)')
++    _require(f.ndim == 2 and f.shape[1] == 3 and np.issubdtype(f.dtype, np.integer),
++             'POST faces must be integer (N,3)')
++    _require(isinstance(K, (int, np.integer)) and not isinstance(K, (bool, np.bool_))
++             and 0 < K <= len(f), 'K must be an integer in 1..N')
++    K = int(K)
++    _require(np.all((f >= 0) & (f < len(v))), 'POST face vertex IDs out of range')
++    lineage = validate_source_lineage(condition, parent)
++    _require(lineage['summary']['K'] == K, 'POST K differs from source condition')
++    canonical_C = np.asarray(condition['C'])
++    _require(_bits(v[f[:K]], canonical_C), 'POST C is not in exact registered canonical coordinate order')
++    permutation = np.tile(np.arange(3, dtype=np.int64), (len(f), 1))
++    permutation[:K] = lineage['P_inverse']
++    restored = permute_corner_data(f, permutation)
++    _require(_bits(restored[K:], f[K:]), 'Free rows changed during C restoration')
++    _require(_bits(v[restored[:K]], lineage['C_original']), 'Restored indexed C differs from original source order')
++    _require(np.array_equal(np.sort(restored, axis=1), np.sort(f, axis=1)), 'Unordered indexed triangle identity changed')
++    _require(_bits(permute_corner_data(restored[:K], lineage['P']), f[:K]), 'Indexed inverse round trip failed')
++    result = dict(faces=restored, C=v[restored[:K]].copy(),
++                  face_corner_permutation=permutation,
++                  C_original_source_vertex_ids=lineage['C_original_source_vertex_ids'],
++                  C_original_source_face_ids=lineage['C_original_source_face_ids'],
++                  C_canonical_source_vertex_ids=lineage['C_source_vertex_ids'],
++                  P=lineage['P'], P_inverse=lineage['P_inverse'],
++                  face_rows=lineage['face_rows'], summary=dict(lineage['summary'],
++                    version=VERSION, total_faces=len(f), free_faces=len(f)-K,
++                    vertices_bytewise_unchanged=True, free_face_rows_bytewise_unchanged=True,
++                    unordered_face_vertex_IDs_unchanged=True, face_order_unchanged=True,
++                    canonical_C_order_changed=not _bits(v[restored[:K]], canonical_C),
++                    per_corner_mapping='new output slot -> original cached POST corner slot',
++                    automatic_extra_attributes=False, model_calls=0, orientation_solver_calls=0))
++    if source_face_ids is not None:
++        sf = _integer(source_face_ids, (len(f),), 'POST source_face_ids')
++        _require(np.array_equal(sf[:K], np.arange(K)), 'POST source face IDs do not retain original C row order')
++        result['source_face_ids'] = sf.copy()
++    if source_corner_ids is not None:
++        sc = _permutation(source_corner_ids, len(f), 'POST local source_corner_ids')
++        _require(np.array_equal(sc[:K], np.tile(np.arange(3), (K, 1))),
++                 'Canonical POST C source-corner map must be identity before restoration')
++        result['source_corner_ids'] = permute_corner_data(sc, permutation)
++    return result
+--- /dev/null
++++ b/r2/tools/source_winding_export_v1/restoration_checks.py
+@@ -0,0 +1,177 @@
++"""Eight finite CPU arithmetic checks; no real POST export or orientation solve."""
++from pathlib import Path
++import os
++for _name in ('OMP_NUM_THREADS', 'MKL_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'NUMEXPR_NUM_THREADS'):
++    os.environ[_name] = '2'
++os.environ['CUDA_VISIBLE_DEVICES'] = ''
++import hashlib, itertools, json, resource, subprocess, sys, time, traceback
++import numpy as np
++from . import restoration as R
++
++ROOT=Path(__file__).resolve().parents[3]
++OUT=ROOT/'experiments/r2_source_winding_export_v1/restoration_checks'
++
++def sha(path):
++    h=hashlib.sha256()
++    with Path(path).open('rb') as f:
++        for block in iter(lambda:f.read(1<<20),b''):h.update(block)
++    return h.hexdigest()
++
++def checked(path):
++    p=Path(path).absolute()
++    if any(x.is_symlink() for x in (p,*p.parents)):raise ValueError('Symlink output')
++    p=p.resolve()
++    if p==OUT.resolve() or not p.is_relative_to(OUT.resolve()):raise ValueError('Output outside owned checks directory')
++    return p
++
++def write(path,value):
++    p=checked(path);p.parent.mkdir(parents=True,exist_ok=True);tmp=p.with_name(p.name+'.tmp')
++    with tmp.open('w',encoding='utf-8') as f:
++        json.dump(value,f,indent=2,allow_nan=False);f.flush();os.fsync(f.fileno())
++    tmp.replace(p)
++
++def resources():
++    def run(args):
++        p=subprocess.run(args,capture_output=True,text=True,timeout=20)
++        return dict(code=p.returncode,stdout=p.stdout,stderr=p.stderr)
++    return dict(CPU_cores=os.cpu_count(),loadavg=list(os.getloadavg()),memory=Path('/proc/meminfo').read_text(),
++        GPU=run(['nvidia-smi','--query-gpu=name,memory.total,memory.used,memory.free,utilization.gpu','--format=csv,noheader,nounits']),
++        GPU_processes=run(['nvidia-smi','--query-compute-apps=pid,process_name,used_memory','--format=csv']),
++        CPU_processes=run(['ps','-eo','pid,pcpu,pmem,comm','--sort=-pcpu']))
++
++def bits(a,b):return a.shape==b.shape and a.dtype==b.dtype and a.tobytes()==b.tobytes()
++
++def fixture():
++    # Six known triangles cover all S3 permutations; distinct post vertex
++    # numbering and nontrivial known source-face order prevent accidental IDs.
++    vertex=[]
++    for i in range(8):vertex += [[i*2.,-0.,0.],[i*2.+1.,0.,0.],[i*2.,1.,.25]]
++    vertex += [vertex[0].copy()]  # same-coordinate different source ID
++    pv=np.asarray(vertex,np.float32);original=np.arange(24,dtype=np.int64).reshape(8,3)
++    P=np.asarray(list(itertools.permutations(range(3)))+[(0,1,2),(0,1,2)],np.int64)
++    ids=R.permute_corner_data(original,P);M=pv[ids]
++    parent=dict(full_target=M.reshape(8,9).copy(),model_vertices=pv,original_source_faces=original.copy(),
++        retained_to_original_face=np.arange(8,dtype=np.int64),source_faces=original.copy(),
++        source_face_vertex_ids=ids,source_corner_permutations=P)
++    chosen=np.asarray([4,1,5,0,3,2],np.int64)
++    condition=dict(C=M[chosen].copy(),source_face_ids=chosen.copy(),original_source_face_ids=chosen.copy(),
++        C_source_vertex_ids=ids[chosen].copy(),C_source_corner_permutations=P[chosen].copy(),
++        K=np.asarray(6,np.int64),N=np.asarray(8,np.int64))
++    vorder=np.arange(len(pv)-1,-1,-1);v=pv[vorder].copy();remap=np.argsort(vorder)
++    f=remap[np.concatenate((ids[chosen],ids[6:]))].astype(np.int32)
++    sf=np.arange(8,dtype=np.int64);sc=np.tile(np.arange(3,dtype=np.int64),(8,1))
++    return v,f,6,condition,parent,sf,sc
++
++def run_fixture(data):
++    v,f,K,c,p,sf,sc=data
++    return R.restore_source_order(v,f,K,c,p,source_face_ids=sf,source_corner_ids=sc)
++
++def expect_rejection(data,substring):
++    try:run_fixture(data)
++    except ValueError as e:
++        assert substring in str(e),(substring,str(e))
++        return dict(expected_exception='ValueError',message=str(e))
++    raise AssertionError('Expected source contract rejection')
++
++def all_six():
++    data=fixture();v,f,K,c,p,sf,sc=data
++    original={name:x.tobytes() for name,x in [('vertices',v),('faces',f),('sf',sf),('sc',sc)]}
++    r=run_fixture(data);q=run_fixture(data)
++    expected=p['model_vertices'][p['original_source_faces'][c['original_source_face_ids']]]
++    assert bits(r['C'],expected) and np.array_equal(r['C_original_source_vertex_ids'],p['original_source_faces'][c['original_source_face_ids']])
++    assert bits(r['faces'][K:],f[K:]) and bits(r['source_face_ids'],sf)
++    assert bits(r['faces'],q['faces']) and r['face_rows']==q['face_rows']
++    for name,x in [('vertices',v),('faces',f),('sf',sf),('sc',sc)]:assert x.tobytes()==original[name]
++    assert r['summary']['C_rows_reordered']==5 and r['summary']['C_winding_reversed_from_canonical']==3
++    return dict(permutations=6,exact_source_vertex_IDs=True,nontrivial_source_face_order_retained=True,
++        input_arrays_unchanged=True,free_rows_unchanged=True,deterministic=True,summary=r['summary'])
++
++def cyclic_inverse():
++    data=fixture();c=data[3];r=run_fixture(data);rows=[]
++    for j,P in enumerate(c['C_source_corner_permutations']):
++        if P.tolist() not in ([1,2,0],[2,0,1]):continue
++        Q=r['P_inverse'][j];assert not np.array_equal(P,Q)
++        assert np.array_equal(P[Q],np.arange(3)) and np.array_equal(Q[P],np.arange(3))
++        assert bits(c['C'][j][Q],r['C'][j]);rows.append(dict(P=P.tolist(),P_inverse=Q.tolist()))
++    assert len(rows)==2
++    return dict(three_cycles=rows,forward_permutation_is_not_its_inverse=True)
++
++def parity_normals():
++    data=fixture();c=data[3];r=run_fixture(data)
++    def normals(t):
++        t=t.astype(np.float64);return np.cross(t[:,1]-t[:,0],t[:,2]-t[:,0])
++    nm,nr=normals(c['C']),normals(r['C']);odd=R.permutation_parity(c['C_source_corner_permutations'])
++    assert np.array_equal(nr,np.where(odd[:,None],-nm,nm))
++    assert int(odd.sum())==3 and int((~odd).sum())==3
++    return dict(odd_reversals=3,even_preservations=3,normal_sign_matches_parity=True)
++
++def composed_attributes():
++    data=fixture();v,f,K,c,p,sf,sc=data;r=run_fixture(data)
++    second=np.tile(np.arange(3),(len(f),1));second[K:]=[0,2,1]
++    final=R.compose_corner_permutations(r['face_corner_permutation'],second)
++    attrs=np.arange(len(f)*3*2,dtype=np.float32).reshape(len(f),3,2);attrs[0,0,0]=np.float32(-0.)
++    sequential=R.permute_corner_data(R.permute_corner_data(attrs,r['face_corner_permutation']),second)
++    composed=R.permute_corner_data(attrs,final);assert bits(sequential,composed)
++    final_sc=R.permute_corner_data(r['source_corner_ids'],second)
++    assert np.array_equal(final_sc,R.permute_corner_data(sc,final))
++    assert bits(final[:K],r['face_corner_permutation'][:K])
++    assert np.signbit(composed[0][np.flatnonzero(final[0]==0)[0],0])
++    return dict(trailing_attributes_bitwise=True,signed_zero_preserved=True,source_corner_IDs_composed=True,C_mapping_unchanged_by_free_stage=True)
++
++def coincident_ID_mismatch():
++    data=fixture();v,f,K,c,p,sf,sc=data
++    where=np.argwhere(c['C_source_vertex_ids']==0)[0];i,j=map(int,where)
++    assert bits(p['model_vertices'][0],p['model_vertices'][-1])
++    c['C_source_vertex_ids'][i,j]=len(p['model_vertices'])-1
++    return expect_rejection(data,'Condition source vertex ID mismatch')
++
++def parent_lineage_mismatch():
++    data=fixture();data[4]['retained_to_original_face'][[0,1]]=[1,0]
++    return expect_rejection(data,'Parent retained face lineage mismatch')
++
++def invalid_permutation():
++    data=fixture();data[3]['C_source_corner_permutations'][0]=[0,0,2]
++    return expect_rejection(data,'must contain each of 0,1,2')
++
++def noncanonical_POST():
++    data=fixture();data[1][0]=data[1][0,[0,2,1]]
++    return expect_rejection(data,'POST C is not in exact registered canonical coordinate order')
++
++CASES=[('all_six_permutations_exact_identity',all_six),('three_cycle_inverse_not_forward',cyclic_inverse),
++       ('even_and_odd_parity_normals',parity_normals),('per_corner_composition_signed_zero',composed_attributes),
++       ('coincident_coordinate_source_ID_mismatch_rejected',coincident_ID_mismatch),
++       ('parent_original_face_lineage_mismatch_rejected',parent_lineage_mismatch),
++       ('malformed_saved_permutation_rejected',invalid_permutation),('noncanonical_POST_order_rejected',noncanonical_POST)]
++
++def main():
++    sources={str(Path(R.__file__)):sha(R.__file__),str(Path(__file__)):sha(__file__)}
++    completion=OUT/'completion.json'
++    if completion.exists():
++        done=json.loads(completion.read_text());assert done['status']=='PASS' and done['source_hashes']==sources
++        for p,h in done['files'].items():assert sha(p)==h
++        print(json.dumps(dict(status='VERIFIED_REUSE',cases=8,model_calls=0)));return
++    if (OUT/'registration.json').exists():raise RuntimeError('Incomplete attempted checks; no silent retry')
++    measured=resources();start=time.perf_counter()
++    protected={str(p):sha(p) for p in (ROOT/'AGENTS.md',ROOT/'WORKSPACE.md',ROOT/'native_t1/docs/control_metrics.md',ROOT/'r2/tools/c_restore_bounded_v1/orientation.py')}
++    write(OUT/'registration.json',dict(status='REGISTERED',source_hashes=sources,protected=protected,
++        cases=[name for name,_ in CASES],definition=R.definition(),CPU_workers=1,CPU_threads=2,GPU_workers=0,
++        real_POST_exports=0,orientation_solver_calls=0,model_calls=0))
++    write(OUT/'resources_before.json',measured);results=[]
++    try:
++        for name,fn in CASES:
++            write(OUT/name/'started.json',dict(status='STARTED'))
++            detail=fn();value=dict(case=name,status='PASS',**detail);write(OUT/name/'result.json',value);results.append(value)
++        for p,h in protected.items():assert sha(p)==h
++        files={str(p):sha(p) for p in OUT.rglob('*') if p.is_file()}
++        done=dict(status='PASS',cases=results,source_hashes=sources,protected_before=protected,
++            protected_after={p:sha(p) for p in protected},protected_unchanged=True,files=files,
++            seconds=time.perf_counter()-start,peak_CPU_RSS_KiB=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
++            real_POST_exports=0,orientation_solver_calls=0,model_calls=0,GEO_calls=0,quality_calls=0,
++            torch_imported='torch' in sys.modules)
++        write(completion,done);print(json.dumps({k:v for k,v in done.items() if k not in ('files','source_hashes','protected_before','protected_after')},indent=2))
++    except BaseException:
++        write(OUT/'failure.json',dict(status='FAILED',traceback=traceback.format_exc(),completed_cases=results,
++            model_calls=0,real_POST_exports=0,orientation_solver_calls=0))
++        raise
++
++if __name__=='__main__':main()
+--- /dev/null
++++ b/r2/tools/source_winding_export_v1/run.py
+@@ -0,0 +1,168 @@
++"""Restore source C order then orient free on36 cached POSTs; CPU-only."""
++import os
++for _k in ('OMP_NUM_THREADS','OPENBLAS_NUM_THREADS','MKL_NUM_THREADS','NUMEXPR_NUM_THREADS'):os.environ[_k]='2'
++os.environ['CUDA_VISIBLE_DEVICES']=''
++import collections, concurrent.futures, multiprocessing, resource, sys, time, traceback
++from pathlib import Path
++import numpy as np
++from . import common as C
++from .prepare import prepare,registration
++from . import restoration as R
++from r2.tools.c_restore_bounded_v1.orientation import orient_fixed_C
++from r2.pilots.anchor_aware_denoiser_v1 import evaluation as E
++from r2.tools.c_restore_coupling_v1.evaluation import opposite_reach
++from native_t1 import postprocess_cli as PC
++
++STAGES=('MODEL_POST','RESTORED_C_ONLY','ORIENTED')
++INPUT_CORNER_KEYS=('corner_displacement','corner_displacement_vector','corner_target_input_ids','corner_vertex_ids','corner_status','corner_C_candidate_count')
++def meta(r):return dict(E.meta(E.canonical_identity(r)),method=r['method'])
++def case_dir(r):return C.OUT/'outputs'/r['method']/r['request_id']
++
++def direction_counts(faces,K):
++ def count(fs):
++  edges=collections.defaultdict(list)
++  for fi,f in enumerate(fs):
++   for j in range(3):
++    u,v=int(f[j]),int(f[(j+1)%3]);edges[tuple(sorted((u,v)))].append((fi,u,v))
++  two=[x for x in edges.values() if len(x)==2 and x[0][0]!=x[1][0]]
++  return dict(two_face_edges=len(two),same_direction_edges=sum(x[0][1:]==x[1][1:] for x in two),nonmanifold_edges=sum(len(x)>2 for x in edges.values()))
++ cc=count(faces[:K]);whole=count(faces)
++ return dict(C_C_local_two_face_edges=cc['two_face_edges'],C_C_local_same_direction_edges=cc['same_direction_edges'],C_C_local_nonmanifold_edges=cc['nonmanifold_edges'],whole_two_face_same_direction_edges=whole['same_direction_edges'])
++
++def topology(a,faces,K,pairs):
++ top,edges,reached=E.actual_valid_graph(a['vertices'],faces,K,pairs)
++ top.update(opposite_reach(a['vertices'][faces],K,edges));top.update(direction_counts(faces,K))
++ return top,edges,reached
++
++def save_export(dest,name,a,faces,perm,rest,flips):
++ tri=a['vertices'][faces];K=len(rest['C']);sc=R.permute_corner_data(a['source_corner_ids'],perm);sf=a['source_face_ids']
++ assert C.same(faces,R.permute_corner_data(a['faces'],perm))
++ assert C.same(tri,R.permute_corner_data(a['output'],perm))
++ assert C.same(faces,a['corner_vertex_ids'][sf[:,None],sc])
++ out=dict(vertices=a['vertices'],faces=faces,output=tri,C=tri[:K],free=tri[K:],known_faces=np.int64(K),input_faces=a['input_faces'],
++  source_face_ids=sf,source_corner_ids=sc,corner_permutation_to_MODEL_POST=perm,free_face_flips=flips,
++  C_original_source_vertex_ids=rest['C_original_source_vertex_ids'],C_original_source_face_ids=rest['C_original_source_face_ids'],
++  C_canonical_source_vertex_ids=rest['C_canonical_source_vertex_ids'],C_source_corner_permutation=rest['P'],C_inverse_corner_permutation=rest['P_inverse'],
++  vertex_source_input_corner_ids=a['vertex_source_input_corner_ids'],source_face_kept=a['source_face_kept'],
++  source_face_reason=a['source_face_reason'],duplicate_of_source_face=a['duplicate_of_source_face'])
++ for key in INPUT_CORNER_KEYS:
++  out['input_'+key]=a[key]
++  out['output_'+key]=a[key][sf[:,None],sc]
++ C.save_npz(dest/(name+'.npz'),**out)
++ PC.write_indexed_ply(C.checked(dest/(name+'.ply')),a['vertices'],faces)
++ v,f=PC.read_indexed_ply(dest/(name+'.ply'));assert C.same(v,a['vertices']) and C.same(f,faces)
++ return out
++
++def process_one(r):
++ tick=time.perf_counter();r=E.canonical_identity(r);dest=case_dir(r);rp=dest/'receipt.json'
++ identity=dict(**meta(r),post_sha256=C.sha(r['post_path']),condition_sha256=C.sha(r['condition_source']),parent_sha256=C.sha(r['parent_prepared_path']),registration_sha256=C.sha(C.OUT/'registration.json'))
++ if rp.exists():
++  q=C.read(rp);assert q['status']=='PASS' and q['identity']==identity;C.verify(q['files']);return dict(path=str(rp),reused=True,seconds=0,peak_RSS_KiB=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
++ started=C.OUT/'events'/r['method']/(r['request_id']+'_started.json')
++ if dest.exists() or started.exists():raise RuntimeError('Incomplete previously attempted case; automatic replay prohibited')
++ C.write(started,dict(identity=identity,utc=time.time()))
++ a=C.payload(r['post_path']);cond=C.payload(r['condition_source']);parent=C.payload(r['parent_prepared_path']);d=C.read(r['diagnostic_path']);K=int(r['K'])
++ assert C.same(a['output'][:K],cond['C']) and C.same(a['vertices'][a['faces']],a['output'])
++ assert d['quality']['identity']['processed_sha256']==identity['post_sha256']
++ pairs=C.read(d['quality']['pair_audit_path'])
++ rest=R.restore_source_order(a['vertices'],a['faces'],K,cond,parent,source_face_ids=a['source_face_ids'],source_corner_ids=a['source_corner_ids'])
++ stage0,edge0,_=topology(a,a['faces'],K,pairs)
++ for key in ('C_F_valid_edge_count','C_F_valid_opposite_winding_edge_count','reached_free_faces','graph_valid_edges'):assert stage0[key]==d['topology'][key]
++ assert np.isclose(stage0['opposite_winding_reached_free_area_fraction'],d['topology']['opposite_winding_reached_free_area_fraction'],atol=1e-13,rtol=1e-12)
++ zero=np.zeros(len(a['faces']),bool)
++ first=save_export(dest,'restored_C',a,rest['faces'],rest['face_corner_permutation'],rest,zero)
++ C.csvwrite(dest/'source_C_face_mapping.csv',rest['face_rows'])
++ C.write(dest/'source_restoration.json',rest['summary'])
++ stage1,edge1,_=topology(a,rest['faces'],K,pairs)
++ C.write(dest/'orientation_started.json',dict(utc=time.time(),restored_C_sha256=C.sha(dest/'restored_C.npz')))
++ oriented=orient_fixed_C(a['vertices'],rest['faces'],K)
++ perm=R.compose_corner_permutations(rest['face_corner_permutation'],oriented['face_corner_permutation'])
++ final=save_export(dest,'oriented',a,oriented['faces'],perm,rest,oriented['flips'])
++ assert C.same(final['C'],rest['C']) and C.same(final['faces'][:K],rest['faces'][:K])
++ assert C.same(first['free'],a['output'][K:])
++ for state in (first,final):
++  assert C.same(state['vertices'],a['vertices']) and C.same(state['source_face_ids'],a['source_face_ids'])
++  assert np.array_equal(np.sort(state['faces'],axis=1),np.sort(a['faces'],axis=1))
++  assert np.array_equal(state['C_original_source_vertex_ids'],parent['original_source_faces'][cond['original_source_face_ids']])
++ stage2,edge2,reached=topology(a,oriented['faces'],K,pairs)
++ for stage in (stage1,stage2):
++  for key in ('C_F_shared_edge_count','C_F_valid_edge_count','reached_free_faces','graph_valid_edges','boundary_edges','nonmanifold_edges'):assert stage[key]==stage0[key]
++  assert np.isclose(stage['reached_free_area_fraction'],stage0['reached_free_area_fraction'],atol=1e-12,rtol=1e-12)
++  assert stage['C_C_local_same_direction_edges']==0
++ for name,edges in zip(STAGES,(edge0,edge1,edge2)):C.csvwrite(dest/('valid_edges_'+name+'.csv'),edges)
++ C.csvwrite(dest/'orientation_components.csv',oriented['component_rows']);C.csvwrite(dest/'orientation_constraints.csv',oriented['edge_rows'])
++ C.write(dest/'orientation_details.json',dict(summary=oriented['summary'],components=oriented['component_rows'],edges=oriented['edge_rows']))
++ # Preserve nearest-point identity by remapping the old chosen corner witness;
++ # this is not a new nearest-neighbor tie-breaking run.
++ boundary=[];metric=[]
++ for name,p in zip(STAGES,(np.tile(np.arange(3),(len(a['faces']),1)),rest['face_corner_permutation'],perm)):
++  inv=np.argsort(p,axis=1)
++  for v in d['vertices']:
++   j=v.get('nearest_free_face');c=v.get('nearest_free_corner')
++   mapped=int(inv[K+int(j),int(c)]) if j is not None and c is not None else None
++   boundary.append({**v,'stage':name,'original_MODEL_POST_nearest_free_corner':c,'nearest_free_corner':mapped,'witness_status':'REMAP_OF_ORIGINAL_CHOSEN_WITNESS_NOT_NEW_SEARCH'})
++  metric.extend(dict(stage=name,**v,value_status='INHERITED_AFTER_GEOMETRY_EQUIVALENCE') for v in d['metrics'])
++ C.csvwrite(dest/'boundary_vertices.csv',boundary);C.csvwrite(dest/'AVMR_PMR.csv',metric)
++ eq=dict(vertex_bytes_unchanged=True,unordered_indexed_faces_unchanged=True,face_rows_and_source_face_ids_unchanged=True,
++  input_audit_arrays_unchanged=True,output_corner_mapping_verified=True,restored_C_source_order_bytes_exact=True,
++  no_vertex_merge_or_split_or_face_deletion=True,physical_coordinates_scale_unchanged=True,
++  model_input_not_modified=True,UV_normals_colors='NA_NOT_PRESENT',new_quality_calls=0,
++  quality_status='INHERITED_UNORIENTED_GEOMETRY_EQUIVALENCE_NOT_A_NEW_SCORER_RUN',
++  quality_original_POST_sha256=d['quality']['identity']['processed_sha256'],quality_original_diagnostic_path=r['diagnostic_path'])
++ q=dict(status='PASS',identity=identity,restoration=rest['summary'],orientation=oriented['summary'],
++  topology=dict(zip(STAGES,(stage0,stage1,stage2))),geometry_equivalence=eq,quality_reference=d['quality'],
++  original_metrics=d['metrics'],original_boundary_vertices=d['vertices'],oriented_reached_free_face_ids=reached,
++  seconds=time.perf_counter()-tick,peak_RSS_KiB=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
++  orientation_solves=1,model_forwards=0,new_full_quality_scores=0,new_GEO_C=0,
++  files={str(p):C.sha(p) for p in dest.iterdir() if p.is_file()})
++ C.write(rp,q);C.write(C.OUT/'events'/r['method']/(r['request_id']+'_complete.json'),dict(receipt_sha256=C.sha(rp),seconds=q['seconds']))
++ assert 'torch' not in sys.modules
++ return dict(path=str(rp),reused=False,seconds=q['seconds'],peak_RSS_KiB=q['peak_RSS_KiB'])
++
++def aggregate(reg):
++ topology_rows=[];orientations=[];boundary=[];vm=[];quality=[];mapping=[];components=[];constraints=[];pairs=[];equivalence=[]
++ for r in reg['records']:
++  dest=case_dir(r);q=C.read(dest/'receipt.json');m=meta(r)
++  for stage,top in q['topology'].items():
++   topology_rows.append(dict(**m,stage=stage,**top))
++   quality.append(dict(**m,stage=stage,value_status='INHERITED_GEOMETRY_EQUIVALENCE',**q['quality_reference']['metrics'],free_face_denominator=q['quality_reference']['free_face_denominator']))
++  orientations.append({**m,**{k:v for k,v in q['orientation'].items() if not isinstance(v,dict)},**{'restoration_'+k:v for k,v in q['restoration'].items()}})
++  equivalence.append(dict(**m,**q['geometry_equivalence']))
++  for destlist,file in ((boundary,'boundary_vertices.csv'),(vm,'AVMR_PMR.csv'),(mapping,'source_C_face_mapping.csv'),(components,'orientation_components.csv'),(constraints,'orientation_constraints.csv')):
++   destlist.extend(dict(**m,**v) for v in C.rows(dest/file))
++  t0,t1,t2=(q['topology'][x] for x in STAGES)
++  pairs.append(dict(**m,C_C_same_before=t0['C_C_local_same_direction_edges'],C_C_same_after=t2['C_C_local_same_direction_edges'],
++   valid_edges_unchanged=t2['C_F_valid_edge_count'],opposed_MODEL_POST=t0['C_F_valid_opposite_winding_edge_count'],opposed_RESTORED_C_ONLY=t1['C_F_valid_opposite_winding_edge_count'],opposed_ORIENTED=t2['C_F_valid_opposite_winding_edge_count'],
++   unoriented_reach=t0['reached_free_area_fraction'],opposed_reach_MODEL_POST=t0['opposite_winding_reached_free_area_fraction'],opposed_reach_RESTORED_C_ONLY=t1['opposite_winding_reached_free_area_fraction'],opposed_reach_ORIENTED=t2['opposite_winding_reached_free_area_fraction'],
++   reach_gain=t2['opposite_winding_reached_free_area_fraction']-t0['opposite_winding_reached_free_area_fraction'],parity_conflict_components=q['orientation']['parity_conflict_components'],fixed_source_C_conflict_components=q['orientation']['fixed_C_anchor_conflict_components'],
++   flipped_free_faces=q['orientation']['flipped_free_faces'],nonmanifold_edges=q['orientation']['nonmanifold_edges']))
++ for name,rows in [('topology_per_output',topology_rows),('orientation_per_output',orientations),('boundary_vertices',boundary),('AVMR_PMR_per_output',vm),('quality_inherited_per_output',quality),('source_C_face_mapping',mapping),('orientation_components',components),('orientation_constraints',constraints),('paired_per_parent_noise',pairs),('geometry_equivalence',equivalence)]:C.csvwrite(C.OUT/(name+'.csv'),rows)
++ summaries=[]
++ for kind,key in [('ALL',None),('REGION','region_type'),('PARENT','parent_id'),('NOISE','candidate')]:
++  for method in ('D0_BASE','RBF','BLEND'):
++   for value in (sorted({r[key] for r in topology_rows}) if key else ['ALL']):
++    for stage in STAGES:
++     sub=[r for r in topology_rows if r['method']==method and r['stage']==stage and (key is None or r[key]==value)]
++     numeric=['C_F_valid_edge_count','C_F_valid_opposite_winding_edge_count','C_C_local_same_direction_edges','reached_free_area_fraction','opposite_winding_reached_free_area_fraction','nonmanifold_edges']
++     summaries.append(dict(group=kind,value=value,method=method,stage=stage,n=len(sub),**{k+'_mean':float(np.mean([r[k] for r in sub])) for k in numeric},
++      outputs_with_valid_edges=sum(r['C_F_valid_edge_count']>0 for r in sub),outputs_with_opposed_edges=sum(r['C_F_valid_opposite_winding_edge_count']>0 for r in sub),
++      valid_edge_total=sum(r['C_F_valid_edge_count'] for r in sub),opposed_edge_total=sum(r['C_F_valid_opposite_winding_edge_count'] for r in sub)))
++ C.csvwrite(C.OUT/'topology_summary.csv',summaries)
++ C.write(C.OUT/'aggregate_completion.json',dict(status='PASS',outputs=36,topology_rows=108,AVMR_rows=len(vm),full_quality_values_status='INHERITED_NOT_RECOMPUTED',new_full_quality_scores=0))
++
++def main():
++ check=C.read(C.OUT/'restoration_checks/completion.json');assert check['status']=='PASS'
++ reg=prepare();tick=time.perf_counter();C.write(C.OUT/'resources_before_dispatch.json',C.resources())
++ first=process_one(reg['records'][0]);res=C.resources();C.write(C.OUT/'resources_after_first_case.json',res)
++ mem={s.split(':')[0]:int(s.split()[1])*1024 for s in res['memory'].splitlines() if s.split()[1].isdigit()}
++ workers=2 if (os.cpu_count() or 1)>=4 and mem['MemAvailable']>max(4<<30,3*first['peak_RSS_KiB']*1024) and res['loadavg'][0]<(os.cpu_count() or 1)-2 else 1
++ C.write(C.OUT/'CPU_dispatch.json',dict(workers=workers,threads_per_worker=2,first_authorized_case=first,available_RAM_bytes=mem['MemAvailable'],loadavg=res['loadavg'],GPU_workers=0,reason='Measured actual complete first case; independent remaining source restoration/orientation jobs, at most two CPU workers; no model probes',timing_scope='Concurrent wall time, not isolated benchmark'))
++ with concurrent.futures.ProcessPoolExecutor(max_workers=workers,mp_context=multiprocessing.get_context('spawn')) as pool:receipts=[first,*pool.map(process_one,reg['records'][1:],chunksize=1)]
++ aggregate(reg);C.verify(reg['protected']);C.verify(reg['runner_hashes'])
++ assert len(list((C.OUT/'events').glob('*/*_started.json')))==len(list((C.OUT/'events').glob('*/*_complete.json')))==36
++ C.write(C.OUT/'resources_after_experiment.json',C.resources())
++ C.write(C.OUT/'execution_completion.json',dict(status='PASS',outputs=36,source_C_restorations=36,orientation_solves=36,CPU_workers=workers,receipts=receipts,phase_seconds=time.perf_counter()-tick,protected_files_unchanged=len(reg['protected']),frozen_sources_unchanged=True,model_loads=0,model_forwards=0,training_updates=0,new_GEO_C=0,new_full_quality_scores=0,new_images=0,scientific_stage_stopped=True))
++ C.event('EXECUTION_COMPLETE',outputs=36,orientation_solves=36,new_model_forwards=0,new_quality_scores=0)
++ print('SOURCE_WINDING_EXPORT_COMPLETE',flush=True)
++
++if __name__=='__main__':main()

@@ -1,0 +1,946 @@
+--- /dev/null
++++ b/r2/tools/multistep_denoise_v1/common.py
+@@ -0,0 +1,76 @@
++"""Immutable fixed-panel registration and output-only file utilities."""
++from pathlib import Path
++import hashlib,json,time,shutil
++ROOT=Path(__file__).resolve().parents[3]
++OUT=ROOT/'experiments/r2_multistep_denoise_v1'
++PREV=ROOT/'experiments/r2_postprocess_avmr_pmr_v1'
++CODE=Path(__file__).parent
++ASSET=PREV/'assets/chair_denoiser_0030000.pt'
++EXPECTED='6a31f4c7dcbea7a6ac58c26075b20c897fd19aad4c33b5295cc4c93ed7078c36'
++SCALE=.95*.3762
++VERSION='r2_user_mix_repeated_frozen_denoiser_v1'
++def sha(p):
++ h=hashlib.sha256()
++ with Path(p).open('rb') as f:
++  for b in iter(lambda:f.read(8<<20),b''):h.update(b)
++ return h.hexdigest()
++def read(p):return json.loads(Path(p).read_text(encoding='utf-8-sig'))
++def checked(p):
++ p=Path(p).resolve()
++ if not p.is_relative_to(OUT.resolve()):raise ValueError('Output outside new experiment: '+str(p))
++ return p
++def write(p,value):
++ p=checked(p);p.parent.mkdir(parents=True,exist_ok=True);temp=p.with_name(p.name+'.tmp')
++ temp.write_text(json.dumps(value,ensure_ascii=False,indent=2,allow_nan=False)+'\n',encoding='utf-8');temp.replace(p)
++def event(name,**kw):
++ OUT.mkdir(parents=True,exist_ok=True)
++ with (OUT/'denoise_ledger.jsonl').open('a',encoding='utf-8') as f:f.write(json.dumps(dict(utc=time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),event=name,**kw))+'\n')
++def verify(reg):
++ for path,expected in reg['protected'].items():
++  if sha(path)!=expected:raise ValueError('Protected file changed: '+path)
++ return len(reg['protected'])
++def prepare():
++ OUT.mkdir(parents=True,exist_ok=True);path=OUT/'registration.json'
++ if path.exists():
++  reg=read(path);verify(reg)
++  for source,h in reg['runner_hashes'].items():
++   if sha(source)!=h:raise ValueError('Registered runner changed')
++  return reg
++ old=read(PREV/'registration.json');records=[r for r in old['records'] if r['label']=='R2_USER_MIX']
++ if len(records)!=12 or len({r['request_id'] for r in records})!=12:raise ValueError('Require exactly12 registered MIX outputs')
++ protected=dict(old['protected'])
++ # Verify inherited old-input expectations BEFORE extending new protection map.
++ verify(dict(protected=protected))
++ for file in PREV.rglob('*'):
++  if file.is_file() and not file.is_relative_to(PREV/'assets'):protected[str(file)]=sha(file)
++ protected[str(ROOT/'r2/tools/postprocess_avmr_pmr_v1/denoise_run.py')]=sha(ROOT/'r2/tools/postprocess_avmr_pmr_v1/denoise_run.py')
++ for file in (CODE/'score.py',CODE/'gallery.py',ROOT/'r2/tools/postprocess_avmr_pmr_v1/run.py',ROOT/'r2/tools/postprocess_avmr_pmr_v1/quality.py'):
++  protected[str(file)]=sha(file)
++ for r in records:
++  rid=r['request_id'];base=PREV/'denoised/R2_USER_MIX'/rid
++  proof=read(base/'receipt.json')
++  for k in ['request_id','label','raw_sha256']:
++   if proof[k]!=r[k]:raise ValueError('D1 identity mismatch')
++  if sha(base/'denoised.npz')!=proof['output_sha256'] or proof['checkpoint_sha256']!=EXPECTED:raise ValueError('D1 asset mismatch')
++  r['D1_denoised_path']=str(base/'denoised.npz');r['D1_denoised_sha256']=proof['output_sha256']
++  r['D1_receipt_path']=str(base/'receipt.json');r['D1_post_path']=str(PREV/'outputs/R2_USER_MIX'/rid/'post.npz')
++  r['D1_score_path']=str(PREV/'scores/R2_USER_MIX'/rid/'score.json')
++ reg=dict(version=VERSION,status='REGISTERED',label='R2_USER_MIX',records=records,settings=old['settings'],protected=protected,
++  runner_hashes={str(CODE/f):sha(CODE/f) for f in ('common.py','denoise.py','run.py')},
++  stages=['RAW','D1','D3','D5'],new_rounds=[2,3,4,5],GEO_terminal_rounds=[3,5],
++  budget=dict(existing_RAW=12,reused_D1=12,new_denoiser_forwards=48,new_generator_forwards=0,training_updates=0,new_noise=0,new_GEO_outputs=24,new_quality_outputs=24,render_PNG=24),
++  coordinate_scale=SCALE,checkpoint_path=str(ASSET),checkpoint_sha256=EXPECTED,
++  recurrence='X0=existing RAW; Xr=project_original_C(official_denoise(Xr-1)); reuse frozen X1; no GEO between rounds; one independent fixed GEO_C at each evaluated endpoint',
++  precision=read(PREV/'denoise_registration.json')['precision'],postprocess_config=old['postprocess_config'],
++  metrics='Same eight strict F-only A-VMR/PMR settings, frozen C2048 quality queries, actual POST free denominators and indexed topology',
++  scope='Current USER_MIX only; six previously inspected DEV parents and two fixed noises; no other generator checkpoints',
++  failure_policy='Stop on nonfinite/OOM; completed per-round receipts reusable; no silent replay of a started forward lacking receipt; no >48 attempts',
++  stopping='Complete fixed D3/D5 plus baseline comparison and stop; no training/distillation/default switch/commit/push')
++ write(path,reg)
++ dst=OUT/'asset_audit/official_denoiser_source_manifest.json';dst.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(PREV/'asset_audit/official_denoiser_source_manifest.json',dst)
++ event('REGISTERED',budget=reg['budget'],protected_files=len(protected),registration_sha256=sha(path))
++ # Negative safety check is read-only: the forbidden path must reject before opening.
++ try:checked(records[0]['raw_path'])
++ except ValueError:write(OUT/'output_guard_check.json',dict(status='PASS',source_write_rejected=True))
++ else:raise AssertionError('Unsafe output guard')
++ return reg--- /dev/null
++++ b/r2/tools/multistep_denoise_v1/denoise.py
+@@ -0,0 +1,109 @@
++"""Exactly four additional fixed denoiser calls per existing USER_MIX mesh."""
++import os
++os.environ['CUBLAS_WORKSPACE_CONFIG']=':4096:8'
++for k in ('OMP_NUM_THREADS','MKL_NUM_THREADS','OPENBLAS_NUM_THREADS','NUMEXPR_NUM_THREADS'):os.environ[k]='4'
++import gc,importlib.util,sys,time,json
++from pathlib import Path
++import numpy as np
++import torch
++from common import ROOT,OUT,PREV,ASSET,EXPECTED,SCALE,prepare,read,write,checked,sha,event,verify
++
++def run():
++ start=time.perf_counter();reg=prepare();regh=sha(OUT/'registration.json')
++ spec=importlib.util.spec_from_file_location('_frozen_denoiser_helpers',ROOT/'r2/tools/postprocess_avmr_pmr_v1/denoise_run.py')
++ d=importlib.util.module_from_spec(spec);spec.loader.exec_module(d)
++ # Old helpers only read official code/manifest. All their writes point to this new OUT.
++ d.OUT=OUT;d.SRC=PREV/'source_snapshot/official_denoiser_db86bc3';d.write=write
++ torch.set_num_threads(4);torch.set_num_interop_threads(1);torch.use_deterministic_algorithms(True,warn_only=False)
++ torch.backends.cuda.matmul.allow_tf32=False;torch.backends.cudnn.allow_tf32=False;torch.backends.cudnn.benchmark=False
++ torch.backends.cuda.enable_flash_sdp(False);torch.backends.cuda.enable_mem_efficient_sdp(False);torch.backends.cuda.enable_math_sdp(True)
++ pre=d.nv();head=d.check_headroom(pre);write(OUT/'resources_before_denoise.json',pre)
++ if head['free_MiB']-head['additional_headroom_MiB']<2400:raise RuntimeError('Wait: insufficient memory for observed single worker plus safety headroom')
++ if sha(ASSET)!=EXPECTED:raise ValueError('Official weight hash mismatch')
++ checkpoint_stat=(ASSET.stat().st_size,ASSET.stat().st_mtime_ns)
++ mod,attention,manifest=d.official_modules();d.math_checks(attention)
++ oldload=read(PREV/'strict_load.json');kw=oldload['init_kwargs']
++ ledger=OUT/'denoise_ledger.jsonl';prior=[json.loads(x) for x in ledger.read_text().splitlines() if x]
++ attempts={(x['request_id'],x['round']) for x in prior if x['event']=='DENOISER_FORWARD_STARTED'}
++ if len(attempts)>48:raise RuntimeError('Budget exceeded')
++ # A complete rerun is a receipt validation; no extra model load needed.
++ allkeys={(r['request_id'],n) for r in reg['records'] for n in reg['new_rounds']}
++ complete={k for k in allkeys if (OUT/'denoised'/f'D{k[1]}'/k[0]/'receipt.json').is_file()}
++ if complete==allkeys:
++  for rid,n in allkeys:
++   proof=read(OUT/'denoised'/f'D{n}'/rid/'receipt.json')
++   if proof['status']!='PASS' or proof['registration_sha256']!=regh or sha(OUT/'denoised'/f'D{n}'/rid/'denoised.npz')!=proof['output_sha256']:raise ValueError('Invalid completed receipt')
++  verify(reg);print(json.dumps(dict(status='REUSED_ALL_48',new_forwards=0)));return
++ event('CPU_CHECKPOINT_LOAD_STARTED',checkpoint_sha256=EXPECTED)
++ load_start=time.perf_counter();ck=torch.load(ASSET,weights_only=True,mmap=True,map_location='cpu')
++ if ck['config']!=oldload['config']:raise ValueError('Checkpoint config changed')
++ state={k.removeprefix('module.'):v for k,v in ck['ema'].items()};model=mod.AutoencoderKL(**kw)
++ loaded=model.load_state_dict(state,strict=True)
++ if loaded.missing_keys or loaded.unexpected_keys:raise ValueError('Strict load failed')
++ if sum(p.numel() for p in model.parameters())!=455592963 or any(p.dtype!=torch.float32 for p in model.parameters()):raise ValueError('Parameter contract mismatch')
++ model.eval().requires_grad_(False)
++ for m in model.modules():
++  if isinstance(m,attention.SelfAttention):
++   if m.dropout!=0 or m.causal:raise ValueError('Unexpected stochastic attention')
++   m.mixed_precision='fp32'
++ write(OUT/'strict_load.json',dict(status='PASS',checkpoint_sha256=EXPECTED,branch='ema',parameters=455592963,init_kwargs=kw,CPU_load_seconds=time.perf_counter()-load_start,strict_missing=[],strict_unexpected=[]))
++ del state,ck;gc.collect();model.to('cuda');torch.cuda.synchronize()
++ on=d.nv();d.check_headroom(on);write(OUT/'resources_model_resident.json',on)
++ phase=time.perf_counter();calls=0;timings=[]
++ for r in reg['records']:
++  rid=r['request_id'];K,N=int(r['K']),int(r['N'])
++  if sha(r['raw_path'])!=r['raw_sha256'] or sha(r['D1_denoised_path'])!=r['D1_denoised_sha256']:raise ValueError('RAW or D1 mismatch')
++  with np.load(r['raw_path'],allow_pickle=False) as data:raw=data['raw'].reshape(N,3,3).copy();C=data['C'].reshape(K,3,3).copy()
++  with np.load(r['D1_denoised_path'],allow_pickle=False) as data:one=data['output'].reshape(N,3,3).copy()
++  if raw[:K].tobytes()!=C.tobytes() or one[:K].tobytes()!=C.tobytes():raise ValueError('Original C changed')
++  previous=one;previous_path=Path(r['D1_denoised_path'])
++  for n in reg['new_rounds']:
++   key=(rid,n);dest=checked(OUT/'denoised'/f'D{n}'/rid);path=dest/'denoised.npz';receipt=dest/'receipt.json'
++   inputhash=sha(previous_path)
++   identity=dict(request_id=rid,label='R2_USER_MIX',round=n,raw_sha256=r['raw_sha256'],input_path=str(previous_path),input_sha256=inputhash,registration_sha256=regh,checkpoint_sha256=EXPECTED)
++   if receipt.exists():
++    proof=read(receipt)
++    if proof['status']!='PASS' or any(proof[k]!=v for k,v in identity.items()) or sha(path)!=proof['output_sha256']:raise ValueError('Invalid reusable round')
++    with np.load(path,allow_pickle=False) as a:previous=a['output'].copy()
++    if previous.dtype!=np.float32 or previous.shape!=(N,3,3) or previous[:K].tobytes()!=C.tobytes():raise ValueError('Bad saved C or N')
++    previous_path=path;continue
++   if key in attempts:raise RuntimeError('Started call lacks receipt; no automatic replay')
++   if len(attempts)>=48:raise RuntimeError('48 call limit')
++   dest.mkdir(parents=True,exist_ok=True)
++   if path.exists():raise RuntimeError('Incomplete output exists; no overwrite/replay')
++   if previous.dtype!=np.float32 or previous.shape!=(N,3,3) or not np.isfinite(previous).all():raise ValueError('Invalid round input')
++   if previous[:K].tobytes()!=C.tobytes():raise ValueError('C drift before inference')
++   x=torch.from_numpy(previous.reshape(1,N,9)).to('cuda')*SCALE;cond=torch.tensor([N],dtype=torch.long,device='cuda')
++   rng_cpu=torch.get_rng_state().clone();rng_gpu=torch.cuda.get_rng_state().clone()
++   torch.cuda.reset_peak_memory_stats();torch.cuda.synchronize();tick=time.perf_counter()
++   event('DENOISER_FORWARD_STARTED',**identity,N=N,K=K);attempts.add(key)
++   try:
++    with torch.inference_mode(),torch.autocast('cuda',dtype=torch.bfloat16):
++     z=model.pe_nerf(x.reshape(1,3*N,3));residual=model.decode(z,cond,mask=None)
++    proposal=((residual.float()+x.float())/SCALE).reshape(N,3,3).cpu().numpy().copy();torch.cuda.synchronize();elapsed=time.perf_counter()-tick
++    if proposal.dtype!=np.float32 or not np.isfinite(proposal).all():raise ValueError('Nonfinite output')
++    if not torch.equal(rng_cpu,torch.get_rng_state()) or not torch.equal(rng_gpu,torch.cuda.get_rng_state()):raise ValueError('RNG consumed')
++    output=proposal.copy();output[:K]=C
++    step=output.astype(float)-previous.astype(float);total=output.astype(float)-raw.astype(float);fromone=output.astype(float)-one.astype(float)
++    cproposal=np.linalg.norm(proposal[:K].astype(float)-C.astype(float),axis=-1)
++    with path.open('xb') as f:np.savez_compressed(f,output=output,C=C,official_unconstrained_proposal=proposal,displacement_from_previous=step,displacement_from_RAW=total,displacement_from_D1=fromone,known_faces=np.asarray(K),input_faces=np.asarray(N),coordinate_scale=np.asarray(SCALE),round=np.asarray(n))
++    with np.load(path,allow_pickle=False) as a:
++     if a['output'].tobytes()!=output.tobytes() or a['output'][:K].tobytes()!=C.tobytes():raise ValueError('Output roundtrip mismatch')
++    free_step=np.linalg.norm(step[K:],axis=-1);free_total=np.linalg.norm(total[K:],axis=-1)
++    peaks=dict(peak_allocated_bytes=torch.cuda.max_memory_allocated(),peak_reserved_bytes=torch.cuda.max_memory_reserved(),scope='Resident FP32 official network plus one BF16 forward; no optimizer')
++    proof=dict(status='PASS',**identity,output_sha256=sha(path),N=N,K=K,seconds=elapsed,C_bitwise=True,C_proposal_max_displacement_model=float(cproposal.max()),max_step_free_displacement_model=float(free_step.max()),mean_step_free_displacement_model=float(free_step.mean()),max_total_free_displacement_model=float(free_total.max()),mean_total_free_displacement_model=float(free_total.mean()),no_rng_consumed=True,residual_dtype=str(residual.dtype),precision='BF16 network; FP32 parameters and residual/scale',no_intermediate_GEO=True,vram=peaks)
++    write(receipt,proof);event('DENOISER_FORWARD_COMPLETE',**identity,seconds=elapsed,**peaks);calls+=1;timings.append(elapsed)
++    if calls==1:
++     current=d.nv();d.check_headroom(current)
++     write(OUT/'first_actual_forward.json',dict(resources=current,result=proof,GPU_workers=1,dispatch_reason='Measured first authorized call; prior comparable48 calls phase5.13s, CPU model load+transfer longer. Each request round depends on prior. Available VRAM allows more copies but remaining47 brief calls do not justify duplicate process/load. CPU scoring uses independent workers.'))
++    del x,cond,z,residual;previous=output;previous_path=path
++   except BaseException as error:
++    write(dest/'failure.json',dict(status='STOPPED',**identity,error=repr(error),forward_attempt_consumed=True));event('DENOISER_FAILED',**identity,error=repr(error));raise
++ torch.cuda.synchronize();write(OUT/'resources_after_denoise.json',d.nv())
++ if (ASSET.stat().st_size,ASSET.stat().st_mtime_ns)!=checkpoint_stat:raise ValueError('Checkpoint changed')
++ proofs=[read(OUT/'denoised'/f'D{n}'/r['request_id']/'receipt.json') for r in reg['records'] for n in reg['new_rounds']]
++ if len(attempts)!=48 or len(proofs)!=48 or any(p['status']!='PASS' for p in proofs):raise ValueError('Incomplete forward budget')
++ protected=verify(reg)
++ result=dict(status='PASS',requests=12,reused_D1=12,new_rounds=[2,3,4,5],total_forward_attempts=len(attempts),new_forwards_this_invocation=calls,completed_round_outputs=len(proofs),all_C_bitwise=True,all_N_preserved=True,GPU_workers=1,training_updates=0,generator_forwards=0,new_noise=0,forward_phase_wall_seconds=time.perf_counter()-phase,total_wall_seconds=time.perf_counter()-start,sum_forward_seconds=sum(timings),peak_allocated_bytes=max(p['vram']['peak_allocated_bytes'] for p in proofs),peak_reserved_bytes=max(p['vram']['peak_reserved_bytes'] for p in proofs),protected_hashes=protected)
++ write(OUT/'denoise_completion.json',result);event('DENOISE_COMPLETE',**result);print(json.dumps(result))
++if __name__=='__main__':run()--- /dev/null
++++ b/r2/tools/multistep_denoise_v1/finalize.py
+@@ -0,0 +1,202 @@
++"""Read-only result aggregation, report and artifact packaging metadata. No models."""
++from pathlib import Path
++import csv,json,statistics,hashlib,difflib,datetime,re
++from common import ROOT,OUT,PREV,CODE,read,write,sha,verify,checked
++
++def rows(name):return list(csv.DictReader((OUT/name).open(encoding='utf-8-sig')))
++def csvwrite(name,data):
++ with checked(OUT/name).open('w',encoding='utf-8-sig',newline='') as f:
++  w=csv.DictWriter(f,fieldnames=list(data[0]));w.writeheader();w.writerows(data)
++def save(name,text):checked(OUT/name).write_text(text,encoding='utf-8')
++def table(head,data):return '\n'.join(['| '+' | '.join(head)+' |','|'+'|'.join(['---']*len(head))+'|']+['| '+' | '.join(map(str,r))+' |' for r in data])
++def pct(v):return f'{float(v)*100:.2f}'
++reg=read(OUT/'registration.json');qc=rows('quality_per_output.csv');qs=rows('quality_summary.csv');sm=rows('summary.csv');ts=rows('topology_summary.csv');stages=['RAW','D1','D3','D5']
++assert read(OUT/'denoise_completion.json')['total_forward_attempts']==48
++assert read(OUT/'score_completion.json')['new_scored_outputs']==24
++assert read(OUT/'independent_review/REPORT.json')['status']=='PASS'
++assert (OUT/'gallery/AI_PROXY_REVIEW.md').exists()
++q={(r['stage'],r['group']):r for r in qs};a={(r['stage'],r['group'],r['setting']):r for r in sm};top={(r['stage'],r['group']):r for r in ts}
++qfields=['CF_proper_affected_free_fraction','FF_illegal_affected_free_fraction','ConflictCov_C','free_minimum_angle_lt5_fraction']
++main=[]
++for st in stages:
++ main.append([st]+[pct(q[st,'ALL'][k]) for k in qfields]+[pct(a[st,'ALL','raw_tau_1e-6']['A_VMR']),pct(a[st,'ALL','raw_tau_1e-6']['PMR']),top[st,'ALL']['outputs_with_C_free_shared_edge']+'/12'])
++mt=table(['阶段','CF↓%','FF↓%','I↓%','小角↓%','严格A-VMR↑%','严格PMR↑%','存在C/free共边'],main)
++paired=[]
++for st in ('D3','D5'):
++ for group in ('ALL','seat','back'):
++  rr=[r for r in rows('quality_paired_vs_D1.csv') if r['stage']==st and (group=='ALL' or r['region_type']==group)]
++  for k in qfields+['ConflictCov_C_cross','ConflictCov_C_dup']:
++   ds=[float(r['delta_'+k]) for r in rr]
++   paired.append(dict(stage=st,reference='D1',group=group,metric=k,outputs=len(ds),mean_delta=statistics.mean(ds),median_delta=statistics.median(ds),min_delta=min(ds),max_delta=max(ds),improved=sum(x<-1e-12 for x in ds),tied=sum(abs(x)<=1e-12 for x in ds),worsened=sum(x>1e-12 for x in ds)))
++csvwrite('paired_delta_summary.csv',paired)
++curves=[]
++for n in (2,3,4,5):
++ rr=[read(p) for p in (OUT/'denoised'/f'D{n}').glob('*/receipt.json')]
++ curves.append(dict(round=n,outputs=len(rr),mean_step_free_displacement_model=statistics.mean(r['mean_step_free_displacement_model'] for r in rr),maximum_step_free_displacement_model=max(r['max_step_free_displacement_model'] for r in rr),mean_from_RAW_free_displacement_model=statistics.mean(r['mean_total_free_displacement_model'] for r in rr),maximum_from_RAW_free_displacement_model=max(r['max_total_free_displacement_model'] for r in rr)))
++csvwrite('round_displacement_summary.csv',curves)
++qr={(r['request_id'],r['stage']):r for r in qc};cost=[]
++for st in stages:
++ for group in ('ALL','seat','back'):
++  rr=[r for r in qc if r['stage']==st and (group=='ALL' or r['region_type']==group)];before=[qr[r['request_id'],'RAW'] for r in rr]
++  original=sum(int(float(r['free_face_denominator'])) for r in before);retained=sum(int(float(r['free_face_denominator'])) for r in rr)
++  cost.append(dict(stage=st,group=group,outputs=len(rr),original_free_total=original,retained_free_total=retained,deleted_free_total=original-retained,pooled_deleted_fraction=(original-retained)/original,macro_deleted_fraction=statistics.mean(1-float(r['free_face_denominator'])/float(o['free_face_denominator']) for r,o in zip(rr,before)),macro_free_area_ratio_to_RAW=statistics.mean(float(r['free_total_surface_area'])/float(o['free_total_surface_area']) for r,o in zip(rr,before))))
++csvwrite('deletion_summary.csv',cost)
++costt=table(['阶段','原free总数','保留free总数','删面数','池化删面比例%','逐例free面积/RAW均值%'],[[r['stage'],r['original_free_total'],r['retained_free_total'],r['deleted_free_total'],pct(r['pooled_deleted_fraction']),pct(r['macro_free_area_ratio_to_RAW'])] for r in cost if r['group']=='ALL'])
++fullt=table(['阶段']+[x['name'] for x in reg['settings']],[[st]+[pct(a[st,'ALL',x['name']]['A_VMR'])+'/'+pct(a[st,'ALL',x['name']]['PMR']) for x in reg['settings']] for st in stages])
++regiont=table(['区域','阶段','CF↓%','FF↓%','I↓%','小角↓%'],[[g,st]+[pct(q[st,g][k]) for k in qfields] for g in ('seat','back') for st in stages])
++pairst=table(['对比','指标','改善/持平/退化（12例）','平均变化pp','中位变化pp','最小/最大变化pp'],[[r['stage']+'−D1',r['metric'],f"{r['improved']}/{r['tied']}/{r['worsened']}",f"{100*r['mean_delta']:+.3f}",f"{100*r['median_delta']:+.3f}",f"{100*r['min_delta']:+.3f}/{100*r['max_delta']:+.3f}"] for r in paired if r['group']=='ALL' and r['metric'] in qfields])
++caserid='NEWDEV__33ec1e64a02ff718faaadcdc0221eb72__seat__medium__n0'
++case=table(['阶段','保留free面','FF↓%','小角↓%','free面积（模型单位²）'],[[st,int(float(qr[caserid,st]['free_face_denominator'])),pct(qr[caserid,st]['FF_illegal_affected_free_fraction']),pct(qr[caserid,st]['free_minimum_angle_lt5_fraction']),f"{float(qr[caserid,st]['free_total_surface_area']):.3f}"] for st in stages])
++findings=f'''# USER_MIX 累计1／3／5次去噪：固定面板结论
++
++实际完成同一12份USER_MIX RAW的对照。复用第一次结果，新增48次官方去噪前向；每轮恢复原C，未在中间合并/删面，各终点最后执行一次同配置GEO_C。没有训练、蒸馏、新生成或新噪声。
++
++**多次去噪能够继续降低部分相交指标，但这批结果不支持直接将3或5次设为默认。** I没有改善，PMR仍全0；而且出现明确的细腿支撑消失。不能仅因FF更低就称成品更好。
++
++{mt}
++
++D5相对D1的FF改善10/12、退化2/12，I改善4/12、持平3/12、退化5/12。严格匹配少量增加；1%L A-VMR为5.56→7.54→9.39%，但2%L为16.40→16.07→15.61%。四份座面在2%L下始终0。新增的一份共边输出不满足“双面且反向绕序”的检查，不能算新增可靠接口。
++
++最明显坏例为33ec中等座面n0：D1还有细腿，D3/D5两个对向视角都看不到支撑腿，只余座背；C与灰座面的错层仍在。D1保留136个free面，D3只85，D5只66，D5的FF=0但小角比例54.55%。[该例图](gallery/{caserid}__v0.png)及[反向视角](gallery/{caserid}__v1.png)。
++
++也有局部整理收益：866e n1前沿细长面减少但盒形/短脚仍在，f596 n1减面后主轮廓保留。全24图已实际AI_PROXY审阅；其余11请求未见同等级支撑消失，但有限视角不能认证它们完全无损。FF改善不全由删面造成：D1的208个非法面对中，到D5有140对两面仍在且变为合法接触/分离，同时40对涉及删面、28对仍非法，另有72个新非法对。
++
++**建议继续以一次去噪作为当前比较基准；这轮没有提供采用3/5次作为统一后处理或蒸馏目标的充分证据。** 这是六父开发面板结论，不是所有网格或所有重复修正方式的定论。固定任务已停止，不自动启动训练/蒸馏、改loss、切换默认模型或commit/push。
++
++[完整报告](REPORT.md) · [全部24张对照图](gallery/index.html) · [逐例几何指标](quality_per_output.csv) · [逐例边界匹配](per_output.csv) · [终点网格索引](post_index.csv)
++'''
++save('FINDINGS.md',findings)
++report=f'''# R2 USER_MIX 多次官方去噪固定面板实验
++
++日期2026-10-10；版本{reg['version']}。状态 COMPLETE。本轮回答：同一模型、同一RAW连续去噪3/5次，能否较一次进一步改善最终mesh？
++
++结论：**FF/CF有进一步改善和少量精确边界匹配增量；I与完全匹配没有改善，且一份细腿椅子出现严重支撑丢失。暂不支持全局替换一次基准。** 完整指标与坏例一并保存。
++
++## 固定范围与重复定义
++
++仅当前研究候选R2_USER_MIX的12份已有RAW：6 USER开发条件（2座面、4靠背）×2固定噪声。没有重跑四个生成器，也没有训练、蒸馏、生成器前向或新抽Gaussian。全部来源、C/RAW/checkpoint/noise hash在registration.json。此开发面板已反复检查，不能外推独立泛化。
++
++令X0为已有RAW，Xr为官方去噪后的连续三角面；每轮直接读取前一轮尚未几何整理的输出，执行：
++
++`Xr = restore_original_C(denoiser(Xr−1))`
++
++原始N、面顺序/槽位始终不变，r=2严格从前轮保存的未Geo X1开始。每轮模型输入乘固定0.35739，BF16网络前向后在FP32累加残差并除回同尺度，原C逐字节恢复；没有输出bbox归一、噪声日程或噪声注入。推理使用同一官方EMA/同一face-count条件、SDPA math、TF32关闭、严格deterministic。官方identity encoder未采样，48个receipt均核验前后RNG无消耗。
++
++D1／D3／D5分别是`GEO_C(X1)`、`GEO_C(X3)`、`GEO_C(X5)`；终点都只做一次同配置顶点合并和free退化/重复删除。D3的Geo结果绝不作为D4输入。D2/D4仅保存中间几何、位移和receipt，没有追加终点评分。D1及RAW复用旧冻结结果。**这不是循环执行完整Geo，也不是降低噪声强度的扩散采样。**
++
++新前向预算12×4=48，实际48成功、0重试；新Geo24/24、新CPU几何评分24/24。原C中间48/48及全部POST36/36逐位保持。统一4阶段共48条mesh记录，其中24引用旧产物、24新增。
++
++权重、匹配源码及运行时适配沿用[前轮完整报告](../r2_postprocess_avmr_pmr_v1/REPORT.md)：官方Chair0030000.pt、455,592,963参数、固定SHA256 `6a31f4c7dcbea7a6ac58c26075b20c897fd19aad4c33b5295cc4c93ed7078c36`，对应官方commit db86bc32423c316c00bcc2f645a26243e8010f20。没有再次下载或复制7.29GB训练包。仍是发布权重的C保持适配：最终GEO_C替代原量化/无约束导出，不能称官方原脚本逐位复现。
++
++## 总体数值
++
++百分比为逐输出宏平均；每父2噪声相同，等于先噪声均值再父等权。↓为低好，↑为高好，但每项仅支持其明确性质。
++
++{mt}
++
++CF=与C严格穿插的受影响free面比例；FF=与其他free发生严格穿插或正面积共面重叠的受影响free面比例。它们不是非法面对占所有面对的比例，POST分母随实际free面数变化。I=冻结C表面2048查询上的cross与dup候选并集；近并行覆盖候选可能含合法薄壁，不能直接当非法重复层。原检测器、固定L、阈值、冻结查询和定义全部沿用，未按本轮结果调整。
++
++{pairst}
++
++FF均值改善没有覆盖所有请求；I两终点均有5/12退化，dup候选均值D1 1.009%→D3 1.156%→D5 1.245%。CF median变化0，不能把均值下降称普遍改善。
++
++## 座面与靠背分别看
++
++{regiont}
++
++座面小角均值D1 33.28%→D3 34.67%→D5 33.81%，全组小角改善主要由靠背贡献。座面CF降到0也不保证座面/腿的结构合理，严重坏例正好出现在座面组。无唯一GT重建排名，无外露任务或必要接口注册，未强行算S/E或新增S_join。
++
++## A-VMR／PMR及实际连接
++
++来源规则沿用[指标政策](../../native_t1/docs/control_metrics.md#meshfim-boundary-metrics)：源顶点ID拓扑的全部C开放边界端点，仅匹配F角点，严格欧氏距离小于tau，逐输出匹配比例宏平均、全部边界顶点匹配的输出比例为PMR。L固定为sqrt(3)×2/.3762=9.208138264587333，不按输出bbox改变。模型单位1e-6设置名沿用raw_tau_1e-6。论文评分尺度兼容性仍UNKNOWN，全部C开放边并非已注册必须接合接口；匹配不认证水密、主体接入或语义用途。
++
++全部8档（每格A-VMR/PMR，%）：
++
++{fullt}
++
++1%L有增量，2%L反而下降，不存在所有容差都改善。4份seat在2%L仍全0，不能据此把整片C到F表面距离也说成0/无穷；这里查的是边界顶点到F顶点。
++
++实际C/free共享边输出D1 1/12→D3/D5 2/12。都是86ec back full：n1原已有一条双面反向绕序边；n0新增一条共享边，但双面反向绕序检查为0。因此新增计数不能当新增有效完整接口。POST共边分量均数14.25→7.00→6.25，非流形边均数6.67→8.25→8.25；更少碎分量不保证合法拓扑，详见topology_per_output.csv。
++
++## 减面、位移与面对变化
++
++{costt}
++
++池化删面比与按输出先算比例再平均不同，deletion_summary.csv同时保留。D1→D5净少235free面，但终点Geo独立、保留面集合并非嵌套：D1保留面中241在D5删除，同时6个D1已删面在D5被保留。不能描述为沿D1索引依次删除235面。
++
++连续去噪的平均每轮free角点移动仍非零：D2约0.01554、D3约0.01061、D4约0.00866、D5约0.00772模型单位；各轮最大移动分别0.26736/0.21597/0.19410/0.19490。到D5累计相对RAW最大0.46633。均值递减不等于已收敛或无局部大漂移。逐轮、相对RAW/D1、Geo单独位移及源面映射均保存，后续合并半径0.0419709561不能冒充全流程位移上界。
++
++FF下降并非只有删面贡献。读取既有面对分类与source_face_ids对齐，无重评分：D1的208个非法面对，到D3有136对保留双面变非非法、31对涉及删面、41仍非法，另93个新非法对；到D5为140、40、28，另72个新非法对。D5的140对具体为31共享边接触、68共享点接触、41分离，没有把UNKNOWN当改善。详见FF_pair_fates_*.csv与独立FF_fates_REPORT.json。该诊断按面对计数，不按穿透体积或面积计，不提供对去噪和Geo的单独因果归因。
++
++## 全图审阅与严重反例
++
++[完整24张图集](gallery/index.html)：12请求×2对向视角，每张RAW/D1/D3/D5四面板共用范围和相机，C蓝、F灰，全三角面保留，不读GT或为美观隐藏面。
++
++33ec seat medium n0：
++
++{case}
++
++D1已有腿部变细，D3/D5两个对向视角都看不到任何支撑腿，只余座背；C低于灰座面的错层继续存在。D5删除原146/212free、FF=0而小角54.55%，是“更低局部冲突不能代替完整形状质量”的明确反例。[视角0](gallery/{caserid}__v0.png) · [视角1](gallery/{caserid}__v1.png)。该观察对应最终完整流程，不能仅据终点图片将全部损伤唯一归因于神经位移或最后合并。
++
++也如实保留正面变化：866e n1前沿细长层面整理、盒形短脚仍在；f596 n1大量减面但主轮廓保留；f596 n0部分脚踝间隙收拢，但背孔较D1更锯齿、局部中断仍在。其余11请求未观察到同等级整组支撑消失，不表示它们通过严格完整性认证。
++
++[逐图审阅](gallery/AI_PROXY_REVIEW.md)与48条逐阶段、12条逐请求表全部保留。实际看过全部24PNG，标为非盲AI_PROXY，审阅者知道之前图审及部分数值提示；不包装成人评、盲评或接合认证。无图像证据支持普遍改变C的宏观用途关系。
++
++## 执行、恢复与独立核验
++
++Windows/WSL测资源后启动：RTX5080总16303MiB，前置约2702MiB使用、13278MiB空闲，GPU利用1%；CPU24逻辑核、Windows可用RAM约63.54GiB。记录活动进程，没有停止任何用户进程。按旧同设置及本轮首个真实前向测量选择一个GPU进程；48个短前向仅数秒，重复模型加载/进程成本超过潜在收益。每请求各轮必须按依赖执行，显存富余本身不构成增加worker收益。
++
++去噪进程39.39秒，48个前向计时之和2.777秒；登记forward_phase_wall 8.873秒包含I/O、资源和终态哈希核验，不是纯神经时间。单次scope含常驻FP32权重的PyTorch峰allocated 1,881,729,536bytes、reserved 1,910,505,472bytes；WDDM逐进程显存不可可靠提供，不能用PyTorch计数冒充进程总显存。CPU评分首例测量后2worker各2线程，24份21.445秒；图集1CPU/1线程并行4.248秒。并行耗时不当隔离benchmark。
++
++独立审计不导入主评分器，用NumPy源ID边统计、SciPy cKDTree、手写binary PLY解析与edge incidence/union-find复算：384指标、496距离、96摘要、288对D1配对、48拓扑一致，最大距离差0；24新PLY和12旧D1 PLY均与NPZ逐位一致。48轮未Geo输入链、原N/FP32、C恢复、proposal的F和位移全部核验。官方权重重新读全SHA通过，895保护文件终态一致。质量不是另重写几何检测器，而是独立核对保存来源1968数值及各汇总、分母/固定查询；明确区分这两种核验范围。证据在independent_review/REPORT.json、aggregate_REPORT.json、FF_fates_REPORT.json。
++
++工程预检有两项均已记账：GPU前CPU评分schema允许五个明确D1来源字段的修正，保留pre_gpu_registration_v0.json及新版hash，预算/科学设置未改；面对去向派生脚本首次assert把total计入求和，已修正，原失败/修正执行写账本。它们没有消耗额外GPU前向或重算24正式几何评分。原数据/旧报告/权重没有被写入。
++
++可恢复总入口：`r2/tools/multistep_denoise_v1/run.py --stage all`；可分别prepare/denoise/score/gallery。已有有效receipt复用；已开始的模型调用若没有成功receipt将拒绝静默重放。完成本固定任务后不再调用额外阶段。
++
++## 交付与后续判断
++
++outputs/D3和D5保存24最终NPZ/PLY，post_index.csv给出4阶段48条完整来源；denoised/D2..D5保存48中间网格/原proposal/位移和receipt。per_output/summary保存全部8阈值；quality/topology/paired/per_condition_noise保存逐例、配对和分组；scores保存真实逐点/逐面对诊断；实际执行源码快照、code.diff、source_hashes及资源账本一并保存，权重只引用不复制。
++
++本轮完成并停止。建议保留一次作为当前比较基准，暂不将3/5次升为统一后处理或蒸馏教师目标。更少局部穿插伴随明显个例结构代价，且主要C接合缺口仍在。没有自动训练、蒸馏、改loss、切默认、阈值扫描或commit/push。
++'''
++save('REPORT.md',report)
++# Freeze actual code and dependencies, with flat inherited names to avoid nested path inflation.
++source_rows=[]
++for file in sorted(CODE.glob('*.py')):
++ dst=OUT/'source_snapshot/local'/file.name;dst.parent.mkdir(parents=True,exist_ok=True);dst.write_bytes(file.read_bytes())
++ source_rows.append(dict(original=str(file),snapshot=dst.relative_to(OUT).as_posix(),sha256=sha(file),bytes=file.stat().st_size))
++for file in sorted({Path(p) for p in reg['protected'] if p.endswith('.py')}):
++ digest=sha(file);dst=OUT/'source_snapshot/inherited'/(digest[:12]+'_'+file.name);dst.parent.mkdir(parents=True,exist_ok=True)
++ if not dst.exists():dst.write_bytes(file.read_bytes())
++ source_rows.append(dict(original=str(file),snapshot=dst.relative_to(OUT).as_posix(),sha256=digest,bytes=file.stat().st_size))
++for file in (OUT/'independent_review').glob('*.py'):
++ dst=OUT/'source_snapshot/independent'/file.name;dst.parent.mkdir(parents=True,exist_ok=True);dst.write_bytes(file.read_bytes());source_rows.append(dict(original=str(file),snapshot=dst.relative_to(OUT).as_posix(),sha256=sha(file),bytes=file.stat().st_size))
++csvwrite('source_hashes.csv',source_rows)
++diff=[]
++for file in sorted(CODE.glob('*.py')):diff.extend(difflib.unified_diff([],file.read_text().splitlines(keepends=True),fromfile='/dev/null',tofile='b/'+file.relative_to(ROOT).as_posix()))
++save('code.diff',''.join(diff))
++protected_count=verify(reg)
++expected={'per_output.csv':384,'per_vertex_distances.csv':496,'quality_per_output.csv':48,'topology_per_output.csv':48,'summary.csv':96,'post_index.csv':48,'paired_vs_D1.csv':288,'quality_paired_vs_D1.csv':36,'per_condition_noise_quality.csv':24,'gallery/AI_PROXY_per_stage_review.csv':48,'gallery/AI_PROXY_per_request_review.csv':12}
++counts={k:len(rows(k)) for k in expected};assert counts==expected
++links=0
++for name in ('REPORT.md','FINDINGS.md'):
++ for link in re.findall(r'\]\(([^)]+)\)',(OUT/name).read_text()):
++  if link.startswith(('https:','http:','#')):continue
++  assert (OUT/link.split('#')[0]).exists(),(name,link);links+=1
++write(OUT/'completion.json',dict(status='COMPLETE',finished_utc=datetime.datetime.now(datetime.timezone.utc).isoformat(),generator='R2_USER_MIX',requests=12,stages=stages,reused_RAW_outputs=12,reused_D1_outputs=12,new_denoiser_forwards=48,forward_retries=0,new_GEO=24,new_geometry_scores=24,generator_forwards=0,training_updates=0,distillation_updates=0,new_noise=0,new_intermediate_C_exact=48,total_POST_C_exact=36,new_PLY_NPZ_consistent=24,protected_hashes=protected_count,independent_audit='PASS',quality_aggregate_audit='PASS',FF_fates_audit='PASS',AI_PROXY_reviewed_PNG=24,CPU_score_workers=2,GPU_workers=1,render_workers=1,row_counts=counts,links_verified=links,no_default_change=True,no_git_operations=True,task_stopped=True))
++# Persistent project notes are maintained documentation, never immutable experiment inputs.
++note='''\n## 2026-10-10 USER_MIX 多次去噪对照完成：暂不采用3/5次默认\n\n同一12 USER_MIX RAW复用D1，实际新增48官方去噪前向得到D2..D5，每轮C原字节恢复、N不变，无中途Geo；D3/D5终点各一次同配置GEO_C、24 CPU评分与24两视角图全部完成。零训练/蒸馏/新生成/新噪声。ALL D1/3/5：FF12.02/8.02/6.12%，CF4.88/4.49/4.32%，I3.69/3.71/3.77%，小角17.06/16.28/16.06%；严格A-VMR1.39/2.31/3.37%，PMR全0，共边输出1/2/2，但新增共边未通过双面反向绕序检查。四座面在2%L仍0。\n\nD5 FF改善10/12、退化2；I改善4/12、持平3、退化5。33ec seat n0在D3/D5两视角整组腿消失，D1/3/5 free数136/85/66，D5 FF=0却小角54.55%，C错层未解决。其他11请求未见同等级支撑消失，但图审非盲AI_PROXY，不能认证无损。实际FF改善不仅靠删面：140个D1非法面对两面保留后变合法接触/分离，也有新非法对。保留一次为比较基准，未自动改默认或蒸馏目标。\n\n[结论](experiments/r2_multistep_denoise_v1/FINDINGS.md)、[完整报告](experiments/r2_multistep_denoise_v1/REPORT.md)、[全部图集](experiments/r2_multistep_denoise_v1/gallery/index.html)、384指标行/496顶点距离/48质量与拓扑/逐父噪声/24新PLY及实际源码diff/hash均保存。独立数值、网格和48前向链审计PASS，895受保护文件/官方权重hash一致。固定任务完成后停止；没有commit/push、新loss、模型切换或后续训练。\n\n'''
++w=ROOT/'WORKSPACE.md';b=w.read_bytes();mark='## 2026-10-10 USER_MIX 多次去噪对照完成：暂不采用3/5次默认'.encode()
++assert str(w) not in reg['protected']
++if mark not in b:
++ ix=b.index(b'\n')+1;w.write_bytes(b[:ix]+note.encode()+b[ix:])
++metricnote='''### 2026-10-10 多次去噪补充证据：低冲突不等于完整成品\n\n固定USER_MIX12输出的D1/D3/D5复评分已完成，见[完整报告](../../experiments/r2_multistep_denoise_v1/REPORT.md)。每轮恢复C，中间不Geo；终点各Geo一次。FF12.02→8.02→6.12%，I3.69→3.71→3.77%，PMR全0。33ec座面n0的D5虽FF=0，却在两视角失去整组支撑腿、小角54.55%。这是必须同时报告完整形状、删面和薄构件损伤的直接证据，不能只取FF最低点。严格A-VMR略升及共边输出1→2也未解决四座面边界匹配，新增共边没有通过双面反向绕序检查。所有阈值、配对及AI_PROXY局限保留；不新增S_join或改旧定义，不自动升为默认。\n\n'''
++m=ROOT/'native_t1/docs/control_metrics.md';b=m.read_bytes();assert str(m) not in reg['protected'];mark='### 2026-10-10 多次去噪补充证据：低冲突不等于完整成品'.encode()
++if mark not in b:
++ token='## 长期执行要点'.encode();assert token in b;m.write_bytes(b.replace(token,metricnote.encode()+token,1))
++manifest=[]
++for f in sorted(OUT.rglob('*')):
++ if f.is_file() and f.name!='artifact_manifest.csv':manifest.append(dict(path=f.relative_to(OUT).as_posix(),bytes=f.stat().st_size,sha256=sha(f)))
++csvwrite('artifact_manifest.csv',manifest)
++print(json.dumps(dict(status='COMPLETE',protected_hashes=protected_count,files=len(manifest),artifact_MiB=sum(x['bytes'] for x in manifest)/1048576,row_counts=counts,links=links),ensure_ascii=False))--- /dev/null
++++ b/r2/tools/multistep_denoise_v1/gallery.py
+@@ -0,0 +1,265 @@
++"""CPU-only fixed RAW/D1/D3/D5 gallery for the same 12 R2_USER_MIX requests.
++No source parent GT, hidden face deletion, rescaling, learned model, or new generation.
++Shared renderer/validation copied from postprocess_avmr_pmr_v1/gallery.py; original readonly.
++"""
++from __future__ import annotations
++
++import argparse
++import csv
++import hashlib
++import html
++import json
++import os
++import re
++import time
++from pathlib import Path
++
++for _name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
++    os.environ[_name] = "1"
++os.environ["CUDA_VISIBLE_DEVICES"] = ""
++
++import numpy as np
++import matplotlib
++matplotlib.use("Agg")
++import matplotlib.pyplot as plt
++from matplotlib.colors import to_rgb
++from mpl_toolkits.mplot3d.art3d import Poly3DCollection
++
++SCHEMA = "r2_multistep_denoise_gallery_v1"
++STAGES = ("RAW", "D1", "D3", "D5")
++CAMERAS = ((22.0, -60.0), (22.0, 120.0))
++COLORS = {"C": "#2387c9", "F": "#b8bec4", "edges": "#38424b"}
++DEFAULT_ROOT = "/mnt/e/MeshFlow/experiments/r2_multistep_denoise_v1"
++OLD_ROOT = Path("/mnt/e/MeshFlow/experiments/r2_postprocess_avmr_pmr_v1")
++
++
++def sha256(path):
++    digest = hashlib.sha256()
++    with Path(path).open("rb") as handle:
++        for chunk in iter(lambda: handle.read(1 << 20), b""):
++            digest.update(chunk)
++    return digest.hexdigest()
++
++
++def path_value(value):
++    value = str(value)
++    if os.name != "nt" and re.match(r"^[A-Za-z]:[\\/]", value):
++        value = "/mnt/" + value[0].lower() + "/" + value[3:].replace("\\", "/")
++    return Path(value)
++
++
++def json_write(path, value):
++    Path(path).write_text(json.dumps(value, indent=2, ensure_ascii=False, allow_nan=False) + "\n", encoding="utf8")
++
++
++def same_bits(a, b):
++    return a.shape == b.shape and a.dtype == b.dtype and a.tobytes() == b.tobytes()
++
++
++def triangles(array, name):
++    a = np.asarray(array)
++    if a.ndim == 2 and a.shape[1:] == (9,):
++        a = a.reshape(-1, 3, 3)
++    if a.ndim != 3 or a.shape[1:] != (3, 3) or a.dtype.kind != "f" or not np.isfinite(a).all():
++        raise ValueError(f"{name}: expected finite float triangle array")
++    return a.copy()
++
++
++def load_mesh(path, k, stage):
++    with np.load(path, allow_pickle=False) as data:
++        keys = set(data.files)
++        if stage == "RAW":
++            if "raw" not in keys:
++                raise ValueError(f"{path}: missing RAW array")
++            mesh = triangles(data["raw"], "raw")
++        elif {"vertices", "faces"} <= keys:
++            vertices = np.asarray(data["vertices"])
++            faces = np.asarray(data["faces"])
++            if vertices.ndim != 2 or vertices.shape[1:] != (3,) or faces.ndim != 2 or faces.shape[1:] != (3,):
++                raise ValueError(f"{path}: invalid indexed mesh shape")
++            if not np.issubdtype(faces.dtype, np.integer) or (faces.size and (faces.min() < 0 or faces.max() >= len(vertices))):
++                raise ValueError(f"{path}: invalid vertex indices")
++            mesh = triangles(vertices[faces], "indexed POST")
++            if "output" in keys and not same_bits(mesh, triangles(data["output"], "output")):
++                raise ValueError(f"{path}: indexed POST differs from output triangles")
++        elif "output" in keys:
++            mesh = triangles(data["output"], "output")
++        elif {"C", "free"} <= keys:
++            mesh = np.concatenate([triangles(data["C"], "C"), triangles(data["free"], "free")])
++        else:
++            raise ValueError(f"{path}: unsupported explicit POST schema: {sorted(keys)}")
++        if k <= 0 or k > len(mesh):
++            raise ValueError(f"{path}: invalid K")
++        if "C" in keys and not same_bits(mesh[:k], triangles(data["C"], "C")):
++            raise ValueError(f"{path}: C identity mismatch")
++        if "known_faces" in keys and int(data["known_faces"]) != k:
++            raise ValueError(f"{path}: K differs from stored known_faces")
++        if "known_face_indices" in keys and not np.array_equal(np.asarray(data["known_face_indices"]), np.arange(k)):
++            raise ValueError(f"{path}: C not in declared prefix order")
++    return mesh
++
++
++def shaded(tri, color):
++    tri = np.asarray(tri, dtype=float)
++    normal = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
++    norms = np.linalg.norm(normal, axis=1)
++    normal = np.divide(normal, norms[:, None], out=np.zeros_like(normal), where=norms[:, None] > 0)
++    light = np.asarray([.3, .7, .6]); light /= np.linalg.norm(light)
++    factor = .70 + .30 * np.abs(normal @ light)
++    return np.clip(np.asarray(to_rgb(color))[None, :] * factor[:, None], 0, 1)
++
++
++def draw(ax, mesh, k, bounds, camera):
++    color = shaded(mesh, COLORS["F"])
++    color[:k] = shaded(mesh[:k], COLORS["C"])
++    ax.add_collection3d(Poly3DCollection(mesh[:, :, [0, 2, 1]].astype(float), facecolors=color,
++                                        edgecolors=COLORS["edges"], linewidths=.35, alpha=1., zsort="average"))
++    center = np.asarray(bounds["center_model_xyz"])[[0, 2, 1]]
++    half = bounds["span"] / 2
++    ax.set(xlim=(center[0]-half, center[0]+half), ylim=(center[1]-half, center[1]+half), zlim=(center[2]-half, center[2]+half))
++    ax.set_proj_type("ortho"); ax.set_box_aspect((1, 1, 1))
++    ax.view_init(elev=camera[0], azim=camera[1]); ax.set_axis_off()
++
++
++
++def mesh_paths(root, row):
++    rid=row["request_id"]
++    return {"RAW":path_value(row["raw_path"]),
++            "D1":OLD_ROOT/"outputs"/"R2_USER_MIX"/rid/"post.npz",
++            "D3":root/"outputs"/"D3"/rid/"post.npz",
++            "D5":root/"outputs"/"D5"/rid/"post.npz"}
++
++
++def render_request(root, row, out):
++    rid=row["request_id"]
++    if not re.fullmatch(r"[A-Za-z0-9_.-]+",rid):
++        raise ValueError("Unsafe request identifier")
++    k=int(row["K"])
++    paths=mesh_paths(root,row)
++    sources={str(p):sha256(p) for p in paths.values()}
++    loaded={s:load_mesh(p,k,"RAW" if s=="RAW" else "POST") for s,p in paths.items()}
++    for s,mesh in loaded.items():
++        if not same_bits(mesh[:k],loaded["RAW"][:k]):
++            raise ValueError(f"C changes in {rid}/{s}")
++    vv=np.concatenate([m.reshape(-1,3) for m in loaded.values()]).astype(float)
++    lo,hi=vv.min(0),vv.max(0)
++    span=float(np.max(hi-lo))*1.12
++    if span<=0:
++        raise ValueError("Zero spatial extent")
++    bounds={"bounds_model_xyz":[lo.tolist(),hi.tolist()],"center_model_xyz":((lo+hi)/2).tolist(),
++            "span":span,"coordinate_rescaling":False,"same_bounds_all_4_panels":True,
++            "axis_transform":"model[x,y,z] -> plot[x,z,y]; model Y vertical","projection":"orthographic"}
++    receipts=[]
++    for view_id,camera in enumerate(CAMERAS):
++        image_path=out/f"{rid}__v{view_id}.png"
++        identity={"schema":SCHEMA,"request_id":rid,"parent_id":row["parent_id"],"region_type":row["region_type"],
++                  "label":"R2_USER_MIX","stages":list(STAGES),"bounds":bounds,"camera_elev_azim":list(camera),
++                  "source_hashes":sources,"source_code_sha256":sha256(__file__),"matplotlib_version":matplotlib.__version__,
++                  "numpy_version":np.__version__,"colors":COLORS,"pixels":[1600,1400],"hidden_triangles_removed":False,
++                  "GT_read":False,"model_calls":0,"GPU":0,"C_bitwise_unchanged_all_stages":True,
++                  "topology_claim_from_picture":False}
++        sidecar=image_path.with_suffix(".png.json")
++        if image_path.exists() or sidecar.exists():
++            if not image_path.exists() or not sidecar.exists():
++                raise RuntimeError(f"Incomplete render: {image_path}")
++            receipt=json.loads(sidecar.read_text(encoding="utf8"))
++            if receipt["identity"]!=identity or receipt["sha256"]!=sha256(image_path):
++                raise RuntimeError(f"Render identity mismatch: {image_path}")
++            receipts.append(receipt)
++            continue
++        fig=plt.figure(figsize=(16,14),dpi=100,facecolor="white")
++        for i,s in enumerate(STAGES):
++            mesh=loaded[s]
++            ax=fig.add_subplot(2,2,i+1,projection="3d")
++            draw(ax,mesh,k,bounds,camera)
++            label="RAW (no postprocessing)" if s=="RAW" else f"{s[1:]} denoise pass(es) + one GEO_C"
++            ax.set_title(f"{s}: {label}\nN={len(mesh)} | C={k}, F={len(mesh)-k}",fontsize=13,pad=0)
++        fig.suptitle(f"R2_USER_MIX: fixed RAW / D1 / D3 / D5 | {row['parent_id']}\n{row['region_type']} | {rid.rsplit('__',1)[-1]} | view {view_id+1}: elev {camera[0]:g}, azim {camera[1]:g}",fontsize=14,y=.985)
++        fig.text(.5,.022,"BLUE = unchanged C | GRAY = generated F | Identical camera and bounds across all four panels",ha="center",fontsize=11)
++        fig.text(.5,.008,"C restored after every denoiser pass. Geometry cleanup only once at each endpoint. Opaque surfaces may occlude C; pictures do not certify attachment.",ha="center",fontsize=9)
++        fig.subplots_adjust(left=.005,right=.995,top=.935,bottom=.04,hspace=.02,wspace=0)
++        temporary=image_path.with_suffix(".png.tmp")
++        fig.savefig(temporary,format="png",dpi=100,facecolor="white")
++        plt.close(fig)
++        if any(sha256(p)!=h for p,h in sources.items()):
++            raise RuntimeError("Source changed during rendering")
++        temporary.replace(image_path)
++        receipt={"status":"COMPLETE","identity":identity,"image":str(image_path),"sha256":sha256(image_path),"visual_review":"PENDING_AI_PROXY"}
++        json_write(sidecar,receipt)
++        receipts.append(receipt)
++    return receipts
++
++
++def artifact_link(path,out,label):
++    path=path_value(path)
++    if not path.exists(): return f"{html.escape(label)}: unavailable"
++    return f'<a href="{html.escape(Path(os.path.relpath(path,out)).as_posix(),quote=True)}">{html.escape(label)}</a>'
++
++
++def make_html(root,rows,out):
++    blocks=['<!doctype html><html lang="en"><meta charset="utf-8"><title>R2_USER_MIX multistep denoising</title>',
++            '<style>body{font:15px Arial,sans-serif;margin:24px;max-width:1650px}img{width:49%;vertical-align:top}table{border-collapse:collapse}td,th{padding:5px 12px;border:1px solid #ddd}section{margin:35px 0}a{color:#176299}</style>',
++            '<h1>R2_USER_MIX: RAW / D1 / D3 / D5</h1>',
++            '<p>Same 12 existing RAW meshes, two fixed opposite views each. Blue C, gray free. Common camera and joint bounds per request, no geometry normalization or hidden-face deletion. Each learned pass restores original C. One geometric cleanup at each endpoint; intermediate denoising meshes are not geometrically cleaned.</p>',
++            '<p>AI_PROXY visual observations are separate from human ratings and numerical topology audits. Pictures alone do not certify attachment. <a href="gallery_manifest.json">Render provenance</a> | <a href="visual_review.md">Visual review</a> | <a href="../REPORT.md">Experiment report</a></p>']
++    for row in rows:
++        rid=row['request_id']
++        paths=mesh_paths(root,row)
++        blocks.append(f'<section><h2>{html.escape(rid)}</h2><table><tr><th>Stage</th><th>Mesh</th></tr>')
++        for s,p in paths.items():
++            ply=p.with_suffix('.ply')
++            blocks.append(f'<tr><td>{s}</td><td>{artifact_link(p,out,"NPZ")} | {artifact_link(ply,out,"PLY")}</td></tr>')
++        blocks.append('</table>')
++        for v in range(2):
++            name=f'{rid}__v{v}.png'
++            blocks.append(f'<a href="{name}"><img src="{name}" alt="{html.escape(rid)} view {v+1}"></a>')
++        blocks.append('</section>')
++    blocks.append('</html>')
++    (out/'index.html').write_text('\n'.join(blocks),encoding='utf8')
++
++
++def cpu_resources():
++    out={"logical_CPU":os.cpu_count(),"process_threads":1,"pid":os.getpid(),"CUDA_VISIBLE_DEVICES":os.environ.get("CUDA_VISIBLE_DEVICES"),"load_1_5_15":list(os.getloadavg())}
++    mem={}
++    for line in Path('/proc/meminfo').read_text().splitlines():
++        name,value=line.split(':',1)
++        if name in ('MemTotal','MemAvailable'): mem[name+'_KiB']=int(value.strip().split()[0])
++    out.update(mem)
++    return out
++
++
++def main():
++    parser=argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('--root',default=DEFAULT_ROOT)
++    parser.add_argument('--check-only',action='store_true')
++    args=parser.parse_args()
++    if args.check_only:
++        print(json.dumps({"status":"PASS_INTERFACE_IMPORTS","schema":SCHEMA,"CPU_threads":1,"model_calls":0,"renders":0,"matplotlib":matplotlib.__version__}))
++        return
++    started=time.monotonic()
++    root=path_value(args.root).resolve()
++    if root!=Path(DEFAULT_ROOT).resolve(): raise ValueError('This fixed pilot only writes its registered experiment directory')
++    reg_path=root/'registration.json'
++    reg_sha=sha256(reg_path)
++    registration=json.loads(reg_path.read_text(encoding='utf8'))
++    rows=sorted(registration['records'],key=lambda r:r['request_id'])
++    if len(rows)!=12 or len({r['request_id'] for r in rows})!=12 or any(r['label']!='R2_USER_MIX' for r in rows):
++        raise ValueError('Expected 12 fixed R2_USER_MIX request rows')
++    out=root/'gallery'; out.mkdir(parents=True,exist_ok=True)
++    resources=cpu_resources()
++    receipts=[]
++    for row in rows:
++        receipts.extend(render_request(root,row,out))
++        print(json.dumps({"request_id":row['request_id'],"renders_complete":len(receipts)}),flush=True)
++    if sha256(reg_path)!=reg_sha: raise RuntimeError('Registration changed during render')
++    make_html(root,rows,out)
++    manifest={"schema":SCHEMA,"status":"COMPLETE","requests":12,"stages":list(STAGES),"input_meshes":48,"PNG_count":len(receipts),
++              "registration_sha256":reg_sha,"source_code_sha256":sha256(__file__),"wall_seconds":time.monotonic()-started,"CPU_workers":1,"CPU_threads":1,
++              "resources_before":resources,"resources_after":cpu_resources(),"GPU":0,"model_calls":0,"GT_read":False,"source_geometry_modified":False,
++              "visual_review_status":"PENDING_AI_PROXY","receipts":receipts}
++    json_write(out/'gallery_manifest.json',manifest)
++    print(json.dumps({"status":"COMPLETE","images":len(receipts),"wall_seconds":manifest['wall_seconds']}),flush=True)
++
++
++if __name__=='__main__':
++    main()
+--- /dev/null
++++ b/r2/tools/multistep_denoise_v1/run.py
+@@ -0,0 +1,14 @@
++"""Recoverable fixed-budget entrypoint; scientific stages run in separate processes."""
++import argparse,subprocess,sys
++from pathlib import Path
++from common import prepare,OUT,write,read
++if __name__=='__main__':
++ p=argparse.ArgumentParser();p.add_argument('--stage',choices=['prepare','denoise','score','gallery','all'],default='prepare');args=p.parse_args()
++ reg=prepare()
++ if args.stage=='prepare':print('REGISTERED 12 USER_MIX; 48 new denoiser forwards; endpoints D1/D3/D5');raise SystemExit(0)
++ stages=['denoise','score','gallery'] if args.stage=='all' else [args.stage]
++ for stage in stages:
++  target=Path(__file__).with_name(stage+'.py')
++  if not target.exists():raise FileNotFoundError('Stage implementation not ready: '+str(target))
++  command=[sys.executable,'-B',str(target)]
++  subprocess.run(command,check=True)--- /dev/null
++++ b/r2/tools/multistep_denoise_v1/score.py
+@@ -0,0 +1,266 @@
++"""USER_MIX D1/D3/D5 evaluation, strictly CPU and independent output directory.
++Reuse immutable RAW/D1 evidence; score only 24 newly postprocessed endpoints.
++Run after all D2..D5 model forwards have completed. No intermediate GEO_C.
++"""
++from __future__ import annotations
++import os
++for key in ('OMP_NUM_THREADS','OPENBLAS_NUM_THREADS','MKL_NUM_THREADS','NUMEXPR_NUM_THREADS'):
++    os.environ[key]='2'
++os.environ['CUDA_VISIBLE_DEVICES']=''
++import argparse, concurrent.futures, importlib.util, json, multiprocessing, resource, sys, time
++from pathlib import Path
++import numpy as np
++REPO=Path(__file__).resolve().parents[3]
++OUT=REPO/'experiments/r2_multistep_denoise_v1'
++OLD=REPO/'experiments/r2_postprocess_avmr_pmr_v1'
++RAW_AVMR=REPO/'experiments/r2_avmr_pmr_offline_v1'
++LABEL='R2_USER_MIX'
++STAGES=('RAW','D1','D3','D5')
++META=('request_id','condition_id','parent_id','region_type','tier','candidate','N','K')
++sys.path.insert(0,str(REPO))
++def module(name,path):
++    if name in sys.modules:return sys.modules[name]
++    spec=importlib.util.spec_from_file_location(name,path)
++    m=importlib.util.module_from_spec(spec);sys.modules[name]=m;spec.loader.exec_module(m);return m
++# Import only definitions; none of the old main/prepare/write entrypoints run.
++P=module('_multistep_frozen_post_primitives',REPO/'r2/tools/postprocess_avmr_pmr_v1/run.py')
++A=P.A
++for key in ('OMP_NUM_THREADS','OPENBLAS_NUM_THREADS','MKL_NUM_THREADS','NUMEXPR_NUM_THREADS'):os.environ[key]='2'
++Q=module('_multistep_frozen_quality',REPO/'r2/tools/postprocess_avmr_pmr_v1/quality.py')
++sha,read,csv_read=A.sha,A.read,A.csv_read
++VERSION='r2_multistep_denoise_fixed_endpoints_cpu_v1'
++
++def checked(path):
++    path=Path(path).resolve()
++    if not path.is_relative_to(OUT.resolve()):raise ValueError('Refusing output outside this experiment: '+str(path))
++    return path
++
++def write(path,value):return A.write(checked(path),value)
++def csv_write(path,rows):return A.csv_write(checked(path),rows)
++def event(kind,**fields):
++    path=checked(OUT/'score_ledger.jsonl');path.parent.mkdir(parents=True,exist_ok=True)
++    with path.open('a',encoding='utf-8') as f:f.write(json.dumps(dict(utc=time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),event=kind,**fields),allow_nan=False)+'\n')
++
++def registration(check_hashes=False):
++    reg=read(OUT/'registration.json');rows=reg['records']
++    if len(rows)!=12 or len({r['request_id'] for r in rows})!=12 or any(r['label']!=LABEL for r in rows):raise ValueError('Expected exactly the fixed 12 USER_MIX outputs')
++    old=read(OLD/'registration.json')
++    originals={r['request_id']:r for r in old['records'] if r['label']==LABEL}
++    extra={'D1_denoised_path','D1_denoised_sha256','D1_receipt_path','D1_post_path','D1_score_path'}
++    if {r['request_id'] for r in rows}!=set(originals):raise ValueError('Original USER_MIX request set changed')
++    for r in rows:
++        original=originals[r['request_id']]
++        if any(r.get(k)!=v for k,v in original.items()) or set(r)-set(original)-extra:raise ValueError('Original USER_MIX record identity or allowed D1 schema changed')
++        if 'D1_denoised_path' in r and sha(r['D1_denoised_path'])!=r['D1_denoised_sha256']:raise ValueError('Registered reused D1 denoised file changed')
++    if reg['settings']!=old['settings']:raise ValueError('Frozen AVMR settings changed')
++    if check_hashes:
++        for p,h in reg['protected'].items():
++            if sha(p)!=h:raise ValueError('Protected file changed: '+p)
++    if 'torch' in sys.modules:raise AssertionError('CPU scorer imported torch')
++    return reg
++
++def denoise_identity(r,stage):
++    roundnum=int(stage[1:]);path=OUT/'denoised'/stage/r['request_id']/'denoised.npz';receipt=read(path.with_name('receipt.json'))
++    wanted=dict(request_id=r['request_id'],raw_sha256=r['raw_sha256'],round=roundnum,status='PASS')
++    if any(receipt.get(k)!=v for k,v in wanted.items()):raise ValueError('Denoiser receipt identity mismatch: '+str(path))
++    if sha(path)!=receipt['output_sha256']:raise ValueError('Denoiser artifact hash mismatch')
++    return path,receipt
++
++def validate_post(r):
++    den,dr=denoise_identity(r,r['stage']);post=Path(r['post_path']);pp=read(post.with_name('postprocess.json'))
++    if sha(r['raw_path'])!=r['raw_sha256'] or sha(post)!=r['post_sha256']:raise ValueError('RAW or POST changed')
++    if pp['status']!='PASS' or pp['input']['file_sha256']!=dr['output_sha256']:raise ValueError('GEO_C ancestry mismatch')
++    for name,detail in pp['files'].items():
++        if sha(post.parent/name)!=detail['sha256']:raise ValueError('GEO_C artifact changed')
++    return dr,pp
++
++def old_receipt(r):
++    p=read(OLD/'scores'/LABEL/r['request_id']/'score.json')
++    if p['status']!='PASS' or p['identity']['raw_sha256']!=r['raw_sha256']:raise ValueError('Old D1 score identity mismatch')
++    for path,h in p['files'].items():
++        if sha(path)!=h:raise ValueError('Frozen D1 score detail changed')
++    return p
++
++def postprocess_all():
++    reg=registration(True);index=[];tick=time.perf_counter()
++    oldindex={r['request_id']:r for r in csv_read(OLD/'post_index.csv') if r['label']==LABEL}
++    for r in reg['records']:
++        rid=r['request_id'];K=int(r['K']);old=oldindex[rid];p=old_receipt(r)
++        if sha(old['post_path'])!=p['identity']['post_sha256']:raise ValueError('Old D1 post changed')
++        with np.load(r['raw_path'],allow_pickle=False) as a:raw=a['raw'].reshape(-1,3,3)
++        for stage in STAGES:
++            if stage=='RAW':
++                index.append(dict(r,stage=stage,post_path=r['raw_path'],post_sha256=r['raw_sha256'],post_ply='',denoised_path='',output_N=int(r['N']),reused=True))
++                continue
++            if stage=='D1':
++                index.append(dict(r,stage=stage,post_path=old['post_path'],post_sha256=old['post_sha256'],post_ply=old['post_ply'],denoised_path=old['denoised_path'],output_N=int(old['output_N']),reused=True))
++                continue
++            den,dr=denoise_identity(r,stage);dest=checked(OUT/'outputs'/stage/rid);ppath=dest/'postprocess.json'
++            with np.load(den,allow_pickle=False) as a:
++                if a['output'].dtype!=np.float32 or a['output'].shape!=raw.shape or not A.bit_equal(a['output'][:K],raw[:K]):raise ValueError('Denoising changed N/C/dtype')
++            if ppath.exists():
++                pp=read(ppath)
++                if pp['status']!='PASS' or pp['input']['file_sha256']!=dr['output_sha256']:raise ValueError('Invalid GEO_C resume')
++                for name,detail in pp['files'].items():
++                    if sha(dest/name)!=detail['sha256']:raise ValueError('Existing GEO_C file changed')
++            else:
++                event('GEO_C_STARTED',stage=stage,request_id=rid)
++                pp=P.PC.run(den,K,dest,input_key='output')
++                event('GEO_C_COMPLETE',stage=stage,request_id=rid,seconds=pp['seconds'],deleted=pp['stats']['deleted_free_faces'])
++            with np.load(dest/'post.npz',allow_pickle=False) as a:
++                if not A.bit_equal(a['output'][:K],raw[:K]) or not A.bit_equal(a['C'],raw[:K]):raise ValueError('POST C changed')
++            index.append(dict(r,stage=stage,post_path=str(dest/'post.npz'),post_sha256=sha(dest/'post.npz'),post_ply=str(dest/'post.ply'),denoised_path=str(den),output_N=pp['output_faces'],reused=False))
++    csv_write(OUT/'post_index.csv',index)
++    write(OUT/'postprocess_completion.json',dict(status='PASS',new_postprocess=24,reused_RAW_D1=24,all_C_unchanged=True,wall_seconds=time.perf_counter()-tick,intermediate_GEO_C=0))
++    return index
++
++def distances_stats(x,y,K):
++    d=np.linalg.norm(x[K:].astype(np.float64)-y[K:].astype(np.float64),axis=-1).ravel()
++    return dict(mean=float(d.mean()) if len(d) else None,p95=float(np.quantile(d,.95)) if len(d) else None,max=float(d.max()) if len(d) else None)
++
++def score_one(r):
++    tick=time.perf_counter();stage=r['stage'];rid=r['request_id'];K=int(r['K'])
++    if stage not in ('D3','D5'):raise ValueError('Only new endpoints may be scored')
++    dr,pp=validate_post(r);dest=checked(OUT/'scores'/stage/rid);receipt=dest/'score.json'
++    identity=dict(label=LABEL,stage=stage,request_id=rid,raw_sha256=r['raw_sha256'],post_sha256=r['post_sha256'],registration_sha256=sha(OUT/'registration.json'),score_source_sha256=sha(__file__))
++    if receipt.exists():
++        saved=read(receipt)
++        if saved['identity']!=identity or saved['status']!='PASS':raise ValueError('Cannot reuse mismatched score')
++        for path,h in saved['files'].items():
++            if sha(path)!=h:raise ValueError('Scoring detail changed')
++        return dict(reused=True,stage=stage,request_id=rid,path=str(receipt))
++    with np.load(r['raw_path'],allow_pickle=False) as a:raw=a['raw'].reshape(-1,3,3)
++    with np.load(r['post_path'],allow_pickle=False) as a:
++        post=a['output'];vertices=a['vertices'];faces=a['faces'];source_ids=a['source_face_ids']
++    with np.load(r['condition_source'],allow_pickle=False) as a:
++        C=a['C'];bid,pts,boundary_audit=A.topology(C,a['C_source_vertex_ids'])
++    if not A.bit_equal(C,raw[:K]) or not A.bit_equal(C,post[:K]):raise ValueError('Source/RAW/POST C differs')
++    ds,nearest=A.nearest(pts,post[K:]);vrows=[]
++    for vid,p,d,j in zip(bid,pts,ds,nearest):
++        v=post[K:].reshape(-1,3)[j] if j>=0 else [None]*3
++        vrows.append(dict(source_vertex_id=vid,cx=float(p[0]),cy=float(p[1]),cz=float(p[2]),distance_model=float(d) if np.isfinite(d) else None,distance_L_fraction=float(d/A.L) if np.isfinite(d) else None,
++            nearest_free_face=int(j)//3 if j>=0 else None,nearest_free_corner=int(j)%3 if j>=0 else None,nearest_original_source_face=int(source_ids[K+int(j)//3]) if j>=0 else None,
++            fx=float(v[0]) if j>=0 else None,fy=float(v[1]) if j>=0 else None,fz=float(v[2]) if j>=0 else None))
++    metrics=[dict(setting=n,threshold_model=t,scale=s,tau=v,**A.metric(ds,t)) for n,t,s,v in A.SETTINGS]
++    quality=Q.score_quality(r,r['post_path'],checked(dest/'quality'))
++    with np.load(r['denoised_path'],allow_pickle=False) as a:den=a['output']
++    d1path=OLD/'denoised'/LABEL/rid/'denoised.npz'
++    with np.load(d1path,allow_pickle=False) as a:d1=a['output']
++    displacements=dict(RAW_to_denoised_free_model=distances_stats(raw,den,K),D1_to_denoised_free_model=distances_stats(d1,den,K))
++    original_kept=raw[source_ids];den_kept=den[source_ids]
++    displacements['RAW_to_POST_retained_free_model']=distances_stats(original_kept,post,K)
++    displacements['GEO_C_retained_free_model']=distances_stats(den_kept,post,K)
++    result=dict(status='PASS',version=VERSION,identity=identity,metadata={k:r[k] for k in META},stage=stage,C_unchanged=True,metrics=metrics,vertices=vrows,boundary_audit=boundary_audit,
++        topology_POST_INDEXED=P.topology_stats(vertices,faces,K),quality=quality,postprocess_stats=pp['stats'],denoise=dr,displacements=displacements,seconds=time.perf_counter()-tick,files=quality['files'])
++    write(receipt,result)
++    if 'torch' in sys.modules:raise AssertionError('CPU evaluation unexpectedly imported torch')
++    return dict(reused=False,stage=stage,request_id=rid,path=str(receipt),seconds=result['seconds'],peak_rss_kib=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
++
++def index_rows():
++    reg=registration();rows=csv_read(OUT/'post_index.csv')
++    expected={(r['request_id'],s) for r in reg['records'] for s in STAGES}
++    if len(rows)!=48 or {(r['request_id'],r['stage']) for r in rows}!=expected:raise ValueError('48-stage output index incomplete or duplicated')
++    return rows
++
++def score_all(workers=2):
++    registration(True);rows=[r for r in index_rows() if r['stage'] in ('D3','D5')];tick=time.perf_counter()
++    before=A.resources();before['dispatch']=dict(CPU_workers=1,BLAS_threads_per_worker=2,GPU_workers=0,reason='First authorized real score measured before parallel dispatch')
++    write(OUT/'resources_before_cpu_scoring.json',before)
++    first=score_one(rows[0]);event('CPU_SCORE_COMPLETE',**first)
++    snapshot=A.resources();snapshot['dispatch']=dict(CPU_workers=workers,BLAS_threads_per_worker=2,GPU_workers=0,first_actual_score=first,reason='24 independent frozen-geometry endpoint audits; two CPU workers bounded by registered budget, no GPU or extra probes')
++    write(OUT/'resources_before_parallel_scoring.json',snapshot)
++    with concurrent.futures.ProcessPoolExecutor(max_workers=workers,mp_context=multiprocessing.get_context('spawn')) as pool:
++        jobs={pool.submit(score_one,r):r for r in rows[1:]}
++        for f in concurrent.futures.as_completed(jobs):
++            r=jobs[f]
++            try:event('CPU_SCORE_COMPLETE',**f.result())
++            except Exception as exc:
++                event('CPU_SCORE_FAILED',stage=r['stage'],request_id=r['request_id'],error=repr(exc));raise
++    write(OUT/'score_completion.json',dict(status='PASS',new_scored_outputs=24,reused_RAW_D1_outputs=24,CPU_workers=workers,BLAS_threads_per_worker=2,wall_seconds=time.perf_counter()-tick,model_forwards=0,new_queries=0))
++    summarize()
++
++def parse(v):
++    if v in ('','None','null',None):return None
++    try:return float(v)
++    except (TypeError,ValueError):return v
++
++def numeric_summary(rows,exclude):
++    fields=set.intersection(*(set(r) for r in rows))-set(exclude);out={}
++    for k in sorted(fields):
++        vals=[r[k] for r in rows if isinstance(r[k],(int,float)) and r[k] is not None]
++        if vals or all(r[k] is None for r in rows):
++            out[k]=float(np.mean(vals)) if vals else None;out[k+'_valid_outputs']=len(vals)
++    return out
++
++def flatten_numeric(prefix,data):
++    result={}
++    for k,v in data.items():
++        name=prefix+k
++        if isinstance(v,dict):result.update(flatten_numeric(name+'_',v))
++        elif isinstance(v,(str,int,float,bool)) or v is None:result[name]=v
++    return result
++
++def summarize():
++    reg=registration();rows=index_rows();per=[];verts=[];quals=[];topos=[];effects=[]
++    rawq={(r['request_id'],r['stage']):r for r in csv_read(OLD/'quality_per_output.csv') if r['label']==LABEL}
++    by_record={r['request_id']:r for r in reg['records']}
++    for r in rows:
++        stage=r['stage'];rid=r['request_id'];meta={k:r[k] for k in META};meta.update(label=LABEL,stage=stage)
++        d1=old_receipt(by_record[rid])
++        if stage=='RAW':
++            p=read(RAW_AVMR/'scores'/LABEL/(rid+'.json'))
++            if p['status']!='PASS' or p['identity']['raw_sha256']!=r['raw_sha256']:raise ValueError('RAW score receipt mismatch')
++            metrics=p['metrics'];vertex=p['vertices'];quality={k:parse(v) for k,v in rawq[(rid,'RAW')].items() if k not in META and k not in ('label','stage')};topo=d1['topology_RAW_EXACT_COORD_INDEX'];toponame='RAW_EXACT_COORD_INDEX'
++        else:
++            if stage=='D1':p=d1
++            else:
++                score_one(r);p=read(OUT/'scores'/stage/rid/'score.json')
++            metrics=p['metrics'];vertex=p['vertices'];quality=dict(p['quality']['metrics'],free_face_denominator=p['quality']['free_face_denominator']);topo=p['topology_POST_INDEXED'];toponame='POST_INDEXED'
++            effects.append(dict(meta,**flatten_numeric('',p['postprocess_stats']),**flatten_numeric('denoise_',p['denoise']),**flatten_numeric('displacement_',p.get('displacements',{}))))
++        per.extend(dict(meta,**v) for v in metrics);verts.extend(dict(meta,**v) for v in vertex);quals.append(dict(meta,**quality));topos.append(dict(meta,index_definition=toponame,**topo))
++    csv_write(OUT/'per_output.csv',per);csv_write(OUT/'per_vertex_distances.csv',verts);csv_write(OUT/'quality_per_output.csv',quals);csv_write(OUT/'topology_per_output.csv',topos);csv_write(OUT/'modifications_per_output.csv',effects)
++    summary=[];qsummary=[];tsummary=[]
++    for stage in STAGES:
++        for group in ('ALL','seat','back'):
++            for setting,_,_,_ in A.SETTINGS:
++                sub=[r for r in per if r['stage']==stage and r['setting']==setting and (group=='ALL' or r['region_type']==group)]
++                valid=[r for r in sub if r['status']=='PASS']
++                summary.append(dict(label=LABEL,stage=stage,group=group,setting=setting,outputs=len(sub),valid_outputs=len(valid),A_VMR=float(np.mean([r['VMR'] for r in valid])) if valid else None,PMR=float(np.mean([r['perfect'] for r in valid])) if valid else None))
++            qs=[r for r in quals if r['stage']==stage and (group=='ALL' or r['region_type']==group)]
++            ts=[r for r in topos if r['stage']==stage and (group=='ALL' or r['region_type']==group)]
++            qsummary.append(dict(label=LABEL,stage=stage,group=group,outputs=len(qs),**numeric_summary(qs,(*META,'label','stage'))))
++            tsummary.append(dict(label=LABEL,stage=stage,group=group,outputs=len(ts),**numeric_summary(ts,(*META,'label','stage')),outputs_with_C_free_shared_edge=sum(r['C_open_edges_with_free']>0 for r in ts)))
++    csv_write(OUT/'summary.csv',summary);csv_write(OUT/'quality_summary.csv',qsummary);csv_write(OUT/'topology_summary.csv',tsummary)
++    lookup={(r['request_id'],r['stage'],r['setting']):r for r in per};ql={(r['request_id'],r['stage']):r for r in quals};tl={(r['request_id'],r['stage']):r for r in topos}
++    paired=[];qpaired=[];tpaired=[]
++    for r in reg['records']:
++        rid=r['request_id'];meta={k:r[k] for k in META};meta['label']=LABEL
++        for stage in ('RAW','D3','D5'):
++            for setting,_,_,_ in A.SETTINGS:
++                a,b=lookup[(rid,'D1',setting)],lookup[(rid,stage,setting)]
++                paired.append(dict(meta,reference='D1',stage=stage,setting=setting,D1_VMR=a['VMR'],endpoint_VMR=b['VMR'],delta_VMR=b['VMR']-a['VMR'],D1_perfect=a['perfect'],endpoint_perfect=b['perfect'],delta_matched_count=b['matched_count']-a['matched_count']))
++            for dst,source in ((qpaired,ql),(tpaired,tl)):
++                a,b=source[(rid,'D1')],source[(rid,stage)];fields=set(a)&set(b)-set(META)-{'label','stage'};vals={}
++                for k in sorted(fields):
++                    if isinstance(a[k],(int,float)) and isinstance(b[k],(int,float)):
++                        vals['D1_'+k]=a[k];vals['endpoint_'+k]=b[k];vals['delta_'+k]=b[k]-a[k]
++                dst.append(dict(meta,reference='D1',stage=stage,**vals))
++    csv_write(OUT/'paired_vs_D1.csv',paired);csv_write(OUT/'quality_paired_vs_D1.csv',qpaired);csv_write(OUT/'topology_paired_vs_D1.csv',tpaired)
++    parent=[]
++    for stage in STAGES:
++        for cid in sorted({r['condition_id'] for r in reg['records']}):
++            samples=[r for r in quals if r['stage']==stage and r['condition_id']==cid]
++            parent.append(dict(label=LABEL,stage=stage,condition_id=cid,parent_id=samples[0]['parent_id'],region_type=samples[0]['region_type'],noise_outputs=len(samples),**numeric_summary(samples,(*META,'label','stage'))))
++    csv_write(OUT/'per_condition_noise_quality.csv',parent)
++    after={p:sha(p) for p in reg['protected']}
++    if after!=reg['protected']:raise ValueError('Protected inputs changed')
++    write(OUT/'scoring_protected_after.json',dict(status='PASS',count=len(after),files=after))
++    write(OUT/'scoring_aggregation.json',dict(status='PASS',stage_outputs=48,new_scored_outputs=24,threshold_rows=len(per),vertex_rows=len(verts),quality_rows=len(quals),topology_rows=len(topos),settings=len(A.SETTINGS),stages=list(STAGES),torch_imported='torch' in sys.modules))
++    event('AGGREGATED',stage_outputs=48,threshold_rows=len(per),quality_rows=len(quals));print(json.dumps(dict(status='PASS',new_scores=24,stage_outputs=48,summary=str(OUT/'summary.csv'))))
++
++def main():
++    p=argparse.ArgumentParser();p.add_argument('--stage',choices=('postprocess','score','summarize','all'),default='all');p.add_argument('--workers',type=int,choices=(1,2),default=2);a=p.parse_args()
++    if a.stage in ('postprocess','all'):postprocess_all()
++    if a.stage in ('score','all'):score_all(a.workers)
++    if a.stage=='summarize':summarize()
++if __name__=='__main__':main()

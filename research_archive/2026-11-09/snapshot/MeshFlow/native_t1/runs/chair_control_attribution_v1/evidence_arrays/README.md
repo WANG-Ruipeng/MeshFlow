@@ -1,0 +1,1 @@
+这些是原B终点144个输出的free/C/GT/Q小型副本；L0、源面ID及噪声字节hash一并保留。没有保存新的Gaussian，没有模型调用。完整原raw含状态轨迹仍只读留在源目录。manifest记录原raw及导出副本SHA256。

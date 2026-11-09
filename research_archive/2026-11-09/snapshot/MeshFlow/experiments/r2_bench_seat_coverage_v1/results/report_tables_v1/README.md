@@ -1,0 +1,13 @@
+# 汇总范围与解释边界
+
+只读原 collect 的252行评分和已完成的252单元真实AI_PROXY图审；无新模型调用、评分、渲染或自动标签。
+
+全177字段原值、状态和NA在all_177_per_output.csv保留。all_numeric系列只按原有限值汇总；核心表的I按原PASS状态筛选，未改检测器。父等权先平均同条件噪声，再平均条件，最后平均父；逐请求与逐父配对和增减范围均保存。
+
+strict_visual_three_axis仅表示同一输出同时C_use=PLAUSIBLE、overall_shape=REASONABLE、support_retention=PRESENT。它不是新的几何接续成功定义，未包含合法接口或CF/FF/I阈值。UNCERTAIN不算YES且单独计数；总请求分母包括不确定。原五轴及每个类别均保存。
+
+NEW_PARENT_HOLDOUT只有一个父两个噪声；NEW_TRAIN只有两个父。旧SEAM仅有原24请求，不补齐新增结果。旧CURRENT_TRAIN显示为OLD_TRAIN，源记录不改。图审非盲AI_PROXY；历史标签漂移保留在原visual_review/summary_v1中。
+
+free_total_surface_area是当前阶段实际free表面面积，可能包含新增BRIDGE；不是未知真实成品面积的保留率，也不证明支撑完整。原free面、删除面与新增面单独记账。单位沿用旧PRIMARY_TABLES，fraction差值不自动转换成百分点。
+
+本轮候选同时增加训练步数与改变数据/采样分布；结果不是新增父的单因素因果证明。不输出自动promote决定。

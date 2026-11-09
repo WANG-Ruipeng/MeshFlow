@@ -1,0 +1,113 @@
+--- run_all.py.before
++++ run_all.py
+@@ -30,7 +30,7 @@
+ VERSION='BENCH_PARTS_REGISTERED_DISPATCH_V1'
+ 
+ 
+-def read(path):return json.loads(Path(path).read_text(encoding='utf-8-sig'))
++def read(path):return C.read(path)
+ 
+ 
+ def sha(path):
+@@ -101,7 +101,7 @@
+             event(self.events,'EXPLICIT_CONTROLLER_REATTACH',previous=old,child_retry_authorized=False)
+         self.complete=None
+         identity=dict(schema=VERSION,registration_sha256=sha(self.root/'registration.json'),
+-            code_hashes={str(p):sha(p) for p in [Path(__file__),Path(C.__file__),*[Path(__file__).with_name(n+'.py') for n in ('train','sample','postprocess','evaluation','curves','convergence')]]},
++            code_hashes={str(p):sha(p) for p in [Path(__file__),Path(C.__file__),*[Path(__file__).with_name(n+'.py') for n in ('train','resume_train','sample','postprocess','evaluation','curves','convergence')]]},
+             plan=plan(self.root),no_automatic_scientific_retry=True)
+         ip=self.dest/'identity.json'
+         if ip.exists() and read(ip)!=identity:raise DispatchBlocked('Dispatch implementation/registration changed; explicit engineering version required')
+@@ -343,7 +343,8 @@
+             if state['state']=='ABSENT':
+                 if arm!='COMMON':args+=['--fork',self.root/'training/COMMON/step12000.pt'];start=12000
+             else:args+=['--resume',state['checkpoint']]
+-            jobs.append(dict(key='train_'+arm+'_'+str(target),kind='training',gpu=True,arm=arm,start_step=start,target=target,command=self.cmd('train',*args)))
++            module='resume_train' if state['state']!='ABSENT' and start%1000 else 'train'
++            jobs.append(dict(key='train_'+arm+'_'+str(target),kind='training',gpu=True,arm=arm,start_step=start,target=target,command=self.cmd(module,*args)))
+         self.wave(jobs)
+         for arm in arms:
+             state=self.wait_training(arm)
+@@ -483,6 +484,63 @@
+             no_quality_promotion_from_loss_plateau=True,source_registration_sha256=sha(self.root/'registration.json'))
+         write(self.root/'summary.json',summary)
+ 
++    def drain_after_failure(self, exc):
++        """Keep the WSL parent alive until owned children finish safely.
++
++        No pending job is launched, and no failed scientific job is retried.
++        Training receives its existing update-boundary stop signal once;
++        already-running nontraining work is allowed to finish naturally.
++        """
++        active=[j for j in self.jobs if j['process'].poll() is None]
++        signals=[];shutdown_errors=[]
++        for job in active:
++            if job['kind']=='training':
++                try:
++                    job['process'].send_signal(signal.SIGTERM)
++                    signals.append(dict(key=job['key'],pid=job['process'].pid,signal='SIGTERM_SAFE_UPDATE_BOUNDARY'))
++                except ProcessLookupError:
++                    pass
++                except Exception as signal_error:
++                    shutdown_errors.append(dict(stage='SEND_STOP_SIGNAL',key=job['key'],error=repr(signal_error)))
++        failure=dict(error=repr(exc),traceback=traceback.format_exc(),safe_stop_requests=signals,
++            policy='Stop new dispatch; no scientific retry. Keep coordinator alive until every owned live child exits; training saves at update boundary, other tasks finish naturally.',
++            drain_status='WAITING_FOR_OWNED_CHILDREN',unix=time.time())
++        def record_safely(stage, operation):
++            try:operation()
++            except Exception as record_error:
++                shutdown_errors.append(dict(stage=stage,error=repr(record_error)))
++                print(json.dumps(dict(event='FAILURE_RECORD_ERROR_CONTINUING_CHILD_DRAIN',stage=stage,error=repr(record_error))),flush=True)
++        record_safely('INITIAL_FAILURE_RECORD',lambda:write(self.dest/'failure.json',failure))
++        self.phase='FAILURE_DRAIN'
++        record_safely('INITIAL_STOPPING_STATUS',lambda:self.update('STOPPING_AFTER_FAILURE',failure=failure))
++        last_notice=0.
++        while any(j['process'].poll() is None for j in active):
++            if time.time()-last_notice>=30:
++                print(json.dumps(dict(event='WAITING_FOR_SAFE_CHILD_SHUTDOWN',
++                    children=[dict(key=j['key'],pid=j['process'].pid,kind=j['kind']) for j in active if j['process'].poll() is None],
++                    no_new_dispatch=True,unix=time.time())),flush=True)
++                last_notice=time.time()
++            try:time.sleep(self.poll)
++            except KeyboardInterrupt:
++                shutdown_errors.append(dict(stage='WAIT_INTERRUPTED',error='KeyboardInterrupt; still waiting for already-signalled owned children'))
++        outcomes=[]
++        for job in active:
++            try:
++                self.reap(job)
++            except DispatchBlocked:
++                pass  # Nonzero exit is preserved by reap, never retried.
++            except Exception as record_error:
++                shutdown_errors.append(dict(stage='CHILD_COMPLETION_RECORD',key=job['key'],error=repr(record_error)))
++            outcome=dict(key=job['key'],pid=job['process'].pid,returncode=job['process'].returncode)
++            if job['kind']=='training':
++                try:outcome['recovery_precheck']=C.recovery_precheck(self.root,job['arm'])
++                except Exception as audit_error:outcome['recovery_precheck_error']=repr(audit_error)
++            outcomes.append(outcome)
++        failure.update(drain_status='ALL_OWNED_CHILDREN_EXITED',child_outcomes=outcomes,shutdown_record_errors=shutdown_errors,drain_finished_unix=time.time())
++        record_safely('FINAL_FAILURE_RECORD',lambda:write(self.dest/'failure.json',failure))
++        record_safely('FINAL_BLOCKED_STATUS',lambda:self.update('BLOCKED',failure=failure))
++        return failure
++
+     def run(self):
+         if self.complete:return self.complete
+         try:
+@@ -498,16 +556,8 @@
+                 if stop:return self.final_cpu(target,decision)
+             raise DispatchBlocked('No terminal stopping decision at registered cap')
+         except BaseException as exc:
+-            # Only our training children implement update-boundary SIGTERM.
+-            # Never kill unrelated processes or interrupt a sampling cell.
+-            signals=[]
+-            for job in self.jobs:
+-                if job['process'].poll() is None and job['kind']=='training':
+-                    job['process'].send_signal(signal.SIGTERM);signals.append(dict(key=job['key'],pid=job['process'].pid,signal='SIGTERM_SAFE_UPDATE_BOUNDARY'))
+-            failure=dict(error=repr(exc),traceback=traceback.format_exc(),safe_stop_requests=signals,
+-                policy='Stop all new dispatch; no scientific retry. Other already-running authorized sampling cells are not forcibly killed.',
+-                unix=time.time())
+-            write(self.dest/'failure.json',failure);self.update('BLOCKED',failure=failure);raise
++            self.drain_after_failure(exc)
++            raise
+ 
+ 
+ def checkpoint_content_audit(source,target,step,output):

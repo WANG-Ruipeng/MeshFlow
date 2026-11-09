@@ -1,0 +1,2763 @@
+diff --git a/experiments/mf_h1_local0/native_patch_audit.py b/experiments/mf_h1_local0/native_patch_audit.py
+new file mode 100644
+--- /dev/null
++++ b/experiments/mf_h1_local0/native_patch_audit.py
+@@ -0,0 +1,216 @@
++﻿"""Read-only CPU post-run audit for native_patch_*; no model or OT calls.
++
++This module writes nothing. It loads finalized JSON/NPZ and safely mmap-loads
++endpoints, verifies actual bytes/tensors/counters, and prints one JSON summary.
++Run only after the main process records PASS_EXECUTION.
++"""
++from __future__ import annotations
++import argparse
++from collections import Counter,defaultdict
++import hashlib
++import json
++from pathlib import Path
++import traceback
++import numpy as np
++import torch
++
++BASE_SHA='b32197096ecf8d662bfee18bbc4abf16cc4b4690cd28e5c47d14850729d2c222'
++MODELS=('Native0','T1','T2')
++PARENTS=(0,1)
++TRAIN_K=(4,8,12)
++EVAL_K=(2,4,8,12)
++SEEDS=(9201,9202,9203,9204)
++SHARED_FIELDS=('shared_batch_sha256','shared_input_hashes','parent_indices','K','free_face_counts',
++    'effective_free_coordinates','times','Gaussian_hashes','paired_noise_hashes','pre_OT_target_hashes','known_slots','cycle_phase')
++
++
++def file_sha(path):
++    digest=hashlib.sha256()
++    with Path(path).open('rb') as stream:
++        for block in iter(lambda:stream.read(8<<20),b''):digest.update(block)
++    return digest.hexdigest()
++
++
++def array_sha(value,legacy_dtype=False):
++    value=np.ascontiguousarray(value)
++    descriptor=(value.dtype,value.shape) if legacy_dtype else (str(value.dtype),tuple(value.shape))
++    return hashlib.sha256(str(descriptor).encode()+value.tobytes()).hexdigest()
++
++
++def state_sha(state):
++    digest=hashlib.sha256()
++    for name,value in sorted(state.items()):
++        value=value.detach().cpu().contiguous()
++        digest.update(name.encode());digest.update(str((tuple(value.shape),value.dtype)).encode())
++        digest.update(value.view(torch.uint8).numpy().tobytes())
++    return digest.hexdigest()
++
++
++def require(condition,message):
++    if not condition:raise AssertionError(message)
++
++
++def batch_plan(index):
++    rotation={k:TRAIN_K[(i+index%3)%3] for i,k in enumerate(TRAIN_K)}
++    pairs=((0,4),(0,4),(0,8),(0,12),(1,4),(1,8),(1,8),(1,12))
++    return [(parent,rotation[k]) for parent,k in pairs]
++
++
++def _endpoint(out,report,arm):
++    result=report['arms'][arm];record=result['checkpoint'];path=Path(record['path'])
++    require(path.resolve()==(out/arm/'endpoint_step500.pt').resolve(),'Endpoint path differs from current arm')
++    require(path.stat().st_size==record['bytes'] and file_sha(path)==record['sha256'],'Endpoint file bytes/hash changed')
++    saved=torch.load(path,map_location='cpu',weights_only=True,mmap=True)
++    require(saved['schema']=='native_connected_patch_v1' and saved['arm']==arm,'Wrong checkpoint schema/arm')
++    require(saved['completed_updates']==saved['optimizer_step_attempts']==500,'Endpoint update count differs')
++    require(saved['recoverable'] and not saved['optimizer_step_in_progress'],'Endpoint not recoverable clean update boundary')
++    require(saved['initial_backbone_sha256']==BASE_SHA,'Endpoint was not initialized from official EMA')
++    require(saved['initial_state_sha256']==report['native_initial_state_sha256']==result['initial_state_sha256'],'Full initial model hashes differ')
++    require(saved['protocol_sha256']==report['protocol_sha256'] and saved['protocol']==report['protocol'],'Endpoint protocol identity differs')
++    state=saved['model'];parameters=sum(v.numel() for v in state.values())
++    require(parameters==130251267 and len(state)==183,'Full trainable model tensor/parameter count differs')
++    require(all(v.device.type=='cpu' and v.dtype==torch.float32 and bool(torch.isfinite(v).all()) for v in state.values()),'Nonfinite or non-FP32 endpoint tensor')
++    current_hash=state_sha(state)
++    backbone_hash=state_sha({name[len('backbone.'):]:value for name,value in state.items() if name.startswith('backbone.')})
++    require(current_hash==record['state_sha256'],'Full endpoint tensor hash changed')
++    require(backbone_hash==record['backbone_state_sha256']==result['final_backbone_sha256'] and backbone_hash!=BASE_SHA,'Experimental backbone update/hash mismatch')
++    optim=saved['optimizer'];require(len(optim['param_groups'])==1,'Unexpected optimizer groups')
++    group=optim['param_groups'][0]
++    require(group['lr']==1e-5 and tuple(group['betas'])==(.9,.95) and group['weight_decay']==0,'Optimizer hyperparameters changed')
++    require(len(optim['state'])==len(group['params'])==183,'Optimizer does not cover full model')
++    elements=0
++    for item in optim['state'].values():
++        require(float(item['step'])==500,'AdamW state step differs from500')
++        require(item['exp_avg'].dtype==item['exp_avg_sq'].dtype==torch.float32,'Optimizer moment precision differs')
++        require(item['exp_avg'].shape==item['exp_avg_sq'].shape,'Optimizer moment shape mismatch')
++        require(bool(torch.isfinite(item['exp_avg']).all()) and bool(torch.isfinite(item['exp_avg_sq']).all()),'Nonfinite optimizer moment')
++        elements+=item['exp_avg'].numel()
++    require(elements==parameters,'Optimizer moment parameter coverage differs')
++    stream=saved['rng']['stream']
++    require(stream['batch_index']==500 and stream['sample_index']==4000 and stream['seed']==10 and stream['arm']==arm,'Saved stream boundary differs')
++    for name,value in stream['rng'].items():
++        rng=np.random.RandomState();rng.set_state((value[0],np.asarray(value[1],dtype=np.uint32),int(value[2]),int(value[3]),float(value[4])))
++        restored=rng.get_state()
++        require(restored[0]==value[0] and np.array_equal(restored[1],value[1]) and list(restored[2:])==value[2:],'Unsafe or inconsistent RNG restore')
++    return dict(arm=arm,path=str(path),bytes=record['bytes'],file_sha256=record['sha256'],model_state_sha256=current_hash,
++        backbone_state_sha256=backbone_hash,parameters=parameters,tensors=183,all_FP32_finite=True,
++        optimizer_states_step500=183,optimizer_moment_elements=elements,role_nonzero_elements=int(torch.count_nonzero(state['role_embedding'])),
++        recoverable=True,stream_batch_index=500,stream_sample_index=4000,stream_RNG_valid=True,
++        weights_only_mmap_loaded=True,model_instantiated=False)
++
++
++def audit(output):
++    if torch.cuda.is_initialized():raise RuntimeError('Read-only audit must be a fresh CPU-only process')
++    torch.set_num_threads(2)
++    out=Path(output).resolve();report=json.loads((out/'results.json').read_text(encoding='utf-8-sig'))
++    require(report['status']=='PASS_EXECUTION','Main process is not complete; no audit executed')
++    require(file_sha(out/'protocol.json')==report['protocol_sha256'],'Protocol changed')
++    inp=report['assets']['inputs'];path=Path(inp['path'])
++    require(path.resolve()==(out/'inputs.npz').resolve() and file_sha(path)==inp['sha256'],'Input archive identity differs')
++    with np.load(path,allow_pickle=False) as saved:arrays={key:saved[key].copy() for key in saved.files}
++    require(set(arrays)==set(inp['arrays']),'Input archive key set changed')
++    for name,value in arrays.items():
++        record=inp['arrays'][name]
++        require(array_sha(value,True)==record['sha256'] and list(value.shape)==record['shape'] and str(value.dtype)==record['dtype'],'Input array changed: '+name)
++    for parent in PARENTS:
++        previous=None
++        for K in EVAL_K:
++            C=arrays[f'parent{parent}_K{K}_constraints']
++            require(C.shape==(K,3,3) and C.dtype==np.float32,'Known patch shape/dtype differs')
++            if previous is not None:require(np.array_equal(C[:len(previous)],previous),'Nested patch C altered')
++            previous=C
++            target=arrays[f'parent{parent}_target'];free=arrays[f'parent{parent}_K{K}_free_target'];ids=arrays[f'parent{parent}_K{K}_source_face_ids'];free_ids=arrays[f'parent{parent}_K{K}_free_source_ids']
++            require(len(set(ids.tolist()+free_ids.tolist()))==112 and len(ids)+len(free_ids)==112,'C/free source decomposition not disjoint and complete')
++            require(np.array_equal(target[ids].reshape(K,3,3),C) and np.array_equal(target[free_ids],free),'Patch source geometry changed')
++    for seed in SEEDS:
++        require(array_sha(arrays[f'noise_seed{seed}'],True)==report['assets']['noise_hashes'][str(seed)],'Actual archived Gaussian changed')
++    expected={(m,p,k,s) for m in MODELS for p in PARENTS for k in EVAL_K for s in SEEDS}
++    generated=report['generated'];observed={(r['model'],r['parent'],r['K'],r['seed']) for r in generated}
++    require(len(generated)==96 and observed==expected,'Formal generation matrix incomplete/duplicated')
++    trajectory_hashes={};state_count=0
++    for row in generated:
++        raw_path=Path(row['raw_path'])
++        require(raw_path.resolve().is_relative_to((out/'raw').resolve()),'Raw path escapes current output')
++        require(file_sha(raw_path)==row['raw_sha256'],'Raw file hash changed: '+row['key'])
++        with np.load(raw_path,allow_pickle=False) as saved:
++            require(set(saved.files)=={'output','path'},'Formal raw archive lacks complete path')
++            full=saved['output'].copy();states=saved['path'].copy()
++        K,parent,seed=row['K'],row['parent'],row['seed']
++        C=arrays[f'parent{parent}_K{K}_constraints'].reshape(K,9);z=arrays[f'noise_seed{seed}'][0]
++        require(full.shape==(112,9) and states.shape==(51,112,9),'Output/path face count differs')
++        require(full.dtype==states.dtype==np.float32 and np.isfinite(full).all() and np.isfinite(states).all(),'Raw nonfinite or wrong dtype')
++        require(array_sha(full)==row['output_sha256'],'Raw endpoint array hash changed')
++        require(np.array_equal(full,states[-1]),'Raw endpoint is not final saved state')
++        require(np.array_equal(states[:,:K],np.broadcast_to(C,(51,K,9))),'C not bitwise preserved in all51 states')
++        require(np.array_equal(states[0,K:],z[K:]),'Free initial state is not untouched archived Gaussian slots')
++        require(len(full[K:])==112-K and not np.array_equal(states[0,K:],states[-1,K:]),'Free output count/update differs')
++        require(row['sampling']['nfe']==50 and row['sampling']['known_all51_bitwise'],'Sampling facts differ')
++        trajectory_hashes[row['key']]=dict(file_sha256=row['raw_sha256'],path_sha256=array_sha(states),K=K,known_states_verified=51,free_faces=112-K)
++        state_count+=51
++    teacher_summary=[];cover=Counter();donors=defaultdict(Counter);noise_hashes=set();shared_sequence=[]
++    correct=report['arms']['Native_correct'];independent=report['arms']['Native_independent']
++    for arm,result in report['arms'].items():
++        require(result['status']=='PASS_EXECUTION' and result['completed_updates']==result['optimizer_step_attempts']==500,'Training arm incomplete')
++        require(result['initial_state_sha256']==report['native_initial_state_sha256'] and result['initial_backbone_sha256']==BASE_SHA,'Fresh initialization hashes differ')
++        require(not result['optimizer_step_in_progress'] and not result.get('batch_in_progress',False),'Training arm stopped inside a batch')
++        require([t['step'] for t in result['teacher']]==[0,100,250,500],'Teacher checkpoints differ')
++        for teacher in result['teacher']:
++            require(teacher['forward_calls']==60 and len(teacher['rows'])==30,'Teacher must use60 forwards/30paired rows')
++            entries={(q['parent'],q['K'],q['t']) for q in teacher['rows']}
++            require(entries=={(p,k,t) for p in PARENTS for k in TRAIN_K for t in (.05,.2,.5,.8,.95)},'Teacher failed six-case time coverage')
++            require(all(np.isfinite(q[m]['mse']) for q in teacher['rows'] for m in ('correct','mismatch')),'Nonfinite teacher MSE')
++        teacher_summary.append(dict(arm=arm,steps=[0,100,250,500],forward_calls=240,paired_rows=120))
++    require(len(correct['batch_audits'])==len(independent['batch_audits'])==500,'Training batch count differs')
++    for index,(a,b) in enumerate(zip(correct['batch_audits'],independent['batch_audits'])):
++        require(a['step']==b['step']==index+1,'Training step labels differ')
++        require(all(a[field]==b[field] for field in SHARED_FIELDS),'Two-arm shared input stream differs at step'+str(index+1))
++        plan=Counter(batch_plan(index));actual=Counter(zip(a['parent_indices'],a['K']))
++        require(plan==actual,'Actual parent/K coverage differs from registered cycle')
++        denom=sum((112-k)*9 for _,k in batch_plan(index))
++        require(a['effective_free_coordinates']==b['effective_free_coordinates']==a['free_coordinate_denominator']==b['free_coordinate_denominator']==denom,'Effective loss denominator differs')
++        require(len(a['shared_input_hashes'])==8,'Wrong microbatch count')
++        require(all(p==d for p,d in zip(a['parent_indices'],a['donor_indices'])),'Correct arm donor mismatched')
++        cover.update(actual);noise_hashes.update(a['Gaussian_hashes']);shared_sequence.append(a['shared_batch_sha256'])
++        for parent,K,donor in zip(b['parent_indices'],b['K'],b['donor_indices']):
++            require(donor in (0,1),'Independent donor outside two parents');donors[(parent,K)][donor]+=1
++    expected_coverage=Counter(pair for i in range(500) for pair in batch_plan(i))
++    require(cover==expected_coverage and sum(cover.values())==4000 and len(noise_hashes)==4000,'Actual full500 input coverage/fresh-noise mismatch')
++    source_records={}
++    require(report['source_files_unchanged'] and report['source_files']==report['source_files_after'],'Execution source protected comparison failed')
++    for name,record in report['source_files'].items():
++        p=out.parent.parent/name
++        require(p.stat().st_size==record['bytes'] and file_sha(p)==record['sha256'],'Execution source changed: '+name)
++        source_records[name]=record['sha256']
++    require(report['protected_unchanged'] and report['protected_before']==report['protected_after'],'Historical/official protection check failed')
++    endpoints=[_endpoint(out,report,arm) for arm in ('Native_correct','Native_independent')]
++    counts=report['counts'];gates=report['model_gates']['actual_counts']
++    expected_forwards=8000+480+4900+gates['native_forward_attempts']+gates['reference_forward_attempts']
++    require(counts['model_forward_attempts']==counts['model_forward_returns']==expected_forwards,'Actual model-forward ledger differs from all stages')
++    require(counts['optimizer_step_attempts']==counts['optimizer_updates']==counts['experimental_backbone_updates']==1000 and counts['protected_official_updates']==0,'Update ledger differs')
++    require(counts['formal_rollouts']==96 and counts['diagnostic_rollouts']==2 and counts['complete_rollouts']==98 and counts['euler_updates']==4900,'Rollout/Euler ledger differs')
++    require(counts['backward_attempts']==counts['backward_completed']==8000+gates['backward_attempts'],'Backward ledger differs')
++    require(counts['geometry_gradient_attempts']==counts['geometry_gradient_completed']==0,'Unexpected geometry guidance used')
++    require(len(report['sampling_diagnostics'])==2 and all(x['status']=='PASS' and x['bitwise_equal'] for x in report['sampling_diagnostics']),'Recorded sampling/reload diagnostics failed')
++    require(len(report['scores'])==96 and len(report['bindings'])==48,'Scoring/binding grid incomplete')
++    require(not torch.cuda.is_initialized(),'Audit initialized CUDA')
++    donor_rows=[dict(parent=p,K=k,donor0=c[0],donor1=c[1],samples=sum(c.values()),correct=c[p],correct_fraction=c[p]/sum(c.values())) for (p,k),c in sorted(donors.items())]
++    return dict(status='PASS',output=str(out),input_archive_sha256=inp['sha256'],raw_files_verified=96,
++        complete_paths_verified=96,known_states_verified=state_count,all_shapes_FP32_finite=True,
++        all_known_coordinates_bitwise_preserved=True,all_initial_free_slots_equal_archived_Gaussian=True,
++        trajectory_hashes=trajectory_hashes,training_batches_matched=500,training_microbatches_matched=4000,
++        fresh_Gaussian_count=4000,coverage=[dict(parent=p,K=k,samples=n) for (p,k),n in sorted(cover.items())],
++        shared_batch_sequence_sha256=hashlib.sha256(''.join(shared_sequence).encode()).hexdigest(),
++        independent_donor_statistics=donor_rows,teacher=teacher_summary,endpoints=endpoints,
++        source_hashes_unchanged=source_records,protected_file_records_unchanged=len(report['protected_before']),
++        protected_file_current_bytes_rehashed=False,protected_file_current_hash_scope='Main process before/after record equality; this audit freshly hashes execution sources, inputs, raw outputs and two endpoints',
++        runtime_ledger=counts,audit_model_forwards=0,audit_OT_calls=0,audit_optimizer_updates=0,audit_cuda_initialized=False)
++
++
++if __name__=='__main__':
++    parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--output',required=True);args=parser.parse_args()
++    try:
++        result=audit(args.output)
++    except Exception as error:
++        print(json.dumps(dict(status='FAIL',error=repr(error),traceback=traceback.format_exc(),
++            audit_model_forwards=0,audit_OT_calls=0,audit_optimizer_updates=0),indent=2));raise
++    print(json.dumps(result,indent=2,allow_nan=False))
+diff --git a/experiments/mf_h1_local0/native_patch_data.py b/experiments/mf_h1_local0/native_patch_data.py
+new file mode 100644
+--- /dev/null
++++ b/experiments/mf_h1_local0/native_patch_data.py
+@@ -0,0 +1,322 @@
++﻿"""Input-only edge-connected seat-region patches and balanced mixed-K data.
++
++Only new native_patch_* inputs/preview are written. Historical coordinates,
++weights and code are immutable. 'Seat-region' is a geometric/visual description;
++there are no semantic part labels. K is face count, never a surface-area claim.
++"""
++from __future__ import annotations
++import copy
++import hashlib
++import itertools
++import json
++from collections import Counter,defaultdict
++from pathlib import Path
++import numpy as np
++import torch
++from .native_inpainting_data import (
++    NativeTrainingStream as _BaseStream,native_collate,with_context,shared_sample_hash,
++    verify_source_faces,_original_pre_ot,_record,PROJECT,UIDS,PERMUTATIONS)
++from .learning_data import array_hash
++from .prompt_dataset import file_sha256,sample_surface_primitive
++from .inference_pilot_data import _preserve_cpu_rng
++from .nxc112_data import _persist
++
++HISTORY=PROJECT/'outputs/native_inpainting_20260928_233911'
++TRAIN_K=(4,8,12)
++EVAL_K=(2,4,8,12)
++NOISE_SEEDS=(9201,9202,9203,9204)
++SELECTION_RULE=("Use original y as vertical. Among source faces with abs(normal_y)>=0.9 and centroid height in [20%,75%] of the complete source bbox, choose maximum-area face, tie by canonical face ID. Grow one edge-connected prefix by selecting frontier face with lexicographically smallest (max absolute vertex-y distance to seed plane, horizontal centroid distance to source bbox center, negative area, canonical face ID). Prefixes K2/4/8/12 are fixed before model evaluation.")
++
++
++def _topology(face_ids):
++    edges=defaultdict(list)
++    for i,face in enumerate(np.asarray(face_ids)):
++        for a,b in ((0,1),(1,2),(2,0)):
++            edges[tuple(sorted((int(face[a]),int(face[b]))))].append(i)
++    adjacency=[set() for _ in face_ids]
++    for members in edges.values():
++        for face in members:adjacency[face].update(other for other in members if other!=face)
++    unseen=set(range(len(face_ids)));components=[]
++    while unseen:
++        seen={min(unseen)};queue=list(seen)
++        while queue:
++            face=queue.pop()
++            for other in adjacency[face]-seen:seen.add(other);queue.append(other)
++        unseen-=seen;components.append(sorted(seen))
++    report=dict(face_count=len(face_ids),edge_count=len(edges),component_count=len(components),
++        component_sizes=sorted([len(c) for c in components],reverse=True),components=components,
++        boundary_edges=sum(len(v)==1 for v in edges.values()),nonmanifold_edge_incidence=sum(len(v)>2 for v in edges.values()),
++        interpretation='Shared undirected edge incidence only; not a self-intersection or orientation/vertex-manifold certification')
++    return report,adjacency,edges
++
++
++def _source_topology(parent,target):
++    """Map real raw vertex/face IDs through unchanged official normalization."""
++    from datasets.mesh_dataset import ObjaverseDataset
++    if file_sha256(parent['path'])!=parent['sha256']:raise RuntimeError('Original raw parent changed')
++    with np.load(parent['path'],allow_pickle=False) as saved:
++        raw={key:saved[key].copy() for key in ('vertices','faces','faces_num','uid')}
++    dataset=ObjaverseDataset.__new__(ObjaverseDataset)
++    dataset.__dict__.update(training=True,use_custom_prior=False,do_dataset_normalize=True,max_face_length=800,
++        use_rot_aug=False,use_scale_aug=False,noise_sort='ot',use_permut_aug=False,std=.3762,data=[raw])
++    captured=[]
++    def capture_sort(vertices,faces,num_tokens=None):
++        captured.append(vertices.copy())
++        return ObjaverseDataset.sort_vertices_and_faces(dataset,vertices,faces,num_tokens)
++    dataset.sort_vertices_and_faces=capture_sort
++    dataset.sample_noise=lambda coords:(coords,np.zeros_like(coords))
++    dataset[0]
++    if len(captured)!=1:raise RuntimeError('Could not capture original normalized vertex identity')
++    raw_model_vertices=(captured[0]/dataset.std*2).astype(np.float32)
++    original_model_faces=raw_model_vertices[raw['faces']]
++    canonical=np.asarray(target,dtype=np.float32).reshape(112,3,3)
++    canonical_to_raw=[];canonical_vertex_ids=[];permutations=[]
++    for triangle in canonical:
++        equal=(original_model_faces[:,PERMUTATIONS,:]==triangle[None,None]).all(axis=(2,3))
++        source=np.flatnonzero(equal.any(1))
++        if len(source)!=1:raise RuntimeError('Raw-to-archived source face is not exact and unique')
++        j=int(source[0]);pi=int(np.flatnonzero(equal[j])[0])
++        canonical_to_raw.append(j);permutations.append(PERMUTATIONS[pi].tolist())
++        canonical_vertex_ids.append(raw['faces'][j,PERMUTATIONS[pi]])
++    canonical_vertex_ids=np.asarray(canonical_vertex_ids,dtype=np.int64)
++    if len(set(canonical_to_raw))!=112:raise RuntimeError('Raw/canonical face mapping is not bijective')
++    if not np.array_equal(raw_model_vertices[canonical_vertex_ids],canonical):raise RuntimeError('Raw shared vertex map changed source coordinates')
++    original,raw_adj,_=_topology(raw['faces'])
++    raw_unique,raw_inverse=np.unique(raw['vertices'],axis=0,return_inverse=True)
++    raw_exact,_,_=_topology(raw_inverse[raw['faces']])
++    canonical_unique,inverse=np.unique(canonical.reshape(-1,3),axis=0,return_inverse=True)
++    exact_faces=inverse.reshape(112,3)
++    exact,exact_adj,_=_topology(exact_faces)
++    mapped,adjacency,edges=_topology(canonical_vertex_ids)
++    inverse_face={raw_id:canonical_id for canonical_id,raw_id in enumerate(canonical_to_raw)}
++    original_mapped=[{inverse_face[j] for j in raw_adj[raw_id]} for raw_id in canonical_to_raw]
++    if adjacency!=original_mapped or adjacency!=exact_adj:raise RuntimeError('Original and exact-coordinate connectivity differ; manual audit required')
++    if max(original['component_sizes'])<12:raise RuntimeError('BLOCKED_NO_EDGE_CONNECTED_12_FACE_COMPONENT')
++    return dict(raw_model_vertices=raw_model_vertices,canonical_vertex_ids=canonical_vertex_ids,
++        exact_coordinate_vertex_ids=exact_faces,canonical_to_raw=np.asarray(canonical_to_raw,dtype=np.int64),
++        adjacency=adjacency,edges=edges),dict(status='PASS',raw_vertex_count=len(raw['vertices']),exact_raw_coordinate_count=len(raw_unique),
++        exact_canonical_coordinate_count=len(canonical_unique),raw_original_vertex_topology=original,
++        raw_exact_coordinate_topology=raw_exact,canonical_exact_coordinate_topology=exact,
++        canonical_original_vertex_topology=mapped,original_vs_exact_adjacency_equal=True,
++        canonical_to_raw_face_ids=canonical_to_raw,raw_corner_permutations=permutations,
++        mapping_all112_exact_unique_bijective=True,coordinate_modifications=0,welding_applied=False)
++
++
++def _select_patch(target,adjacency):
++    triangles=np.asarray(target,dtype=np.float64).reshape(112,3,3)
++    cross=np.cross(triangles[:,1]-triangles[:,0],triangles[:,2]-triangles[:,0]);area=np.linalg.norm(cross,axis=-1)/2
++    if (area<=0).any():raise RuntimeError('Degenerate source face cannot be patch input')
++    normals=cross/(2*area[:,None]);centroids=triangles.mean(1)
++    lo=triangles.reshape(-1,3).min(0);hi=triangles.reshape(-1,3).max(0)
++    relative_height=(centroids[:,1]-lo[1])/(hi[1]-lo[1])
++    candidates=np.flatnonzero((relative_height>=.2)&(relative_height<=.75)&(abs(normals[:,1])>=.9))
++    if not len(candidates):raise RuntimeError('BLOCKED_NO_GEOMETRIC_SEAT_REGION_SEED')
++    seed=min(candidates,key=lambda i:(-area[i],int(i)));level=float(centroids[seed,1]);xzcenter=(lo+hi)[[0,2]]/2
++    def score(i):
++        return (float(abs(triangles[i,:,1]-level).max()),float(np.linalg.norm(centroids[i,[0,2]]-xzcenter)),float(-area[i]),int(i))
++    selected=[int(seed)];frontier=set(adjacency[seed]);steps=[]
++    while len(selected)<12:
++        if not frontier:raise RuntimeError('BLOCKED_NO_EDGE_CONNECTED_12_FACE_PATCH')
++        face=min(frontier,key=score);frontier.remove(face);selected.append(face)
++        steps.append(dict(added_face=face,score=list(score(face)),prefix_count=len(selected)))
++        frontier|=adjacency[face]-set(selected)
++    return selected,area,dict(rule=SELECTION_RULE,seed_face_id=int(seed),seed_plane_y=level,
++        candidate_seed_face_ids=candidates.tolist(),nested_face_order=selected,growth_steps=steps,
++        selection_used_model_outputs=False,semantic_labels_available=False,
++        descriptor='Input-only seat-region connected patch; larger prefixes include thickness/edge/support surfaces, not a pure planar seat semantic annotation')
++
++
++def _boundary(selected,topology):
++    known=set(selected);vertices=topology['raw_model_vertices'];rows=[]
++    for edge,faces in sorted(topology['edges'].items()):
++        inside=[f for f in faces if f in known];outside=[f for f in faces if f not in known]
++        if inside and outside:
++            rows.append((edge,inside,outside))
++    return dict(vertex_ids=np.asarray([r[0] for r in rows],dtype=np.int64),
++        coordinates=np.asarray([vertices[list(r[0])] for r in rows],dtype=np.float32),
++        known_face_ids=[r[1] for r in rows],free_face_ids=[r[2] for r in rows])
++
++
++def prepare_inputs(output,persist=True):
++    out=Path(output).resolve()
++    if not out.is_relative_to(PROJECT/'outputs') or not out.name.startswith('native_patch_'):raise ValueError('New native_patch_* output required')
++    if torch.cuda.is_initialized():raise RuntimeError('CPU data preparation must precede CUDA')
++    with _preserve_cpu_rng():
++        result_path=HISTORY/'results.json';old=json.loads(result_path.read_text(encoding='utf-8-sig'))
++        if old['status']!='PASS_EXECUTION' or any(old['arms'][arm]['completed_updates']!=500 for arm in ('Native_correct','Native_independent')):
++            raise RuntimeError('Previous fixed same-object run is not complete')
++        old_input=old['assets']['inputs'];old_path=Path(old_input['path'])
++        if file_sha256(old_path)!=old_input['sha256']:raise RuntimeError('Historical native input archive changed')
++        with np.load(old_path,allow_pickle=False) as saved:old_arrays={key:saved[key].copy() for key in saved.files}
++        if set(old_arrays)!=set(old_input['arrays']) or any(array_hash(value)!=old_input['arrays'][key]['sha256'] for key,value in old_arrays.items()):
++            raise RuntimeError('Archived native input tensor hashes changed')
++        arrays={};cases=[];parents=[];topology_records=[];selection_records=[]
++        for parent_index,uid in enumerate(UIDS):
++            source=next(row['source'] for row in old['assets']['official_pre_OT_capture'] if uid in row['source']['path'])
++            parent=dict(uid=uid,parent_uid=uid,path=source['path'],sha256=source['sha256'],faces=112);parents.append(parent)
++            target=old_arrays[f'parent{parent_index}_target'].copy();pre,pre_audit=_original_pre_ot(parent,target)
++            if not np.array_equal(pre,old_arrays[f'parent{parent_index}_pre_ot']):raise RuntimeError('Official pre-OT source coordinates changed')
++            topology,topo_audit=_source_topology(parent,target)
++            selected,areas,selection=_select_patch(target,topology['adjacency'])
++            topology_records.append(dict(parent_index=parent_index,parent_uid=uid,**topo_audit,pre_OT=pre_audit))
++            selection_records.append(dict(parent_index=parent_index,parent_uid=uid,**selection))
++            bbox=float(np.linalg.norm(np.ptp(target.reshape(-1,3),axis=0)))
++            arrays[f'parent{parent_index}_target']=target;arrays[f'parent{parent_index}_pre_ot']=pre
++            arrays[f'parent{parent_index}_source_vertices']=topology['raw_model_vertices']
++            arrays[f'parent{parent_index}_source_face_vertex_ids']=topology['canonical_vertex_ids']
++            arrays[f'parent{parent_index}_canonical_to_raw_face']=topology['canonical_to_raw']
++            for k in EVAL_K:
++                prefix=f'parent{parent_index}_K{k}_';ids=selected[:k];C=target[ids].reshape(k,3,3).copy()
++                unique,matches=verify_source_faces(target,C,bbox)
++                if unique!=ids:raise RuntimeError('Selected patch identity changed')
++                free_ids=np.asarray([i for i in range(112) if i not in ids],dtype=np.int64)
++                patch_faces=topology['canonical_vertex_ids'][ids]
++                patch_topology,_,_=_topology(patch_faces)
++                if patch_topology['component_count']!=1:raise RuntimeError('Patch prefix is not genuinely edge-connected')
++                boundary=_boundary(ids,topology)
++                checks=np.stack([sample_surface_primitive(triangle,3,128,np.random.RandomState(95000+100*parent_index+int(face)),False) for triangle,face in zip(C,ids)])
++                for key,value in dict(constraints=C,checks=checks,source_face_ids=np.asarray(ids,dtype=np.int64),free_source_ids=free_ids,
++                        free_target=target[free_ids],pre_ot_free=pre[free_ids],boundary_edges=boundary['coordinates'],
++                        boundary_vertex_ids=boundary['vertex_ids']).items():arrays[prefix+key]=value.copy()
++                cases.append(dict(case_id=f'P{parent_index}_K{k}',parent_index=parent_index,parent_uid=uid,K=k,N=112,N_free=112-k,
++                    bbox_diagonal=bbox,source_face_ids=ids,source_face_matches=matches,raw_source_face_ids=topology['canonical_to_raw'][ids].tolist(),
++                    area_fraction=float(areas[ids].sum()/areas.sum()),patch_area=float(areas[ids].sum()),full_area=float(areas.sum()),
++                    patch_Y_range=[float(C[:,:,1].min()),float(C[:,:,1].max())],edge_connected=True,patch_topology=patch_topology,
++                    patch_boundary_edge_count=len(boundary['coordinates']),boundary_known_source_face_ids=boundary['known_face_ids'],
++                    boundary_free_source_face_ids=boundary['free_face_ids'],
++                    train_context=k in TRAIN_K,out_of_training_K=k==2,context_type='Connected seat-region source-face patch',
++                    historical_K2_same_prompt=False,prior_K2_source_ids=old_arrays[f'parent{parent_index}_K2_source_face_ids'].tolist(),
++                    constraints_sha256=array_hash(C),free_target_sha256=array_hash(target[free_ids]),target_sha256=array_hash(target),
++                    extra_coordinates_or_alignment=False,known_slots_sampling=list(range(k)),semantic_part_annotation=False))
++        for seed in NOISE_SEEDS:
++            arrays[f'noise_seed{seed}']=old_arrays[f'noise_seed{seed}'].copy()
++            if array_hash(arrays[f'noise_seed{seed}'])!=old['assets']['noise_hashes'][str(seed)]:raise RuntimeError('Sampling noise not exact old arrays')
++        artifact=_persist(out/'inputs.npz',arrays,persist)
++        if persist:
++            with np.load(artifact['path'],allow_pickle=False) as saved:loaded={key:saved[key].copy() for key in saved.files}
++            if set(loaded)!=set(arrays) or any(array_hash(loaded[key])!=array_hash(value) for key,value in arrays.items()):raise RuntimeError('Input NPZ reload differs')
++            arrays=loaded
++        bank_cases=[]
++        for case in cases:
++            p,k=case['parent_index'],case['K'];prefix=f'parent{p}_K{k}_'
++            bank_cases.append(dict(**copy.deepcopy(case),constraints=arrays[prefix+'constraints'],checks=arrays[prefix+'checks'],
++                full_target=arrays[f'parent{p}_target'],free_target=arrays[prefix+'free_target'],pre_ot_free=arrays[prefix+'pre_ot_free'],
++                free_source_ids=arrays[prefix+'free_source_ids'],boundary_edges=arrays[prefix+'boundary_edges'],
++                boundary_vertex_ids=arrays[prefix+'boundary_vertex_ids'],source_vertices=arrays[f'parent{p}_source_vertices'],
++                source_face_vertex_ids=arrays[f'parent{p}_source_face_vertex_ids']))
++        bank=dict(cases=bank_cases,cases_by_key={(c['parent_index'],c['K']):c for c in bank_cases},parents=parents,parent_uids=list(UIDS),
++            N=112,training_K=list(TRAIN_K),evaluation_K=list(EVAL_K),noises={seed:torch.from_numpy(arrays[f'noise_seed{seed}'].copy()) for seed in NOISE_SEEDS},
++            noise_seeds=list(NOISE_SEEDS),sampling_noises_previously_evaluated=True,prior_results=old)
++        audit=dict(status='PASS',source_results=_record(result_path),source_inputs=_record(old_path),inputs=artifact,
++            raw_source_topology=topology_records,input_only_patch_selection=selection_records,cases=cases,
++            source_face_gate='PASS',patch_nested=True,selection_used_model_outputs=False,coordinates_modified=False,
++            noise_hashes={str(seed):array_hash(bank['noises'][seed].numpy()) for seed in NOISE_SEEDS},
++            noise_policy='9201..9204 copied byte-exactly from previous native inputs; already evaluated in prior run, not an unseen confirmation set in this experiment',
++            train_K=list(TRAIN_K),out_of_training_K=2,old_K2_prompt_comparability='Different C/source faces: only new nested K2 is an out-of-training context; cannot be called the previous K2 prompt',
++            training_500_coverage=planned_coverage(500),fresh_official_EMA_initialization_required=True,
++            pretrained_endpoint_reuse_for_training=False,model_forwards=0,optimizer_updates=0,OT_calls=0,CUDA_initialized=False)
++    return bank,audit
++
++
++def _batch_plan(index):
++    phase=index%3;rotation={k:TRAIN_K[(i+phase)%3] for i,k in enumerate(TRAIN_K)}
++    base=[(0,4),(0,4),(0,8),(0,12),(1,4),(1,8),(1,8),(1,12)]
++    return [(parent,rotation[k]) for parent,k in base]
++
++
++def planned_coverage(updates):
++    combo=Counter(pair for index in range(updates) for pair in _batch_plan(index));K=Counter();parents=Counter();denominators=Counter()
++    for (p,k),count in combo.items():parents[p]+=count;K[k]+=count
++    for index in range(updates):denominators[sum((112-k)*9 for _,k in _batch_plan(index))]+=1
++    return dict(updates=updates,samples=8*updates,parent_K=[dict(parent=p,K=k,samples=count) for (p,k),count in sorted(combo.items())],
++        parents={str(k):v for k,v in parents.items()},K={str(k):v for k,v in K.items()},free_coordinate_denominator_update_counts={str(k):v for k,v in denominators.items()},
++        three_update_rule='Each24 examples has four of every (parent,K); each batch4 per parent; K counts3/3/2 rotate',
++        final_partial_cycle_updates=updates%3)
++
++
++class PatchTrainingStream(_BaseStream):
++    def next_effective_batch(self,size=8):
++        if size!=8:raise ValueError('Fixed effective batch8 required')
++        phase=self.batch_index%3;pairs=_batch_plan(self.batch_index)
++        samples=[self._sample(*pairs[index]) for index in self.order_rng.permutation(8)]
++        self.batch_index+=1
++        shared=[s['shared_input_sha256'] for s in samples]
++        self.last_audit=dict(batch_index=self.batch_index,cycle_phase=phase,samples=8,shared_input_hashes=shared,
++            shared_batch_sha256=hashlib.sha256(''.join(shared).encode()).hexdigest(),
++            parent_indices=[s['parent_index'] for s in samples],K=[s['K'] for s in samples],free_face_counts=[112-s['K'] for s in samples],
++            effective_free_coordinates=sum((112-s['K'])*9 for s in samples),times=[float(s['t']) for s in samples],
++            donor_indices=[s['donor_index'] for s in samples],context_hashes=[s['context_sha256'] for s in samples],
++            accidentally_correct_count=sum(s['donor_index']==s['parent_index'] for s in samples),
++            donor_rng_seed=self.seed+70000,donor_independent_of_target_stream=True,
++            Gaussian_hashes=[array_hash(s['free_gaussian_before_OT']) for s in samples],
++            paired_noise_hashes=[array_hash(s['free_noise_after_OT']) for s in samples],pre_OT_target_hashes=[array_hash(s['free_target_before_OT']) for s in samples],
++            known_slots=[np.flatnonzero(s['known_mask']).tolist() for s in samples],no_full112_OT=True,official_OT_call_count=8)
++        if Counter(s['parent_index'] for s in samples)!=Counter({0:4,1:4}):raise RuntimeError('Mixed-K parent imbalance')
++        if sorted(Counter(s['K'] for s in samples).values())!=[2,3,3]:raise RuntimeError('Mixed-K count schedule differs')
++        return samples
++
++
++NativeTrainingStream=PatchTrainingStream
++
++
++def run_cpu_tests(bank):
++    from utils.ot_utils import optimal_sum_numpy
++    if torch.cuda.is_initialized():raise RuntimeError('CPU tests before CUDA only')
++    a=PatchTrainingStream(bank,'Native_correct',10);b=PatchTrainingStream(bank,'Native_independent',10)
++    observed=Counter();denominators=[];all_hashes=[];donors=[];calls=0
++    for phase in range(3):
++        aa=a.next_effective_batch();bb=b.next_effective_batch();calls+=16
++        assert a.last_audit['shared_batch_sha256']==b.last_audit['shared_batch_sha256']
++        denominators.append(a.last_audit['effective_free_coordinates'])
++        for sa,sb in zip(aa,bb):
++            observed[(sa['parent_index'],sa['K'])]+=1;all_hashes.append(sa['shared_input_sha256'])
++            assert shared_sample_hash(sa)==shared_sample_hash(sb)
++            assert sorted(sa['source_face_ids'].tolist())==list(range(112))
++            assert sa['known_mask'].sum()==sa['K'] and sa['K'] in TRAIN_K
++            assert np.array_equal(sa['xt'][sa['known_mask']],sa['context'][sa['known_mask']])
++            assert shared_sample_hash(with_context(sa,1-sa['parent_index']))==sa['shared_input_sha256']
++            donors.append(dict(parent=sb['parent_index'],K=sb['K'],donor=sb['donor_index']))
++        batch=native_collate(aa)
++        assert batch['free_coordinates']==a.last_audit['effective_free_coordinates']
++        assert batch['xt'].shape==(8,112,9) and bool(batch['valid_mask'].all())
++        first=aa[0];again=optimal_sum_numpy(first['free_target_before_OT'],first['free_gaussian_before_OT'],optimal=True);calls+=1
++        assert np.array_equal(again,first['free_noise_after_OT'])
++    assert observed==Counter({(p,k):4 for p in range(2) for k in TRAIN_K})
++    assert denominators==[7524,7452,7488] and len(set(all_hashes))==24
++    saved=copy.deepcopy(a.state_dict());once=a.next_effective_batch();a.load_state_dict(saved);twice=a.next_effective_batch();calls+=16
++    assert [s['shared_input_sha256'] for s in once]==[s['shared_input_sha256'] for s in twice]
++    for p in range(2):
++        cases=[bank['cases_by_key'][(p,k)] for k in EVAL_K]
++        assert all(np.array_equal(cases[-1]['constraints'][:c['K']],c['constraints']) for c in cases)
++        assert all(c['edge_connected'] for c in cases)
++    return dict(status='PASS',shared_samples_checked=24,three_batch_denominators=denominators,
++        balanced_24_sample_counts=[dict(parent=p,K=k,count=n) for (p,k),n in sorted(observed.items())],
++        safe_stream_restore=True,nested_contexts_exact=True,all_contexts_edge_connected=True,
++        donor_draws=donors,total_OT_calls=calls,sample_OT_calls=64,OT_reference_calls=3,
++        model_forwards=0,optimizer_updates=0,CUDA_initialized=False,planned_500_coverage=planned_coverage(500))
++
++
++def plot_patch_preview(bank,destination):
++    """Input-only fixed view of both source meshes and every nested prefix."""
++    import matplotlib
++    matplotlib.use('Agg')
++    import matplotlib.pyplot as plt
++    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
++    destination=Path(destination)
++    if destination.exists():raise FileExistsError('Never overwrite a patch preview')
++    fig=plt.figure(figsize=(16,9),dpi=150)
++    full=np.concatenate([bank['cases_by_key'][(p,12)]['full_target'].reshape(-1,3) for p in range(2)])
++    lo,hi=full.min(0),full.max(0);center=(lo+hi)/2;radius=float((hi-lo).max())*.54
++    for p in range(2):
++        for col,k in enumerate(EVAL_K):
++            case=bank['cases_by_key'][(p,k)];ax=fig.add_subplot(2,4,p*4+col+1,projection='3d')
++            T=case['full_target'].reshape(112,3,3)[:,:,[0,2,1]];C=case['constraints'][:,:,[0,2,1]]
++            ax.add_collection3d(Poly3DCollection(T,facecolor=(.55,.60,.66,.13),edgecolor=(.35,.4,.45,.25),linewidth=.35))
++            ax.add_collection3d(Poly3DCollection(C,facecolor=(.08,.5,.83,.94),edgecolor=(.02,.13,.2,1),linewidth=.85))
++            ax.set_xlim(center[0]-radius,center[0]+radius);ax.set_ylim(center[2]-radius,center[2]+radius);ax.set_zlim(center[1]-radius,center[1]+radius)
++            ax.set_box_aspect((1,1,1));ax.view_init(elev=24,azim=-54);ax.set_axis_off()
++            suffix='evaluation only' if k==2 else 'training context'
++            ax.set_title(f'P{p} | K={k} | area {case["area_fraction"]:.2%}\n{suffix}',fontsize=11)
++    fig.suptitle('INPUT ONLY: nested edge-connected seat-region source patches\nBlue = exact known faces; gray = complete source. No semantic annotations or generated meshes.',fontsize=14)
++    fig.tight_layout(rect=(0,0,1,.92));destination.parent.mkdir(parents=True,exist_ok=True);fig.savefig(destination);plt.close(fig)
++    return dict(**_record(destination),selection='Both input parents and every preregistered K; fixed camera/shared bounds',model_outputs_shown=False)
+diff --git a/experiments/mf_h1_local0/native_patch_metrics.py b/experiments/mf_h1_local0/native_patch_metrics.py
+new file mode 100644
+--- /dev/null
++++ b/experiments/mf_h1_local0/native_patch_metrics.py
+@@ -0,0 +1,334 @@
++"""Offline metrics for nested connected K=4/8/12 native-context diagnostics.
++
++The K-specific target remainder changes with K. Therefore its RMS trend is not
++by itself a causal estimate of context benefit. A fixed R12-to-predicted-free
++coverage diagnostic uses the identical target point bank for every K.
++"""
++from __future__ import annotations
++
++import json
++from pathlib import Path
++import time
++
++import numpy as np
++
++from .evaluate import raw_quality, sample_mesh_surface, surface_distance_squared
++from .native_inpainting_metrics import (
++    array_sha, known_fidelity, near_context_diagnostic, symmetric_surface_rms,
++    binding_four_grid,
++)
++
++
++TRAINED_K = (4, 8, 12)
++EVALUATED_K = (2, 4, 8, 12)
++REGRESSION_SEEDS = (9201, 9202, 9203, 9204)
++COMMON_REFERENCE_K = 12
++COMMON_POINTS = 512
++COMMON_POINT_SEED = 9973
++
++
++def _triangles(value):
++    value = np.asarray(value)
++    if value.ndim == 2 and value.shape[-1] == 9:
++        value = value.reshape(-1, 3, 3)
++    if value.ndim != 3 or value.shape[1:] != (3, 3):
++        raise ValueError(f"Expected [N,9] or [N,3,3], got {value.shape}")
++    return value
++
++
++def _areas(triangles):
++    triangles = _triangles(triangles).astype(np.float64, copy=False)
++    return .5 * np.linalg.norm(np.cross(triangles[:, 1] - triangles[:, 0],
++                                      triangles[:, 2] - triangles[:, 0]), axis=-1)
++
++
++def prepare_common_reference(common_remainders, bbox_diagonals, seed=COMMON_POINT_SEED):
++    """Build one immutable point bank for each parent's fixed unknown R12.
++
++    The same returned bank must be passed to every K/model/noise score. This
++    helper reads geometry only, never generated outputs. Seed9973/+parent are
++    CPU surface-sampling seeds, not new model-generation noise seeds.
++    """
++    if len(common_remainders) != 2 or len(bbox_diagonals) != 2:
++        raise ValueError("Exactly two parent reference remainders are required")
++    rows = []
++    for parent, (target, diagonal) in enumerate(zip(common_remainders, bbox_diagonals)):
++        reference = _triangles(target).copy()
++        diagonal = float(diagonal)
++        if not np.isfinite(reference).all() or not np.isfinite(diagonal) or diagonal <= 0:
++            raise ValueError("Finite reference and positive full-target bbox required")
++        points = sample_mesh_surface(reference, COMMON_POINTS, np.random.RandomState(seed + parent))
++        if points is None:
++            raise ValueError("Common R12 must have positive surface area")
++        rows.append(dict(target=reference, points=points.copy(), audit=dict(
++            parent_index=parent, common_reference_K=COMMON_REFERENCE_K,
++            reference_faces=len(reference), reference_sha256=array_sha(reference),
++            point_count=COMMON_POINTS, point_seed=seed + parent, point_sha256=array_sha(points),
++            target_full_bbox_diagonal=diagonal,
++            reference_surface_area=float(_areas(reference).sum()),
++            source="Fixed R12 target geometry only; never selected from outputs",
++            usage="R12-to-predicted-free one-way coverage, identical target points across K/models/noises",
++            not_model_generation_noise=True)))
++    return dict(references=rows, audit=dict(
++        schema="native_patch_common_reference_v1", common_K=COMMON_REFERENCE_K,
++        point_count=COMMON_POINTS, point_seed_base=seed,
++        references=[row["audit"] for row in rows],
++        scoring_is_asymmetric=True,
++        excludes_prediction_to_R12_penalty=True,
++        rationale="K4/K8 legitimately generate faces later included in C12; a symmetric prediction-to-R12 penalty would change what is penalized across K",
++        model_forwards=0, geometry_autograd_calls=0, optimizer_updates=0))
++
++
++def extract_patch_prediction(tokens, context, known_mask):
++    """Extract all valid free slots once, without any geometry-based selection.
++
++    Supports the declared K4/8/12 family and optional nested-K2 evaluation only.
++    The latter must be labeled separately by the caller; it is not historical
++    disjoint K2 and is outside the mixed-K4/8/12 training distribution.
++    """
++    tick = time.perf_counter()
++    full, desired = _triangles(tokens).copy(), _triangles(context).copy()
++    known = np.asarray(known_mask)
++    if known.dtype != np.bool_ or known.shape not in ((len(full),), (1, len(full))):
++        raise ValueError("known_mask must be bool[N] or bool[1,N]")
++    known = known.reshape(-1)
++    K = len(desired)
++    if K not in (2, 4, 8, 12) or int(known.sum()) != K or len(full) <= K:
++        raise ValueError("Require declared K, exactly K known slots, and nonempty free geometry")
++    if not (np.isfinite(full).all() and np.isfinite(desired).all()):
++        raise ValueError("Cannot score nonfinite output or context")
++    free = full[~known].copy()
++    return dict(full=full, free=free, context=desired, known_mask=known.copy(), audit=dict(
++        schema="native_patch_extraction_v1", mode="known_mask", K=K,
++        input_faces=len(full), free_faces=len(free),
++        excluded_face_indices=np.flatnonzero(known).tolist(), free_face_indices=np.flatnonzero(~known).tolist(),
++        actual_context_sha256=array_sha(desired), full_sha256=array_sha(full), free_sha256=array_sha(free),
++        known_mask_sha256=array_sha(known), source_target_used_for_extraction=False,
++        extraction_count=1, cross_target_rematching=False,
++        seconds=time.perf_counter() - tick))
++
++
++def common_unknown_coverage(free_tokens, reference):
++    """Fixed R12 target samples -> all extracted predicted free triangles."""
++    free = _triangles(free_tokens)
++    audit, points, target = reference["audit"], reference["points"], reference["target"]
++    if array_sha(points) != audit["point_sha256"] or array_sha(target) != audit["reference_sha256"]:
++        raise AssertionError("Fixed common unknown reference changed")
++    distances = surface_distance_squared(points, free)
++    if not np.isfinite(distances).all():
++        raise ValueError("Common coverage returned nonfinite distances")
++    diagonal = audit["target_full_bbox_diagonal"]
++    rms = float(np.sqrt(distances.mean()))
++    return dict(
++        status="PASS", direction="Fixed target R12 -> predicted free surface only",
++        target_index=audit["parent_index"], common_reference_K=COMMON_REFERENCE_K,
++        target_point_count=len(points), target_point_seed=audit["point_seed"],
++        target_point_sha256=audit["point_sha256"], target_reference_sha256=audit["reference_sha256"],
++        target_full_bbox_diagonal=diagonal, predicted_free_sha256=array_sha(free),
++        mean_squared=float(distances.mean()), rms=rms, rms_bbox_pct=100 * rms / diagonal,
++        q95_bbox_pct=float(100 * np.quantile(np.sqrt(distances), .95) / diagonal),
++        fraction_target_points_within_1pct_bbox=float((distances <= (.01 * diagonal) ** 2).mean()),
++        prediction_to_common_R12_error="INTENTIONALLY_NOT_COMPUTED",
++        extraction_or_assignment_performed=False,
++        caveat="One-way coverage controls target-region support across K; it does not measure extra/incorrect predicted area or by itself establish causal conditioning")
++
++
++def score_patch_extracted(prediction, context, full_target, remainder_targets,
++                          bbox_diagonals, parent_index, common_reference,
++                          seam_result=None, variant="raw"):
++    """Score one free set against same-K R0/R1 and fixed common R12 banks."""
++    tick = time.perf_counter()
++    parent_index = int(parent_index)
++    if parent_index not in (0, 1) or len(remainder_targets) != 2 or len(bbox_diagonals) != 2:
++        raise ValueError("Exactly two same-K target parents required")
++    if variant != "raw":
++        raise ValueError("This authorized run is raw-only; projected geometry is not evaluated")
++    full, free, desired = prediction["full"], prediction["free"], _triangles(context)
++    if array_sha(desired) != prediction["audit"]["actual_context_sha256"]:
++        raise AssertionError("Scoring context differs from actual generated context")
++    original_free_sha = prediction["audit"]["free_sha256"]
++    if array_sha(free) != original_free_sha:
++        raise AssertionError("Extracted free set changed before scoring")
++    K = len(desired)
++    cross, common_cross = [], []
++    for target_index in (0, 1):
++        remainder = _triangles(remainder_targets[target_index])
++        if len(remainder) != len(free):
++            raise ValueError("Same-K target and predicted remainders must have N-K faces")
++        value = symmetric_surface_rms(free, remainder, bbox_diagonals[target_index])
++        value.update(target_index=target_index, predicted_free_sha256=original_free_sha,
++                     target_remainder_sha256=array_sha(remainder), rematching_performed=False)
++        cross.append(value)
++        reference = common_reference["references"][target_index]
++        if reference["audit"]["target_full_bbox_diagonal"] != float(bbox_diagonals[target_index]):
++            raise AssertionError("Common coverage and same-K score use different bbox normalization")
++        common_cross.append(common_unknown_coverage(free, reference))
++    if cross[0].get("prediction_sample_sha256") != cross[1].get("prediction_sample_sha256"):
++        raise AssertionError("Same free geometry must have the same prediction-side sampling bank")
++    diagonal = float(bbox_diagonals[parent_index])
++    target = _triangles(full_target)
++    context_area, total_area = float(_areas(desired).sum()), float(_areas(target).sum())
++    if total_area <= 0:
++        raise ValueError("Full target must have positive surface area")
++    result = dict(
++        schema="native_patch_metrics_v1", variant=variant, parent_index=parent_index,
++        K=K, total_faces=len(full), free_faces=len(free),
++        K_scope="mixed_training_K4_K8_K12" if K in TRAINED_K else "nested_K2_untrained_reference_not_historical_disjoint_K2",
++        known_fidelity=known_fidelity(full, desired, diagonal), extraction=prediction["audit"],
++        context_coverage=dict(known_faces=K, full_faces=len(target), face_fraction=K / len(target),
++            context_surface_area=context_area, full_target_surface_area=total_area,
++            surface_area_fraction=context_area / total_area,
++            rule="Actual triangle areas in the shared coordinates; not K/112 as a proxy for covered surface area"),
++        remainder=dict(own=cross[parent_index], cross=cross, fixed_free_sha256=original_free_sha,
++            extraction_count=1, rematching_for_cross_scores=False,
++            across_K_warning="R_K changes when K changes. Lower R_K RMS can reflect removal of difficult target regions; do not interpret alone as causal context improvement"),
++        common_unknown_R12=dict(own=common_cross[parent_index], cross=common_cross,
++            normalization="Each target parent's fixed full bbox; common R12 and its target samples held identical for all K",
++            direction="R12 to predicted free only"),
++        whole=dict(surface=symmetric_surface_rms(full, target, diagonal), quality=raw_quality(full)),
++        free_quality=raw_quality(free), near_context=near_context_diagnostic(free, desired, diagonal),
++        seam=dict(status="NOT_RUN", reason="Independent seam diagnostic has not been attached") if seam_result is None else seam_result,
++        scoring_seconds=time.perf_counter() - tick,
++        geometry_postprocessing="NONE",
++        model_forwards=0, geometry_autograd_calls=0, optimizer_updates=0)
++    if array_sha(free) != original_free_sha or array_sha(full) != prediction["audit"]["full_sha256"]:
++        raise AssertionError("CPU scoring mutated generated geometry")
++    json.dumps(result, allow_nan=False)
++    return result
++
++
++def evaluate_patch_output(tokens, context, full_target, remainder_targets,
++                          common_reference, bbox_diagonals, parent_index,
++                          known_mask, seam_result=None, variant="raw", extraction=None):
++    """Return (JSON metrics, reusable extracted array package).
++
++    No projection is implemented or accepted in this raw-only experiment.
++    """
++    prediction = extraction or extract_patch_prediction(tokens, context, known_mask)
++    if array_sha(_triangles(tokens)) != prediction["audit"]["full_sha256"]:
++        raise AssertionError("Provided extraction belongs to a different output")
++    score = score_patch_extracted(prediction, context, full_target, remainder_targets,
++                                  bbox_diagonals, parent_index, common_reference, seam_result, variant)
++    return score, prediction
++
++
++def patch_binding_four_grid(context0_metrics, context1_metrics):
++    """Same-K binding from fixed free sets, plus common-region binding."""
++    if context0_metrics["K"] != context1_metrics["K"]:
++        raise ValueError("Binding must compare the same K")
++    if context0_metrics["variant"] != context1_metrics["variant"]:
++        raise ValueError("Raw and projected variants cannot be pooled")
++    result = binding_four_grid(context0_metrics, context1_metrics)
++    a, b = context0_metrics["common_unknown_R12"]["cross"], context1_metrics["common_unknown_R12"]["cross"]
++    e00, e10, e01, e11 = a[0]["rms_bbox_pct"], a[1]["rms_bbox_pct"], b[0]["rms_bbox_pct"], b[1]["rms_bbox_pct"]
++    d0, d1 = e01 - e00, e10 - e11
++    result["common_unknown_R12_binding"] = dict(
++        E_R0_F_C0=e00, E_R0_F_C1=e01, E_R1_F_C1=e11, E_R1_F_C0=e10,
++        direction0_bbox_percentage_points=d0, direction1_bbox_percentage_points=d1,
++        mean_binding_bbox_percentage_points=(d0 + d1) / 2,
++        both_directions_positive=d0 > 0 and d1 > 0,
++        direction="Fixed common target R12 -> free coverage, target samples identical across K")
++    result["variant"] = context0_metrics["variant"]
++    return result
++
++
++def plot_patch_fixed(outputs, contexts, savepath):
++    """Fixed parent0/seed9201: full and free rows for each K, shared bounds.
++
++    outputs={2:{'Native0':package,'T1':package,'T2':package},4:{...},8:{...},12:{...}}.
++    All rows use one camera/range. The C column is blank in free-only rows.
++    """
++    import matplotlib
++    matplotlib.use("Agg")
++    import matplotlib.pyplot as plt
++    from mpl_toolkits.mplot3d.art3d import Line3DCollection, Poly3DCollection
++
++    if tuple(sorted(outputs)) != EVALUATED_K or tuple(sorted(contexts)) != EVALUATED_K:
++        raise ValueError("Fixed view requires K2 reference plus every trained K4/8/12")
++    groups = ("Native0", "T1", "T2")
++    vertices = []
++    for K in EVALUATED_K:
++        if set(outputs[K]) != set(groups):
++            raise ValueError("Each K must include Native0, T1 and T2")
++        vertices.append(_triangles(contexts[K]).reshape(-1, 3))
++        vertices.extend(outputs[K][group]["full"].reshape(-1, 3) for group in groups)
++    all_vertices = np.concatenate(vertices)
++    all_vertices = all_vertices[np.isfinite(all_vertices).all(axis=1)]
++    low, high = all_vertices.min(axis=0), all_vertices.max(axis=0)
++    center, half = (low + high) / 2, max(float((high - low).max()) * .55, 1e-3)
++    limits = np.stack((center - half, center + half), axis=1)
++    figure = plt.figure(figsize=(15, 26), constrained_layout=True)
++    for ki, K in enumerate(EVALUATED_K):
++        desired = _triangles(contexts[K])
++        for row, part in enumerate(("full", "free")):
++            for column, group in enumerate(("C",) + groups):
++                axis = figure.add_subplot(8, 4, (2 * ki + row) * 4 + column + 1, projection="3d")
++                triangles = (desired if row == 0 else np.empty((0, 3, 3))) if group == "C" else outputs[K][group][part]
++                finite = triangles[np.isfinite(triangles).all(axis=(1, 2))]
++                if len(finite):
++                    closed = np.concatenate((finite, finite[:, :1]), axis=1)
++                    axis.add_collection3d(Line3DCollection(closed, colors="#58798f", linewidths=.55, alpha=.75))
++                if row == 0:
++                    axis.add_collection3d(Poly3DCollection(desired, facecolors="#ed2727", edgecolors="#b00000", linewidths=.9, alpha=.3))
++                axis.set_title(f"K={K} | {group} | {part}" + (" [NONFINITE]" if len(finite) != len(triangles) else ""), fontsize=10)
++                axis.set_xlim(limits[0]); axis.set_ylim(limits[1]); axis.set_zlim(limits[2])
++                axis.set_box_aspect((1, 1, 1)); axis.view_init(elev=22, azim=35)
++                axis.tick_params(labelsize=7)
++    figure.suptitle("Fixed parent0 / reused regression noise9201 | nested K2 reference (not trained), connected K4/8/12\n"
++                   "Red: input C. Full/free pairs share one camera and complete coordinate range; no C overlay on free rows.", fontsize=14)
++    path = Path(savepath); path.parent.mkdir(parents=True, exist_ok=True)
++    figure.savefig(path, dpi=150); plt.close(figure)
++    return dict(path=str(path), fixed_parent=0, fixed_regression_seed=9201, K=list(EVALUATED_K),
++                groups=list(groups), shared_limits=limits.tolist(), camera=dict(elevation=22, azimuth=35),
++                context_overlay_in_free_rows=False, postprocessing="NONE")
++
++
++def run_cpu_tests():
++    """Small mathematical fixtures; no official model, GPU, or gradient calls."""
++    base = np.asarray([[0., 0., 0.], [1., 0., 0.], [0., 1., 0.]], dtype=np.float32)
++    target0 = np.stack([base + np.asarray([2. * (i % 4), 2. * (i // 4), .1 * (i % 2)], dtype=np.float32) for i in range(16)])
++    target1 = target0 + np.asarray([.2, -.1, .4], dtype=np.float32)
++    diagonal = [float(np.linalg.norm(np.ptp(target.reshape(-1, 3), axis=0))) for target in (target0, target1)]
++    common = prepare_common_reference([target0[12:], target1[12:]], diagonal)
++    common_hash_before = json.dumps(common["audit"], sort_keys=True)
++    scores = []
++    for K in TRAINED_K:
++        known = np.arange(len(target0)) < K
++        metric, package = evaluate_patch_output(target0, target0[:K], target0,
++            [target0[K:], target1[K:]], common, diagonal, 0, known)
++        assert len(package["free"]) == 16 - K
++        assert metric["known_fidelity"]["context_bitwise_present"]
++        assert metric["known_fidelity"]["thresholds"][-1]["all_targets_all_vertices_pass"]
++        assert metric["remainder"]["own"]["symmetric_rms_bbox_pct"] < 1e-12
++        assert metric["common_unknown_R12"]["own"]["rms_bbox_pct"] < 1e-12
++        assert metric["remainder"]["cross"][0]["predicted_free_sha256"] == metric["remainder"]["cross"][1]["predicted_free_sha256"]
++        assert metric["common_unknown_R12"]["own"]["prediction_to_common_R12_error"] == "INTENTIONALLY_NOT_COMPUTED"
++        json.dumps(metric, allow_nan=False)
++        scores.append(metric)
++    hashes = [metric["common_unknown_R12"]["own"]["target_point_sha256"] for metric in scores]
++    assert len(set(hashes)) == 1
++    assert json.dumps(common["audit"], sort_keys=True) == common_hash_before
++    irregular = target0.copy(); irregular[0, 1:] = irregular[0, 0] + .1 * (irregular[0, 1:] - irregular[0, 0])
++    metric, _ = evaluate_patch_output(irregular, irregular[:4], irregular,
++        [irregular[4:], target1[4:]], common, diagonal, 0, np.arange(16) < 4)
++    assert abs(metric["context_coverage"]["surface_area_fraction"] - 4 / 16) > .01
++    k2, _ = evaluate_patch_output(target0, target0[:2], target0, [target0[2:], target1[2:]],
++                                  common, diagonal, 0, np.arange(16) < 2)
++    assert k2["K_scope"] == "nested_K2_untrained_reference_not_historical_disjoint_K2"
++    try:
++        patch_binding_four_grid(scores[0], scores[1])
++    except ValueError:
++        pass
++    else:
++        raise AssertionError("Cross-K binding accepted")
++    return dict(status="PASS", tests=[
++        "K4_K8_K12_known_mask_counts", "generic_Hungarian_fidelity_up_to_K12",
++        "fixed_free_set_cross_scoring", "fixed_common_R12_points_across_all_K",
++        "zero_exact_surface_and_common_coverage", "no_prediction_to_R12_penalty",
++        "actual_surface_area_not_face_count_fraction", "nested_K2_explicit_untrained_scope",
++        "cross_K_binding_rejected", "reference_arrays_unchanged", "JSON_safe"],
++        model_forwards=0, geometry_autograd_calls=0, optimizer_updates=0)
++
++
++if __name__ == "__main__":
++    print(json.dumps(run_cpu_tests(), sort_keys=True))
+diff --git a/experiments/mf_h1_local0/native_patch_report.py b/experiments/mf_h1_local0/native_patch_report.py
+new file mode 100644
+--- /dev/null
++++ b/experiments/mf_h1_local0/native_patch_report.py
+@@ -0,0 +1,602 @@
++"""Offline report for mixed-K connected context and raw seam diagnostics.
++
++No model, optimizer, geometry projection, or regeneration occurs here. The
++already-used 9201..9204 arrays are regression noises, not a fresh test set.
++"""
++from __future__ import annotations
++
++import argparse
++import ast
++import difflib
++import hashlib
++import json
++from pathlib import Path
++import statistics
++import subprocess
++
++from .native_inpainting_report import _dist, _number, _table, _nested, _binding_concentration
++
++
++MODELS = ("Native0", "T1", "T2")
++TRAINED_K = (4, 8, 12)
++EVAL_K = (2, 4, 8, 12)
++SEEDS = (9201, 9202, 9203, 9204)
++
++
++def _sha(path):
++    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
++
++
++def _intersection_rates(seam, expected_free_faces):
++    """Derive geometric C/free rates solely from already recorded contacts."""
++    intersections = seam.get("context_free_intersections")
++    if not intersections or "tested_pairs" not in intersections:
++        return dict(status="NOT_RUN", proper=None, coplanar_overlap=None,
++                    geometry_calls=0, model_calls=0)
++    free_faces = int(intersections["free_faces"])
++    tested_pairs = int(intersections["tested_pairs"])
++    if free_faces != int(expected_free_faces) or free_faces <= 0 or tested_pairs <= 0:
++        raise AssertionError("Recorded C/free intersection denominators disagree")
++    contacts = intersections.get("contacts", [])
++    output = dict(status="DERIVED_FROM_RECORDED_CONTACTS", free_faces=free_faces,
++                  tested_pairs=tested_pairs, geometry_calls=0, model_calls=0,
++                  scope="C/free pairs only; not full free/free or whole-mesh self-intersection",
++                  unresolved_pairs=intersections.get("unresolved_pairs"),
++                  degenerate_pairs=intersections.get("degenerate_pairs"))
++    for key, classification, counter_key in (
++        ("proper", "proper_transverse_penetration", "proper_transverse_pairs"),
++        ("coplanar_overlap", "coplanar_positive_area_overlap", "coplanar_positive_area_pairs")):
++        selected = [contact for contact in contacts if contact.get("classification") == classification]
++        pair_count = int(intersections[counter_key])
++        if len(selected) != pair_count:
++            raise AssertionError("Recorded intersection contacts and pair count disagree")
++        face_ids = sorted(set(int(contact["free_face"]) for contact in selected))
++        if any(index < 0 or index >= free_faces for index in face_ids):
++            raise AssertionError("Contact free-face index outside recorded remainder")
++        output[key] = dict(classification=classification,
++            affected_free_face_indices=face_ids, affected_free_faces=len(face_ids),
++            free_faces_denominator=free_faces, affected_free_face_fraction=len(face_ids) / free_faces,
++            pair_count=pair_count, tested_pairs_denominator=tested_pairs,
++            pair_fraction=pair_count / tested_pairs)
++    output["primary_interpenetration_rate"] = output["proper"]["affected_free_face_fraction"]
++    output["coplanar_is_separate_not_counted_as_proper_penetration"] = True
++    return output
++
++
++def _row(row):
++    metrics = row["metrics"]
++    remainder = metrics["remainder"]["own"]
++    fidelity = metrics["known_fidelity"]
++    whole, free = metrics["whole"], metrics["free_quality"]
++    common = metrics["common_unknown_R12"]["own"]
++    seam = metrics.get("seam", {})
++    coverage = metrics["context_coverage"]
++    rates = _intersection_rates(seam, metrics["free_faces"])
++    return dict(
++        model=row["model"], parent=int(row["parent"]), K=int(row["K"]), seed=int(row["seed"]),
++        split=row.get("split", "reused_regression"), variant=metrics.get("variant", "raw"),
++        K_scope=metrics["K_scope"], face_coverage_fraction=coverage["face_fraction"],
++        area_coverage_fraction=coverage["surface_area_fraction"],
++        remainder_rms_bbox_pct=remainder["symmetric_rms_bbox_pct"],
++        remainder_pred_to_target_bbox_pct=remainder["predicted_to_target_rms_bbox_pct"],
++        remainder_target_to_pred_bbox_pct=remainder["target_to_predicted_rms_bbox_pct"],
++        remainder_below_2pct=remainder["symmetric_rms_bbox_pct"] is not None and remainder["symmetric_rms_bbox_pct"] < 2.,
++        common_R12_coverage_rms_bbox_pct=common["rms_bbox_pct"],
++        common_R12_coverage_q95_bbox_pct=common["q95_bbox_pct"],
++        common_R12_target_point_sha256=common["target_point_sha256"],
++        common_R12_target_reference_sha256=common["target_reference_sha256"],
++        known_vertex_rms_bbox_pct=fidelity["aggregate_vertex_rms_bbox_pct"],
++        known_max_vertex_bbox_pct=fidelity["maximum_vertex_error_bbox_pct"],
++        context_bitwise_present=fidelity["context_bitwise_present"],
++        fixed_free_sha256=metrics["remainder"]["fixed_free_sha256"],
++        whole_rms_bbox_pct=whole["surface"]["symmetric_rms_bbox_pct"],
++        whole_narrow_fraction=whole["quality"]["min_angle_lt5_fraction"],
++        whole_angle_p05=whole["quality"]["angles_p05"],
++        whole_degenerate_fraction=whole["quality"]["degenerate_fraction"],
++        free_narrow_fraction=free["min_angle_lt5_fraction"], free_angle_p05=free["angles_p05"],
++        free_degenerate_fraction=free["degenerate_fraction"],
++        nan_count=whole["quality"]["nan_count"], inf_count=whole["quality"]["inf_count"],
++        near_C_face_fraction=metrics["near_context"]["near_complete_context_face_fraction"],
++        near_C_point_fraction=metrics["near_context"]["free_surface_sample_points_near_context_fraction"],
++        exact_duplicate_C_faces=metrics["near_context"]["exact_permutation_duplicate_face_count"],
++        seam_boundary_rms_bbox_pct=None if _nested(seam, "boundary_to_free_surface", "rms_bbox_fraction") is None else 100 * seam["boundary_to_free_surface"]["rms_bbox_fraction"],
++        seam_boundary_max_bbox_pct=None if _nested(seam, "boundary_to_free_surface", "max_bbox_fraction") is None else 100 * seam["boundary_to_free_surface"]["max_bbox_fraction"],
++        seam_boundary_near_fraction=_nested(seam, "boundary_to_free_surface", "length_weighted_near_surface_fraction"),
++        seam_free_vertex_candidates=_nested(seam, "free_vertices_near_boundary", "candidate_count"),
++        seam_near_vertex_gap_rms_bbox_pct=None if _nested(seam, "free_vertices_near_boundary", "nearest_segment_distance_stats", "rms_bbox_fraction") is None else 100 * seam["free_vertices_near_boundary"]["nearest_segment_distance_stats"]["rms_bbox_fraction"],
++        seam_near_vertex_gap_max_bbox_pct=None if _nested(seam, "free_vertices_near_boundary", "nearest_segment_distance_stats", "max_bbox_fraction") is None else 100 * seam["free_vertices_near_boundary"]["nearest_segment_distance_stats"]["max_bbox_fraction"],
++        interpenetration=rates,
++        proper_affected_free_faces=_nested(rates, "proper", "affected_free_faces"),
++        proper_free_face_denominator=_nested(rates, "proper", "free_faces_denominator"),
++        proper_free_face_fraction=_nested(rates, "proper", "affected_free_face_fraction"),
++        proper_pair_fraction=_nested(rates, "proper", "pair_fraction"),
++        proper_tested_pairs_denominator=_nested(rates, "proper", "tested_pairs_denominator"),
++        coplanar_affected_free_faces=_nested(rates, "coplanar_overlap", "affected_free_faces"),
++        coplanar_free_face_denominator=_nested(rates, "coplanar_overlap", "free_faces_denominator"),
++        coplanar_free_face_fraction=_nested(rates, "coplanar_overlap", "affected_free_face_fraction"),
++        coplanar_pair_fraction=_nested(rates, "coplanar_overlap", "pair_fraction"),
++        coplanar_tested_pairs_denominator=_nested(rates, "coplanar_overlap", "tested_pairs_denominator"),
++        seam_proper_transverse_pairs=_nested(seam, "context_free_intersections", "proper_transverse_pairs"),
++        seam_coplanar_area_pairs=_nested(seam, "context_free_intersections", "coplanar_positive_area_pairs"),
++        seam_unresolved_pairs=_nested(seam, "context_free_intersections", "unresolved_pairs"),
++        seam_degenerate_pairs=_nested(seam, "context_free_intersections", "degenerate_pairs"),
++        topology_boundary_edges=_nested(seam, "raw_topology", "boundary_edges"),
++        topology_nonmanifold_edges=_nested(seam, "raw_topology", "nonmanifold_edges"),
++        topology_components=_nested(seam, "raw_topology", "exact_edge_connected_face_components"),
++        scoring_seconds=metrics.get("scoring_seconds"), seam_seconds=seam.get("seconds"))
++
++
++NUMBERS = (
++    "remainder_rms_bbox_pct", "remainder_pred_to_target_bbox_pct", "remainder_target_to_pred_bbox_pct",
++    "common_R12_coverage_rms_bbox_pct", "common_R12_coverage_q95_bbox_pct", "known_vertex_rms_bbox_pct",
++    "known_max_vertex_bbox_pct", "whole_rms_bbox_pct", "whole_narrow_fraction", "whole_angle_p05",
++    "whole_degenerate_fraction", "free_narrow_fraction", "free_angle_p05", "free_degenerate_fraction",
++    "near_C_face_fraction", "near_C_point_fraction", "exact_duplicate_C_faces", "seam_boundary_rms_bbox_pct",
++    "seam_boundary_max_bbox_pct", "seam_boundary_near_fraction", "seam_free_vertex_candidates",
++    "seam_near_vertex_gap_rms_bbox_pct", "seam_near_vertex_gap_max_bbox_pct",
++    "seam_proper_transverse_pairs", "seam_coplanar_area_pairs", "seam_unresolved_pairs", "seam_degenerate_pairs",
++    "proper_affected_free_faces", "proper_free_face_denominator", "proper_free_face_fraction", "proper_pair_fraction",
++    "proper_tested_pairs_denominator", "coplanar_affected_free_faces", "coplanar_free_face_denominator",
++    "coplanar_free_face_fraction", "coplanar_pair_fraction", "coplanar_tested_pairs_denominator",
++    "topology_boundary_edges", "topology_nonmanifold_edges", "topology_components", "scoring_seconds", "seam_seconds")
++
++
++def _strict(values):
++    if any(value is None for value in values):
++        return None
++    return all(b < a for a, b in zip(values, values[1:]))
++
++
++def summarize(report):
++    rows = [_row(row) for row in report.get("scores", [])]
++    if any(row["variant"] != "raw" for row in rows):
++        raise AssertionError("This experiment authorized raw-only evaluation")
++    rows.sort(key=lambda row: (row["model"], row["parent"], row["K"], row["seed"]))
++    lookup = {(row["model"], row["parent"], row["K"], row["seed"]): row for row in rows}
++    if len(lookup) != len(rows):
++        raise AssertionError("Duplicate score rows")
++    common_checks = []
++    for parent in (0, 1):
++        selected = [row for row in rows if row["parent"] == parent]
++        point_hashes = sorted(set(row["common_R12_target_point_sha256"] for row in selected))
++        reference_hashes = sorted(set(row["common_R12_target_reference_sha256"] for row in selected))
++        if selected and (len(point_hashes) != 1 or len(reference_hashes) != 1):
++            raise AssertionError("Common R12 region or samples changed across K/models/noises")
++        common_checks.append(dict(parent=parent, scored_outputs=len(selected), target_point_hashes=point_hashes,
++                                  target_reference_hashes=reference_hashes, fixed_across_K=bool(selected)))
++    groups = []
++    for model in MODELS:
++        for parent in (0, 1):
++            for K in EVAL_K:
++                selected = [row for row in rows if (row["model"], row["parent"], row["K"]) == (model, parent, K)]
++                if selected:
++                    groups.append(dict(model=model, parent=parent, K=K, n=len(selected),
++                        seeds=[row["seed"] for row in selected], trained_K=K in TRAINED_K,
++                        distributions={name: _dist([row[name] for row in selected]) for name in NUMBERS},
++                        remainder_below_2pct_count=sum(row["remainder_below_2pct"] for row in selected),
++                        C_bitwise_present_count=sum(row["context_bitwise_present"] for row in selected),
++                        nan_count=sum(row["nan_count"] for row in selected), inf_count=sum(row["inf_count"] for row in selected),
++                        context_face_fraction=selected[0]["face_coverage_fraction"],
++                        context_area_fraction=selected[0]["area_coverage_fraction"],
++                        intersection_rate_totals={field: sum(row[field] for row in selected if row[field] is not None)
++                            for field in ("proper_affected_free_faces", "proper_free_face_denominator", "seam_proper_transverse_pairs",
++                                          "proper_tested_pairs_denominator", "coplanar_affected_free_faces", "coplanar_free_face_denominator",
++                                          "seam_coplanar_area_pairs", "coplanar_tested_pairs_denominator")},
++                        intersection_rate_recorded_outputs=sum(row["proper_free_face_fraction"] is not None for row in selected)))
++    pairs = []
++    for row in rows:
++        if row["model"] != "T1":
++            continue
++        for comparator in ("Native0", "T2"):
++            other = lookup.get((comparator, row["parent"], row["K"], row["seed"]))
++            if other:
++                delta = row["remainder_rms_bbox_pct"] - other["remainder_rms_bbox_pct"]
++                common_delta = row["common_R12_coverage_rms_bbox_pct"] - other["common_R12_coverage_rms_bbox_pct"]
++                pairs.append(dict(parent=row["parent"], K=row["K"], seed=row["seed"], comparator=comparator,
++                    T1_minus_comparator_RK_bbox_points=delta, T1_RK_improves=delta < 0,
++                    T1_minus_comparator_common_R12_bbox_points=common_delta, T1_common_R12_improves=common_delta < 0))
++    pair_groups = []
++    for comparator in ("Native0", "T2"):
++        for parent in (0, 1):
++            for K in EVAL_K:
++                selected = [row for row in pairs if (row["comparator"], row["parent"], row["K"]) == (comparator, parent, K)]
++                if selected:
++                    pair_groups.append(dict(comparator=comparator, parent=parent, K=K, n=len(selected),
++                        RK_difference=_dist([row["T1_minus_comparator_RK_bbox_points"] for row in selected]),
++                        RK_win_count=sum(row["T1_RK_improves"] for row in selected),
++                        common_R12_difference=_dist([row["T1_minus_comparator_common_R12_bbox_points"] for row in selected]),
++                        common_R12_win_count=sum(row["T1_common_R12_improves"] for row in selected)))
++    trends = []
++    for model in MODELS:
++        for parent in (0, 1):
++            for seed in SEEDS:
++                selected = [lookup.get((model, parent, K, seed)) for K in EVAL_K]
++                if all(row is not None for row in selected):
++                    remainder = [row["remainder_rms_bbox_pct"] for row in selected]
++                    common = [row["common_R12_coverage_rms_bbox_pct"] for row in selected]
++                    trends.append(dict(model=model, parent=parent, seed=seed, K=list(EVAL_K),
++                        RK_rms_bbox_pct=remainder, common_R12_coverage_bbox_pct=common,
++                        RK_strictly_decreasing_K2_4_8_12=_strict(remainder),
++                        RK_strictly_decreasing_trained_K4_8_12=_strict(remainder[1:]),
++                        common_R12_strictly_decreasing_K2_4_8_12=_strict(common),
++                        common_R12_strictly_decreasing_trained_K4_8_12=_strict(common[1:]),
++                        caveat="RK target changes with K; K2 is outside mixed-K training, not the previous disjoint K2; no causal conclusion from monotonicity alone"))
++    mean_trends = []
++    for model in MODELS:
++        for parent in (0, 1):
++            selected = [next((row for row in groups if (row["model"], row["parent"], row["K"]) == (model, parent, K)), None) for K in EVAL_K]
++            if all(row is not None for row in selected):
++                values = [row["distributions"]["remainder_rms_bbox_pct"]["mean"] for row in selected]
++                common = [row["distributions"]["common_R12_coverage_rms_bbox_pct"]["mean"] for row in selected]
++                per_seed = [row for row in trends if row["model"] == model and row["parent"] == parent]
++                mean_trends.append(dict(model=model, parent=parent, K=list(EVAL_K),
++                    RK_mean_rms_bbox_pct=values, common_R12_mean_coverage_bbox_pct=common,
++                    RK_mean_strictly_decreasing_all_K=_strict(values), RK_mean_strictly_decreasing_trained_K=_strict(values[1:]),
++                    common_R12_mean_strictly_decreasing_all_K=_strict(common), common_R12_mean_strictly_decreasing_trained_K=_strict(common[1:]),
++                    RK_all_K_per_seed_strict_count=sum(row["RK_strictly_decreasing_K2_4_8_12"] is True for row in per_seed),
++                    RK_trained_K_per_seed_strict_count=sum(row["RK_strictly_decreasing_trained_K4_8_12"] is True for row in per_seed),
++                    common_all_K_per_seed_strict_count=sum(row["common_R12_strictly_decreasing_K2_4_8_12"] is True for row in per_seed),
++                    common_trained_K_per_seed_strict_count=sum(row["common_R12_strictly_decreasing_trained_K4_8_12"] is True for row in per_seed),
++                    seeds=len(per_seed)))
++    binding_groups = []
++    for model in MODELS:
++        for K in EVAL_K:
++            selected = [row for row in report.get("bindings", []) if row["model"] == model and row["K"] == K]
++            if selected:
++                contribution = _binding_concentration(selected)
++                values = [row["mean_binding_bbox_percentage_points"] for row in selected]
++                net, gross = sum(values), sum(abs(value) for value in values)
++                target = next((row for row in selected if row["seed"] == 9202), None)
++                share = None if target is None or abs(net) <= max(1e-10, .1 * gross) else target["mean_binding_bbox_percentage_points"] / net
++                binding_groups.append(dict(model=model, K=K, n=len(selected), trained_K=K in TRAINED_K,
++                    direction0=_dist([row["direction0_bbox_percentage_points"] for row in selected]),
++                    direction1=_dist([row["direction1_bbox_percentage_points"] for row in selected]),
++                    binding=_dist(values), both_positive_count=sum(row["both_directions_positive"] is True for row in selected),
++                    concentration=contribution, seed9202_fraction_of_net=share,
++                    other_three_seeds_mean=_dist([row["mean_binding_bbox_percentage_points"] for row in selected if row["seed"] != 9202]),
++                    common_R12_binding=_dist([_nested(row, "common_unknown_R12_binding", "mean_binding_bbox_percentage_points") for row in selected]),
++                    common_R12_both_positive_count=sum(_nested(row, "common_unknown_R12_binding", "both_directions_positive") is True for row in selected),
++                    per_noise=selected))
++    arms = report.get("arms", {})
++    a, b = arms.get("Native_correct", {}).get("batch_audits", []), arms.get("Native_independent", {}).get("batch_audits", [])
++    shared = [x.get("shared_batch_sha256", x.get("shared_input_sha256")) == y.get("shared_batch_sha256", y.get("shared_input_sha256"))
++              and x.get("shared_input_hashes") == y.get("shared_input_hashes") for x, y in zip(a, b)]
++    donor_groups = []
++    for parent in (0, 1):
++        for K in TRAINED_K:
++            donors = [donor for batch in b for target, k, donor in zip(batch.get("parent_indices", []), batch.get("K", []), batch.get("donor_indices", [])) if target == parent and k == K]
++            if donors:
++                donor_groups.append(dict(parent=parent, K=K, n=len(donors), donor0=donors.count(0), donor1=donors.count(1),
++                                         accidentally_correct=donors.count(parent), fraction=donors.count(parent) / len(donors)))
++    generated = report.get("generated", [])
++    costs = []
++    for model in MODELS:
++        selected = [row for row in generated if row.get("model") == model]
++        if selected:
++            costs.append(dict(model=model, new_formal_rollouts=len(selected),
++                model_forwards=sum(_nested(row, "sampling", "nfe", default=0) for row in selected),
++                seconds=_dist([_nested(row, "sampling", "seconds") for row in selected]),
++                peak_cuda_allocated=max((_nested(row, "sampling", "peak_cuda_allocated", default=0) for row in selected), default=0),
++                known51_pass=sum(_nested(row, "sampling", "known_all51_bitwise") is True for row in selected)))
++    return dict(schema="native_patch_offline_v1", execution_status=report["status"], score_rows=len(rows),
++        expected_score_rows=96, raw_only=True, per_output=rows, groups=groups,
++        fixed_common_R12_checks=common_checks, paired_T1=pairs, paired_T1_groups=pair_groups,
++        per_noise_K_trends=trends, mean_K_trends=mean_trends, binding_groups=binding_groups,
++        training_stream=dict(compared_batches=len(shared), all_shared_equal=all(shared) if shared else None, independent_donors=donor_groups),
++        sampling_costs=costs,
++        hypothesis_scope="P0<2%, strict K trends, K>=8 both-direction4/4 binding and diluted9202 dependence are observed hypotheses, never preaccepted conclusions",
++        regression_noise_scope="Previously evaluated exact9201..9204 tensors; no fresh confirmation/generalization claim",
++        offline_model_calls=0, offline_geometry_gradients=0, offline_optimizer_updates=0)
++
++
++def _group(summary, model, parent, K):
++    return next((row for row in summary["groups"] if (row["model"], row["parent"], row["K"]) == (model, parent, K)), None)
++
++
++def render_report(report, summary):
++    complete = report["status"] == "PASS_EXECUTION" and summary["score_rows"] == 96
++    lines = ["# 混合K连通上下文：原生补全与原始接缝诊断", "",
++        f"状态：**{report['status']}**。本轮仅两臂各500步授权，总上限1000次优化器更新；实际执行账本见后文。"
++        "本轮只评原始生成，不投影、不加接缝正则、不修改损失。", "",
++        "## 结论范围与待验证假设", "",
++        "K4⊂K8⊂K12是真实共享边连接的新输入面片族；本轮nested K2只作训练域外评价参考，"
++        "与旧实验disjoint K2的C和源面ID不同。K2→K4还跨越训练支持范围，不能把整个序列称为旧K2的直接因果延长。", "",
++        "9201–9204是前轮已评价过、实际数组逐位复用的固定回归噪声，不是新的确认集。只有两个训练父对象，"
++        "不涉及新对象或工业泛化。P0剩余误差低于2% bbox、K严格单调、K≥8双向绑定4/4、9202依赖减弱均是待检验假设，"
++        "不会据假设预认‘条件欠定’是先前失败原因。", ""]
++    if complete:
++        p0 = [_group(summary, "T1", 0, K) for K in EVAL_K]
++        trend = next(row for row in summary["mean_K_trends"] if row["model"] == "T1" and row["parent"] == 0)
++        bindings = {(row["model"], row["K"]): row for row in summary["binding_groups"]}
++        pair_groups = summary["paired_T1_groups"]
++        wins = {comparator: sum(row["RK_win_count"] for row in pair_groups
++                if row["comparator"] == comparator and row["K"] in TRAINED_K)
++                for comparator in ("Native0", "T2")}
++        p0_k12 = [row for row in summary["per_output"] if row["model"] == "T1" and row["parent"] == 0 and row["K"] == 12]
++        lines += ["**更大连通上下文在P0和条件绑定上出现了改善信号，但未建立逐噪声严格单调、两对象一致胜过负对照或可靠接缝补全。**", "",
++            "T1的P0剩余RMS结果（均值/中位数，%完整bbox；<2%成功数）：" + "；".join(
++            f"K{row['K']} {_number(row['distributions']['remainder_rms_bbox_pct']['mean'])}/{_number(row['distributions']['remainder_rms_bbox_pct']['median'])}，{row['remainder_below_2pct_count']}/{row['n']}"
++            for row in p0) + "。K12的逐噪声RMS（9201–9204）为" +
++            "、".join(_number(row["remainder_rms_bbox_pct"]) for row in p0_k12) +
++            "；均值低于2%不代表四次都达标。", "",
++            f"P0的训练K4→8→12均值严格下降为{trend['RK_mean_strictly_decreasing_trained_K']}，"
++            f"完整K2→4→8→12均值严格下降为{trend['RK_mean_strictly_decreasing_all_K']}；"
++            f"逐噪声全序严格下降仅{trend['RK_all_K_per_seed_strict_count']}/4，训练K序列仅{trend['RK_trained_K_per_seed_strict_count']}/4。"
++            f"固定公共R12覆盖的训练K均值也严格下降为{trend['common_R12_mean_strictly_decreasing_trained_K']}，"
++            f"但逐噪声仅{trend['common_trained_K_per_seed_strict_count']}/4；这支持平均覆盖改善，不能消除跨K自由面数和噪声子集变化。", "",
++            "T1在K8/K12的双向正绑定分别为" +
++            "、".join(f"{bindings[('T1', K)]['both_positive_count']}/4" for K in (8, 12)) +
++            "，绑定均值为" + "、".join(_number(bindings[("T1", K)]["binding"]["mean"]) for K in (8, 12)) +
++            "个bbox百分点；9202占净绑定总和分别为" +
++            "、".join(_number(100 * bindings[("T1", K)]["seed9202_fraction_of_net"], 2) + "%" for K in (8, 12)) +
++            "，改善不再主要集中在这一条噪声。但Native0的K12和T2的K8也达到4/4；"
++            "4/4本身不能独立证明正确条件训练的增益。T2的K8/K12绑定均值为" +
++            "、".join(_number(bindings[("T2", K)]["binding"]["mean"]) for K in (8, 12)) + "。", "",
++            f"只看训练支持的K4/8/12，T1比Native0更低的剩余RMS为{wins['Native0']}/24，比T2为{wins['T2']}/24。"
++            "P1上T1三个训练K的均值为" +
++            "、".join(_number(_group(summary, "T1", 1, K)["distributions"]["remainder_rms_bbox_pct"]["mean"]) for K in TRAINED_K) +
++            "，对应T2为" +
++            "、".join(_number(_group(summary, "T2", 1, K)["distributions"]["remainder_rms_bbox_pct"]["mean"]) for K in TRAINED_K) +
++            "：三个均值均未胜过独立条件负对照，不能把P0收益推广成统一的正确条件学习优势。", "",
++            "接缝仍未解决。T1 K12的P0/P1边界到free表面RMS均值为" +
++            "、".join(_number(_group(summary, "T1", parent, 12)["distributions"]["seam_boundary_rms_bbox_pct"]["mean"]) + "%" for parent in (0, 1)) +
++            "；真正横穿C的受影响free面比例（按重复输出累加原始分子/分母）为" +
++            "、".join(
++                f"{_group(summary, 'T1', parent, 12)['intersection_rate_totals']['proper_affected_free_faces']}/"
++                f"{_group(summary, 'T1', parent, 12)['intersection_rate_totals']['proper_free_face_denominator']}="
++                f"{_number(100 * _group(summary, 'T1', parent, 12)['distributions']['proper_free_face_fraction']['mean'], 2)}%"
++                for parent in (0, 1)) +
++            "。原GT对应穿刺为0、边界距离为数值零。T1 K12的精确共享边连通分量均为101，"
++            "边界边数P0/P1为312/314，尚未形成GT的一体连接；近距离或C精确保持不能替代接缝和拓扑。"
++            "穿刺比例仅检查C/free，不是完整网格自交认证；跨K分母和参与检测的C区域也在变化。", "",
++            "**下一步建议：保留原生条件路线，先做小规模机制与稳健性定位，优先核对P1负对照失利、"
++            "P0噪声依赖和接缝穿刺，再考虑独立对象验证。** 当前结果不支持直接宣称条件欠定根因已证实或进入工业泛化；"
++            "本轮到此停止，不自动扩训、投影或添加接缝正则。", ""]
++    else:
++        lines += ["实验未形成完整96条评价，不给能力或路线优劣结论。停止原因：`" + str(report.get("error", "尚未完成")) + "`。", ""]
++    lines += ["## 条件、面积和训练支持", "",
++        "面片仅按输入几何预选，保留真实源面顶点；没有模型输出筛选、重新网格化或手工修补。"
++        "它是座面附近的连通区域，较大前缀可包含厚度、边缘或支撑面；没有语义部件标注，不能把它一概称作纯平面坐垫。", ""]
++    case_rows = []
++    for case in report.get("assets", {}).get("cases", []):
++        case_rows.append([case["parent_index"], case["K"], "训练支持" if case["K"] in TRAINED_K else "仅训练域外参考",
++            str(case["source_face_ids"]), case.get("edge_connected"), _number(100 * case["K"] / case.get("N", 112), 2),
++            _number(100 * case.get("area_fraction", 0), 2), case.get("patch_boundary_edge_count", "N/A")])
++    lines += [_table(["P", "K", "范围", "源面ID", "共享边连通", "面数覆盖%", "实际面积覆盖%", "C边界段数"], case_rows), "",
++        "面数比例K/112不是表面面积或信息量比例。两个对象同K的实际面积覆盖也可能不同，解释趋势时应同时保留。", "",
++        "所有总N=y=112；训练只混合K4/8/12，K2从不进入更新。两个新实验模型均从同一官方EMA和零角色出发，"
++        "全量微调原主干＋角色，独立臂按同K逐例均匀抽两个父对象的C，允许偶然正确。"
++        "有效batch8、micro1；六种父对象×K组合按预定轮换覆盖，分母按实际整批自由坐标数，不假设每个microbatch等权。", "",
++        "原AdamW、学习率与时间分布按协议固定，无scheduler、新EMA、几何正则。自由面单独按官方原尺度nested OT，"
++        "保留原坐标变换；两臂target/K/Gaussian/OT/t/面角排列流逐步对账。原官方文件只读，实验副本主干实际更新另计。", "",
++        "稳定配置沿用严格确定性、CUDA初始化前CUBLAS=:4096:8、TF32关闭、SDPA math、BF16 autocast，"
++        "FP32参数/C/噪声/积分状态。每轨迹50次Euler；C直接保留，检查全部51状态；eval关闭随机dropout但训练不禁止梯度。", "",
++        "## 剩余质量与固定公共区域", "",
++        "R_K=T删除当前K个源面，因此K变化时评价GT也变了。更低R_K RMS可能部分来自删除困难区域，不能单独据此归因更多上下文。"
++        "为此，对所有K追加固定公共未知区域R12→预测free的单向覆盖RMS：同一R12、同一512个面积采样点、同一完整GT bbox。"
++        "不计算预测free→R12的反向惩罚，因为K4/K8合法包含后来才作为C12的面，这样反罚会改变任务。"
++        "该单向覆盖也不衡量多余/错误表面积，仍须与R_K双向、完整输出和质量诊断共同解释。", "",
++        "同一归档Gaussian有112个面槽，各K实际使用自由槽K:112。因此跨K不仅改变C和R_K，也改变自由面数与自由初始噪声子集。"
++        "固定R12覆盖控制的是评价目标区域，不能把跨K趋势解释成仅改变条件信息量的因果实验。", "",
++        "下表单元为R_K对称均值（预测→目标 / 目标→预测），随后列固定R12单向覆盖均值，单位均为%完整bbox。", ""]
++    remainder_rows = []
++    for row in summary["groups"]:
++        d = row["distributions"]
++        remainder_rows.append([row["model"], row["parent"], row["K"], row["n"],
++            f"{_number(d['remainder_rms_bbox_pct']['mean'])} ({_number(d['remainder_pred_to_target_bbox_pct']['mean'])}/{_number(d['remainder_target_to_pred_bbox_pct']['mean'])})",
++            _number(d["remainder_rms_bbox_pct"]["median"]), _number(d["common_R12_coverage_rms_bbox_pct"]["mean"]),
++            _number(d["common_R12_coverage_rms_bbox_pct"]["median"]), f"{row['remainder_below_2pct_count']}/{row['n']}"])
++    lines += [_table(["模型", "P", "K", "噪声数", "R_K均值(两方向)", "R_K中位数", "固定R12覆盖均值", "R12中位数", "R_K<2%"], remainder_rows), "",
++        "T1相对对照，负差表示更低误差；胜数使用逐噪声匹配，不把同一父对象的四噪声当作四个独立对象。", ""]
++    lines += [_table(["对照", "P", "K", "R_K均值差", "R_K胜数", "公共R12均值差", "公共R12胜数"],
++        [[row["comparator"], row["parent"], row["K"], _number(row["RK_difference"]["mean"]),
++          f"{row['RK_win_count']}/{row['n']}", _number(row["common_R12_difference"]["mean"]),
++          f"{row['common_R12_win_count']}/{row['n']}"] for row in summary["paired_T1_groups"]]), "",
++        "## 严格单调性：均值与逐噪声分开", "",
++        "严格下降使用相邻值的原始 `<`，未事后放宽阈值。K2→4→8→12和训练支持内K4→8→12分别报告。"
++        "这里是描述性趋势检查，不能消除GT区域、自由面数量、面积覆盖与训练支持同时改变的影响。", ""]
++    lines += [_table(["模型", "P", "R_K均值2/4/8/12", "R12均值2/4/8/12", "R_K均值全K/训练K严格降", "R_K逐seed全K/训练K", "R12均值全K/训练K严格降", "R12逐seed全K/训练K"],
++        [[row["model"], row["parent"], "/".join(_number(v) for v in row["RK_mean_rms_bbox_pct"]),
++          "/".join(_number(v) for v in row["common_R12_mean_coverage_bbox_pct"]),
++          f"{row['RK_mean_strictly_decreasing_all_K']}/{row['RK_mean_strictly_decreasing_trained_K']}",
++          f"{row['RK_all_K_per_seed_strict_count']}/{row['seeds']} ; {row['RK_trained_K_per_seed_strict_count']}/{row['seeds']}",
++          f"{row['common_R12_mean_strictly_decreasing_all_K']}/{row['common_R12_mean_strictly_decreasing_trained_K']}",
++          f"{row['common_all_K_per_seed_strict_count']}/{row['seeds']} ; {row['common_trained_K_per_seed_strict_count']}/{row['seeds']}"]
++         for row in summary["mean_K_trends"]]), "",
++        "T1逐噪声原始序列：", "",
++        _table(["P", "seed", "R_K 2/4/8/12", "公共R12 2/4/8/12", "R_K全K严格降", "公共R12全K严格降"],
++          [[row["parent"], row["seed"], "/".join(_number(v) for v in row["RK_rms_bbox_pct"]),
++            "/".join(_number(v) for v in row["common_R12_coverage_bbox_pct"]),
++            row["RK_strictly_decreasing_K2_4_8_12"], row["common_R12_strictly_decreasing_K2_4_8_12"]]
++           for row in summary["per_noise_K_trends"] if row["model"] == "T1"]), "",
++        "## 同K条件绑定与9202依赖", "",
++        "每个实际C生成后，只按known_mask提取一次free；交换目标评分时不重新选删面。"
++        "方向0=E(R0,F(C1))−E(R0,F(C0))，方向1=E(R1,F(C0))−E(R1,F(C1))；正值有利。"
++        "4/4要求四个噪声的两个方向均正，不是平均绑定大于零。净和接近正负抵消零时不报告贡献百分比。", ""]
++    lines += [_table(["模型", "K", "方向0均值", "方向1均值", "绑定均值", "中位数", "双向均正", "9202占净和%", "其他3噪声均值", "公共R12双向均正"],
++        [[row["model"], row["K"], _number(row["direction0"]["mean"]), _number(row["direction1"]["mean"]),
++          _number(row["binding"]["mean"]), _number(row["binding"]["median"]), f"{row['both_positive_count']}/{row['n']}",
++          _number(None if row["seed9202_fraction_of_net"] is None else 100 * row["seed9202_fraction_of_net"], 2),
++          _number(row["other_three_seeds_mean"]["mean"]), f"{row['common_R12_both_positive_count']}/{row['n']}"]
++         for row in summary["binding_groups"]]), "",
++        "逐噪声T1/T2绑定及四格原始值在results.bindings保留。下表避免均值掩盖单一噪声主导：", "",
++        _table(["模型", "K", "seed", "E00", "E01", "E11", "E10", "方向0", "方向1", "平均绑定"],
++          [[group["model"], group["K"], row["seed"], _number(row["E_R0_F_C0"]), _number(row["E_R0_F_C1"]),
++            _number(row["E_R1_F_C1"]), _number(row["E_R1_F_C0"]), _number(row["direction0_bbox_percentage_points"]),
++            _number(row["direction1_bbox_percentage_points"]), _number(row["mean_binding_bbox_percentage_points"])]
++           for group in summary["binding_groups"] if group["model"] in ("T1", "T2") for row in group["per_noise"]]), "",
++        "## 原始接缝与质量：只诊断，不修补", "",
++        "接缝边界取输入C的真实几何边界，检查边界到free表面的长度加权距离、附近free顶点、C-free面相交类型及"
++        "原始坐标下的精确共享边拓扑。边界接近free表面不代表共享顶点或拓扑缝合；相交不等于合理连接。"
++        "相交检查只覆盖C×free，不是free×free全部自交认证。原始边计数也是只读诊断，未做坐标焊接。", ""]
++    lines += [_table(["模型", "P", "K", "边界→free RMS%", "max%均值", "边界近表面比例", "近边界free顶点均数", "C-free横穿面pair均数", "共面正面积pair均数", "未解决pair均数", "原始边界边均数", "非流形边均数", "精确边连通分量均数"],
++        [[row["model"], row["parent"], row["K"],
++          *[_number(row["distributions"][field]["mean"]) for field in (
++              "seam_boundary_rms_bbox_pct", "seam_boundary_max_bbox_pct", "seam_boundary_near_fraction",
++              "seam_free_vertex_candidates", "seam_proper_transverse_pairs", "seam_coplanar_area_pairs",
++              "seam_unresolved_pairs", "topology_boundary_edges", "topology_nonmanifold_edges", "topology_components")]]
++         for row in summary["groups"]]), "",
++        "Interpenetration Ratio主口径为：已有C-free相交记录中，被proper transverse穿刺影响的**不重复free面数/N_free**。"
++        "同一free面被多个C面穿刺只计一次；另列proper穿刺pair/全部测试pair。共面正面积覆盖单独统计，不混入proper穿刺。"
++        "下表保留整数累计分子/分母及逐输出比例均值；未解决或退化pair继续单列，未将它们擅自当成阴性。", "",
++        _table(["模型", "P", "K", "诊断数", "proper free面Σ/N_freeΣ", "主穿刺率均值%", "proper pairsΣ/testedΣ", "proper pair率均值%", "coplanar free面Σ/N_freeΣ", "coplanar free面率均值%", "coplanar pairsΣ/testedΣ", "coplanar pair率均值%"],
++          [[row["model"], row["parent"], row["K"], f"{row['intersection_rate_recorded_outputs']}/{row['n']}",
++            f"{row['intersection_rate_totals']['proper_affected_free_faces']}/{row['intersection_rate_totals']['proper_free_face_denominator']}" if row["intersection_rate_recorded_outputs"] else "N/A",
++            _number(None if row["distributions"]["proper_free_face_fraction"]["mean"] is None else 100 * row["distributions"]["proper_free_face_fraction"]["mean"], 4),
++            f"{row['intersection_rate_totals']['seam_proper_transverse_pairs']}/{row['intersection_rate_totals']['proper_tested_pairs_denominator']}" if row["intersection_rate_recorded_outputs"] else "N/A",
++            _number(None if row["distributions"]["proper_pair_fraction"]["mean"] is None else 100 * row["distributions"]["proper_pair_fraction"]["mean"], 4),
++            f"{row['intersection_rate_totals']['coplanar_affected_free_faces']}/{row['intersection_rate_totals']['coplanar_free_face_denominator']}" if row["intersection_rate_recorded_outputs"] else "N/A",
++            _number(None if row["distributions"]["coplanar_free_face_fraction"]["mean"] is None else 100 * row["distributions"]["coplanar_free_face_fraction"]["mean"], 4),
++            f"{row['intersection_rate_totals']['seam_coplanar_area_pairs']}/{row['intersection_rate_totals']['coplanar_tested_pairs_denominator']}" if row["intersection_rate_recorded_outputs"] else "N/A",
++            _number(None if row["distributions"]["coplanar_pair_fraction"]["mean"] is None else 100 * row["distributions"]["coplanar_pair_fraction"]["mean"], 4)]
++           for row in summary["groups"]]), "",
++        "逐输出的实际受影响free面ID、分子、分母保存在offline_summary.per_output[].interpenetration。"
++        "这些比例只从既有contacts分类派生，没有重新运行几何判交、模型或优化器。", "",
++        "附近free顶点筛选阈值为10⁻³ bbox。没有候选时距离为缺失N/A，绝不记为零；下面距离均值仅覆盖有候选的轨迹，单独列出该轨迹数。", "",
++        _table(["模型", "P", "K", "候选顶点均数", "有候选gap统计轨迹", "近顶点gap RMS%均值", "近顶点gap max%均值"],
++          [[row["model"], row["parent"], row["K"], _number(row["distributions"]["seam_free_vertex_candidates"]["mean"], 2),
++            f"{row['distributions']['seam_near_vertex_gap_rms_bbox_pct']['n']}/{row['n']}",
++            _number(row["distributions"]["seam_near_vertex_gap_rms_bbox_pct"]["mean"], 6),
++            _number(row["distributions"]["seam_near_vertex_gap_max_bbox_pct"]["mean"], 6)] for row in summary["groups"]]), "",
++        "边界表面的max来自预定512预算的采样，不能称精确Hausdorff最大距离。边界邻近顶点计数按三角形顶点槽计，不能当作焊接后独立顶点数。", "",
++        "同一C和GT剩余面的原始接缝参照在results.ground_truth_seams；若参照本身具有非零边界距离或特定接触类型，"
++        "不能把该类型一概判为生成失败。独立接缝CPU测试与其明确分类范围见seam_cpu_tests。", "",
++        _table(["GT P", "K", "边界RMS%bbox", "C-free横穿pair", "共面正面积pair", "完整GT边界边", "非流形边", "精确共享边分量"],
++          [[row["parent"], row["K"], _number(None if _nested(row, "seam", "boundary_to_free_surface", "rms_bbox_fraction") is None else 100 * row["seam"]["boundary_to_free_surface"]["rms_bbox_fraction"], 8),
++            _nested(row, "seam", "context_free_intersections", "proper_transverse_pairs"),
++            _nested(row, "seam", "context_free_intersections", "coplanar_positive_area_pairs"),
++            _nested(row, "full_topology", "boundary_edges"), _nested(row, "full_topology", "nonmanifold_edges"),
++            _nested(row, "full_topology", "exact_edge_connected_face_components")]
++           for row in report.get("ground_truth_seams", [])]), "",
++        _table(["模型", "P", "K", "完整RMS%", "free窄长面%", "free角p05", "free退化比", "近C完整面比", "NaN/Inf"],
++          [[row["model"], row["parent"], row["K"], _number(row["distributions"]["whole_rms_bbox_pct"]["mean"]),
++            _number(None if row["distributions"]["free_narrow_fraction"]["mean"] is None else 100 * row["distributions"]["free_narrow_fraction"]["mean"], 2),
++            _number(row["distributions"]["free_angle_p05"]["mean"], 3), _number(row["distributions"]["free_degenerate_fraction"]["mean"], 6),
++            _number(row["distributions"]["near_C_face_fraction"]["mean"], 6), f"{row['nan_count']}/{row['inf_count']}"]
++           for row in summary["groups"]]), "",
++        _table(["模型", "P", "K", "C逐位存在", "一对一顶点RMS%bbox均值", "一对一最大顶点误差%均值"],
++          [[row["model"], row["parent"], row["K"], f"{row['C_bitwise_present_count']}/{row['n']}",
++            _number(row["distributions"]["known_vertex_rms_bbox_pct"]["mean"], 8),
++            _number(row["distributions"]["known_max_vertex_bbox_pct"]["mean"], 8)] for row in summary["groups"]]), "",
++        "精确C包含和51状态保持来自夹持规则，不是补全学习证据。窄面/p05应结合对应GT参照，不能只因相比Base变化就断言破坏几何。"
++        "没有检测到NaN、退化或重复C也不代表所有质量无代价。完整自由网格自交认证、工业可用性与自动拓扑缝合均未建立。", "",
++        "## 门禁、实际更新和成本", "",
++        f"模型门禁：`{_nested(report, 'model_gates', 'status', default='NOT_RUN')}`；"
++        f"指标CPU测试：`{_nested(report, 'metric_cpu_tests', 'status', default='NOT_RUN')}`；"
++        f"接缝CPU测试：`{_nested(report, 'seam_cpu_tests', 'status', default='NOT_RUN')}`。"
++        "全部free回归官方、逐面时间/角色、梯度通路、实际K混批、重复/重载及C保持检查按本轮原始记录记账。", ""]
++    arm_rows = []
++    checkpoint_rows = []
++    for name, arm in report.get("arms", {}).items():
++        arm_rows.append([name, arm.get("status"), arm.get("optimizer_step_attempts", 0), arm.get("completed_updates", 0),
++            arm.get("trainable_parameters"), _number(arm.get("training_seconds"), 2),
++            _number(arm.get("peak_cuda_allocated", 0) / 2**30, 3),
++            arm.get("final_backbone_sha256") is not None and arm.get("final_backbone_sha256") != arm.get("initial_backbone_sha256")])
++        checkpoint = arm.get("checkpoint", {})
++        checkpoint_rows.append([name, checkpoint.get("path", "NOT_SAVED"), checkpoint.get("bytes", "N/A"), checkpoint.get("sha256", "N/A"), checkpoint.get("recoverable", "N/A")])
++    lines += [_table(["臂", "状态", "更新尝试", "已完成更新", "可训练参数", "训练秒", "峰值GiB", "主干真实改变"], arm_rows), "",
++        "共享训练流对账：`" + json.dumps(summary["training_stream"], ensure_ascii=False, sort_keys=True) + "`。"
++        "实际类别/K覆盖量、donor计数、梯度/参数更新与固定teacher检查点原始日志均保留，不由损失推断完整生成成功。", "",
++        _table(["实际调用", "数目"], [[key, report.get("counts", {}).get(key, "未记录")] for key in (
++            "model_forward_attempts", "model_forward_returns", "official_forward_attempts", "native_forward_attempts",
++            "backward_attempts", "backward_completed", "optimizer_step_attempts", "optimizer_updates",
++            "experimental_backbone_updates", "protected_official_updates", "complete_rollouts", "formal_rollouts", "diagnostic_rollouts",
++            "geometry_gradient_attempts", "geometry_gradient_completed", "euler_updates")]), "",
++        _table(["模型", "新正式轨迹", "模型前向", "平均秒/轨迹", "峰值GiB", "51态C逐位保持轨迹"],
++          [[row["model"], row["new_formal_rollouts"], row["model_forwards"], _number(row["seconds"]["mean"], 3),
++            _number(row["peak_cuda_allocated"] / 2**30, 3), row["known51_pass"]] for row in summary["sampling_costs"]]), "",
++        f"总执行墙钟：{_number(report.get('elapsed_seconds'), 2)}秒。采样计时包含诊断保存/同步开销，不能据小样本冷启动比较宣称最快吞吐。"
++        "CPU评分/接缝检查不计作模型前向或主干反向；原噪声复用也不意味着复用旧模型输出。"
++        f"记录的表面/质量评分耗时合计{_number(sum(row.get('scoring_seconds') or 0 for row in summary['per_output']), 2)}秒，"
++        f"接缝诊断合计{_number(sum(row.get('seam_seconds') or 0 for row in summary['per_output']), 2)}秒；两项分别计时。"
++        "可选投影helper即使随代码交付，也未用于任何正式输出，正式投影/正则次数为0。", "",
++        _table(["臂", "本地完整终点", "字节", "文件SHA256", "可恢复"], checkpoint_rows), "",
++        f"原资产保护：`{report.get('protected_unchanged', '尚未完成')}`；协议SHA256：`{report.get('protocol_sha256', '未记录')}`。"
++        "没有复制打包官方2GB权重或历史大包，只记录本轮终点路径/大小/哈希。", "",
++        "## 固定可视化、交付与停止", ""]
++    figure = report.get("upright_figure") or report.get("figure")
++    if figure:
++        name = Path(figure["path"]).name
++        lines += [f"![固定P0 / 回归seed9201 / nested K2,4,8,12]({name})", ""]
++        if report.get("upright_figure"):
++            lines += ["上图仅将显示坐标轴排为X、Z、Y，未改变原始坐标、评分或输出；"
++                f"图SHA256：`{figure.get('sha256', '未记录')}`。"
++                f"原固定图仍保留为[{Path(report['figure']['path']).name}]({Path(report['figure']['path']).name})，"
++                f"原图SHA256：`{report['figure'].get('sha256', '未记录')}`。", ""]
++    else:
++        lines += ["固定生成图：NOT_RUN / 尚未生成。", ""]
++    lines += ["固定图在所有K、模型间使用相同相机和完整范围，并单列free-only，不用C遮盖补全缺陷。"
++        "输入连通面片选择图若存在，仅展示预先几何选择，不代表根据生成质量选取。", "",
++        "- [唯一结果JSON、逐输出/四格/接缝原始诊断](results.json)", "- [实际代码diff](code.diff)",
++        "- [固定输入与回归Gaussian](inputs.npz)", "- [原始51状态生成目录](raw/)", "",
++        "下一步应由R_K、固定R12覆盖、独立上下文对照、每噪声绑定和接缝诊断共同决定；"
++        "单一漂亮均值、严格C保持或某个大K改善都不证明条件欠定根因、架构优越性或工业泛化。"
++        "本轮无接缝正则、投影、额外训练臂或参数搜索；完成预定预算或按真实阻断停止后，不自动启动下一阶段。", ""]
++    return "\n".join(lines)
++
++
++def _source_names(project):
++    runner = project / "native_patch_run.py"
++    tree = ast.parse(runner.read_text(encoding="utf-8-sig"))
++    names = None
++    for node in tree.body:
++        if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "CODE_FILES" for target in node.targets):
++            names = list(ast.literal_eval(node.value))
++    if names is None:
++        names = sorted(path.name for path in project.glob("native_patch_*.py"))
++    for offline_name in ("native_patch_report.py", "native_patch_visual.py"):
++        if (project / offline_name).exists() and offline_name not in names:
++            names.append(offline_name)
++    if any(not name.startswith("native_patch_") or not name.endswith(".py") or "/" in name or "\\" in name for name in names):
++        raise ValueError("Unexpected code delivery source")
++    return names
++
++
++def finalize(output):
++    project = Path(__file__).resolve().parent
++    out = Path(output).resolve()
++    if out.parent != project / "outputs" or not out.name.startswith("native_patch_"):
++        raise ValueError("Only the new isolated native_patch output is writable")
++    result_path = out / "results.json"
++    report = json.loads(result_path.read_text(encoding="utf-8-sig"))
++    if report["status"] not in ("PASS_EXECUTION", "STOPPED"):
++        raise RuntimeError("Do not finalize while model execution is active")
++    protocol_sha = _sha(out / "protocol.json")
++    if protocol_sha != report["protocol_sha256"]:
++        raise RuntimeError("Frozen protocol changed")
++    summary = summarize(report)
++    patch, sources = [], []
++    for name in _source_names(project):
++        path = project / name
++        text = path.read_bytes().decode("utf-8")
++        if not text.endswith("\n"):
++            raise RuntimeError("Refuse a patch that changes source final newline")
++        relative = "experiments/mf_h1_local0/" + name
++        patch.extend([f"diff --git a/{relative} b/{relative}\n", "new file mode 100644\n"])
++        patch.extend(difflib.unified_diff([], text.splitlines(keepends=True), fromfile="/dev/null", tofile="b/" + relative))
++        sources.append(dict(path=str(path), bytes=path.stat().st_size, sha256=_sha(path)))
++    destination = out / "code.diff"
++    destination.write_bytes("".join(patch).encode("utf-8"))
++    numstat = subprocess.run(["git", "apply", "--numstat", str(destination)], cwd=project.parents[1], check=True, capture_output=True, text=True)
++    subprocess.run(["git", "apply", "--reverse", "--check", str(destination)], cwd=project.parents[1], check=True, capture_output=True, text=True)
++    summary["code_delivery"] = dict(path=str(destination), sha256=_sha(destination), sources=sources,
++                                    numstat=numstat.stdout.strip(), reverse_check_passed=True,
++                                    byte_policy="BOM and original CRLF/LF preserved")
++    report["offline_summary"] = summary
++    report_path = out / "NATIVE_PATCH_AND_SEAM_REPORT.md"
++    report_path.write_text(render_report(report, summary), encoding="utf-8", newline="\n")
++    report["delivery"] = dict(report=dict(path=str(report_path), sha256=_sha(report_path)),
++                             code_diff=dict(path=str(destination), sha256=_sha(destination)),
++                             offline_model_calls=0, offline_updates=0)
++    temporary = out / "results.offline.tmp"
++    temporary.write_text(json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False) + "\n", encoding="utf-8")
++    temporary.replace(result_path)
++    if _sha(out / "protocol.json") != protocol_sha:
++        raise AssertionError("Offline reporting changed frozen protocol")
++    return dict(status=report["status"], report=str(report_path), results=str(result_path), code_diff=str(destination), model_calls=0, optimizer_updates=0)
++
++
++if __name__ == "__main__":
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--output", required=True)
++    print(json.dumps(finalize(parser.parse_args().output), ensure_ascii=False, sort_keys=True))
+diff --git a/experiments/mf_h1_local0/native_patch_run.py b/experiments/mf_h1_local0/native_patch_run.py
+new file mode 100644
+--- /dev/null
++++ b/experiments/mf_h1_local0/native_patch_run.py
+@@ -0,0 +1,594 @@
++"""Connected native patches: exactly two fresh 500-update arms; raw seam diagnosis."""
++from .stable_runtime import configure_stable_runtime, stable_execution
++import argparse, copy, gc, hashlib, io, json, platform, random, subprocess, time, traceback
++from pathlib import Path
++import numpy as np
++import torch
++from .official_wrapper import state_sha256
++from .nxc112_run import PROJECT, REPO, EMA, EMA_SHA, BASE_SHA, atomic_json, file_record, protected_paths
++from .prompt_dataset import file_sha256
++from .nxc112_evaluation import array_hash
++from .native_inpainting_run import load_native, release, fixed_case, checkpoint_rng, save_raw, selected_parameters, magnitude
++from .native_inpainting_model import native_execution, _difference, _grad_facts, NUMERICAL_POLICY
++
++REGRESSION_SEEDS=(9201,9202,9203,9204)
++TRAIN_K=(4,8,12)
++EVAL_K=(2,4,8,12)
++MAX_FORWARDS=14500
++
++class Ledger:
++    def __init__(self,report): self.report=report
++    def attach(self,model,kind):
++        def pre(module,args):
++            c=self.report['counts']; stage=self.report['active_stage']
++            if c['model_forward_attempts']>=MAX_FORWARDS: raise RuntimeError('Predeclared 14500 new model-forward ceiling reached')
++            c['model_forward_attempts']+=1; c[kind+'_forward_attempts']+=1
++            c['forward_by_stage'][stage]=c['forward_by_stage'].get(stage,0)+1
++        def post(module,args,output):
++            c=self.report['counts'];c['model_forward_returns']+=1;c[kind+'_forward_returns']+=1
++        return [model.register_forward_pre_hook(pre),model.register_forward_hook(post)]
++
++@torch.no_grad()
++def clamped_sample(model,z,C,counts,native=True):
++    from .native_inpainting_model import native_execution
++    if z.dtype!=torch.float32 or z.shape!=(1,112,9) or C.dtype!=torch.float32: raise ValueError('Exact FP32 inputs required')
++    C=C.reshape(-1,9);K=len(C)
++    if K not in EVAL_K: raise ValueError('Only registered nested K2/4/8/12')
++    before=counts['model_forward_attempts'];source=array_hash(z);ch=array_hash(C)
++    state=z.clone();state[:,:K]=C[None]
++    known=torch.zeros((1,112),device=z.device,dtype=torch.bool);known[:,:K]=True
++    valid=torch.ones_like(known);y=torch.tensor([112],device=z.device)
++    path=[state[0].cpu().numpy().copy()];checks=[]
++    torch.cuda.synchronize();torch.cuda.reset_peak_memory_stats();tick=time.perf_counter()
++    context=native_execution(model,coordinates=state) if native else stable_execution(model)
++    with context as facts:
++        for k in range(50):
++            if not torch.equal(state[0,:K],C): raise RuntimeError('Known coordinates changed before forward')
++            t=torch.full((1,),k/50,device=z.device,dtype=torch.float32)
++            v=model(state,t,y,valid,known).float() if native else model(state,t,y=y,mask=valid).float()
++            next_state=state.clone()
++            next_state[:,K:]=state[:,K:]+v[:,K:]*(1/50)
++            next_state[:,:K]=C[None]
++            state=next_state;counts['euler_updates']+=1
++            ok=torch.equal(state[0,:K],C);checks.append(ok)
++            if not ok or state.dtype!=torch.float32 or not bool(torch.isfinite(state).all()): raise RuntimeError('Invalid clamped Euler state')
++            path.append(state[0].cpu().numpy().copy())
++    torch.cuda.synchronize();seconds=time.perf_counter()-tick
++    if counts['model_forward_attempts']-before!=50: raise RuntimeError('Expected exactly50 forward calls')
++    if array_hash(z)!=source or array_hash(C)!=ch: raise RuntimeError('Sampling input mutated')
++    path=np.stack(path)
++    if not np.array_equal(path[:,:K],np.broadcast_to(C.cpu().numpy(),(51,K,9))): raise RuntimeError('51-state known check failed')
++    if np.array_equal(path[0,K:],path[-1,K:]): raise RuntimeError('Free coordinates did not move')
++    counts['complete_rollouts']+=1
++    return state[0].cpu().numpy(),path,dict(nfe=50,geometry_gradient_calls=0,seconds=seconds,
++        peak_cuda_allocated=torch.cuda.max_memory_allocated(),runtime=facts,known_all51_bitwise=True,known_state_checks=51,
++        known_slots=list(range(K)),free_slots=list(range(K,112)),known_export_order='Original archived C face and vertex order',
++        free_updated=True,noise_sha256=source,condition_sha256=ch,initial_distribution='C in firstK slots; original Gaussian slots K:112 retained',
++        known_input_dtype='torch.float32',integration_dtype='torch.float32',total_faces=112,postprocessing=None)
++
++def run_patch_model_gates(model, x, t, y, valid_mask, known_mask, counters=None):
++    """Bounded root-invoked gates on one disposable full-model copy.
++
++    Root-owned hooks count all native and reference model forwards. This helper
++    additionally reports local call counts and adds only backward attempts and
++    completions to the provided central counters. No optimizer is constructed.
++    The caller must discard this gate model and freshly reload EMA for training.
++    """
++    from .official_wrapper import state_sha256
++    report = dict(status='RUNNING', tests=[], numerical_policy=dict(NUMERICAL_POLICY),
++                  actual_counts=dict(native_forward_attempts=0, native_forward_returns=0,
++                                     reference_forward_attempts=0, reference_forward_returns=0,
++                                     backward_attempts=0, backward_completed=0,
++                                     optimizer_updates=0, complete_rollouts=0),
++                  model_scope='Disposable independent EMA copy; reload before formal training',
++                  nonzero_role_scope='Temporary role values on disposable copy, restored before exit')
++    initial_hash = state_sha256(model.backbone)
++    original_role = model.role_embedding.detach().clone()
++    report['initial_backbone_sha256'] = initial_hash
++    counts = report['actual_counts']
++    handles = []
++
++    def add(name, value):
++        report['tests'].append(dict(name=name, **value))
++        if value['status'] != 'PASS':
++            raise RuntimeError('Native implementation gate failed: ' + name)
++
++    def call(value, mask, *, observer=None, global_time=t, is_reference=False, precision=True):
++        prefix = 'reference' if is_reference else 'native'
++        counts[prefix + '_forward_attempts'] += 1
++        with native_execution(model, coordinates=(value, global_time), autocast=precision):
++            if is_reference:
++                result = model.backbone(value, global_time, y, mask=valid_mask)
++            else:
++                result = model(value, global_time, y, valid_mask, mask, observer=observer)
++        counts[prefix + '_forward_returns'] += 1
++        return result
++
++    try:
++        if not model.experiment_trainable or not all(p.requires_grad for p in model.parameters()):
++            raise RuntimeError('Gate model must permit full-model backward')
++        if not torch.equal(original_role, torch.zeros_like(original_role)):
++            raise RuntimeError('Formal initialization must have exactly zero role embeddings')
++        if sorted(known_mask.sum(1).tolist()) != [4, 8, 12]:
++            raise RuntimeError('Gates require a real batch with K4, K8, K12')
++        if not bool(((t > 0) & (t < 1)).all()):
++            raise RuntimeError('Mixed-time gate requires free times strictly inside (0,1)')
++        all_free = torch.zeros_like(known_mask)
++        with torch.no_grad():
++            native_fp32 = call(x, all_free, precision=False)
++            base_fp32 = call(x, all_free, is_reference=True, precision=False)
++            add('all_free_zero_role_fp32_matches_original',
++                _difference(native_fp32, base_fp32, atol=1e-5, rtol=1e-5))
++            del native_fp32, base_fp32
++            native_bf16 = call(x, all_free)
++            base_bf16 = call(x, all_free, is_reference=True)
++            add('all_free_zero_role_bf16_matches_original_without_shortcut',
++                _difference(native_bf16, base_bf16, atol=0, rtol=0))
++            del native_bf16, base_bf16
++            observed = []
++            expected_time = torch.where(known_mask, torch.ones_like(t[:, None]), t[:, None])
++
++            def observe(event):
++                if event['site'] == 'embedding':
++                    return
++                checks = []
++                for chosen, free, known in zip(event['selected_mods'], event['free_mods'], event['known_mods']):
++                    free_exp = free[:, None].expand_as(chosen)
++                    known_exp = known[:, None].expand_as(chosen)
++                    checks.append(torch.equal(chosen[~known_mask], free_exp[~known_mask])
++                                  and torch.equal(chosen[known_mask], known_exp[known_mask]))
++                observed.append(dict(site=event['site'], layer=event['layer'],
++                                     time_exact=torch.equal(event['face_time'], expected_time),
++                                     selected_modulations_exact=all(checks),
++                                     known_context_valid=bool(valid_mask[known_mask].all()),
++                                     free_and_known_modulation_differ=any(
++                                         not torch.equal(f, k) for f, k in zip(event['free_mods'], event['known_mods']))))
++
++            mixed = call(x, known_mask, observer=observe)
++            repeated = call(x, known_mask)
++            add('mixed_time_visits_every_block_and_final_head', dict(
++                status='PASS' if len(observed) == len(model.backbone.layers) + 1
++                and all(q['time_exact'] and q['selected_modulations_exact']
++                        and q['known_context_valid'] and q['free_and_known_modulation_differ'] for q in observed)
++                else 'FAIL', sites=observed,
++                known_counts=known_mask.sum(1).tolist(),
++                valid_counts=valid_mask.sum(1).tolist(),
++                free_counts=(valid_mask & ~known_mask).sum(1).tolist()))
++            add('same_input_repeated_native_forward_bitwise',
++                _difference(mixed, repeated, atol=0, rtol=0))
++            order = torch.arange(x.shape[1] - 1, -1, -1, device=x.device)
++            face_perm = call(x[:, order], known_mask[:, order])
++            add('bf16_face_role_time_permutation',
++                _difference(face_perm, mixed[:, order], atol=.015625, rtol=.03125))
++            corner_order = torch.tensor([2, 0, 1], device=x.device)
++            corner_x = x.reshape(x.shape[0], 112, 3, 3)[:, :, corner_order].reshape_as(x)
++            corner_pred = call(corner_x, known_mask)
++            corner_expected = mixed.reshape(x.shape[0], 112, 3, 3)[:, :, corner_order].reshape_as(mixed)
++            add('bf16_corner_permutation',
++                _difference(corner_pred, corner_expected, atol=.015625, rtol=.03125))
++            changed_context = x.clone()
++            changed_context[known_mask] += .125
++            changed_prediction = call(changed_context, known_mask)
++            context_change = _difference(changed_prediction[~known_mask], mixed[~known_mask], atol=0, rtol=0)
++            add('free_velocity_reads_known_context', dict(
++                status='PASS' if not context_change['bitwise_equal'] else 'FAIL', difference=context_change))
++            # This is the disposable full-model gate copy, not either formal arm.
++            model.role_embedding[0].fill_(.0078125)
++            model.role_embedding[1].fill_(-.0078125)
++            nonzero_role_prediction = call(x, known_mask)
++            role_change = _difference(nonzero_role_prediction, mixed, atol=0, rtol=0)
++            add('nonzero_roles_on_disposable_copy_change_output', dict(
++                status='PASS' if not role_change['bitwise_equal'] else 'FAIL', difference=role_change))
++            model.role_embedding.copy_(original_role)
++            del mixed, repeated, face_perm, corner_pred, changed_prediction, nonzero_role_prediction
++
++        model.zero_grad(set_to_none=True)
++        grad_input = x.detach().clone().requires_grad_(True)
++        retained = {}
++
++        def retain_context(event):
++            if event['site'] == 'embedding':
++                event['hidden'].retain_grad()
++                retained['embedded_corners'] = event['hidden']
++
++        with torch.enable_grad(), native_execution(model, coordinates=(grad_input, t)):
++            counts['native_forward_attempts'] += 1
++            pred = model(grad_input, t, y, valid_mask, known_mask, observer=retain_context)
++            counts['native_forward_returns'] += 1
++            pred.retain_grad()
++            loss_mask = valid_mask & ~known_mask
++            # Zero velocity target is a structural gate, not training data.
++            denominator = int(loss_mask.sum()) * 9
++            loss = pred.float().square()[loss_mask].sum() / denominator
++            counts['backward_attempts'] += 1
++            if counters is not None:
++                counters['backward_attempts'] = counters.get('backward_attempts', 0) + 1
++            loss.backward()
++            torch.cuda.synchronize(x.device)
++            counts['backward_completed'] += 1
++            if counters is not None:
++                counters['backward_completed'] = counters.get('backward_completed', 0) + 1
++        selected_parameters = {
++            'coordinate_embedding': model.backbone.x_embedder.mlp[0].weight,
++            'first_attention_qkv': model.backbone.layers[0].attn.qkv_proj.weight,
++            'first_attention_output': model.backbone.layers[0].attn.out_proj.weight,
++            'time_embedding': model.backbone.t_embedder.mlp[0].weight,
++            'final_velocity_head': model.backbone.final_layer.linear.weight,
++            'role_embedding': model.role_embedding,
++        }
++        parameter_grads = {name: _grad_facts(parameter.grad) for name, parameter in selected_parameters.items()}
++        embedded_grad = retained['embedded_corners'].grad.reshape(x.shape[0], 112, 3, -1)
++        context_grad = _grad_facts(embedded_grad[known_mask])
++        coordinate_grad = _grad_facts(grad_input.grad[known_mask])
++        prediction_known_grad = pred.grad[known_mask]
++        has_signal = lambda q: q['present'] and q['finite'] and q['max_abs'] > 0
++        add('free_only_loss_backpropagates_through_known_context_and_backbone', dict(
++            status='PASS' if all(has_signal(q) for q in parameter_grads.values())
++            and has_signal(context_grad) and has_signal(coordinate_grad)
++            and torch.equal(prediction_known_grad, torch.zeros_like(prediction_known_grad)) else 'FAIL',
++            free_coordinate_denominator=denominator, free_counts=loss_mask.sum(1).tolist(),
++            known_predicted_velocity_gradient_exact_zero=bool((prediction_known_grad == 0).all()),
++            known_embedded_context_gradient=context_grad, known_coordinate_gradient=coordinate_grad,
++            parameter_gradients=parameter_grads, loss=float(loss.detach())))
++        model.zero_grad(set_to_none=True)
++        if state_sha256(model.backbone) != initial_hash:
++            raise RuntimeError('A zero-update gate changed pretrained backbone tensors')
++        if not torch.equal(model.role_embedding, original_role):
++            raise RuntimeError('Disposable role test failed to restore zero initialization')
++        report['parameter_count'] = sum(p.numel() for p in model.parameters())
++        report['backbone_parameter_count'] = sum(p.numel() for p in model.backbone.parameters())
++        report['role_parameter_count'] = model.role_embedding.numel()
++        report['backbone_unchanged'] = True
++        report['role_restored_bitwise'] = True
++        report['status'] = 'PASS'
++    except Exception as exc:
++        report['status'] = 'STOPPED'
++        report['error'] = repr(exc)
++        report['traceback'] = traceback.format_exc()
++    finally:
++        for handle in handles:
++            handle.remove()
++        with torch.no_grad():
++            model.role_embedding.copy_(original_role)
++        model.zero_grad(set_to_none=True)
++        report['final_backbone_sha256'] = state_sha256(model.backbone)
++        report['final_role_restored'] = torch.equal(model.role_embedding, original_role)
++    return report
++
++@torch.no_grad()
++def teacher(model,bank,step,arm,report):
++    from .native_patch_data import PatchTrainingStream
++    from .native_inpainting_data import native_collate,with_context
++    from .native_inpainting_model import native_execution
++    stream=PatchTrainingStream(bank,'Native_correct',seed=101010)
++    samples=stream.next_effective_batch()
++    examples={}
++    for sample in samples:
++        examples.setdefault((sample['parent_index'],sample['K']),sample)
++    if len(examples)!=6: raise RuntimeError('Teacher must cover both parents and all three trained K values')
++    rows=[];report['active_stage']=f'{arm}_teacher_{step}'
++    for (parent,K),sample in sorted(examples.items()):
++        for t_value in (.05,.2,.5,.8,.95):
++            pair={}
++            for mode,donor in (('correct',parent),('mismatch',1-parent)):
++                item=with_context(sample,donor)
++                batch=native_collate([item],'cuda')
++                t=torch.full((1,),t_value,device='cuda',dtype=torch.float32)
++                xt=t[:,None,None]*batch['x1']+(1-t[:,None,None])*batch['x0']
++                xt=torch.where(batch['known_mask'][...,None],batch['xt'],xt)
++                with native_execution(model,coordinates=xt):
++                    v=model(xt,t,batch['y'],batch['valid_mask'],batch['known_mask']).float()
++                loss_mask=batch['valid_mask']&~batch['known_mask'];u=batch['u']
++                mse=float((v-u).square()[loss_mask].mean())
++                if not np.isfinite(mse):raise RuntimeError('Nonfinite teacher loss')
++                pair[mode]=dict(mse=mse,donor=donor)
++            rows.append(dict(parent=parent,K=K,t=t_value,**pair))
++    return dict(step=step,arm=arm,rows=rows,forward_calls=60,
++        target_noise='Fresh fixed seed101010 free-only OT; independent of training and complete-sampling Gaussian',
++        no_parameter_updates=True)
++
++def train_arm(model,bank,arm,out,report,write,progress,expected_audits=None):
++    from .native_patch_data import PatchTrainingStream
++    from .native_inpainting_data import native_collate
++    from .native_inpainting_model import native_execution,assert_native_runtime
++    torch.manual_seed(10);np.random.seed(10);random.seed(10)
++    stream=PatchTrainingStream(bank,arm,seed=10)
++    optimizer=torch.optim.AdamW(model.parameters(),lr=1e-5,betas=(.9,.95),weight_decay=0.)
++    parameters=list(model.parameters()); selected=selected_parameters(model)
++    initial=state_sha256(model);base_initial=state_sha256(model.backbone)
++    if base_initial!=BASE_SHA or not all(p.requires_grad for p in parameters):raise RuntimeError('Full experiment model must start from trainable official EMA')
++    result=dict(status='RUNNING',completed_updates=0,optimizer_step_attempts=0,optimizer_step_in_progress=False,batch_in_progress=False,
++        initial_state_sha256=initial,initial_backbone_sha256=base_initial,parameters=sum(p.numel() for p in parameters),
++        trainable_parameters=sum(p.numel() for p in parameters if p.requires_grad),batch_audits=[],teacher=[],sparse_diagnostics=[],
++        selected_parameter_names=list(selected),seed=10,training_seconds=0.,peak_cuda_allocated=0)
++    report['arms'][arm]=result;write()
++    def save(stopped=False):
++        name='stopped.pt' if stopped else 'endpoint_step500.pt'
++        dest=out/arm/name;dest.parent.mkdir(exist_ok=True)
++        if dest.exists():raise FileExistsError(dest)
++        # CPU tensors avoid retaining another GPU backbone or optimizer.
++        state={n:p.detach().cpu() for n,p in model.state_dict().items()}
++        optim=optimizer.state_dict()
++        def cpu(v):
++            if torch.is_tensor(v):return v.detach().cpu()
++            if isinstance(v,dict):return {k:cpu(a) for k,a in v.items()}
++            if isinstance(v,list):return [cpu(a) for a in v]
++            if isinstance(v,tuple):return tuple(cpu(a) for a in v)
++            return v
++        torch.save(dict(schema='native_connected_patch_v1',arm=arm,model=state,optimizer=cpu(optim),rng=checkpoint_rng(stream),
++            completed_updates=result['completed_updates'],optimizer_step_attempts=result['optimizer_step_attempts'],
++            optimizer_step_in_progress=result['optimizer_step_in_progress'],initial_state_sha256=initial,
++            initial_backbone_sha256=BASE_SHA,protocol_sha256=report['protocol_sha256'],protocol=report['protocol'],
++            recoverable=not result['optimizer_step_in_progress'] and not result.get('batch_in_progress',False) and len(result['batch_audits'])==result['completed_updates'],full_model_finetuned=True),dest)
++        result['checkpoint']=dict(path=str(dest),**file_record(dest),state_sha256=state_sha256(model),
++            backbone_state_sha256=state_sha256(model.backbone),recoverable=not result['optimizer_step_in_progress'] and not result.get('batch_in_progress',False) and len(result['batch_audits'])==result['completed_updates'])
++        write()
++    try:
++        result['teacher'].append(teacher(model,bank,0,arm,report));write()
++        for step in range(1,501):
++            report['active_stage']=f'{arm}_training'
++            c=report['counts']
++            if c['optimizer_step_attempts']>=1000 or result['optimizer_step_attempts']>=500:raise RuntimeError('Hard training update budget')
++            tick=time.perf_counter();torch.cuda.reset_peak_memory_stats()
++            result['batch_in_progress']=True
++            samples=stream.next_effective_batch()
++            denominator=9*sum(int((s['valid_mask']&~s['known_mask']).sum()) for s in samples)
++            if denominator!=stream.last_audit['effective_free_coordinates'] or not 7200<=denominator<=7776:raise RuntimeError('Actual mixed-K free-coordinate denominator mismatch')
++            audit=copy.deepcopy(stream.last_audit)
++            if expected_audits is not None and audit['shared_batch_sha256']!=expected_audits[step-1]['shared_batch_sha256']:
++                raise RuntimeError('Two-arm target/noise/OT/t/permutation input stream mismatch')
++            optimizer.zero_grad(set_to_none=True);loss_total=0.;c0=c['model_forward_attempts']
++            for sample in samples:
++                batch=native_collate([sample],'cuda')
++                with native_execution(model,coordinates=batch['xt']) as facts:
++                    v=model(batch['xt'],batch['t'],batch['y'],batch['valid_mask'],batch['known_mask']).float()
++                    mask=batch['valid_mask']&~batch['known_mask']
++                    loss=(v-batch['u']).square()[mask].sum()/denominator
++                    if not bool(torch.isfinite(loss)):raise RuntimeError('Nonfinite free FM loss; no numerical fallback')
++                    c['backward_attempts']+=1;loss.backward();c['backward_completed']+=1
++                loss_total+=float(loss.detach())
++            if c['model_forward_attempts']-c0!=8:raise RuntimeError('Each update must use8 fresh microbatch forwards')
++            sparse=step in (1,100,250,500)
++            if sparse:
++                before={n:p.detach().cpu().clone() for n,p in selected.items()}
++                grads={n:(magnitude(p.grad) if p.grad is not None else None) for n,p in selected.items()}
++            norm=float(torch.nn.utils.clip_grad_norm_(parameters,1.,error_if_nonfinite=True))
++            c['optimizer_step_attempts']+=1;result['optimizer_step_attempts']+=1
++            result['optimizer_step_in_progress']=True;write()
++            # Exit every autocast context before optimizer.step to avoid stale casts.
++            optimizer.step();torch.cuda.synchronize()
++            c['optimizer_updates']+=1;c['experimental_backbone_updates']+=1
++            result['completed_updates']=step;result['optimizer_step_in_progress']=False
++            finite=torch.stack([torch.isfinite(p).all() for p in parameters]).all()
++            if not bool(finite):raise RuntimeError('Nonfinite parameter after attempted update')
++            elapsed=time.perf_counter()-tick
++            result['training_seconds']+=elapsed;result['peak_cuda_allocated']=max(result['peak_cuda_allocated'],torch.cuda.max_memory_allocated())
++            audit.update(step=step,loss=loss_total,grad_norm_before_clip=norm,free_coordinate_denominator=denominator,seconds=elapsed)
++            result['batch_audits'].append(audit);result['batch_in_progress']=False
++            if sparse:
++                deltas={n:magnitude(p.detach().cpu()-before[n]) for n,p in selected.items()}
++                result['sparse_diagnostics'].append(dict(step=step,gradients=grads,actual_parameter_updates=deltas,runtime=facts))
++                del before
++            if step==1 or step%10==0:progress(dict(stage=arm,step=step,loss=loss_total,seconds=elapsed,total_updates=c['optimizer_updates']))
++            if step in (100,250,500):result['teacher'].append(teacher(model,bank,step,arm,report));write()
++        result['final_backbone_sha256']=state_sha256(model.backbone)
++        if result['final_backbone_sha256']==BASE_SHA:raise RuntimeError('Full-model backbone did not change')
++        save();result['status']='PASS_EXECUTION';write()
++    except BaseException as error:
++        result.update(status='STOPPED',error=repr(error),traceback=traceback.format_exc())
++        try:save(stopped=True)
++        except BaseException as e:result['save_error']=repr(e)
++        write();raise
++    finally:
++        optimizer.zero_grad(set_to_none=True);del optimizer;gc.collect()
++    return result
++
++
++def run(output):
++    from .native_patch_data import prepare_inputs, PatchTrainingStream, run_cpu_tests as data_tests
++    from .native_inpainting_data import native_collate
++    from .native_inpainting_model import run_cpu_formula_tests
++    from .native_patch_metrics import run_cpu_tests as metric_tests
++    from .native_patch_seams import run_cpu_tests as seam_tests
++    out=Path(output).resolve()
++    if not out.is_relative_to(PROJECT/'outputs') or not out.name.startswith('native_patch_'):
++        raise ValueError('New isolated native_patch output required')
++    out.mkdir(exist_ok=True);(out/'raw').mkdir(exist_ok=True)
++    if (out/'results.json').exists():raise FileExistsError('No overwrite or automatic training resume')
++    torch.set_num_threads(8);runtime=configure_stable_runtime()
++    protocol=dict(
++        experiment='connected_native_patches_raw_seam_diagnosis',phase3=False,architecture_search=False,
++        authorization='User selected two new 500-update arms, total1000; mixed K4/8/12; independent context control; seam diagnosis first, no new regularizer',
++        arms={'Native_correct':500,'Native_independent':500},max_optimizer_step_attempts=1000,
++        full_experiment_model_finetuning=True,initialization='Fresh official EMA plus zero role table for both arms; not old endpoints',
++        original_ema_and_history_readonly=True,parents=2,N_total=112,training_K=list(TRAIN_K),evaluation_K=list(EVAL_K),
++        K2_scope='New nested K2, evaluation only, out-of-training; not historical disjoint K2',
++        patch_selection='Input geometry only: largest eligible interior horizontal seed; deterministic shared-edge frontier expansion; nested prefixes; no semantic labels',
++        training_seed=10,effective_batch=8,microbatch=1,
++        balanced='Each batch four samples per parent; K totals3/3/2 rotate; every3 batches each(parent,K)four samples',
++        independent_donor='Uniform over both parents, independent RNG, sameK, each sample redrawn; correct donor probability1/2',
++        optimizer={'name':'AdamW','lr':1e-5,'betas':[.9,.95],'weight_decay':0.,'grad_clip':1.},
++        loss='Original sum free velocity squared error / actual effective-batch free coordinate count',
++        regularizer=None,new_ema=False,scheduler=None,role_embedding_shape=[2,768],role_init='zeros',
++        time_distribution='Original sigmoid(N(0,1))',known_time=1,free_time='t',
++        free_pairing='Official free-only nested OT at pre-final-times2 stage; fresh Gaussian each access',
++        training_permutations='Fresh face and cyclic corners; masks/time/roles share mappings',
++        teacher_steps=[0,100,250,500],teacher_times=[.05,.2,.5,.8,.95],teacher_seed=101010,
++        diagnostic_grad_steps=[1,100,250,500],final_step=500,
++        regression_seeds=list(REGRESSION_SEEDS),noise_scope='Actual archived Gaussian arrays reused; not new independent confirmation noises; never train-OT starting noise',
++        both_endpoints_fixed_before_full_evaluation=True,model_selection=False,
++        steps=50,dt=.02,time_grid='FP32 k/50 for k0..49',y=112,face_cfg=1,geometry_cfg=1,
++        precision='BF16 autocast; FP32 parameters, C, Gaussian and Euler coordinates',
++        determinism='CUBLAS=:4096:8 before CUDA; strict deterministic warnFalse; TF32off; SDPA math',
++        all_modules_eval=True,gradient_checkpointing=False,compile=False,
++        postprocessing='NONE; optional boundary projection helper is NOT_RUN on experimental outputs',
++        groups=['Native0','T1','T2'],surface_points=512,surface_seed=9911,common_R12_point_seed=9973,common_R12_parent_seed_offset=True,
++        common_region='For each parent identical fixed points on R12; target-to-predicted-free coverage only; no reverse penalty against R12',
++        seam_boundary_samples=512,seam_seed=9919,near_boundary_threshold_bbox=1e-3,
++        seam_metric='Length-weighted known boundary to entire free surface; requested near-free-vertex gap with explicit count; empty is missing not zero',
++        intersections='FP64 proper free-known triangle penetration, separated from tangent/shared/coplanar contact; not whole-mesh selfintersection certification',
++        topology='Exact-coordinate indexed edge-incidence diagnostics; no tolerance welding; vertex-link manifold certification NOT_RUN',
++        hypotheses={'P0_below_2pct':'Mean, median and each-seed success reported, not guaranteed',
++            'monotonic':'Strict trends per seed and mean separately, R_K and fixed R12 separately; trained4/8/12 and eval-only2/4/8/12 separately',
++            'binding':'K8 andK12 each4/4 with both parent directions positive; mean/median/9202 net-sum share/other3 means',
++            'cause':'Insufficient context is an unproven hypothesis; this two-parent training experiment cannot establish generalization or industrial readiness'},
++        planned_formal_rollouts=96,planned_diagnostic_rollouts=2,max_new_model_forwards=MAX_FORWARDS,
++        expected_training_microbatch_forwards=8000,expected_teacher_forwards=480,
++        numerical_policy=dict(NUMERICAL_POLICY))
++    (out/'protocol.json').write_text(json.dumps(protocol,indent=2,allow_nan=False),encoding='utf-8')
++    code=[PROJECT/name for name in ('native_patch_data.py','native_patch_metrics.py','native_patch_seams.py','native_patch_run.py','native_inpainting_model.py','native_inpainting_data.py','native_inpainting_run.py','stable_runtime.py')]
++    report=dict(status='RUNNING',active_stage='preflight',protocol=protocol,protocol_sha256=file_sha256(out/'protocol.json'),
++        initial_runtime=runtime,arms={},generated=[],sampling_diagnostics=[],source_files={p.name:file_record(p) for p in code},
++        counts=dict(model_forward_attempts=0,model_forward_returns=0,official_forward_attempts=0,official_forward_returns=0,
++            native_forward_attempts=0,native_forward_returns=0,forward_by_stage={},backward_attempts=0,backward_completed=0,
++            optimizer_step_attempts=0,optimizer_updates=0,experimental_backbone_updates=0,protected_official_updates=0,
++            geometry_gradient_attempts=0,geometry_gradient_completed=0,model_backward_calls=0,euler_updates=0,
++            complete_rollouts=0,formal_rollouts=0,diagnostic_rollouts=0),
++        environment=dict(python=platform.python_version(),torch=torch.__version__,numpy=np.__version__,cuda=torch.version.cuda))
++    def write():atomic_json(out/'results.json',report)
++    def progress(event):report['latest_progress']=event;write();print(json.dumps(event,allow_nan=False),flush=True)
++    write();protected=[];model=None;started=time.perf_counter();ledger=Ledger(report)
++    try:
++        protected=[p for p in protected_paths(out) if not p.name.startswith('native_patch_')]
++        report['protected_before']={str(p):file_record(p) for p in protected}
++        if report['protected_before'][str(EMA)]['sha256']!=EMA_SHA:raise RuntimeError('Original official file hash mismatch')
++        bank,audit=prepare_inputs(out);report['assets']=audit
++        preview=out/'INPUT_PATCH_PREVIEW.png'
++        report['input_preview']=dict(path=str(preview),**file_record(preview),verified_before_model_calls=True)
++        report['development_cpu_checks']=dict(data_OT_calls=67,metrics_fixture_runs=1,seam_fixture_runs=2,model_forwards=0,optimizer_updates=0,scope='Agent development checks before formal gate rerun')
++        write()
++        if audit['status']!='PASS':raise RuntimeError('Input patch asset gate failed')
++        report['data_cpu_tests']=data_tests(bank);report['metric_cpu_tests']=metric_tests()
++        report['seam_cpu_tests']=seam_tests();report['formula_cpu_tests']=run_cpu_formula_tests();write()
++        if any(report[key]['status']!='PASS' for key in ('data_cpu_tests','metric_cpu_tests','seam_cpu_tests','formula_cpu_tests')):
++            raise RuntimeError('CPU tests failed')
++        model,loaded=load_native(ledger);report['strict_load']=loaded
++        report['environment'].update(gpu=torch.cuda.get_device_name(),gpu_memory_bytes=torch.cuda.get_device_properties(0).total_memory,
++            git_head=subprocess.check_output(['git','rev-parse','HEAD'],cwd=REPO,text=True).strip())
++        initial=state_sha256(model);report['native_initial_state_sha256']=initial
++        stream=PatchTrainingStream(bank,'Native_correct',seed=10);samples=stream.next_effective_batch()
++        chosen=[next(s for s in samples if s['K']==k) for k in TRAIN_K]
++        batch=native_collate(chosen,'cuda');report['active_stage']='implementation_gates'
++        report['model_gates']=run_patch_model_gates(model,batch['xt'],batch['t'],batch['y'],batch['valid_mask'],batch['known_mask'],counters=report['counts']);write()
++        if report['model_gates']['status']!='PASS':raise RuntimeError('Native K4/8/12 gates failed before training')
++        if state_sha256(model)!=initial:raise RuntimeError('Gate changed initialization')
++        del stream,samples,chosen,batch
++        # First registered Native0 result doubles as the repeat/reload gate.
++        case=fixed_case(bank,0,4);C=torch.from_numpy(case['constraints']).cuda();z=bank['noises'][9201].cuda()
++        report['active_stage']='Native0_pretraining_sampling_gate'
++        raw,path,stats=clamped_sample(model,z,C,report['counts'])
++        save_raw(out,'Native0_P0_K4_seed9201',raw,path,dict(model='Native0',parent=0,K=4,seed=9201,split='reused_regression',sampling=stats),report)
++        report['counts']['formal_rollouts']+=1
++        for label in ('same_input_repeat','serialized_reload_repeat'):
++            report['active_stage']='sampling_gate_'+label
++            if label.startswith('serialized'):
++                payload={n:v.detach().cpu() for n,v in model.state_dict().items()}
++                buffer=io.BytesIO();torch.save(payload,buffer);buffer.seek(0)
++                reloaded=torch.load(buffer,map_location='cpu',weights_only=True);model.load_state_dict(reloaded,strict=True)
++                del payload,reloaded,buffer
++            again,again_path,diag=clamped_sample(model,z,C,report['counts'])
++            equal=np.array_equal(raw,again) and np.array_equal(path,again_path)
++            report['counts']['diagnostic_rollouts']+=1
++            report['sampling_diagnostics'].append(dict(name=label,status='PASS' if equal else 'FAIL',bitwise_equal=equal,sampling=diag))
++            if not equal:raise RuntimeError('Native repeat/reload sampling differs')
++        del raw,path,again,again_path,C,z
++        report['pretraining_all_gates_pass']=True;write();progress(dict(stage='all_pretraining_gates_pass'))
++        model.zero_grad(set_to_none=True);del model;model=None;release()
++        for arm in ('Native_correct','Native_independent'):
++            model,_=load_native(ledger)
++            if state_sha256(model)!=initial:raise RuntimeError('Both arms must have identical complete initialization')
++            expected=None if arm=='Native_correct' else report['arms']['Native_correct']['batch_audits']
++            train_arm(model,bank,arm,out,report,write,progress,expected)
++            del model;model=None;release()
++        report['both_endpoints_fixed_before_full_evaluation']=True;write()
++        evaluate_fixed(bank,out,report,ledger,write,progress)
++        c=report['counts'];c['model_backward_calls']=c['backward_attempts']
++        if c['optimizer_step_attempts']!=1000 or c['optimizer_updates']!=1000:raise RuntimeError('Update accounting differs')
++        if c['formal_rollouts']!=96 or c['diagnostic_rollouts']!=2 or c['complete_rollouts']!=98 or c['euler_updates']!=4900:
++            raise RuntimeError('Sampling accounting differs')
++        if c['model_forward_attempts']!=c['model_forward_returns'] or c['backward_attempts']!=c['backward_completed']:
++            raise RuntimeError('Incomplete model execution')
++        report['protected_after']={str(p):file_record(p) for p in protected}
++        report['protected_unchanged']=report['protected_after']==report['protected_before']
++        report['source_files_after']={p.name:file_record(p) for p in code}
++        report['source_files_unchanged']=report['source_files_after']==report['source_files']
++        if not report['protected_unchanged'] or not report['source_files_unchanged']:raise RuntimeError('Protected input or execution source changed')
++        if file_sha256(out/'protocol.json')!=report['protocol_sha256']:raise RuntimeError('Protocol changed')
++        report.update(status='PASS_EXECUTION',active_stage='complete',elapsed_seconds=time.perf_counter()-started)
++        progress(dict(stage='complete',status=report['status'],counts=c))
++    except BaseException as error:
++        report.update(status='STOPPED',error=repr(error),traceback=traceback.format_exc(),elapsed_seconds=time.perf_counter()-started)
++        report['counts']['model_backward_calls']=report['counts']['backward_attempts']
++        if protected:
++            report['protected_after']={str(p):file_record(p) for p in protected}
++            report['protected_unchanged']=report['protected_after']==report['protected_before']
++        write();raise
++
++
++def evaluate_fixed(bank,out,report,ledger,write,progress):
++    from .native_patch_metrics import prepare_common_reference,evaluate_patch_output,patch_binding_four_grid,plot_patch_fixed
++    from .native_patch_seams import diagnose_patch_seams,triangle_soup_topology
++    if not report.get('both_endpoints_fixed_before_full_evaluation'):raise RuntimeError('Both fixed endpoints required')
++    c=report['counts'];records={(q['model'],q['parent'],q['K'],q['seed']):q for q in report['generated']}
++    for group,arm in (('Native0',None),('T1','Native_correct'),('T2','Native_independent')):
++        model,_=load_native(ledger)
++        if arm:
++            endpoint=report['arms'][arm]['checkpoint']
++            if file_sha256(endpoint['path'])!=endpoint['sha256']:raise RuntimeError('Endpoint bytes changed')
++            payload=torch.load(endpoint['path'],map_location='cpu',weights_only=True,mmap=True)
++            if payload['completed_updates']!=500 or payload['arm']!=arm:raise RuntimeError('Wrong endpoint')
++            model.load_state_dict(payload['model'],strict=True);del payload
++            expected_hash=endpoint['state_sha256']
++        else:expected_hash=report['native_initial_state_sha256']
++        if state_sha256(model)!=expected_hash:raise RuntimeError('Strict reload hash failed')
++        for case in bank['cases']:
++            parent,K=case['parent_index'],case['K'];C=torch.from_numpy(case['constraints']).cuda()
++            for seed in REGRESSION_SEEDS:
++                if (group,parent,K,seed) in records:continue
++                report['active_stage']=group+'_evaluation'
++                raw,path,stats=clamped_sample(model,bank['noises'][seed].cuda(),C,c)
++                key=f'{group}_P{parent}_K{K}_seed{seed}'
++                row=save_raw(out,key,raw,path,dict(model=group,parent=parent,K=K,seed=seed,split='reused_regression',sampling=stats),report)
++                records[(group,parent,K,seed)]=row;c['formal_rollouts']+=1
++            progress(dict(stage=group,parent=parent,K=K,formal_rollouts=c['formal_rollouts']))
++        if state_sha256(model)!=expected_hash:raise RuntimeError('Sampling changed model state')
++        del model;release()
++    common_cases=[fixed_case(bank,p,12) for p in (0,1)]
++    common=prepare_common_reference([q['free_target'] for q in common_cases],[q['bbox_diagonal'] for q in common_cases])
++    report['common_reference_audit']=common['audit'];report['scores']=[];report['ground_truth_seams']=[];index={};figure={}
++    for case in bank['cases']:
++        parent,K=case['parent_index'],case['K'];C=case['constraints'];bbox=case['bbox_diagonal']
++        target_cases=[fixed_case(bank,p,K) for p in (0,1)]
++        remainders=[q['free_target'] for q in target_cases];diagonals=[q['bbox_diagonal'] for q in target_cases]
++        report['ground_truth_seams'].append(dict(parent=parent,K=K,seam=diagnose_patch_seams(C,case['free_target'],bbox),
++            full_topology=triangle_soup_topology(case['full_target'])))
++        for seed in REGRESSION_SEEDS:
++            for group in ('Native0','T1','T2'):
++                report['active_stage']='offline_scoring'
++                row=records[(group,parent,K,seed)]
++                if file_sha256(row['raw_path'])!=row['raw_sha256']:raise RuntimeError('Raw output bytes changed')
++                with np.load(row['raw_path'],allow_pickle=False) as archive:raw=archive['output'].copy()
++                known=np.arange(112)<K
++                seam=diagnose_patch_seams(C,raw[~known],bbox)
++                score,package=evaluate_patch_output(raw,C,case['full_target'],remainders,common,diagonals,parent,known,seam_result=seam)
++                score['full_topology']=triangle_soup_topology(raw)
++                if len(package['full'])!=112 or len(package['free'])!=112-K:raise RuntimeError('Evaluation count mismatch')
++                result=dict(model=group,parent=parent,K=K,seed=seed,split='reused_regression',raw_reference=row['key'],raw_path=row['raw_path'],metrics=score)
++                report['scores'].append(result);index[(group,parent,K,seed)]=result
++                if parent==0 and seed==9201:figure.setdefault(K,{})[group]=package
++            progress(dict(stage='offline_scoring',parent=parent,K=K,seed=seed,scores=len(report['scores'])))
++    report['bindings']=[]
++    for group in ('Native0','T1','T2'):
++        for K in EVAL_K:
++            for seed in REGRESSION_SEEDS:
++                binding=patch_binding_four_grid(index[(group,0,K,seed)]['metrics'],index[(group,1,K,seed)]['metrics'])
++                report['bindings'].append(dict(model=group,K=K,seed=seed,split='reused_regression',**binding))
++    if len(report['scores'])!=96 or len(report['bindings'])!=48:raise RuntimeError('Evaluation matrix incomplete')
++    report['figure']=plot_patch_fixed(figure,{K:fixed_case(bank,0,K)['constraints'] for K in EVAL_K},out/'fixed_parent0_seed9201.png')
++    report['figure']['sha256']=file_sha256(report['figure']['path']);write()
++
++
++if __name__=='__main__':
++    parser=argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('--output',required=True)
++    run(parser.parse_args().output)
+diff --git a/experiments/mf_h1_local0/native_patch_seams.py b/experiments/mf_h1_local0/native_patch_seams.py
+new file mode 100644
+--- /dev/null
++++ b/experiments/mf_h1_local0/native_patch_seams.py
+@@ -0,0 +1,610 @@
++"""CPU-only patch boundary, C/free contact, and optional export diagnostics.
++
++No training, model, optimizer, torch, mesh repairs, or file mutation occurs here.
++The intersection diagnostic covers C-versus-free pairs only, not free/free
++self-intersections or a complete topology certificate. Its plane/interval test
++follows the geometric construction in Moller (1997); the contact taxonomy and
++fixed tolerances below are explicit additions, not exact-predicate guarantees.
++"""
++from __future__ import annotations
++
++from collections import Counter, defaultdict
++import hashlib
++import itertools
++import json
++import math
++import time
++import numpy as np
++
++
++NUMERIC_POLICY = {
++    'computation_dtype': 'float64',
++    'intersection_distance_epsilon_bbox': 1e-9,
++    'degenerate_triangle_area_epsilon_bbox_squared': 1e-12,
++    'coplanar_positive_overlap_area_epsilon_bbox_squared': 1e-12,
++    'parallel_unit_normal_cross_epsilon': 1e-12,
++    'near_boundary_threshold_bbox': 1e-3,
++    'near_boundary_comparison': 'strictly less than threshold',
++    'boundary_sampling_target': 512,
++    'minimum_samples_per_segment': 2,
++    'boundary_sample_seed': 9919,
++    'exact_topology_vertex_key': 'Exact numeric FP64 coordinate tuple; signed zeros compare equal; no tolerance weld',
++    'reference': 'https://web.stanford.edu/class/cs277/resources/papers/Moller1997b.pdf',
++}
++
++
++def _triangles(value):
++    a = np.asarray(value)
++    if a.ndim == 2 and a.shape[-1] == 9:
++        return a.reshape(-1, 3, 3)
++    if a.ndim == 3 and a.shape[-2:] == (3, 3):
++        return a
++    raise ValueError('Expected triangles [N,9] or [N,3,3]')
++
++
++def _bbox_scale(value):
++    length = float(value)
++    if not math.isfinite(length) or length <= 0:
++        raise ValueError('Require a positive finite fixed complete-target bbox diagonal')
++    return length
++
++
++def _hash(a):
++    value = np.ascontiguousarray(a)
++    return hashlib.sha256(str((str(value.dtype), value.shape)).encode() + value.tobytes()).hexdigest()
++
++
++def _index_soup(triangles):
++    triangles = _triangles(triangles)
++    if not np.isfinite(triangles).all():
++        raise ValueError('Nonfinite coordinates cannot define exact-coordinate topology')
++    vertices, mapping, faces = [], {}, []
++    for triangle in triangles:
++        face = []
++        for vertex in triangle:
++            key = tuple(float(q) for q in vertex)
++            if key not in mapping:
++                mapping[key] = len(vertices)
++                vertices.append(vertex.copy())
++            face.append(mapping[key])
++        faces.append(face)
++    v = np.asarray(vertices, dtype=triangles.dtype).reshape(-1, 3)
++    f = np.asarray(faces, dtype=np.int64).reshape(-1, 3)
++    incidences = defaultdict(list)
++    for face_index, face in enumerate(f):
++        for corner in range(3):
++            a, b = int(face[corner]), int(face[(corner + 1) % 3])
++            if a != b:
++                incidences[tuple(sorted((a, b)))].append((face_index, a, b))
++    return v, f, incidences
++
++
++def triangle_soup_topology(triangles, bbox_diagonal=None):
++    """Exact-coordinate indexing audit, not a watertight/manifold certification."""
++    t = _triangles(triangles)
++    v, f, edges = _index_soup(t)
++    counts = Counter(len(incident) for incident in edges.values())
++    repeated_vertex = sum(len(set(face.tolist())) < 3 for face in f)
++    duplicates = Counter(tuple(sorted(face.tolist())) for face in f)
++    same_direction = sum(
++        len(entries) == 2 and entries[0][1:] == entries[1][1:]
++        for entries in edges.values())
++    area_degenerate = None
++    if bbox_diagonal is not None:
++        length = _bbox_scale(bbox_diagonal)
++        area = np.linalg.norm(np.cross(t[:, 1].astype(float) - t[:, 0],
++                                       t[:, 2].astype(float) - t[:, 0]), axis=-1) / 2
++        area_degenerate = int((area <= 1e-12 * length * length).sum())
++    adjacency = [set() for _ in range(len(f))]
++    for entries in edges.values():
++        face_ids = {q[0] for q in entries}
++        for a in face_ids:
++            adjacency[a].update(face_ids - {a})
++    visited, components = set(), 0
++    for start in range(len(f)):
++        if start in visited:
++            continue
++        components += 1
++        pending = [start]
++        while pending:
++            current = pending.pop()
++            if current in visited:
++                continue
++            visited.add(current)
++            pending.extend(adjacency[current] - visited)
++    return dict(
++        status='PASS_EXACT_COORDINATE_AUDIT', faces=len(f), unique_vertices=len(v),
++        unique_undirected_edges=len(edges), boundary_edges=counts.get(1, 0),
++        two_incident_face_edges=counts.get(2, 0),
++        nonmanifold_edges=sum(n > 2 for n in (len(q) for q in edges.values())),
++        same_orientation_two_face_edges=int(same_direction),
++        incidence_histogram={str(k): int(n) for k, n in sorted(counts.items())},
++        exact_repeated_vertex_faces=int(repeated_vertex),
++        duplicate_faces_ignoring_winding=sum(n - 1 for n in duplicates.values()),
++        near_zero_area_faces=area_degenerate, exact_edge_connected_face_components=components,
++        indexing=NUMERIC_POLICY['exact_topology_vertex_key'],
++        vertices_merged_by_tolerance=False,
++        watertight_status='NOT_CERTIFIED', manifold_status='NOT_CERTIFIED',
++        full_self_intersection_status='NOT_RUN',
++    )
++
++
++def extract_boundary_segments(context):
++    """Return actual one-incident-face C edges, removing shared interior edges.
++
++    Returns ``(segments[E,2,3], audit)``. No convex hull, bbox boundary, nearest
++    vertex shortcut, or inferred patch outline substitutes for source edges.
++    """
++    c = _triangles(context)
++    v, faces, incidences = _index_soup(c)
++    boundary = [(edge, entries[0]) for edge, entries in sorted(incidences.items()) if len(entries) == 1]
++    segments = np.asarray([v[list(edge)] for edge, _ in boundary], dtype=c.dtype).reshape(-1, 2, 3)
++    lengths = np.linalg.norm(segments[:, 1].astype(float) - segments[:, 0], axis=-1)
++    if np.any(lengths <= 0):
++        raise RuntimeError('Exact non-self boundary edges must have nonzero lengths')
++    return segments, dict(
++        method='Count exact shared C edges; retain precisely incidence=1',
++        context_faces=len(faces), boundary_segments=len(segments),
++        interior_two_face_edges=sum(len(q) == 2 for q in incidences.values()),
++        nonmanifold_context_edges=sum(len(q) > 2 for q in incidences.values()),
++        segment_lengths=lengths.tolist(), total_boundary_length=float(lengths.sum()),
++        segment_source_faces=[int(entry[0]) for _, entry in boundary],
++        segment_exact_vertex_ids=[list(edge) for edge, _ in boundary],
++        includes_hole_and_disconnected_boundaries=True,
++        source_coordinates_unchanged=True,
++    )
++
++
++def nearest_segments(points, segments):
++    """Exact finite-segment nearest points in FP64; never infinite lines."""
++    p = np.asarray(points, dtype=np.float64).reshape(-1, 3)
++    s = np.asarray(segments, dtype=np.float64).reshape(-1, 2, 3)
++    if not len(s):
++        return None, None, None
++    start, direction = s[:, 0], s[:, 1] - s[:, 0]
++    denominator = np.einsum('si,si->s', direction, direction)
++    numerator = np.einsum('psi,si->ps', p[:, None] - start[None], direction)
++    alpha = np.divide(numerator, denominator[None], out=np.zeros_like(numerator), where=denominator[None] > 0)
++    alpha = np.clip(alpha, 0, 1)
++    closest = start[None] + alpha[..., None] * direction[None]
++    squared = ((p[:, None] - closest) ** 2).sum(-1)
++    which = squared.argmin(1)
++    return squared[np.arange(len(p)), which], closest[np.arange(len(p)), which], which
++
++
++def point_to_triangle_surface_squared(points, triangles, bbox_diagonal):
++    """Minimum to finite triangle interiors/edges; degenerates use their edges."""
++    p = np.asarray(points, dtype=np.float64).reshape(-1, 3)
++    t = _triangles(triangles).astype(np.float64, copy=False)
++    length = _bbox_scale(bbox_diagonal)
++    if not len(t):
++        return None
++    a, ab, ac = t[:, 0], t[:, 1] - t[:, 0], t[:, 2] - t[:, 0]
++    normal = np.cross(ab, ac)
++    n2 = np.einsum('ti,ti->t', normal, normal)
++    stable = n2 > (2e-12 * length * length) ** 2
++    pa = p[:, None] - a[None]
++    d00 = np.einsum('ti,ti->t', ab, ab)
++    d01 = np.einsum('ti,ti->t', ab, ac)
++    d11 = np.einsum('ti,ti->t', ac, ac)
++    d20 = np.einsum('pti,ti->pt', pa, ab)
++    d21 = np.einsum('pti,ti->pt', pa, ac)
++    v = np.divide(d11[None] * d20 - d01[None] * d21, n2[None],
++                  out=np.zeros_like(d20), where=stable[None])
++    w = np.divide(d00[None] * d21 - d01[None] * d20, n2[None],
++                  out=np.zeros_like(d21), where=stable[None])
++    inside = stable[None] & (v >= 0) & (w >= 0) & (v + w <= 1)
++    signed_n = np.einsum('pti,ti->pt', pa, normal)
++    planar = np.divide(signed_n * signed_n, n2[None],
++                       out=np.full_like(signed_n, np.inf), where=stable[None])
++    best = np.where(inside, planar, np.inf).min(1)
++    for edge in ((0, 1), (1, 2), (2, 0)):
++        d2, _, _ = nearest_segments(p, t[:, list(edge)])
++        best = np.minimum(best, d2)
++    return np.maximum(best, 0)
++
++
++def _sample_boundary(segments, seed, target_count):
++    s = np.asarray(segments, dtype=np.float64)
++    lengths = np.linalg.norm(s[:, 1] - s[:, 0], axis=-1)
++    if not len(s):
++        return np.empty((0, 3)), np.empty(0, dtype=np.int64), np.empty(0), []
++    counts = np.maximum(2, np.ceil(int(target_count) * lengths / lengths.sum()).astype(np.int64))
++    rng = np.random.RandomState(int(seed))
++    samples, identities, point_weights = [], [], []
++    for index, (segment, count, segment_length) in enumerate(zip(s, counts, lengths)):
++        # Different independent uniform draws per segment; endpoints are not
++        # forced into an otherwise sampled maximum or treated as full coverage.
++        alpha = rng.uniform(size=int(count))
++        samples.append(segment[0] + alpha[:, None] * (segment[1] - segment[0]))
++        identities.extend([index] * int(count))
++        point_weights.extend([float(segment_length / lengths.sum() / count)] * int(count))
++    return np.concatenate(samples), np.asarray(identities), np.asarray(point_weights), counts.tolist()
++
++
++def _distance_stats(distances, length):
++    d = np.asarray(distances, dtype=np.float64)
++    if not len(d):
++        return None
++    return dict(count=int(d.size), rms=float(np.sqrt(np.mean(d * d))), max=float(d.max()),
++                rms_bbox_fraction=float(np.sqrt(np.mean(d * d)) / length),
++                max_bbox_fraction=float(d.max() / length))
++
++
++def _cross2(a, b):
++    return float(a[0] * b[1] - a[1] * b[0])
++
++
++def _coplanar_clip(a, b, unit_normal):
++    drop = int(np.argmax(np.abs(unit_normal)))
++    keep = [i for i in range(3) if i != drop]
++    # Translate first to limit cancellation for coordinates far from the origin.
++    origin = a[0]
++    aa, bb = (a - origin)[:, keep], (b - origin)[:, keep]
++    orientation = 1.0 if _cross2(bb[1] - bb[0], bb[2] - bb[0]) >= 0 else -1.0
++    polygon = [q.copy() for q in aa]
++    for edge in range(3):
++        p, q = bb[edge], bb[(edge + 1) % 3]
++        if not polygon:
++            break
++        old, polygon = polygon, []
++        previous = old[-1]
++        old_sign = orientation * _cross2(q - p, previous - p)
++        for current in old:
++            sign = orientation * _cross2(q - p, current - p)
++            old_inside, inside = old_sign >= 0, sign >= 0
++            if old_inside != inside:
++                ratio = old_sign / (old_sign - sign)
++                polygon.append(previous + ratio * (current - previous))
++            if inside:
++                polygon.append(current.copy())
++            previous, old_sign = current, sign
++    if len(polygon) < 3:
++        area = 0.0
++    else:
++        v = np.asarray(polygon) - polygon[0]
++        projected = abs(sum(_cross2(v[i], v[(i + 1) % len(v)]) for i in range(len(v)))) / 2
++        area = projected / abs(float(unit_normal[drop]))
++    return polygon, float(area)
++
++
++def _segment_pair_distance(a, b, c, d):
++    endpoints = np.stack([a, b, c, d])
++    da, _, _ = nearest_segments(endpoints[:2], np.stack([c, d])[None])
++    db, _, _ = nearest_segments(endpoints[2:], np.stack([a, b])[None])
++    best = min(float(da.min()), float(db.min()))
++    u, v, w = b - a, d - c, a - c
++    aa, ab, bb = float(u @ u), float(u @ v), float(v @ v)
++    denominator = float(np.cross(u, v) @ np.cross(u, v))
++    if denominator > np.finfo(np.float64).eps * aa * bb:
++        aw, bw = float(u @ w), float(v @ w)
++        s, t = (ab * bw - bb * aw) / denominator, (aa * bw - ab * aw) / denominator
++        if 0 <= s <= 1 and 0 <= t <= 1:
++            best = min(best, float(np.sum((a + s * u - c - t * v) ** 2)))
++    return math.sqrt(max(best, 0.0))
++
++
++def _plane_cut(triangle, distances, epsilon):
++    points = [triangle[i].copy() for i in range(3) if abs(float(distances[i])) <= epsilon]
++    for i, j in ((0, 1), (1, 2), (2, 0)):
++        if (distances[i] > epsilon and distances[j] < -epsilon) or (distances[j] > epsilon and distances[i] < -epsilon):
++            points.append(triangle[i] + distances[i] / (distances[i] - distances[j]) * (triangle[j] - triangle[i]))
++    return points
++
++
++
++def _maximum_unique_matches(allowed):
++    allowed = np.asarray(allowed, dtype=bool)
++    if allowed.shape != (3, 3):
++        raise ValueError('Triangle vertex matching must be 3 by 3')
++    return max(sum(bool(allowed[i, p[i]]) for i in range(3))
++               for p in itertools.permutations(range(3)))
++
++
++def classify_triangle_pair(first, second, bbox_diagonal):
++    """Classify bounded FP64 triangle contacts without calling a model.
++
++    Proper transverse penetration means a positive-length intersection of the
++    relative interiors of both noncoplanar triangles. Shared vertices/edges,
++    boundary tangencies and positive-area coplanar overlap are separate labels.
++    Degenerate and ill-conditioned pairs are reported, never counted as clean.
++    """
++    a, b = np.asarray(first, dtype=np.float64), np.asarray(second, dtype=np.float64)
++    if a.shape != (3, 3) or b.shape != (3, 3) or not np.isfinite(a).all() or not np.isfinite(b).all():
++        raise ValueError('Pair classifier needs two finite [3,3] triangles')
++    length = _bbox_scale(bbox_diagonal)
++    eps, area_eps = 1e-9 * length, 1e-12 * length * length
++    n_a, n_b = np.cross(a[1] - a[0], a[2] - a[0]), np.cross(b[1] - b[0], b[2] - b[0])
++    norm_a, norm_b = float(np.linalg.norm(n_a)), float(np.linalg.norm(n_b))
++    result = dict(classification='disjoint', proper_transverse=False,
++                  intersection_length=0.0, coplanar_overlap_area=0.0,
++                  epsilon=eps, area_epsilon=area_eps)
++    if norm_a / 2 <= area_eps or norm_b / 2 <= area_eps:
++        result.update(classification='degenerate_pair',
++                      first_degenerate=norm_a / 2 <= area_eps, second_degenerate=norm_b / 2 <= area_eps)
++        return result
++    if np.any(a.max(0) < b.min(0) - eps) or np.any(b.max(0) < a.min(0) - eps):
++        return result
++    n_a, n_b = n_a / norm_a, n_b / norm_b
++    b_to_a = (b - a[0]) @ n_a
++    a_to_b = (a - b[0]) @ n_b
++    same_side = lambda d: bool(np.all(d > eps) or np.all(d < -eps))
++    if same_side(a_to_b) or same_side(b_to_a):
++        return result
++    distances = np.linalg.norm(a[:, None] - b[None], axis=-1)
++    # A tiny edge may put two A vertices within epsilon of one B vertex.
++    # Count a maximum one-to-one matching, never two matches to one vertex.
++    shared_a = _maximum_unique_matches(distances <= eps)
++    exact_shared = _maximum_unique_matches(np.all(a[:, None] == b[None], axis=-1))
++    result.update(shared_vertices_within_epsilon=shared_a, exact_shared_vertices=exact_shared,
++                  shared_vertex_count_is_one_to_one=True)
++    coplanar = bool(np.max(np.abs(b_to_a)) <= eps and np.max(np.abs(a_to_b)) <= eps)
++    if coplanar:
++        polygon, overlap = _coplanar_clip(a, b, n_a)
++        result['coplanar_overlap_area'] = overlap
++        if overlap > area_eps:
++            result['classification'] = 'coplanar_positive_area_overlap'
++            return result
++        contact_distance = min(_segment_pair_distance(a[i], a[(i + 1) % 3], b[j], b[(j + 1) % 3])
++                               for i in range(3) for j in range(3))
++        if contact_distance > eps:
++            return result
++        if shared_a >= 2:
++            result['classification'] = 'shared_edge_contact'
++        elif shared_a == 1:
++            result['classification'] = 'shared_vertex_contact'
++        else:
++            result['classification'] = 'coplanar_boundary_or_tolerance_contact'
++        result['minimum_edge_contact_distance'] = float(contact_distance)
++        return result
++    line = np.cross(n_a, n_b)
++    line_norm = float(np.linalg.norm(line))
++    if line_norm <= 1e-12:
++        result['classification'] = 'near_parallel_unresolved'
++        return result
++    line /= line_norm
++    cut_a, cut_b = _plane_cut(a, a_to_b, eps), _plane_cut(b, b_to_a, eps)
++    if not cut_a or not cut_b:
++        return result
++    interval_a = (np.asarray(cut_a) - a[0]) @ line
++    interval_b = (np.asarray(cut_b) - a[0]) @ line
++    overlap = min(float(interval_a.max()), float(interval_b.max())) - max(float(interval_a.min()), float(interval_b.min()))
++    if overlap < -eps:
++        return result
++    result['intersection_length'] = max(overlap, 0.0)
++    straddles = lambda d: bool(d.min() < -eps and d.max() > eps)
++    if overlap > eps and straddles(a_to_b) and straddles(b_to_a):
++        result.update(classification='proper_transverse_penetration', proper_transverse=True)
++    elif overlap > eps:
++        result['classification'] = 'shared_edge_contact' if shared_a >= 2 else 'noncoplanar_edge_or_tangent_contact'
++    else:
++        result['classification'] = 'shared_vertex_contact' if shared_a else 'point_or_tangent_contact'
++    return result
++
++
++def context_free_intersections(context, free, bbox_diagonal):
++    c, f = _triangles(context), _triangles(free)
++    counts, contacts = Counter(), []
++    for ci, known in enumerate(c):
++        for fi, triangle in enumerate(f):
++            result = classify_triangle_pair(known, triangle, bbox_diagonal)
++            counts[result['classification']] += 1
++            if result['classification'] != 'disjoint':
++                contacts.append(dict(context_face=ci, free_face=fi, **result))
++    unresolved = counts.get('near_parallel_unresolved', 0)
++    degenerate = counts.get('degenerate_pair', 0)
++    return dict(
++        status='PASS_DIAGNOSTIC' if not unresolved and not degenerate else 'PARTIAL_UNRESOLVED_OR_DEGENERATE',
++        tested_pairs=len(c) * len(f), context_faces=len(c), free_faces=len(f),
++        classification_counts=dict(counts), proper_transverse_pairs=counts.get('proper_transverse_penetration', 0),
++        coplanar_positive_area_pairs=counts.get('coplanar_positive_area_overlap', 0),
++        unresolved_pairs=unresolved, degenerate_pairs=degenerate, contacts=contacts,
++        scope='Only C/free triangle pairs; NOT a full self-intersection, watertightness, or manifold audit',
++        proper_definition='Noncoplanar positive-length intersection in both triangle relative interiors',
++        coplanar_tolerance='Plane distance <=1e-9 bbox; positive area >1e-12 bbox squared',
++    )
++
++
++def diagnose_patch_seams(context, free, bbox_diagonal, *, seed=9919, boundary_samples=512):
++    """Length-weighted boundary coverage plus near-vertex and C/free diagnostics."""
++    tick = time.perf_counter()
++    c, f = _triangles(context), _triangles(free)
++    length = _bbox_scale(bbox_diagonal)
++    if not np.isfinite(c).all() or not np.isfinite(f).all():
++        return dict(status='NONFINITE', context_finite=bool(np.isfinite(c).all()),
++                    free_finite=bool(np.isfinite(f).all()), no_coordinate_repairs=True)
++    if int(boundary_samples) != 512 or int(seed) != 9919:
++        raise ValueError('Use the preregistered 512-target samples and seed9919; do not tune after output')
++    c_hash, f_hash = _hash(c), _hash(f)
++    segments, boundary = extract_boundary_segments(c)
++    threshold = 1e-3 * length
++    samples, identities, weights, counts = _sample_boundary(segments, seed, boundary_samples)
++    d2 = point_to_triangle_surface_squared(samples, f, length) if len(samples) and len(f) else None
++    coverage = dict(status='NO_BOUNDARY' if not len(samples) else 'NO_FREE_TRIANGLES' if not len(f) else 'PASS',
++                    requested_sample_budget=512, actual_sample_count=len(samples), seed=int(seed),
++                    sample_counts_per_segment=counts, sampled_max_is_not_exact_Hausdorff=True,
++                    reference='Distance to complete free triangle surfaces, not nearest free vertices',
++                    rms=None, max=None, rms_bbox_fraction=None, max_bbox_fraction=None,
++                    sample_near_surface_count=None, length_weighted_near_surface_fraction=None,
++                    per_segment=[])
++    if d2 is not None:
++        weighted_mse = float(np.sum(weights * d2))
++        near = d2 < threshold * threshold
++        coverage.update(rms=math.sqrt(weighted_mse), max=float(np.sqrt(d2.max())),
++                        rms_bbox_fraction=math.sqrt(weighted_mse) / length,
++                        max_bbox_fraction=float(np.sqrt(d2.max()) / length),
++                        sample_near_surface_count=int(near.sum()),
++                        length_weighted_near_surface_fraction=float(weights[near].sum()))
++        for i in range(len(segments)):
++            take = identities == i
++            coverage['per_segment'].append(dict(segment=i, samples=int(take.sum()),
++                length=float(boundary['segment_lengths'][i]), rms=float(np.sqrt(d2[take].mean())),
++                max=float(np.sqrt(d2[take].max())), near_surface_count=int(near[take].sum())))
++    vertex_d2, vertex_closest, vertex_segment = nearest_segments(f.reshape(-1, 3), segments) if len(f) else (None, None, None)
++    near_vertices = dict(status='NO_BOUNDARY' if not len(segments) else 'NO_FREE_VERTICES' if not len(f) else 'PASS',
++                         free_vertex_slots=int(len(f) * 3), candidate_count=0,
++                         candidates=[], nearest_segment_distance_stats=None,
++                         threshold=threshold, threshold_bbox_fraction=1e-3,
++                         no_candidates_mean_empty_not_zero=True)
++    if vertex_d2 is not None:
++        chosen = np.flatnonzero(vertex_d2 < threshold * threshold)
++        near_vertices['candidate_count'] = int(len(chosen))
++        near_vertices['nearest_segment_distance_stats'] = _distance_stats(np.sqrt(vertex_d2[chosen]), length)
++        near_vertices['candidates'] = [dict(free_face=int(i // 3), corner=int(i % 3),
++            segment=int(vertex_segment[i]), distance=float(np.sqrt(vertex_d2[i])),
++            distance_bbox_fraction=float(np.sqrt(vertex_d2[i]) / length),
++            nearest_point=vertex_closest[i].tolist()) for i in chosen]
++    intersections = context_free_intersections(c, f, length)
++    combined = np.concatenate([c, f], axis=0)
++    result = dict(status='PASS', numeric_policy=dict(NUMERIC_POLICY), bbox_diagonal=length,
++                  boundary=boundary, boundary_to_free_surface=coverage,
++                  free_vertices_near_boundary=near_vertices, context_free_intersections=intersections,
++                  raw_topology=triangle_soup_topology(combined, length),
++                  source_context_sha256=c_hash, source_free_sha256=f_hash,
++                  source_arrays_unchanged=_hash(c) == c_hash and _hash(f) == f_hash,
++                  no_projection_or_weld_performed=True, model_forwards=0,
++                  gradient_calls=0, optimizer_updates=0, seconds=time.perf_counter() - tick)
++    json.dumps(result, allow_nan=False)
++    return result
++
++
++def optional_projected_export(full, known_mask, bbox_diagonal, *, threshold_fraction=1e-3):
++    """Project near-boundary free vertices on a COPY only; never weld/remesh.
++
++    This optional export is a declared postprocess, not a learned improvement.
++    It may leave T-junctions and triangle soup boundaries; exact C is untouched.
++    The function writes no file. The caller must preserve and label raw output.
++    """
++    original = np.asarray(full)
++    triangles = _triangles(original)
++    if original.dtype != np.float32 or not np.isfinite(original).all():
++        raise ValueError('Optional export requires finite raw FP32 coordinates')
++    known = np.asarray(known_mask)
++    if known.dtype != bool or known.shape != (len(triangles),):
++        raise ValueError('known_mask must be separate bool[N]')
++    if float(threshold_fraction) != 1e-3:
++        raise ValueError('Only the authorized predeclared 1e-3 bbox projection threshold is supported')
++    length = _bbox_scale(bbox_diagonal)
++    before_hash, context = _hash(original), triangles[known].copy()
++    before_topology = triangle_soup_topology(triangles, length)
++    projected = triangles.copy()
++    free_ids = np.flatnonzero(~known)
++    segments, _ = extract_boundary_segments(context)
++    changed = candidates = 0
++    max_displacement = 0.0
++    if len(segments) and len(free_ids):
++        source = projected[free_ids].reshape(-1, 3).copy()
++        d2, nearest, _ = nearest_segments(source, segments)
++        take = d2 < (1e-3 * length) ** 2
++        candidates = int(take.sum())
++        moved = source.copy()
++        moved[take] = nearest[take].astype(np.float32)
++        changed = int(np.count_nonzero(np.any(moved != source, axis=-1)))
++        if changed:
++            max_displacement = float(np.linalg.norm(moved.astype(float) - source, axis=-1).max())
++        projected[free_ids] = moved.reshape(-1, 3, 3)
++    output = projected.reshape(original.shape)
++    if _hash(original) != before_hash or not np.array_equal(projected[known], context):
++        raise RuntimeError('Projection export mutated raw data or exact context')
++    audit = dict(status='PASS_OPTIONAL_COPY_EXPORT', threshold_bbox_fraction=1e-3,
++        threshold=1e-3 * length, candidate_vertex_slots=candidates, changed_vertex_slots=changed,
++        max_displacement=max_displacement, known_context_bitwise_unchanged=True,
++        raw_input_unchanged=True, raw_sha256=before_hash, export_sha256=_hash(output),
++        topology_before=before_topology, topology_after=triangle_soup_topology(projected, length),
++        projection_only=True, coordinate_weld_performed=False, remeshing_performed=False,
++        watertight_status='NOT_CERTIFIED', manifold_status='NOT_CERTIFIED',
++        warning='Projecting a free vertex into a C edge interior does not split that edge or establish connectivity',
++        model_forwards=0, gradient_calls=0, optimizer_updates=0)
++    return output, audit
++
++
++def run_cpu_tests():
++    """Meaningful geometry fixtures; no data files, torch, models, or updates."""
++    tests, pair_calls = [], 0
++    tri = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0]], dtype=np.float32)
++    square = np.array([[[0, 0, 0], [1, 0, 0], [1, 1, 0]],
++                       [[0, 0, 0], [1, 1, 0], [0, 1, 0]]], dtype=np.float32)
++    segments, boundary = extract_boundary_segments(square)
++    assert len(segments) == 4 and boundary['interior_two_face_edges'] == 1
++    assert boundary['total_boundary_length'] == 4
++    tests.append('actual_shared_interior_edge_removed_square_has_four_boundary_segments')
++    near_origin = np.array([[[0, 0, .0001], [.0001, 0, .0001], [0, .0001, .0001]]], dtype=np.float32)
++    report = diagnose_patch_seams(tri[None], near_origin, math.sqrt(2))
++    assert report['free_vertices_near_boundary']['candidate_count'] == 3
++    assert report['boundary_to_free_surface']['rms_bbox_fraction'] > .2
++    assert report['boundary_to_free_surface']['length_weighted_near_surface_fraction'] < .05
++    tests.append('near_free_vertices_do_not_fake_missing_boundary_surface_coverage')
++    empty = diagnose_patch_seams(tri[None], np.empty((0, 3, 3), np.float32), math.sqrt(2))
++    assert empty['boundary_to_free_surface']['rms'] is None
++    assert empty['free_vertices_near_boundary']['candidates'] == []
++    assert empty['free_vertices_near_boundary']['nearest_segment_distance_stats'] is None
++    tests.append('empty_free_geometry_returns_unavailable_not_zero_error')
++    distant = diagnose_patch_seams(tri[None], (tri + [0, 0, 2])[None], math.sqrt(2))
++    assert distant['free_vertices_near_boundary']['candidate_count'] == 0
++    assert distant['free_vertices_near_boundary']['nearest_segment_distance_stats'] is None
++    tests.append('no_candidate_vertices_have_null_statistics_not_zero_distance')
++    # Distances must use triangle interiors and finite segment endpoints.
++    d2 = point_to_triangle_surface_squared(np.array([[.2, .2, .5], [2, 0, 0]]), tri[None], math.sqrt(2))
++    np.testing.assert_allclose(d2, [.25, 1], rtol=1e-12, atol=1e-12)
++    seg_d2, seg_point, _ = nearest_segments([[2, 0, 0]], [[[0, 0, 0], [1, 0, 0]]])
++    assert seg_d2[0] == 1 and np.array_equal(seg_point[0], [1, 0, 0])
++    tests.append('point_to_surface_interior_and_finite_segment_endpoint_distances')
++
++    def classify(a, b, expected, length=4):
++        nonlocal pair_calls
++        result = classify_triangle_pair(a, b, length)
++        pair_calls += 1
++        assert result['classification'] == expected, (expected, result)
++        return result
++
++    a = np.array([[-1, -1, 0], [1, -1, 0], [0, 1, 0]], dtype=float)
++    b = np.array([[0, -.5, -1], [0, -.5, 1], [0, .5, .2]], dtype=float)
++    trans = classify(a, b, 'proper_transverse_penetration')
++    assert trans['intersection_length'] > 0 and trans['proper_transverse']
++    classify(tri, tri * .5 + [.1, .1, 0], 'coplanar_positive_area_overlap')
++    classify(tri, tri.copy(), 'coplanar_positive_area_overlap')
++    classify(tri, np.array([[0, 0, 0], [1, 0, 0], [0, -1, 0]]), 'shared_edge_contact')
++    classify(tri, np.array([[0, 0, 0], [1, 0, 0], [0, 0, 1]]), 'shared_edge_contact')
++    classify(tri, np.array([[0, 0, 0], [-1, 0, 1], [0, -1, 1]]), 'shared_vertex_contact')
++    classify(tri, np.array([[.2, .2, 0], [.3, .2, 1], [.2, .3, 1]]), 'point_or_tangent_contact')
++    classify(tri, np.array([[.1, .1, 0], [.2, .1, 0], [.2, .1, 1]]), 'noncoplanar_edge_or_tangent_contact')
++    classify(tri, tri + [0, 0, 1], 'disjoint')
++    classify(tri, np.array([[0, 0, 0], [.5, 0, 0], [1, 0, 0]]), 'degenerate_pair')
++    tests.append('proper_transverse_coplanar_shared_edge_vertex_tangent_disjoint_and_degenerate_separated')
++    for pa in itertools.permutations(range(3)):
++        for pb in itertools.permutations(range(3)):
++            classify(a[list(pa)], b[list(pb)], 'proper_transverse_penetration')
++    classify(b, a, 'proper_transverse_penetration')
++    for scale in (.001, 1000):
++        shift = np.array([3, -4, 2]) * scale
++        classify(a * scale + shift, b * scale + shift, 'proper_transverse_penetration', length=4 * scale)
++    tests.append('intersection_vertex_order_pair_order_and_scale_translation_invariance')
++    shared_allowed = np.array([[True, False, False], [True, False, False], [False, False, False]])
++    assert _maximum_unique_matches(shared_allowed) == 1
++    tests.append('shared_vertex_epsilon_neighborhoods_require_one_to_one_correspondence')
++    bridge = np.array([[[.5, .0001, .0001], [2, .3, .2], [2, .4, .3]]], dtype=np.float32)
++    full = np.concatenate([tri[None], bridge])
++    raw_before = full.copy()
++    exported, projection = optional_projected_export(full, np.array([True, False]), math.sqrt(2))
++    assert np.array_equal(full, raw_before) and np.array_equal(exported[0], tri)
++    assert np.array_equal(exported[1, 0], [.5, 0, 0]) and projection['changed_vertex_slots'] == 1
++    assert projection['topology_before']['boundary_edges'] == 6
++    assert projection['topology_after']['boundary_edges'] == 6
++    assert projection['topology_after']['exact_edge_connected_face_components'] == 2
++    tests.append('projection_copy_preserves_raw_C_but_edge_interior_touch_does_not_weld_or_close_boundary')
++    nonmanifold = np.array([tri, [[0, 0, 0], [1, 0, 0], [0, -1, 0]],
++                           [[0, 0, 0], [1, 0, 0], [0, 0, 1]]], dtype=np.float32)
++    assert triangle_soup_topology(nonmanifold, 4)['nonmanifold_edges'] == 1
++    tests.append('exact_three_face_edge_is_nonmanifold')
++    result = dict(status='PASS', tests=tests, numeric_policy=dict(NUMERIC_POLICY),
++                  fixture_diagnostic_calls=3, fixture_pair_classifications=pair_calls,
++                  pair_count_scope='Direct fixture pairs; diagnostic calls add two C/free pairs',
++                  total_triangle_pair_classifications=pair_calls + 2,
++                  fixture_optional_export_calls=1, no_dataset_export_performed=True,
++                  model_forwards=0, GPU_calls=0, gradient_calls=0, optimizer_updates=0)
++    json.dumps(result, allow_nan=False)
++    return result
++
++
++if __name__ == '__main__':
++    print(json.dumps(run_cpu_tests(), indent=2))
+diff --git a/experiments/mf_h1_local0/native_patch_visual.py b/experiments/mf_h1_local0/native_patch_visual.py
+new file mode 100644
+--- /dev/null
++++ b/experiments/mf_h1_local0/native_patch_visual.py
+@@ -0,0 +1,50 @@
++﻿"""Offline upright view of the preregistered parent0/noise9201 raw outputs.
++Display-axis permutation only; no geometry/model/scoring changes.
++"""
++from pathlib import Path
++import json, hashlib
++import numpy as np
++
++
++def render(output):
++    import matplotlib
++    matplotlib.use('Agg')
++    import matplotlib.pyplot as plt
++    from mpl_toolkits.mplot3d.art3d import Line3DCollection, Poly3DCollection
++    out=Path(output).resolve();r=json.loads((out/'results.json').read_text())
++    if r['status']!='PASS_EXECUTION':raise RuntimeError('Formal run must be complete')
++    destination=out/'fixed_parent0_seed9201_upright.png'
++    if destination.exists():raise FileExistsError(destination)
++    groups=('Native0','T1','T2');ks=(2,4,8,12);geometry={};contexts={}
++    for K in ks:
++        for group in groups:
++            row=next(q for q in r['generated'] if (q['model'],q['parent'],q['K'],q['seed'])==(group,0,K,9201))
++            path=Path(row['raw_path'])
++            if hashlib.sha256(path.read_bytes()).hexdigest()!=row['raw_sha256']:raise RuntimeError('Raw hash mismatch')
++            with np.load(path,allow_pickle=False) as f:raw=f['output'].reshape(112,3,3).copy()
++            geometry[K,group]=raw[:,:,[0,2,1]]
++            if group=='Native0':contexts[K]=geometry[K,group][:K].copy()
++            if not np.array_equal(geometry[K,group][:K],contexts[K]):raise RuntimeError('Contexts differ')
++    points=np.concatenate([v.reshape(-1,3) for v in geometry.values()])
++    low,high=points.min(0),points.max(0);center=(low+high)/2;radius=float((high-low).max())*.55
++    fig=plt.figure(figsize=(14,23),constrained_layout=True)
++    for ki,K in enumerate(ks):
++        for ri,part in enumerate(('full','free')):
++            for ci,group in enumerate(('C',)+groups):
++                ax=fig.add_subplot(8,4,(ki*2+ri)*4+ci+1,projection='3d')
++                desired=contexts[K]
++                if group=='C':tri=desired if part=='full' else np.empty((0,3,3))
++                else:tri=geometry[K,group] if part=='full' else geometry[K,group][K:]
++                if len(tri):
++                    ax.add_collection3d(Line3DCollection(np.concatenate([tri,tri[:,:1]],axis=1),colors='#486474',linewidths=.6,alpha=.85))
++                if part=='full':ax.add_collection3d(Poly3DCollection(desired,facecolors='#ef463d',edgecolors='#961c1c',linewidths=.8,alpha=.3))
++                ax.set_xlim(center[0]-radius,center[0]+radius);ax.set_ylim(center[1]-radius,center[1]+radius);ax.set_zlim(center[2]-radius,center[2]+radius)
++                ax.set_box_aspect((1,1,1));ax.view_init(elev=24,azim=-54);ax.set_axis_off()
++                ax.set_title(f'K={K} | {group} | {part}'+ (' (untrained K)' if K==2 else ''),fontsize=10)
++    fig.suptitle('Fixed parent0 / reused noise9201: all declared K and models\nRed = exact known C; free rows exclude C. Display (X,Z,Y), original Y vertical. Shared camera and bounds.',fontsize=13)
++    fig.savefig(destination,dpi=150);plt.close(fig)
++    return dict(path=str(destination),sha256=hashlib.sha256(destination.read_bytes()).hexdigest(),
++        fixed_parent=0,fixed_regression_seed=9201,K=list(ks),groups=list(groups),
++        display_axes=['X','Z','Y'],camera={'elevation':24,'azimuth':-54},shared_center=center.tolist(),shared_radius=radius,
++        raw_coordinates_modified=False,scoring_modified=False,context_overlay_in_free_rows=False,
++        model_calls=0,optimizer_updates=0,postprocessing='NONE',source='All preregistered raw outputs for fixed P0/9201; no success-based image selection')

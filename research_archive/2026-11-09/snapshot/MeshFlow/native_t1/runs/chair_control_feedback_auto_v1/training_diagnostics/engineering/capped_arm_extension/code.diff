@@ -1,0 +1,271 @@
+--- original_three_arm/training_diagnostics.py
++++ capped_support/training_diagnostics.py
+@@ -19,6 +19,8 @@
+ 
+ from .common import OUT, START_SHA, atomic_json
+ from experiments.mf_h1_local0.chair_hybrid_coupling_v1.coupling import array_hash
++
++CAPPED_ARM = "TRAJECTORY_REPLAY_CAPPED"
+ 
+ 
+ def _sha(data):
+@@ -123,7 +125,8 @@
+     n, k = record["N"], record["K"]
+     target = np.zeros((n, 9), np.float32)
+     target[:k] = p["C"].reshape(k, 9)
+-    if arm == "TRAJECTORY_REPLAY":
++    source_arm = "TRAJECTORY_REPLAY" if arm == CAPPED_ARM else arm
++    if source_arm == "TRAJECTORY_REPLAY":
+         kind = "trajectory"
+         target[k:] = p["trajectory_target"].reshape(n-k, 9)
+         xt = p["xt"+str(state)].copy()
+@@ -138,7 +141,7 @@
+         xt = (np.float32(1)-t)*x0+t*target
+         xt[:k] = target[:k]
+         u = target-x0
+-    expected = dict(step=step, arm=arm, training_seed=seed, queue=queue, uid=uid,
++    expected = dict(step=step, arm=source_arm, training_seed=seed, queue=queue, uid=uid,
+         request_id=rid, candidate=record["candidate"], t=float(t), state_index=state,
+         pool_manifest_sha256=pool_sha, payload_sha256=record["payload_sha256"],
+         selection=selection, correspondence=kind, target_sha256=array_hash(p[kind+"_target"]),
+@@ -148,13 +151,68 @@
+     return expected, record["task_id"]
+ 
+ 
++def _expected_balance(fm, auxiliary):
++    """Independent CPU reconstruction; no autograd, RNG or model imports."""
++    fm, auxiliary = float(fm), float(auxiliary)
++    if not (math.isfinite(fm) and math.isfinite(auxiliary)) or fm < 0 or auxiliary < 0:
++        raise ValueError("Invalid recorded cap inputs")
++    denominator = max(auxiliary, 1e-30)
++    ratio = fm/denominator
++    weight = min(.1, ratio)
++    return weight, dict(primary_fm_python_sum=fm, auxiliary_mse_fp32_to_python=auxiliary,
++        denominator=denominator, detached_ratio=ratio, effective_weight=weight,
++        effective_weight_hex=weight.hex(), cap_active=weight < .1, loss_value_cap_only=True)
++
++
++def _coverage(rows, pool):
++    audits = [r["aux_audit"] for r in rows]
++    selected = {a["request_id"] for a in audits}
++    return dict(frozen_pool_trajectories=len(pool[1]), actually_selected_unique_trajectories=len(selected),
++        actual_extra_backward_selections=len(audits), selected_parent_count=len({a["uid"] for a in audits}),
++        unique_request_t_states=len({(a["request_id"], a["state_index"]) for a in audits}),
++        unique_Xt_t_u_states=len({(a["xt_sha256"], a["t"], a["u_sha256"]) for a in audits}),
++        queue_counts=dict(Counter(a["queue"] for a in audits)),
++        noise_counts=dict(Counter(str(a["candidate"]) for a in audits)),
++        time_counts=dict(Counter(str(round(a["t"], 1)) for a in audits)),
++        frozen_but_not_selected=sorted(set(pool[1])-selected))
++
++
++def _plot_balance(destination, steps):
++    chosen = [r for r in steps if r["arm"] == CAPPED_ARM]
++    if not chosen:
++        return
++    import matplotlib
++    matplotlib.use("Agg")
++    import matplotlib.pyplot as plt
++    figure, axes = plt.subplots(1, 2, figsize=(10, 3.5), constrained_layout=True)
++    for phase in sorted({r["phase"] for r in chosen}):
++        rows = [r for r in chosen if r["phase"] == phase]
++        x = [r["step"] for r in rows]
++        w = np.asarray([r["actual_aux_coefficient"] for r in rows])
++        c = np.asarray([r["cap_active"] for r in rows], float)
++        axes[0].plot(x, w, color="#8E5CB2", alpha=.25, linewidth=.6)
++        axes[0].plot(x, [w[max(0,i-24):i+1].mean() for i in range(len(w))], label=phase+" mean", color="#8E5CB2")
++        axes[1].plot(x, [c[max(0,i-24):i+1].mean() for i in range(len(c))], label=phase, color="#8E5CB2")
++    axes[0].set_title("Actual auxiliary coefficient (raw and trailing mean)")
++    axes[0].axhline(.1, color="#555555", linestyle="--", linewidth=.7)
++    axes[0].set_ylim(-.002, .105)
++    axes[1].set_title("Cap activation fraction: trailing up-to-25-step mean")
++    axes[1].set_ylim(-.02, 1.02)
++    for ax in axes:
++        ax.set_xlabel("Completed optimizer step")
++        ax.grid(alpha=.2)
++        ax.legend(fontsize=8)
++    figure.savefig(destination, dpi=180, facecolor="white")
++    plt.close(figure)
++
++
+ def _plot(destination, steps, gradients):
+     import matplotlib
+     matplotlib.use("Agg")
+     import matplotlib.pyplot as plt
+     plt.rcParams.update({"font.family": "DejaVu Sans", "font.size": 9})
+     figure, axes = plt.subplots(3, 2, figsize=(12, 9), constrained_layout=True)
+-    colors = {"FM_CONTROL": "#555555", "REPLAY_FM_CONTROL": "#287BB5", "TRAJECTORY_REPLAY": "#E79535"}
++    colors = {"FM_CONTROL": "#555555", "REPLAY_FM_CONTROL": "#287BB5", "TRAJECTORY_REPLAY": "#E79535", CAPPED_ARM: "#8E5CB2"}
+     groups = defaultdict(list)
+     for row in steps:
+         groups[(row["phase"], row["arm"])].append(row)
+@@ -194,6 +252,17 @@
+     destination = out/"training_diagnostics"/("live" if live else "final")
+     destination.mkdir(parents=True, exist_ok=True)
+     check, snapshots = Checks(), []
++    recipe_path = out/"decisions/H3_recipe.json"
++    recipe = _json(recipe_path) if recipe_path.exists() else None
++    capped_registered = bool(recipe and recipe.get("status") == "FROZEN" and recipe.get("arm") == CAPPED_ARM)
++    recipe_file_sha = _sha(recipe_path.read_bytes()) if recipe_path.exists() else None
++    if recipe:
++        check("capped_recipe_is_frozen", capped_registered)
++        check("capped_recipe_same_START_and_aliases", recipe.get("START_sha256") == START_SHA
++            and recipe.get("primary_stream_arm_alias") == recipe.get("auxiliary_arm_alias") == "TRAJECTORY_REPLAY")
++        for name, expected_sha in recipe.get("sources", {}).items():
++            path = Path(__file__).with_name(name)
++            check("capped_recipe_sources_unchanged", _sha(path.read_bytes()) == expected_sha, name)
+     metrics, completion = {}, {}
+     # Read completion markers before metrics to avoid a live 999/1000 race.
+     for path in sorted((out/"training").glob("*_complete.json")):
+@@ -214,6 +283,8 @@
+     row_index, aux_tasks = {}, {}
+     for (phase, arm), rows in metrics.items():
+         label = phase+"_"+arm
++        if arm == CAPPED_ARM:
++            check("observed_capped_arm_was_registered", capped_registered, label)
+         marked = completion.get(label)
+         check("metric_step_unique_contiguous", [r["pilot_step"] for r in rows] == list(range(1, len(rows)+1)), label)
+         # A 500-step marker is a valid intermediate controller checkpoint.
+@@ -261,15 +332,38 @@
+             previous_ot = Counter(counts)
+             previous_pid = r['pid']
+             audit = r.get("aux_audit", {})
++            actual_coefficient, cap_active, loss_excess = None, None, None
+             if arm != "FM_CONTROL":
+                 expected, task = _expected_aux(step, arm, 20261008 if phase == "explore" else 20261009, pool)
+                 aux_tasks[(phase, arm, step)] = (task, expected["request_id"])
+                 mismatches = [k for k, value in expected.items() if audit.get(k) != value]
+                 check("actual_aux_matches_saved_GT_pool_and_queue", not mismatches, dict(scope=scope, mismatched_fields=mismatches))
+                 check("actual_aux_t_and_free_denominator", r["aux_t"] == expected["t"] and r["aux_free_denominator"] == expected["denominator"], scope)
+-                actual_weighted = float(np.float32(.1)*np.float32(r["aux_unweighted"]))
+-                check("actual_aux_fixed_point_one_weight", actual_weighted == r["aux_weighted"], scope)
+-                aux_rows.append(dict(phase=phase, **audit, audit_status="PASS" if not mismatches else "FAIL"))
++                actual_coefficient = .1
++                if arm == CAPPED_ARM:
++                    primary_python_sum = 0.
++                    for primary_sample in batch:
++                        primary_python_sum += float(primary_sample["FM_contribution"])
++                    check("capped_primary_python_sum_exact", primary_python_sum.hex() == float(r["FM"]).hex(), scope)
++                    actual_coefficient, expected_balance = _expected_balance(r["FM"], r["aux_unweighted"])
++                    balance = r.get("loss_balance", {})
++                    bad_balance = [k for k, value in expected_balance.items() if balance.get(k) != value]
++                    check("actual_cap_detached_coefficient_exact", not bad_balance,
++                        dict(scope=scope, mismatched_fields=bad_balance))
++                    cap_active = expected_balance["cap_active"]
++                    loss_excess = max(0., r["aux_weighted"]-r["FM"])
++                    actual_weighted = float(np.float32(actual_coefficient)*np.float32(r["aux_unweighted"]))
++                    check("actual_capped_FP32_multiply_exact", actual_weighted == r["aux_weighted"], scope)
++                    # Original FP32 multiply is retained exactly when inactive.
++                    if not cap_active:
++                        check("capped_inactive_original_multiply", float(np.float32(.1)*np.float32(r["aux_unweighted"])) == r["aux_weighted"], scope)
++                else:
++                    actual_weighted = float(np.float32(.1)*np.float32(r["aux_unweighted"]))
++                    check("actual_aux_fixed_point_one_weight", actual_weighted == r["aux_weighted"], scope)
++                aux_rows.append(dict(**{**audit, "arm": arm}, phase=phase,
++                    auxiliary_source_arm=audit.get("arm"), nominal_aux_weight=audit.get("lambda_aux"),
++                    actual_aux_coefficient=actual_coefficient, cap_active=cap_active,
++                    audit_status="PASS" if not mismatches else "FAIL"))
+                 hook_due = step == 1 or step % 25 == 0
+                 check("gradient_hook_registered_step_scope", ("weighted_aux_gradient_norm" in r) == hook_due and ("FM_aux_gradient_cosine" in r) == hook_due, scope)
+                 if hook_due and "weighted_aux_gradient_norm" in r:
+@@ -280,6 +374,7 @@
+                     check("cosine_finite_valid_range", cosine is None or (math.isfinite(cosine) and abs(cosine) <= 1.00001), scope)
+                     closure = r["grad_norm_before_clip"]**2-fmnorm**2-auxnorm**2-2*fmnorm*auxnorm*cosine if cosine is not None else None
+                     g = dict(phase=phase, arm=arm, step=step, queue=audit.get("queue"), aux_t=r["aux_t"],
++                        actual_aux_coefficient=actual_coefficient, cap_active=cap_active,
+                         FM_gradient_norm=fmnorm, actual_weighted_aux_gradient_norm=auxnorm,
+                         weighted_aux_over_FM_gradient_norm=_ratio(auxnorm, fmnorm), cosine=cosine,
+                         cosine_status="OBSERVED" if cosine is not None else "UNDEFINED_ZERO_NORM",
+@@ -294,6 +389,10 @@
+             row = dict(phase=phase, arm=arm, step=step, conditional_total_step=r["conditional_total_step"],
+                 FM=r["FM"], aux_unweighted=r["aux_unweighted"], aux_weighted=r["aux_weighted"], loss=r["loss"],
+                 effective_aux_weight=_ratio(r["aux_weighted"], r["aux_unweighted"]),
++                actual_aux_coefficient=actual_coefficient, actual_aux_coefficient_hex=actual_coefficient.hex() if actual_coefficient is not None else None,
++                nominal_aux_weight=.1 if arm != "FM_CONTROL" else None,
++                auxiliary_source_arm=audit.get("arm"), cap_active=cap_active,
++                capped_weighted_loss_excess_over_FM=loss_excess,
+                 weighted_aux_over_FM=_ratio(r["aux_weighted"], r["FM"]),
+                 FM_gradient_norm=r["FM_gradient_norm"], weighted_aux_gradient_norm=r.get("weighted_aux_gradient_norm"),
+                 FM_aux_gradient_cosine=r.get("FM_aux_gradient_cosine"), grad_norm_before_clip=r["grad_norm_before_clip"],
+@@ -314,6 +413,11 @@
+             arm_steps.append(row)
+         arm_summaries.append(dict(phase=phase, arm=arm, steps=len(rows),
+             status="COMPLETE_1000" if completed else "LIVE_PARTIAL" if live else "INCOMPLETE",
++            auxiliary_coverage=_coverage(rows, pool) if arm != "FM_CONTROL" else None,
++            actual_aux_coefficient=_stats([r["actual_aux_coefficient"] for r in arm_steps]),
++            cap_active_fraction=_stats([r["cap_active"] for r in arm_steps])["mean"],
++            cap_active_count=sum(r["cap_active"] is True for r in arm_steps),
++            capped_FP32_loss_rounding_excess=_stats([r["capped_weighted_loss_excess_over_FM"] for r in arm_steps]),
+             last_completion_marker=marked, clipping_fraction=_stats([r["clip_active"] for r in arm_steps])["mean"],
+             FM=_stats([r["FM"] for r in arm_steps]), aux_weighted=_stats([r["aux_weighted"] for r in arm_steps]),
+             first_25_FM=_stats([r["FM"] for r in arm_steps[:25]]), last_25_FM=_stats([r["FM"] for r in arm_steps[-25:]]),
+@@ -402,6 +506,8 @@
+         starts = _jsonl(start_path, live, snapshots)
+         for entry in starts:
+             check("every_arm_shared_START_origin", entry.get("source_checkpoint_sha256") == START_SHA, [entry.get("phase"), entry.get("arm"), entry.get("start_step")])
++            if entry.get("arm") == CAPPED_ARM:
++                check("capped_stage_bound_frozen_recipe_file", entry.get("recipe_addendum_sha256") == recipe_file_sha)
+     load_audits = []
+     for path in sorted((out/"audit").glob("*_train_load.json")):
+         item = _json(path)
+@@ -435,28 +541,47 @@
+             unweighted_aux_mean=float(np.mean([r['aux_unweighted'] for r in rows])),
+             weighted_aux_mean=float(aux), weighted_aux_to_FM_ratio_of_means=_ratio(aux, fm),
+             weighted_aux_to_FM_mean_of_step_ratios=_stats([r["weighted_aux_over_FM"] for r in rows])["mean"],
+-            clipping_fraction=float(np.mean([r["clip_active"] for r in rows]))))
++            clipping_fraction=float(np.mean([r["clip_active"] for r in rows])),
++            actual_aux_coefficient_mean=_stats([r["actual_aux_coefficient"] for r in rows])["mean"],
++            cap_active_fraction=_stats([r["cap_active"] for r in rows])["mean"]))
+     for name, values in (("per_step", steps), ("primary_samples", samples), ("gradient_observations", gradients),
+         ("aux_audit", aux_rows), ("primary_time_strata", t_primary), ("aux_time_strata", t_aux),
+         ("shared_input_pairs", pair_rows), ("ledger_by_step", ledger_rows)):
+         _csv(destination/(name+".csv"), values)
+     _plot(destination/"learning_diagnostics.png", steps, gradients)
++    _plot_balance(destination/"loss_balance_diagnostics.png", steps)
++    coverage_rows = []
++    if pool is not None:
++        for (phase, arm), records in metrics.items():
++            if arm == "FM_CONTROL":
++                continue
++            chosen = Counter(r["aux_audit"]["request_id"] for r in records)
++            for rid, source in pool[1].items():
++                coverage_rows.append(dict(phase=phase, arm=arm, request_id=rid, uid=source["uid"],
++                    candidate=source["candidate"], actual_extra_backward_selections=chosen[rid],
++                    status="SELECTED" if chosen[rid] else "FROZEN_POOL_ONLY_NOT_SELECTED"))
++    _csv(destination/"auxiliary_request_coverage.csv", coverage_rows)
+     incomplete = [r["phase"]+"_"+r["arm"] for r in arm_summaries if r["status"] == "INCOMPLETE"]
+-    missing_explore = [a for a in ("FM_CONTROL", "REPLAY_FM_CONTROL", "TRAJECTORY_REPLAY") if ("explore", a) not in metrics]
++    required_explore = ["FM_CONTROL", "REPLAY_FM_CONTROL", "TRAJECTORY_REPLAY"]+([CAPPED_ARM] if capped_registered else [])
++    missing_explore = [a for a in required_explore if ("explore", a) not in metrics]
+     status = "FAIL" if check.errors else "LIVE_PASS" if live else "INCOMPLETE" if incomplete or missing_explore else "PASS"
+     source_files = ("training.py", "stream.py", "replay.py", "training_diagnostics.py")
+     summary = dict(status=status, live=live, started_unix=started, finished_unix=time.time(),
+         CPU_only=True, model_calls=0, backward_calls=0, optimizer_updates=0, OT_matching_calls=0,
+         checks=sum(check.counts.values()), checks_by_name=dict(check.counts), errors=check.errors,
+         observed_arms=arm_summaries, incomplete_actual_arms=incomplete,
+-        not_yet_observed_explore_arms=missing_explore,
++        not_yet_observed_explore_arms=missing_explore, required_explore_arms=required_explore,
++        capped_recipe_file_sha256=recipe_file_sha,
+         independent_random_seed_counts=independence, matched_primary_batch_pairs=len(pair_rows),
+         audited_actual_call_pairs=len(begin), calls_outside_completed_metric_snapshot=dict(outside),
+         source_START_sha256=START_SHA, load_audits=load_audits, snapshots=snapshots,
+         primary_time_strata=t_primary, aux_time_strata=t_aux,
+         source_hashes={str(Path(__file__).with_name(p)): _sha(Path(__file__).with_name(p).read_bytes()) for p in source_files},
+         definitions=dict(primary="FM is the sum of 8 free-coordinate squared errors divided by 9*sum(N-K).",
+-            auxiliary="Auxiliary has its own 9*(N-K) denominator and fixed weight 0.1.",
++            auxiliary="Auxiliary has its own 9*(N-K) denominator. Original auxiliary arms use fixed 0.1; the registered capped arm uses its logged detached Python coefficient.",
++            cap="min(0.1, Python sequential FM/max(FP32 auxiliary MSE,1e-30)); all logged fields and actual FP32 multiply are checked. ULP-level loss-value overshoot is recorded, not silently corrected.",
++            aliases="Capped training arm retains actual outer label; its auxiliary source arm and nominal lambda_aux=0.1 come from unchanged TR replay. Actual coefficient is separately logged.",
++            coverage="Count unique actually selected request and Xt/t/u identities, not all generated feedback pool trajectories or duplicated queue slots.",
+             gradient="Actual weighted auxiliary backward leaf hooks before accumulation; never a difference of gradient norms.",
+             cosine_scope="Only step 1 and each multiple of 25. Other steps are NA. Zero norm means UNDEFINED.",
+             clipping="Fraction of rows with total pre-clip norm > 1; coefficient is reconstructed from PyTorch clip formula, not observed parameter delta.",
+@@ -480,7 +605,8 @@
+         "Auxiliary gradients are actual weighted extra-backward hook measurements. Cosines are observed only at step 1 / every 25 steps; missing observations are not zeros.", "",
+         "Trajectory replay uses a fixed START feedback pool; it is not an on-policy rollout of the changing model. Main-stream repeat seeds are independent while this supervision pool is intentionally shared.", "",
+         "These values describe the learning process. Different auxiliary state distributions make raw loss magnitudes incomparable as measures of generated-control quality. No DEV effect, recipe change, or training extension is inferred.", "",
+-        "Files: per_step.csv, primary_samples.csv, primary_time_strata.csv, aux_time_strata.csv, gradient_observations.csv, aux_audit.csv, shared_input_pairs.csv, ledger_by_step.csv, learning_diagnostics.png, summary.json."]
++        "Files: per_step.csv, primary_samples.csv, primary_time_strata.csv, aux_time_strata.csv, gradient_observations.csv, aux_audit.csv, auxiliary_request_coverage.csv, shared_input_pairs.csv, ledger_by_step.csv, learning_diagnostics.png, summary.json. The registered capped arm additionally has loss_balance_diagnostics.png.",
++        "", "Actual auxiliary coefficient and nominal source lambda are separate. The fixed START pool contains 16 trajectories; consult auxiliary_coverage for how many actually contributed extra backward inputs."]
+     (destination/"README.md").write_text("\n".join(lines)+"\n", encoding="utf-8")
+     return summary
+ 

@@ -1,0 +1,1844 @@
+--- /dev/null
++++ r2/pilots/nft_training_c_frozen_v1/__init__.py
+@@ -0,0 +1 @@
++"""Frozen eight reward-training conditions, four unseen noises, three policies."""
+--- /dev/null
++++ r2/pilots/nft_training_c_frozen_v1/analysis.py
+@@ -0,0 +1,426 @@
++"""Complete-only analysis of 8 trained C x 4 fresh noises x 3 frozen models.
++
++Reuses the original numerical extractor and raw terminal reward, never its
++within-C training normalization. No model or geometry scoring is performed.
++Unknown R stays None; separate identification intervals are not imputations.
++"""
++from __future__ import annotations
++import os
++for _key in ('OMP_NUM_THREADS', 'MKL_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'NUMEXPR_NUM_THREADS'):
++    os.environ[_key] = '1'
++os.environ['CUDA_VISIBLE_DEVICES'] = ''
++import argparse
++from collections import Counter
++import csv
++import io
++import json
++import math
++from pathlib import Path
++import re
++import statistics
++import sys
++
++ROOT = Path(__file__).resolve().parents[3]
++OUT = ROOT / 'experiments/r2_nft_training_c_frozen_v1'
++EV = OUT / 'evaluation'
++DEST = EV / 'analysis'
++VERSION = 'nft_training_C_frozen_analysis_v1'
++LABELS = ('BASE', 'NFT', 'SELF_FM')
++CONTRASTS = (('NFT', 'BASE'), ('SELF_FM', 'BASE'), ('NFT', 'SELF_FM'))
++REVIEW_FIELDS = ('RAW_adoption', 'POST_adoption', 'POST_body_complete')
++REVIEW_VALUES = {'YES', 'NO', 'UNKNOWN', 'UNCERTAIN', 'NA'}
++EVENTS = ('RAW_adoption_known', 'POST_adoption_known', 'POST_body_complete_known',
++          'joint_RAW_adoption_POST_legal_CF', 'joint_both_adoptions_body_and_CF')
++GEOMETRY = ('CF_illegal_fraction', 'FF_illegal_fraction', 'I_lower', 'I_upper',
++            'free_retained_fraction', 'legal_CF_edges', 'legal_CF_length',
++            'free_near_degenerate_fraction', 'free_small_angle_fraction',
++            'reached_free_area_fraction', 'free_surface_area')
++
++
++def _modules():
++    if 'torch' in sys.modules:
++        raise RuntimeError('Analysis requires a separate torch-free CPU process')
++    from .bootstrap import bind
++    bind()
++    from r2.pilots.terminal_reward_nft_v1 import data as D, evaluation as E, final_analysis as F
++    if D.OUT.resolve() != OUT.resolve() or E.OUT.resolve() != OUT.resolve():
++        raise RuntimeError('Bootstrap did not bind the independent experiment output')
++    return D, E, F
++
++
++def _stats(values):
++    finite = [float(v) for v in values if v is not None and math.isfinite(float(v))]
++    return dict(count=len(values), finite=len(finite), unavailable=len(values) - len(finite),
++                mean=statistics.mean(finite) if finite else None,
++                median=statistics.median(finite) if finite else None,
++                minimum=min(finite) if finite else None, maximum=max(finite) if finite else None)
++
++
++def _truth(value):
++    return True if value == 'YES' else False if value == 'NO' else None
++
++
++def _and(values):
++    return False if any(v is False for v in values) else None if any(v is None for v in values) else True
++
++
++def _event(rows, key):
++    yes = sum(r[key] is True for r in rows)
++    no = sum(r[key] is False for r in rows)
++    unknown = len(rows) - yes - no
++    return dict(total=len(rows), YES=yes, NO=no, UNKNOWN=unknown,
++                positive_fraction_lower=yes / len(rows), positive_fraction_upper=(yes + unknown) / len(rows))
++
++
++def _interval(value):
++    return (0.0, 1.0) if value is None else (float(value), float(value))
++
++
++def _reward_interval(reward, review):
++    """Bounds on the frozen formula; never substitutes a missing observed R."""
++    if reward['status'] == 'SCORABLE' and reward.get('reward') is not None:
++        value = float(reward['reward'])
++        return value, value, 'OBSERVED_RAW_R'
++    if any(review[k] == 'NO' for k in REVIEW_FIELDS):
++        return 0.0, 0.0, 'KNOWN_NO_FORCES_GATE_ZERO_OBSERVED_R_STILL_MISSING'
++    if reward.get('task') is not None and reward.get('quality') is not None:
++        cap = min(1.5, max(0.0, float(reward['task']) * float(reward['quality'])))
++        return 0.0, cap, 'FIXED_GEOMETRY_TASK_TIMES_QUALITY_UPPER_BOUND'
++    return 0.0, 1.5, 'GLOBAL_FROZEN_FORMULA_RANGE_GEOMETRY_UNSCORABLE'
++
++
++def _csv(D, path, rows):
++    fields = list(dict.fromkeys(k for r in rows for k in r)) or ['status']
++    stream = io.StringIO(newline='')
++    writer = csv.DictWriter(stream, fieldnames=fields)
++    writer.writeheader()
++    for row in rows:
++        writer.writerow({k: json.dumps(v, ensure_ascii=False, sort_keys=True) if isinstance(v, (dict, list)) else v
++                         for k, v in D.clean(row).items()})
++    content = stream.getvalue().encode('utf-8-sig')
++    path = D.checked(path)
++    if path.exists():
++        if path.read_bytes() != content:
++            raise ValueError('Refuse changed completed analysis CSV: ' + str(path))
++        return
++    path.parent.mkdir(parents=True, exist_ok=True)
++    with path.open('xb') as f:
++        f.write(content)
++
++
++def readiness(reviews_path=None):
++    D, _, _ = _modules()
++    reviews_path = D.resolve(reviews_path or EV / 'reviews_actual.json')
++    manifest_path = OUT / 'inputs/manifest.json'
++    required = [manifest_path, OUT / 'registration.json', reviews_path]
++    if manifest_path.exists():
++        m = D.read(manifest_path)
++        required += [EV / label / 'scores' / q['request_id'] / stage / 'score.json'
++                     for label in LABELS for q in m['evaluation_requests'] for stage in ('RAW', 'POST')]
++    missing = [str(p) for p in required if not p.is_file()]
++    return dict(status='READY_FOR_VALIDATION' if not missing else 'INCOMPLETE', missing=missing,
++                missing_count=len(missing), reviews_path=str(reviews_path), complete_summary_written=False)
++
++
++def _mean_by_condition(rows, key):
++    cids = sorted({r['condition_id'] for r in rows})
++    return _stats([_stats([r[key] for r in rows if r['condition_id'] == cid])['mean'] for cid in cids])
++
++
++def _summarize_group(rows):
++    result = dict(outputs=len(rows), conditions=len({r['condition_id'] for r in rows}),
++                  parents=len({r['parent_id'] for r in rows}),
++                  events={k: _event(rows, k) for k in EVENTS},
++                  POST_interface_outputs=sum(r['POST_has_legal_CF'] for r in rows),
++                  reward_status_counts=dict(Counter(r['reward_status'] for r in rows)),
++                  reward_observed=_stats([r['reward'] for r in rows]),
++                  reward_observed_equal_condition=_mean_by_condition(rows, 'reward'),
++                  reward_all_registered_mean_lower=_mean_by_condition(rows, 'reward_lower')['mean'],
++                  reward_all_registered_mean_upper=_mean_by_condition(rows, 'reward_upper')['mean'], metrics={})
++    for stage in ('RAW', 'POST'):
++        result[stage + '_I_status_counts'] = dict(Counter(r[stage + '_I_status'] for r in rows))
++        result[stage + '_topology_status_counts'] = dict(Counter(r[stage + '_topology_status'] for r in rows))
++        for metric in GEOMETRY:
++            key = stage + '_' + metric
++            result['metrics'][key] = dict(output_distribution=_stats([r[key] for r in rows]),
++                                          equal_condition_distribution=_mean_by_condition(rows, key))
++    return result
++
++
++def _paired(outputs):
++    lookup = {(r['label'], r['request_id']): r for r in outputs}
++    requests = sorted({r['request_id'] for r in outputs})
++    pairs = []
++    for candidate, reference in CONTRASTS:
++        for rid in requests:
++            a, b = lookup[candidate, rid], lookup[reference, rid]
++            known = a['reward'] is not None and b['reward'] is not None
++            row = dict(candidate_model=candidate, reference_model=reference, request_id=rid,
++                       condition_id=a['condition_id'], parent_id=a['parent_id'], candidate=a['candidate'],
++                       split=a['split'], noise_partition=a['evaluation_noise_partition'],
++                       reward_candidate=a['reward'], reward_reference=b['reward'], reward_both_known=known,
++                       reward_delta=a['reward'] - b['reward'] if known else None,
++                       reward_delta_lower=a['reward_lower'] - b['reward_upper'],
++                       reward_delta_upper=a['reward_upper'] - b['reward_lower'])
++            for event in EVENTS:
++                x, y = a[event], b[event]
++                xl, xu = _interval(x); yl, yu = _interval(y)
++                row.update({event + '_candidate': x, event + '_reference': y,
++                            event + '_delta': int(x) - int(y) if x is not None and y is not None else None,
++                            event + '_delta_lower': xl - yu, event + '_delta_upper': xu - yl})
++            row['POST_has_legal_CF_delta'] = a['POST_has_legal_CF'] - b['POST_has_legal_CF']
++            for stage in ('RAW', 'POST'):
++                for metric in GEOMETRY:
++                    key = stage + '_' + metric
++                    row[key + '_delta'] = a[key] - b[key] if a[key] is not None and b[key] is not None else None
++            pairs.append(row)
++    return pairs
++
++
++def _paired_group(rows):
++    common = [r for r in rows if r['reward_both_known']]
++    delta_keys = [k for k in rows[0] if k.endswith('_delta')]
++    result = dict(paired_outputs=len(rows), conditions=len({r['condition_id'] for r in rows}),
++                  reward_common_known_pairs=len(common), reward_unknown_pairs=len(rows) - len(common),
++                  reward_common_known_condition_count=len({r['condition_id'] for r in common}),
++                  reward_common_known_candidate=_stats([r['reward_candidate'] for r in common]),
++                  reward_common_known_reference=_stats([r['reward_reference'] for r in common]),
++                  reward_common_known_candidate_equal_condition=_mean_by_condition(common, 'reward_candidate'),
++                  reward_common_known_reference_equal_condition=_mean_by_condition(common, 'reward_reference'),
++                  reward_common_known_delta=_stats([r['reward_delta'] for r in common]),
++                  reward_common_known_delta_equal_condition=_mean_by_condition(rows, 'reward_delta'),
++                  reward_all_registered_delta_lower=_mean_by_condition(rows, 'reward_delta_lower')['mean'],
++                  reward_all_registered_delta_upper=_mean_by_condition(rows, 'reward_delta_upper')['mean'],
++                  differences={}, events={})
++    for key in delta_keys:
++        means = [_stats([r[key] for r in rows if r['condition_id'] == cid])['mean']
++                 for cid in sorted({r['condition_id'] for r in rows})]
++        result['differences'][key] = dict(output_distribution=_stats([r[key] for r in rows]),
++                                          equal_condition_distribution=_stats(means),
++                                          conditions_positive=sum(v is not None and v > 0 for v in means),
++                                          conditions_zero=sum(v == 0 for v in means),
++                                          conditions_negative=sum(v is not None and v < 0 for v in means),
++                                          conditions_unavailable=sum(v is None for v in means))
++    for event in EVENTS:
++        values = [r[event + '_delta'] for r in rows]
++        result['events'][event] = dict(gained=sum(v == 1 for v in values), lost=sum(v == -1 for v in values),
++                                      unchanged_known=sum(v == 0 for v in values), unknown_pairs=sum(v is None for v in values),
++                                      all_registered_delta_lower=_mean_by_condition(rows, event + '_delta_lower')['mean'],
++                                      all_registered_delta_upper=_mean_by_condition(rows, event + '_delta_upper')['mean'])
++    return result
++
++
++def analyze(reviews_path=None):
++    D, E, F = _modules()
++    ready = readiness(reviews_path)
++    if ready['status'] != 'READY_FOR_VALIDATION':
++        raise RuntimeError('Incomplete 96-output evaluation; no complete report written: ' + str(ready['missing_count']))
++    protected = {}
++
++    def protect(path, expected=None):
++        path = D.resolve(path)
++        value = D.sha(path)
++        if expected is not None and value != expected:
++            raise ValueError('Input/source hash mismatch: ' + str(path))
++        if str(path) in protected and protected[str(path)] != value:
++            raise ValueError('Input changed during analysis: ' + str(path))
++        protected[str(path)] = value
++        return value
++
++    manifest_path = OUT / 'inputs/manifest.json'
++    manifest_hash = protect(manifest_path)
++    m = D.read(manifest_path)
++    registration_path = OUT / 'registration.json'
++    registration_hash = protect(registration_path)
++    registration = D.read(registration_path)
++    if registration.get('manifest_sha256') != manifest_hash or registration.get('status') != 'FROZEN':
++        raise ValueError('Registration does not certify this frozen manifest')
++    if m.get('status') != 'FROZEN':
++        raise ValueError('Input manifest must be frozen')
++    qs = m['evaluation_requests']
++    qmap = {q['request_id']: q for q in qs}
++    if len(qs) != 32 or len(qmap) != 32 or sorted(Counter(q['condition_id'] for q in qs).values()) != [4] * 8:
++        raise ValueError('Expected exactly eight C with four distinct registered requests each')
++    if len({q['parent_id'] for q in qs}) != 8 or any(q['split'] != 'TRAIN' for q in qs):
++        raise ValueError('Expected eight original TRAIN parents')
++    source_manifest = ROOT / 'experiments/r2_terminal_reward_nft_v1/inputs/manifest.json'
++    protect(source_manifest)
++    source = D.read(source_manifest)
++    original = {c['condition_id']: c for c in source['train_conditions']}
++    if set(original) != {q['condition_id'] for q in qs}:
++        raise ValueError('Evaluation conditions differ from original eight reward conditions')
++    old_seeds = {q['noise_seed'] for q in source['training_requests'] + source['evaluation_requests']}
++    old_noise = {q['Gaussian_sha256'] for q in source['training_requests'] + source['evaluation_requests']}
++    if len({q['noise_seed'] for q in qs}) != 32 or any(q['noise_seed'] in old_seeds or q['Gaussian_sha256'] in old_noise for q in qs):
++        raise ValueError('New evaluation noise collides with registered pilot noise')
++    for q in qs:
++        c = original[q['condition_id']]
++        if any(q[k] != c[k] for k in ('parent_id', 'N', 'K', 'condition_source_sha256')):
++            raise ValueError('Original reward C identity differs')
++        protect(q['input_path'], q['input_sha256'])
++        D.load_request(q)
++    review_path = D.resolve(ready['reviews_path'])
++    protect(review_path)
++    payload = D.read(review_path)
++    review_rows = payload['rows'] if isinstance(payload, dict) else payload
++    expected = {(label, rid) for label in LABELS for rid in qmap}
++    reviews = {}
++    for r in review_rows:
++        key = r.get('label'), r.get('request_id')
++        if key in reviews or key not in expected:
++            raise ValueError('Duplicate or unexpected actual review key')
++        if r.get('review_status') != 'REVIEWED' or r.get('reviewer_kind') not in ('AI_PROXY', 'HUMAN') or not str(r.get('reviewer', '')).strip():
++            raise ValueError('Actual review identity/status missing')
++        if r.get('blinded') is not True and str(r.get('blinded')).lower() != 'true':
++            raise ValueError('Model-blinded review required')
++        if any(r.get(k) not in REVIEW_VALUES for k in REVIEW_FIELDS):
++            raise ValueError('Unknown review vocabulary')
++        image_hash = r.get('image_sha256') or r.get('reviewed_image_sha256') or r.get('evidence_sha256')
++        if not isinstance(image_hash, str) or not re.fullmatch('[0-9a-fA-F]{64}', image_hash):
++            raise ValueError('Actual image hash missing')
++        if r.get('image_path'):
++            protect(r['image_path'], image_hash)
++        reviews[key] = r
++    if len(review_rows) != 96 or set(reviews) != expected:
++        raise ValueError('All 96 actual reviews required; explicit UNKNOWN is permitted')
++    protect(__file__)
++    protect(Path(__file__).with_name('bootstrap.py'))
++    protect(D.__file__)
++    protect(E.__file__)
++    protect(F.__file__)
++    definitions = None
++    outputs, stages, reward_rows = [], [], []
++    for label in LABELS:
++        for q in qs:
++            rid = q['request_id']
++            review = reviews[label, rid]
++            row = {k: q[k] for k in ('request_id', 'parent_id', 'condition_id', 'candidate', 'split', 'N', 'K')}
++            row.update(label=label, evaluation_noise_partition=q.get('evaluation_noise_partition', 'FRESH'),
++                       noise_seed=q['noise_seed'], input_sha256=q['input_sha256'], reviewer_kind=review['reviewer_kind'],
++                       reviewer=review['reviewer'], blinded=True,
++                       image_sha256=review.get('image_sha256') or review.get('reviewed_image_sha256') or review.get('evidence_sha256'))
++            row.update({k: review[k] for k in REVIEW_FIELDS})
++            row.update({k + '_known': _truth(review[k]) for k in REVIEW_FIELDS})
++            post_score = None
++            for stage in ('RAW', 'POST'):
++                path = EV / label / 'scores' / rid / stage / 'score.json'
++                score_hash = protect(path)
++                score = D.read(path)
++                if score['identity'].get('registration_sha256') != registration_hash:
++                    raise ValueError('Score registration is not this experiment registration')
++                if score.get('original_definition_unchanged') is not True or score.get('model_calls') != 0:
++                    raise ValueError('Original model-free numerical scoring contract changed')
++                if definitions is None:
++                    definitions = score['identity']['definition_hashes']
++                    for p, h in definitions.items():
++                        protect(p, h)
++                elif definitions != score['identity']['definition_hashes']:
++                    raise ValueError('Scoring definitions differ between outputs')
++                for p, h in score['identity']['input_hashes'].items():
++                    protect(p, h)
++                values = F.extract_score(score, q, label, stage)
++                if score['free_face_denominator'] != values['actual_free_faces']:
++                    raise ValueError('Actual stage free denominator differs')
++                if values['actual_free_faces'] + values['deleted_free_faces'] != q['N'] - q['K']:
++                    raise ValueError('Free-face retention accounting differs')
++                row.update({stage + '_' + k: v for k, v in values.items()})
++                stages.append(dict(label=label, stage=stage, request_id=rid, condition_id=q['condition_id'],
++                                   parent_id=q['parent_id'], candidate=q['candidate'], split=q['split'],
++                                   score_path=str(path), score_sha256=score_hash, **values,
++                                   original_metrics=score['metrics'],
++                                   original_topology_scalars={k: v for k, v in score['topology'].items() if not isinstance(v, (list, dict))}))
++                if stage == 'POST':
++                    post_score = score
++            try:
++                reward = E.geometry_review_reward(post_score, review)
++            except ValueError as exc:
++                reward = dict(version='terminal_NFT_locked_reward_v1', status='GEOMETRY_UNSCORABLE',
++                              reward=None, reasons=[str(exc)], review_labels={k: review[k] for k in REVIEW_FIELDS})
++            low, high, bound_status = _reward_interval(reward, review)
++            row.update(reward=reward['reward'], reward_status=reward['status'], reward_reasons=reward['reasons'],
++                       reward_lower=low, reward_upper=high, reward_bound_status=bound_status,
++                       reward_gate=reward.get('review_gate'))
++            for block in ('components', 'quality_factors', 'task_terms'):
++                row.update({'reward_' + block + '__' + k: v for k, v in reward.get(block, {}).items()})
++            for key in ('quality', 'task', 'C_boundary_perimeter', 'free_denominator', 'original_free_denominator'):
++                row['reward_' + key] = reward.get(key)
++            row['joint_RAW_adoption_POST_legal_CF'] = _and([row['RAW_adoption_known'], bool(row['POST_has_legal_CF'])])
++            row['joint_both_adoptions_body_and_CF'] = _and([row['RAW_adoption_known'], row['POST_adoption_known'],
++                                                         row['POST_body_complete_known'], bool(row['POST_has_legal_CF'])])
++            outputs.append(row)
++            reward_rows.append(dict(label=label, request_id=rid, condition_id=q['condition_id'], **reward,
++                                    reward_lower=low, reward_upper=high, bound_status=bound_status))
++    if len(outputs) != 96 or len(stages) != 192:
++        raise ValueError('Complete output/stage coverage differs')
++    groups, conditions = [], []
++    for label in LABELS:
++        selected = [r for r in outputs if r['label'] == label]
++        groups.append(dict(label=label, **_summarize_group(selected)))
++        for cid in sorted(original):
++            local = [r for r in selected if r['condition_id'] == cid]
++            conditions.append(dict(label=label, condition_id=cid, parent_id=local[0]['parent_id'], **_summarize_group(local)))
++    pairs = _paired(outputs)
++    paired_summary, paired_conditions = [], []
++    for candidate, reference in CONTRASTS:
++        selected = [r for r in pairs if r['candidate_model'] == candidate and r['reference_model'] == reference]
++        paired_summary.append(dict(candidate_model=candidate, reference_model=reference, **_paired_group(selected)))
++        for cid in sorted(original):
++            local = [r for r in selected if r['condition_id'] == cid]
++            paired_conditions.append(dict(candidate_model=candidate, reference_model=reference, condition_id=cid,
++                                          parent_id=local[0]['parent_id'], **_paired_group(local)))
++    # Every ranked request is retained; no tail cutoff or new accept/reject threshold.
++    tails = []
++    for candidate, reference in CONTRASTS:
++        selected = [r for r in pairs if r['candidate_model'] == candidate and r['reference_model'] == reference]
++        for stage in ('RAW', 'POST'):
++            for metric in ('CF_illegal_fraction', 'FF_illegal_fraction', 'I_lower', 'I_upper'):
++                key = stage + '_' + metric + '_delta'
++                ordered = sorted(selected, key=lambda r: (r[key] is None, -r[key] if r[key] is not None else 0, r['request_id']))
++                for rank, r in enumerate(ordered, 1):
++                    tails.append(dict(candidate_model=candidate, reference_model=reference, stage=stage, metric=metric,
++                                      descending_increase_rank=rank, request_id=r['request_id'], condition_id=r['condition_id'],
++                                      parent_id=r['parent_id'], delta=r[key]))
++    if 'torch' in sys.modules:
++        raise RuntimeError('Analysis imported torch')
++    for p, h in protected.items():
++        if D.sha(p) != h:
++            raise ValueError('Protected input changed during analysis: ' + p)
++    tables = {'per_output': outputs, 'per_output_stage': stages, 'per_condition': conditions,
++              'paired_per_request': pairs, 'paired_per_condition': paired_conditions, 'geometry_tails': tails}
++    for name, rows in tables.items():
++        _csv(D, DEST / (name + '.csv'), rows)
++        D.write(DEST / (name + '.json'), rows)
++    D.write(DEST / 'reward_details.json', reward_rows)
++    D.write(DEST / 'paired_summary.json', paired_summary)
++    table_hashes = {str(p): D.sha(p) for p in DEST.iterdir() if p.is_file() and p.name != 'summary.json'}
++    result = dict(version=VERSION, status='COMPLETE', outputs=96, distinct_requests=32, parent_conditions=8,
++                  RAW_scores=96, POST_scores=96, actual_reviews=96, models=list(LABELS), groups=groups,
++                  definitions=definitions, protected_hashes=protected, tables=table_hashes,
++                  analysis_source_sha256=D.sha(__file__), model_calls=0, metrics_recomputed=False,
++                  new_geometry_samples=0, torch_imported=False, reward_group_normalization_performed=False,
++                  aggregation='Four registered fresh noises per C; first within C, then equal eight C/parents. Known-only means explicitly retain missing-condition counts.',
++                  reward_definition='Unchanged terminal_NFT_locked_reward_v1 raw R, range [0,1.5]; no r_NFT standardization.',
++                  reward_interval_definition='Observed R stays None for abstention/unscorable. Bounds are separate: known R [R,R]; any explicit NO [0,0]; otherwise [0,task*quality] when geometry available, [0,1.5] if unscorable. I lower in quality gives an optimistic upper when I is partial.',
++                  primary_joint_definition='RAW adoption YES and POST at least one valid CF edge',
++                  strict_joint_definition='RAW/POST adoption YES and POST body complete YES and POST valid CF edge',
++                  limitations=['All eight C and parents were used in reward training; this measures fresh-noise performance on trained conditions, not held-out-condition generalization.',
++                               'UNKNOWN/UNCERTAIN/NA reviews are never observed reward zero; common-known paired estimates and all-request bounds are separate.',
++                               'Known-only means and common-known subsets can have model-dependent missingness; inspect all per-C coverage and intervals.',
++                               'The reward uses its frozen geometric coefficients and an actual visual gate; it is not a calibrated probability or a certificate of complete attachment.',
++                               'CF/FF use actual stage free-face denominators, I uses fixed C queries; both stages and retention remain separate.',
++                               'No best-of-four selection, reward recalibration, model selection, new threshold, training, or scientific conclusion is performed.'])
++    D.write(DEST / 'summary.json', result)
++    return result
++
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument('--check', action='store_true')
++    p.add_argument('--reviews')
++    args = p.parse_args()
++    result = readiness(args.reviews) if args.check else analyze(args.reviews)
++    print(json.dumps({k: result[k] for k in ('status', 'outputs', 'distinct_requests', 'missing_count', 'complete_summary_written') if k in result}))
++
++
++if __name__ == '__main__':
++    main()
+--- /dev/null
++++ r2/pilots/nft_training_c_frozen_v1/audit.py
+@@ -0,0 +1,294 @@
++"""CPU execution audit for the 96-output frozen TRAIN-C check; no model or review access."""
++from __future__ import annotations
++import os
++for _name in ('OMP_NUM_THREADS','MKL_NUM_THREADS','OPENBLAS_NUM_THREADS','NUMEXPR_NUM_THREADS'):
++    os.environ[_name]='1'
++import argparse
++from collections import Counter
++import hashlib
++import json
++from pathlib import Path
++import sys
++import numpy as np
++from .bootstrap import bind, OLD
++D,E=bind()
++from r2.pilots.terminal_reward_nft_v1 import resource_summary as R
++VERSION='nft_training_c_frozen_execution_audit_v1'
++LABELS=('BASE','NFT','SELF_FM')
++D0_SHA='6a31f4c7dcbea7a6ac58c26075b20c897fd19aad4c33b5295cc4c93ed7078c36'
++EXPECTED=dict(requests=32,conditions=8,RAW_attempts=96,RAW_complete_events=96,RAW_receipts=96,RAW_verified=96,
++ forward_starts=4800,forward_returns=4800,validation_forwards=0,D0_attempts=96,D0_receipts=96,D0_verified=96,
++ POST_receipts=96,POST_verified=96,score_cells=192,score_verified=192,images=32,image_verified=32,
++ training_update_attempts=0,training_updates=0,backward_events=0,optimizer_events=0,failure_files=0,
++ dispatch_failures=0,controller_failures=0,GPU_Phase_attempts=4,GPU_Phase_completions=4,dispatch_attempts=5,dispatch_completions=5)
++
++class Audit:
++    def __init__(self):
++        self.sources={};self.cache={};self.stamps={};self.violations=[];self.missing=[];self.actual=Counter();self.cells=[]
++    def path(self,path):
++        p=D.resolve(path).resolve()
++        if 'private' in p.parts or p.name in ('review_a.json','review_b.json','reviews_actual.json','reviews_merge_receipt.json'):
++            raise ValueError('Forbidden blind-review/private input: '+str(p))
++        return p
++    def check(self,ok,scope,reason,**detail):
++        if not ok:self.violations.append(dict(scope=str(scope),reason=reason,**detail))
++        return bool(ok)
++    def require(self,ok,scope,reason):
++        if not ok:raise ValueError(str(scope)+': '+reason)
++    def absent(self,p):
++        row=dict(path=str(p),reason='MISSING_REQUIRED_ARTIFACT')
++        if row not in self.missing:self.missing.append(row)
++    def hash(self,path,expected=None):
++        p=self.path(path);key=str(p)
++        if not p.is_file():self.absent(p);return None
++        if key not in self.sources:
++            before=p.stat();h=hashlib.sha256()
++            with p.open('rb') as f:
++                for block in iter(lambda:f.read(1<<20),b''):h.update(block)
++            after=p.stat();self.stamps[key]=(after.st_size,after.st_mtime_ns)
++            self.sources[key]=dict(sha256=h.hexdigest(),bytes=after.st_size)
++            self.check((before.st_size,before.st_mtime_ns)==self.stamps[key],p,'Changed during read')
++        digest=self.sources[key]['sha256']
++        if expected is not None:self.check(digest==expected,p,'SHA256 mismatch',expected=expected,actual=digest)
++        return digest
++    def read(self,path,required=True):
++        p=self.path(path);key=str(p)
++        if not p.is_file():
++            if required:self.absent(p)
++            return None
++        if key not in self.cache:
++            self.hash(p);self.cache[key]=json.loads(p.read_text(encoding='utf-8-sig'))
++        return self.cache[key]
++    def events(self,path):
++        p=self.path(path)
++        if not p.is_file():self.absent(p);return []
++        self.hash(p);raw=p.read_bytes()
++        if raw and not raw.endswith(b'\n'):
++            self.missing.append(dict(path=str(p),reason='PARTIAL_JSONL_TAIL'));raw=raw.rpartition(b'\n')[0]
++        return [json.loads(row) for row in raw.splitlines() if row.strip()]
++    def arrays(self,path):
++        self.hash(path)
++        with np.load(self.path(path),allow_pickle=False) as f:return {k:f[k].copy() for k in f.files}
++    def safe(self,scope,fn):
++        try:return fn()
++        except Exception as exc:self.violations.append(dict(scope=str(scope),reason='EXCEPTION',error=repr(exc)))
++    def finish(self):
++        for path,stamp in self.stamps.items():
++            p=Path(path)
++            if not p.is_file() or (p.stat().st_size,p.stat().st_mtime_ns)!=stamp:
++                self.missing.append(dict(path=path,reason='CHANGED_AFTER_READ'))
++
++def inputs(a):
++    m=a.read(D.OUT/'inputs/manifest.json');a.require(m and m['status']=='FROZEN','inputs','Frozen manifest required')
++    reg=a.read(D.OUT/'registration.json');a.hash(D.OUT/'inputs/manifest.json',reg['manifest_sha256'])
++    old=a.read(m['source_manifest']);a.hash(m['source_manifest'],m['source_manifest_sha256'])
++    lock=a.read(D.OUT/'execution_source_lock.json')
++    for section in (lock['hashes'],m['protected_hashes']):
++        for p,h in section.items():a.hash(p,h)
++    contract=a.read(D.OUT/'evaluation/final_controller/contract.json')
++    if contract:
++        a.hash(D.OUT/'execution_source_lock.json',contract['execution_source_lock_sha256'])
++        a.hash(D.OUT/'inputs/manifest.json',contract['manifest_sha256'])
++        for key in ('source_input_sha256','code_sha256'):
++            for p,h in contract[key].items():a.hash(p,h)
++    oq=a.read(OLD/'inputs/training_queries.json');queries={q['condition_id']:q for q in m['evaluation_queries']}
++    a.check(queries=={q['condition_id']:q for q in oq['queries']},'queries','Original eight query descriptors differ')
++    for q in queries.values():a.hash(q['path'],q['sha256'])
++    qs=m['evaluation_requests'];a.actual['requests']=len(qs);counts=Counter(q['condition_id'] for q in qs);a.actual['conditions']=len(counts)
++    oc={q['condition_id']:q for q in old['train_conditions']}
++    a.check(len({q['request_id'] for q in qs})==32 and set(counts)==set(oc) and set(counts.values())=={4},'inputs','Expected exact eight original C x four distinct requests')
++    oldqs=old['training_requests']+old['evaluation_requests']
++    for field in ('noise_seed','Gaussian_sha256','free_Gaussian_sha256'):
++        values=[q[field] for q in qs];previous={q[field] for q in oldqs if field in q}
++        a.check(len(set(values))==32 and not set(values)&previous,field,'Noise duplicate or previously registered')
++    arrays={}
++    for q in qs:
++        rid=q['request_id'];a.hash(q['input_path'],q['input_sha256']);a.hash(q['condition_source'],q['condition_source_sha256'])
++        b=a.arrays(q['input_path']);c=a.arrays(q['condition_source'])['C'].reshape(q['K'],3,3)
++        a.require(D.same(b['C'],c) and D.array_sha(b['C'])==q['C_sha256'],rid,'Source C identity differs')
++        a.require(D.same(b['z'],D.make_noise(q['noise_seed'],q['N'],q['K'])) and D.array_sha(b['z'])==q['Gaussian_sha256'],rid,'Gaussian differs from frozen MT19937')
++        a.require(D.array_sha(b['z'][:,q['K']:])==q['free_Gaussian_sha256'],rid,'Free Gaussian differs')
++        a.require((int(b['N']),int(b['K']))==(q['N'],q['K']) and q['split']=='TRAIN' and q['condition_source']==oc[q['condition_id']]['condition_source'],rid,'N/K/TRAIN/source differs')
++        arrays[rid]=b
++    return m,arrays,queries
++
++def sampling_events(a,label,qs):
++    path=D.OUT/'evaluation'/label/'sampling_events.jsonl';rows=a.events(path);counts=Counter(e['event'] for e in rows)
++    for key,event in [('RAW_attempts','ROLLOUT_ATTEMPT'),('RAW_complete_events','ROLLOUT_COMPLETE'),('forward_starts','FORWARD_START'),('forward_returns','FORWARD_RETURN'),('validation_forwards','VALIDATION_FORWARD_START'),('training_update_attempts','UPDATE_START'),('training_updates','UPDATE_COMPLETE')]:a.actual[key]+=counts[event]
++    a.actual['backward_events']+=sum(v for k,v in counts.items() if 'BACKWARD' in k.upper())
++    a.actual['optimizer_events']+=sum(v for k,v in counts.items() if 'OPTIMIZER' in k.upper())
++    expected=[q['request_id'] for q in qs]
++    for event in ('ROLLOUT_ATTEMPT','ROLLOUT_COMPLETE'):
++        a.check([e['context']['request_id'] for e in rows if e['event']==event]==expected,path,'Wrong request sequence: '+event)
++    starts=[e for e in rows if e['event']=='FORWARD_START'];returns=[e for e in rows if e['event']=='FORWARD_RETURN']
++    a.check([(e.get('request_id'),e.get('euler_step')) for e in starts]==[(q['request_id'],i) for q in qs for i in range(50)],path,'Euler step sequence differs')
++    a.check([e['count'] for e in starts]==list(range(1,1601)) and [e['count'] for e in returns]==list(range(1,1601)),path,'Forward counters differ')
++    active=None
++    for e in rows:
++        if e['event']=='FORWARD_START':a.check(active is None,path,'Unreturned previous forward');active=e['count']
++        elif e['event']=='FORWARD_RETURN':a.check(active==e['count'],path,'Unmatched forward return');active=None
++    a.check(active is None,path,'Last forward not returned')
++
++def cell(a,label,q,b,query,model_identity):
++    rid=q['request_id'];root=D.OUT/'evaluation'/label;k,n=q['K'],q['N'];scope=label+'/'+rid
++    r=a.read(root/'raw'/rid/'receipt.json')
++    if not r:return
++    a.actual['RAW_receipts']+=1
++    a.require((r['status'],r['label'],r['request_id'])==('COMPLETE',label,rid),scope,'RAW receipt identity')
++    for key in ('input_sha256','C_sha256','Gaussian_sha256','noise_seed','N','K'):a.require(r[key]==q[key],scope,'Paired input differs: '+key)
++    a.require(r['model_identity']==model_identity,scope,'Within-arm model identity differs')
++    for key in ('raw','ply','result'):a.hash(r[key+'_path'],r[key+'_sha256'])
++    z=a.arrays(r['raw_path']);raw=z['raw'].reshape(n,3,3);trajectory=z['trajectory'].reshape(51,n,3,3)
++    a.require(raw.dtype==np.float32 and trajectory.dtype==np.float32 and np.isfinite(trajectory).all(),scope,'RAW dtype/finite')
++    a.require(D.same(z['z'],b['z']) and D.same(z['C'],b['C']) and all(D.same(t[:k],b['C']) for t in trajectory),scope,'Actual Gaussian/C or51-state C differs')
++    a.require(D.same(trajectory[-1],raw) and D.same(raw[:k],b['C']) and D.same(z['free'],raw[k:]),scope,'Final RAW/trajectory differs')
++    a.require(D.same(trajectory[0,k:].reshape(1,n-k,9),b['z'][:,k:]),scope,'Initial free state differs')
++    from meshflow_control.mesh_io import read_ply
++    ply,_=read_ply(D.resolve(r['ply_path']));a.require(D.same(ply,raw),scope,'PLY lost RAW bits')
++    runtime=a.read(r['result_path']);a.require(runtime['nfe']==50 and runtime['known_state_checks']==51,scope,'Euler50 runtime differs')
++    a.actual['RAW_verified']+=1
++    proposal_dir=root/'proposal'/rid;start=a.read(proposal_dir/'started.json');proposal=a.read(proposal_dir/'receipt.json')
++    if start:
++        a.actual['D0_attempts']+=1;a.require((start['event'],start['request_id'],start['raw_sha256'],start['checkpoint_sha256'])==('D0_FORWARD_STARTED',rid,r['raw_sha256'],D0_SHA),scope,'D0 start identity')
++    if not proposal:return
++    a.actual['D0_receipts']+=1
++    a.require((proposal['status'],proposal['model_forwards'],proposal['checkpoint_sha256'],proposal['raw_sha256'])==('PASS',1,D0_SHA,r['raw_sha256']),scope,'Single official D0 identity')
++    a.hash(proposal_dir/'proposal.npz',proposal['output_sha256']);a.actual['D0_verified']+=1
++    post=a.read(root/'post'/rid/'receipt.json')
++    if not post:return
++    a.actual['POST_receipts']+=1
++    a.require((post['status'],post['input_sha256'],post['model_calls'])==('COMPLETE',q['input_sha256'],0),scope,'POST identity/calls')
++    for p,h in post['files'].items():a.hash(p,h)
++    mesh=a.arrays(post['post_path']);source=E.source_metadata(q['condition_source'],raw[:k])
++    a.require(D.same(mesh['output'][:k],source['C_original']),scope,'POST original source-oriented C differs')
++    a.require(D.same(mesh['vertices'][mesh['faces']],mesh['output']) and post['result']['model_forwards_this_invocation']==0,scope,'POST topology/model call differs')
++    a.actual['POST_verified']+=1
++    for stage in ('RAW','POST'):
++        score=a.read(root/'scores'/rid/stage/'score.json')
++        if not score:continue
++        a.actual['score_cells']+=1;i=score['identity']
++        a.require((i['request_id'],i['condition_id'],i['label'],i['stage'],i['N'],i['K'])==(rid,q['condition_id'],label,stage,n,k),scope+'/'+stage,'Score identity')
++        a.require(score['model_calls']==0 and score['new_queries']==0 and i['registration_sha256']==a.hash(D.OUT/'registration.json'),scope+'/'+stage,'Score calls/registration')
++        a.require(i['input_hashes'].get(query['path'])==query['sha256'],scope+'/'+stage,'Wrong original query bank')
++        for section in (i['input_hashes'],i['definition_hashes'],score['files']):
++            for p,h in section.items():a.hash(p,h)
++        a.actual['score_verified']+=1
++    a.cells.append(dict(label=label,request_id=rid,C_all51_bitwise=True,Gaussian_matches_frozen=True,POST_original_C_bitwise=True,RAW_sha256=r['raw_sha256'],POST_sha256=post['post_sha256']))
++
++def results(a,m,arrays,queries):
++    E.package();qs=m['evaluation_requests']
++    expected_ids={q['request_id'] for q in qs}
++    for label in LABELS:
++        root=D.OUT/'evaluation'/label
++        for stage,filename in (('raw','attempt.json'),('raw','receipt.json'),('proposal','started.json'),('proposal','receipt.json'),('post','receipt.json')):
++            found={p.parent.name for p in (root/stage).glob('*/'+filename)}
++            a.check(found==expected_ids,root/stage,filename+' inventory differs from frozen32',missing=sorted(expected_ids-found),extra=sorted(found-expected_ids))
++        found={(p.parent.parent.name,p.parent.name) for p in (root/'scores').glob('*/*/score.json')}
++        a.check(found=={(rid,stage) for rid in expected_ids for stage in ('RAW','POST')},root/'scores','Score inventory differs from frozen64')
++    for label in LABELS:
++        a.safe(label+'/events',lambda label=label:sampling_events(a,label,qs))
++        index=a.read(D.OUT/'evaluation'/label/'raw_index.json')
++        if not index:continue
++        a.require((index['status'],index['label'],index['actual_new_rollouts'],index['actual_sampling_forwards'])==('COMPLETE',label,32,1600),label,'RAW index budget')
++        a.require([r['request_id'] for r in index['receipts']]==[q['request_id'] for q in qs],label,'RAW index request sequence')
++        ident=index['model_identity'];a.require(ident['base_sha256']==m['source_binding']['sha256'],label,'Wrong base model')
++        if label=='BASE':a.require(ident['checkpoint_path'] is None and ident['checkpoint_sha256'] is None,label,'BASE checkpoint must be absent')
++        else:
++            cp=OLD/f'checkpoints/{label}/round15.pt';side=a.read(cp.with_suffix('.json'));h=a.hash(cp,side['sha256'])
++            a.require(D.resolve(ident['checkpoint_path']).resolve()==cp.resolve() and ident['checkpoint_sha256']==h and (side['step'],side['round_index'])==(256,15),label,'Not the final frozen adapter')
++        for q in qs:a.safe(label+'/'+q['request_id'],lambda q=q,label=label,ident=ident:cell(a,label,q,arrays[q['request_id']],queries[q['condition_id']],ident))
++    batch=a.read(D.OUT/'evaluation/denoise_all_worker/batch/completion.json')
++    if batch:
++        a.check((batch['jobs'],batch['new_D0_forwards'],batch['resident_models_loaded'],batch['training_updates'],batch['new_noise'])==(96,96,1,0,0),'D0 batch','Budget differs')
++        a.check(len(batch['receipts'])==96 and {(r['label'],r['request_id']) for r in batch['receipts']}=={(label,rid) for label in LABELS for rid in expected_ids},'D0 batch','Receipt pairing differs')
++    resident=a.read(D.OUT/'evaluation/denoise_all_worker/batch/resident_model.json')
++    if resident:
++        i=resident['identity'];a.check(i['status']=='PASS' and i['checkpoint_sha256']==D0_SHA and i['checkpoint_bytes']==7289979546 and not i['strict_missing_keys'] and not i['strict_unexpected_keys'],'D0 loader','Official strict-loader identity differs')
++        a.check(D.resolve(i['checkpoint_path']).stat().st_size==7289979546,'D0 loader','Retained weight size changed')
++    cpu=a.read(D.OUT/'evaluation/cpu/post_score_render_complete.json')
++    if cpu:
++        a.check((cpu['status'],cpu['requests'],cpu['required_new_POST'],cpu['distinct_requests'],cpu['model_calls'],cpu['torch_imported'])==('COMPLETE',96,96,32,0,False),'CPU','Budget/completion differs')
++        for p,h in cpu['files'].items():a.hash(p,h)
++    gallery=a.read(D.OUT/'evaluation/blind_gallery/manifest.json')
++    if gallery:
++        pages=gallery['images'];a.actual['images']=len(pages)
++        a.check(gallery['status']=='COMPLETE' and len(pages)==32 and {r['request_id'] for r in pages}=={q['request_id'] for q in qs},'gallery','Public image requests differ')
++        for row in pages:
++            p=a.path(row['image_path']);a.require(p.is_relative_to((D.OUT/'evaluation/blind_gallery/images').resolve()),'gallery','Image outside public images')
++            if a.hash(p,row['image_sha256'])==row['image_sha256']:a.actual['image_verified']+=1
++    gate=a.read(D.OUT/'evaluation/review_gate.json')
++    if gate:a.check((gate['status'],gate['new_RAW'],gate['new_sampling_forwards'],gate['new_D0_forwards'],gate['scientific_training_updates_in_final_stage'])==('WAITING_ACTUAL_ANONYMOUS_REVIEW',96,4800,96,0),'controller','Final review gate budget differs')
++    return resident
++
++def resources(a):
++    workers=[];points=[];ri=R.Inputs()
++    phases=[D.OUT/'evaluation'/label/'sampling_worker' for label in LABELS]+[D.OUT/'evaluation/denoise_all_worker']
++    for p in phases:
++        attempt=a.read(p/'attempt.json')
++        if not attempt:continue
++        a.actual['GPU_Phase_attempts']+=1;c=a.read(p/'completion.json')
++        if c and c['status']=='COMPLETE':a.actual['GPU_Phase_completions']+=1
++        found=a.safe(p,lambda p=p:R.phase_row(ri,p/'attempt.json'))
++        if found:
++            row,obs=found;workers.append(row);points.extend(obs);a.check(not row['monitor_errors'],p,'Resource monitor errors')
++    control=D.OUT/'evaluation/final_controller/events.jsonl';events=a.events(control)
++    a.actual['controller_failures']=sum(e['event']=='FINAL_STAGE_STOPPED' for e in events)
++    launches={e['name']:e for e in events if e['event']=='LAUNCH'};exits={e['name']:e for e in events if e['event']=='EXIT'}
++    a.check(len(launches)==sum(e['event']=='LAUNCH' for e in events),control,'Duplicate dispatch name')
++    for i,e in enumerate(events):
++        if e.get('resources'):points.append(R.point(e['resources'],control,i,'CONTROLLER_POLL'))
++    dispatch=[]
++    for p in sorted((D.OUT/'dispatch').glob('*/admission.json')):
++        name=p.parent.name;start=a.read(p);end=a.read(p.parent/'exit.json');a.actual['dispatch_attempts']+=1
++        points.append(R.point(start['resources'],p,0,'ADMISSION'));a.check(start['decision']['admitted'] is True,p,'Dispatch was not admitted')
++        if end:
++            a.actual['dispatch_completions']+=1;a.actual['dispatch_failures']+=int(end['returncode']!=0)
++            points.append(R.point(end['resources'],p.parent/'exit.json',0,'COLLECTION'))
++        dispatch.append(dict(name=name,command=start['command'],exit=end,launch_utc=launches.get(name,{}).get('utc'),exit_utc=exits.get(name,{}).get('utc')))
++        a.check(name in launches and name in exits,p,'Missing launch/exit event')
++    failed=set()
++    for pattern in ('evaluation/*/raw/*/failure.json','evaluation/*/proposal/*/failure*.json','evaluation/*/sampling_worker/failure.json','evaluation/denoise_all_worker/failure.json','evaluation/denoise_all_worker/batch/failure*.json','evaluation/cpu/failure*.json'):failed.update(D.OUT.glob(pattern))
++    a.actual['failure_files']=len(failed)
++    for p in failed:a.read(p)
++    a.check(not (D.OUT/'training').exists(),'training','Unexpected new training directory')
++    ri.finish()
++    for p,v in ri.sources.items():a.hash(p,v['sha256'])
++    a.missing.extend(ri.notes);a.violations.extend(ri.errors)
++    cpu=a.read(D.OUT/'evaluation/cpu/post_score_render_complete.json',False)
++    return dict(global_resources=R.profile(points),workers=workers,groups=R.group_rows(workers),GPU_concurrency=R.overlap(workers),dispatch=dispatch,
++        CPU_stage=dict(seconds=cpu.get('seconds'),pool_workers_recorded=cpu.get('workers'),CPU_threads_per_worker=cpu.get('CPU_threads_per_worker'),actual_pool_PID_peak=None) if cpu else None,
++        failure_paths=[str(p) for p in sorted(failed)],
++        limitations=['Whole-device sampled extrema include unrelated processes; short spikes can be missed.',
++        'WDDM process VRAM N/A remains null; device deltas and CUDA counters are not process VRAM.',
++        'CUDA allocated/reserved reset scopes are retained per actual rollout or D0 call.',
++        'Worker lifetime concurrency is not proof of overlapping kernels; concurrent time is not an isolated benchmark.',
++        'CPU pool count is configuration; continuous child-PID/RAM peak observations may be absent.',
++        'Dispatch elapsed time includes parent collection delay; Phase and CPU clocks take precedence.'])
++
++def run():
++    if 'torch' in sys.modules:raise RuntimeError('Audit must remain model-free')
++    a=Audit();a.hash(__file__);a.hash(R.__file__);setup=a.safe('inputs',lambda:inputs(a));resident=None
++    if setup:resident=a.safe('results',lambda:results(a,*setup))
++    resource=a.safe('resources',lambda:resources(a));a.finish();checks=[]
++    for key,expected in EXPECTED.items():
++        actual=a.actual[key];checks.append(dict(name=key,expected=expected,actual=actual,status='PASS' if actual==expected else 'FAIL'))
++        if actual>expected:a.check(False,'budget/'+key,'Unexpected recorded work',expected=expected,actual=actual)
++        elif actual!=expected:a.missing.append(dict(path='budget/'+key,reason='INCOMPLETE_BUDGET',expected=expected,actual=actual))
++    status='FAIL' if a.violations else 'PARTIAL' if a.missing else 'COMPLETE'
++    digest=hashlib.sha256(json.dumps(a.sources,sort_keys=True).encode()).hexdigest()[:20];out=D.OUT/'audit/snapshots'/digest
++    summary=dict(version=VERSION,status=status,output_dir=str(out),snapshot_path=str(out),
++        budget_checks=dict(status='PASS' if all(x['status']=='PASS' for x in checks) else 'FAIL',expected=EXPECTED,actual=dict(a.actual),checks=checks),
++        protected_inputs=dict(status='PASS' if not a.violations else 'FAIL',hash_scope='Each protected generator/adapter/source freshly hashed once, cached within audit; D0 7.29GB not rehashed, saved strict-loader identity+current file size checked'),
++        violations=a.violations,partial_reasons=a.missing,code_sha256=a.hash(__file__),input_digest=digest,verified_cells=len(a.cells),source_files=len(a.sources),
++        new_model_calls=0,new_training_updates=0,new_scores=0,torch_imported='torch' in sys.modules,private_mapping_read=False,blind_reviews_read=False,D0_loader_identity=resident,
++        no_training_evidence_scope='Zero recorded update/backward/optimizer events, no training directory, exact generation/D0 counts and unchanged execution sources; not an independent GPU profiler')
++    for name,value in [('summary.json',summary),('resources.json',resource),('cells.json',a.cells),('input_sources.json',a.sources)]:D.write(out/name,value)
++    latest=D.checked(D.OUT/'audit/latest.json');latest.parent.mkdir(parents=True,exist_ok=True)
++    pointer=dict(status=status,summary_path=str(out/'summary.json'),summary_sha256=D.sha(out/'summary.json'),output_dir=str(out),snapshot_path=str(out),code_sha256=summary['code_sha256'])
++    temp=latest.with_suffix('.json.tmp');temp.write_text(json.dumps(pointer,indent=2,sort_keys=True)+'\n');temp.replace(latest)
++    print(json.dumps(dict(status=status,output=str(out),actual=dict(a.actual),violations=a.violations,partial_reasons=a.missing),sort_keys=True))
++    return summary
++
++if __name__=='__main__':
++    argparse.ArgumentParser(description=__doc__).parse_args()
++    run()
+--- /dev/null
++++ r2/pilots/nft_training_c_frozen_v1/bootstrap.py
+@@ -0,0 +1,13 @@
++"""Explicit process-local output binding; historical source files stay read-only."""
++from pathlib import Path
++import os
++ROOT = Path(__file__).resolve().parents[3]
++OLD = ROOT / 'experiments/r2_terminal_reward_nft_v1'
++OUT = ROOT / 'experiments/r2_nft_training_c_frozen_v1'
++
++def bind():
++    os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
++    from r2.pilots.terminal_reward_nft_v1 import data as D, evaluation as E
++    D.OUT = OUT
++    E.OUT = OUT
++    return D, E
+--- /dev/null
++++ r2/pilots/nft_training_c_frozen_v1/denoise_worker.py
+@@ -0,0 +1,17 @@
++"""Reuse authenticated D0 job creation for the new32-per-model frozen panel."""
++from .bootstrap import bind
++D,E=bind()
++from r2.pilots.terminal_reward_nft_v1 import denoise_worker as P
++OFFICIAL_D0_SHA256=P.OFFICIAL_D0_SHA256
++retained_d0_binding=P.retained_d0_binding
++
++def stage_requests(manifest, *, round_index=None, evaluation=None):
++    if round_index is not None or evaluation not in ('BASE','NFT','SELF_FM'):
++        raise ValueError('Frozen evaluation only')
++    qs=manifest['evaluation_requests']
++    if len(qs)!=32 or len({q['request_id'] for q in qs})!=32:
++        raise ValueError('32 frozen requests required')
++    return D.OUT/'evaluation'/evaluation,evaluation,list(qs)
++
++P.stage_requests=stage_requests
++prepare_jobs=P.prepare_jobs
+--- /dev/null
++++ r2/pilots/nft_training_c_frozen_v1/final_cpu.py
+@@ -0,0 +1,229 @@
++"""Frozen96 RAW/POST evaluation with isolated, blinded model aliases.
++
++All96 outputs are new. CPU stage requires their official-D0 proposals.
++No weights or model module are imported.
++"""
++from __future__ import annotations
++import os
++for _key in ('OMP_NUM_THREADS','MKL_NUM_THREADS','OPENBLAS_NUM_THREADS','NUMEXPR_NUM_THREADS'):
++    os.environ[_key]='1'
++import argparse
++import concurrent.futures
++import itertools
++import json
++import multiprocessing
++from pathlib import Path
++import time
++import numpy as np
++from .bootstrap import bind
++D,E=bind()
++from r2.pilots.terminal_reward_nft_v1.cpu_worker import _single_thread, _verify_files, torch_free, _post
++
++VERSION='nft_training_c_frozen_cpu_v1'
++LABELS=('BASE','NFT','SELF_FM')
++ALIASES=('A','B','C')
++EV=D.OUT/'evaluation'
++PRIVATE=EV/'private'
++
++
++def prepare_blinding():
++    """Freeze mappings from request IDs only, before final output review."""
++    torch_free()
++    manifest=D.read(D.OUT/'inputs/manifest.json')
++    queries=sorted(manifest['evaluation_requests'],key=lambda q:q['request_id'])
++    if len(queries)!=32:raise ValueError('Expected32 frozen evaluation requests')
++    path=PRIVATE/'label_mapping.json'
++    if path.exists():
++        old=D.read(path)
++        if old['manifest_sha256']!=D.sha(D.OUT/'inputs/manifest.json'):
++            raise ValueError('Blind mapping manifest changed')
++        return old
++    permutations=(list(itertools.permutations(LABELS))*6)[:32]
++    rng=np.random.RandomState(D.noise_seed(VERSION,'BLIND_LABEL_ASSIGNMENT'))
++    order=rng.permutation(32)
++    rows=[]
++    for q,index in zip(queries,order):
++        mapping=dict(zip(ALIASES,permutations[int(index)]))
++        rows.append(dict(request_id=q['request_id'],aliases=mapping))
++    result=dict(status='FROZEN',version=VERSION,manifest_sha256=D.sha(D.OUT/'inputs/manifest.json'),
++        rows=rows,mapping_scope='PRIVATE; do not pass this file or real-label source paths to image reviewers',
++        permutation='Two of6 permutations appear6 times and four appear5 times; shuffled with fixed preregistered MT19937 seed from request-independent namespace',
++        selection_uses='Frozen request IDs only; no metric, image, or generated outcome',
++        model_calls=0,quality_scores=0)
++    D.write(path,result)
++    D.write(EV/'blind_design.json',dict(status='FROZEN',version=VERSION,requests=32,aliases=list(ALIASES),
++        assignment='Independent fixed model permutation per request, nearly balanced across32 requests',
++        review_scope='Model labels hidden; condition/noise identity visible. Reviewers receive only anonymous gallery artifacts, not the private mapping or model-labelled source paths.',
++        review_labels='A/B/C are local to one request and must never be interpreted as fixed global model identities.',
++        output_selection='All32 requests and all3 models retained; no outcome selection',model_calls=0))
++    return result
++
++
++def _records(label,q,manifest,cached):
++    root=EV/label
++    raw=D.read(root/'raw'/q['request_id']/'receipt.json')
++    postpath=root/'post'/q['request_id']/'receipt.json'
++    return raw,D.read(postpath) if postpath.exists() else None
++
++
++def _validate_geometry(q,raw,post):
++    E.package()
++    from r2.pilots.terminal_reward_nft_v1.sample import verify_receipt
++    verify_receipt(q,raw)
++    if post is None:raise ValueError('POST not yet completed')
++    if D.sha(post['post_path'])!=post['post_sha256']:
++        raise ValueError('Final POST changed')
++    a=D.arrays(raw['raw_path'])['raw'].reshape(q['N'],3,3)
++    p=D.arrays(post['post_path'])
++    source=E.source_metadata(q['condition_source'],a[:q['K']])
++    if not D.same(p['output'][:q['K']],source['C_original']):
++        raise ValueError('Final source-oriented C differs from exact manifest input')
++    if not D.same(p['vertices'][p['faces']],p['output']):
++        raise ValueError('Final indexed POST inconsistent')
++
++
++def _job(job):
++    label,q,raw,post,query,stages,regsha=job
++    torch_free()
++    tick=time.perf_counter()
++    with _single_thread():
++        if post is None and 'post' in stages:
++            post=_post(q,EV/label,raw)
++        elif post is None:
++            raise ValueError('Final POST unavailable: '+label+'/'+q['request_id'])
++        _validate_geometry(q,raw,post)
++        result=None
++        if 'score' in stages:
++            result=E.score_one(q,raw['raw_path'],post['post_path'],q['condition_source'],query,
++                EV/label/'scores'/q['request_id'],label=label,registration_sha256=regsha,
++                stages=('RAW','POST'))
++    torch_free()
++    files={raw['raw_path']:raw['raw_sha256'],post['post_path']:post['post_sha256']}
++    if result:files.update({p:D.sha(p) for p in result['score_paths'].values()})
++    return dict(label=label,request_id=q['request_id'],condition_id=q['condition_id'],
++        raw_path=raw['raw_path'],post_path=post['post_path'],condition_path=q['condition_source'],
++        cached_original_POST=bool(post.get('cached_original_POST',False)),files=files,
++        score_paths=result['score_paths'] if result else {},seconds=time.perf_counter()-tick,
++        model_calls=0,torch_imported=False)
++
++
++def collect_inputs():
++    """Verify all96 RAW before allowing any final postprocessing."""
++    torch_free()
++    m=D.read(D.OUT/'inputs/manifest.json')
++    path=D.OUT/"inputs/manifest.json";cache={}
++    rows=[]
++    for label in LABELS:
++        for q in m['evaluation_requests']:
++            raw,post=_records(label,q,m,cache)
++            if raw['status']!='COMPLETE' or raw['input_sha256']!=q['input_sha256']:
++                raise ValueError('All96 final RAW must precede final Stage2')
++            rows.append((label,q,raw,post))
++    if len(rows)!=96 or sum(p is not None and bool(p.get('cached_original_POST')) for _,_,_,p in rows)!=0:
++        raise ValueError('Final96/no-cache cache accounting mismatch')
++    return m,rows,dict(path=str(path),sha256=D.sha(path))
++
++
++def _copy_frozen(source,dest):
++    source=D.resolve(source);dest=D.checked(dest)
++    h=D.sha(source)
++    if dest.exists():
++        if D.sha(dest)!=h:raise ValueError('Anonymous geometry copy changed')
++        return h
++    dest.parent.mkdir(parents=True,exist_ok=True)
++    with source.open('rb') as src,dest.open('xb') as dst:
++        for block in iter(lambda:src.read(1024*1024),b''):dst.write(block)
++        dst.flush();os.fsync(dst.fileno())
++    if D.sha(dest)!=h:raise ValueError('Anonymous copy lost bytes')
++    return h
++
++
++def render_blind(*,workers=1):
++    m,rows,_=collect_inputs()
++    mapping=prepare_blinding()
++    byid={r['request_id']:r['aliases'] for r in mapping['rows']}
++    cases=[];private_provenance=[]
++    with _single_thread():
++        for label,q,raw,post in rows:
++            _validate_geometry(q,raw,post)
++            alias=next(a for a,name in byid[q['request_id']].items() if name==label)
++            dest=EV/'anonymous_inputs'/q['request_id']/alias
++            rawsha=_copy_frozen(raw['raw_path'],dest/'raw.npz')
++            postsha=_copy_frozen(post['post_path'],dest/'post.npz')
++            # Only explicit safe fields enter the public renderer. Full receipts,
++            # model IDs, source model paths and score identities remain private.
++            public={k:q[k] for k in ('request_id','condition_id','parent_id','candidate','split','N','K')}
++            public.update(label=alias,raw_path=str(dest/'raw.npz'),post_path=str(dest/'post.npz'),
++                          condition_path=q['condition_source'])
++            cases.append(public)
++            private_provenance.append(dict(request_id=q['request_id'],label=label,alias=alias,
++                original_raw_path=raw['raw_path'],original_post_path=post['post_path'],
++                anonymous_raw_path=str(dest/'raw.npz'),anonymous_post_path=str(dest/'post.npz'),
++                raw_sha256=rawsha,post_sha256=postsha))
++        D.write(PRIVATE/'anonymous_geometry_provenance.json',dict(status='COMPLETE',version=VERSION,
++            rows=private_provenance,mapping_sha256=D.sha(PRIVATE/'label_mapping.json'),copies_are_byte_identical=True))
++        # Separate renderer keeps the already frozen training renderer unchanged.
++        from r2.pilots.terminal_reward_nft_v1.render_blind import render_panel
++        result=render_panel(cases,EV/'blind_gallery',label_order=list(ALIASES),expected_cases=96,workers=workers)
++    torch_free()
++    # Explicit check that public serialized gallery metadata cannot leak true labels.
++    public_text=json.dumps(result,ensure_ascii=False)
++    if 'SELF_FM' in public_text or '/evaluation/BASE/' in public_text or '/evaluation/NFT/' in public_text:
++        raise RuntimeError('Real model identity leaked into anonymous gallery metadata')
++    return result
++
++
++def run(*,stages=('post','score','render'),workers=1):
++    torch_free()
++    if workers not in (1,2):raise ValueError('Measured CPU worker count must be1 or2')
++    stages=tuple(s for s in ('post','score','render') if s in stages)
++    if not stages:raise ValueError('No final stage selected')
++    m,rows,old_index=collect_inputs()
++    queries={q['condition_id']:q for q in m['evaluation_queries']}
++    regsha=D.sha(D.OUT/'registration.json')
++    done=EV/'cpu'/('_'.join(stages)+'_complete.json')
++    if done.exists():
++        old=D.read(done);_verify_files(old['files'])
++        if old['registration_sha256']!=regsha:raise ValueError('Final registration changed')
++        return old
++    tick=time.perf_counter();results=[];gallery=None
++    if any(s in stages for s in ('post','score')):
++        jobs=[(label,q,raw,post,queries[q['condition_id']],stages,regsha) for label,q,raw,post in rows]
++        if workers==1:results=[_job(j) for j in jobs]
++        else:
++            with concurrent.futures.ProcessPoolExecutor(max_workers=workers,
++                    mp_context=multiprocessing.get_context('spawn')) as pool:
++                results=list(pool.map(_job,jobs))
++        D.write(EV/'indices'/('_'.join(s for s in stages if s!='render')+'_index.json'),
++                dict(status='COMPLETE',version=VERSION,rows=results,requests=96))
++    if 'render' in stages:gallery=render_blind(workers=workers)
++    torch_free()
++    files={old_index['path']:old_index['sha256']}
++    for r in results:files.update(r['files'])
++    if gallery:files[str(EV/'blind_gallery/manifest.json')]=D.sha(EV/'blind_gallery/manifest.json')
++    result=dict(status='COMPLETE',version=VERSION,stages=stages,requests=96,distinct_requests=32,
++                BASE_cached_old_POST=0,required_new_POST=96,model_calls=0,torch_imported=False,
++                registration_sha256=regsha,manifest_sha256=D.sha(D.OUT/'inputs/manifest.json'),
++                workers=workers,CPU_threads_per_worker=1,seconds=time.perf_counter()-tick,files=files,
++                gallery_manifest=str(EV/'blind_gallery/manifest.json') if gallery else None)
++    D.write(done,result)
++    return result
++
++
++def main():
++    parser=argparse.ArgumentParser()
++    parser.add_argument('--stage',default='all',help='post,score,render,all, or comma combination')
++    parser.add_argument('--workers',type=int,choices=(1,2),default=1)
++    parser.add_argument('--prepare-blinding',action='store_true')
++    args=parser.parse_args()
++    if args.prepare_blinding:
++        result=prepare_blinding()
++        print(json.dumps(dict(status=result['status'],requests=len(result['rows']),model_calls=0)),flush=True)
++        return
++    stages=('post','score','render') if args.stage=='all' else tuple(args.stage.replace('+',',').split(','))
++    if any(s not in ('post','score','render') for s in stages):parser.error('Unknown stage')
++    r=run(stages=stages,workers=args.workers)
++    print(json.dumps({k:r[k] for k in ('status','requests','required_new_POST','workers','seconds','model_calls')}),flush=True)
++
++
++if __name__=='__main__':main()
+--- /dev/null
++++ r2/pilots/nft_training_c_frozen_v1/merge_review.py
+@@ -0,0 +1,43 @@
++"""Validate complete actual anonymous reviews, preserve them, then decode aliases."""
++from .bootstrap import bind
++D,E=bind()
++FIELDS=('RAW_adoption','POST_adoption','POST_body_complete')
++
++def run():
++    ev=D.OUT/'evaluation';g=ev/'blind_gallery'
++    gallery=D.read(g/'manifest.json');review=D.read(g/'reviews_anonymous_actual.json');views=D.read(g/'view_receipts.json')
++    assert gallery['status']==review['status']==views['status']=='COMPLETE'
++    assert review['gallery_manifest_sha256']==D.sha(g/'manifest.json')
++    images={r['request_id']:r for r in gallery['images']}
++    assert len(images)==32 and gallery['identity']['cases']==96
++    actual={r['request_id']:r for r in views['rows']}
++    assert len(views['rows'])==32 and set(actual)==set(images)
++    for rid,v in actual.items():
++        im=images[rid]
++        assert v['viewed_actual'] is True and v['image_sha256']==im['image_sha256']
++        assert D.resolve(v['image_path'])==D.resolve(im['image_path'])
++        assert D.sha(im['image_path'])==im['image_sha256']
++    expected={(rid,a) for rid in images for a in ('A','B','C')}
++    rows=review['rows'];seen=set()
++    for r in rows:
++        key=(r['request_id'],r['label']);assert key in expected and key not in seen;seen.add(key)
++        assert r['review_status']=='REVIEWED' and r['reviewer_kind']=='AI_PROXY' and r['blinded'] is True
++        assert all(r[f] in ('YES','NO','UNKNOWN') for f in FIELDS)
++        assert r['notes'].strip() and r['reviewer'].strip()
++        assert r['image_sha256']==images[r['request_id']]['image_sha256']
++    assert len(rows)==96 and seen==expected
++    # Mapping is read only after all review labels and actual-view receipts passed.
++    sealed={str(g/f):D.sha(g/f) for f in ('reviews_anonymous_actual.json','view_receipts.json','manifest.json')}
++    D.write(ev/'review_seal_before_unblinding.json',dict(status='PASS',files=sealed,rows=96,pages=32,review_labels_modified=0,model_calls=0))
++    mapping=D.read(ev/'private/label_mapping.json')
++    maps={r['request_id']:r['aliases'] for r in mapping['rows']}
++    result=[]
++    for r in rows:
++        rr=dict(r);rr['anonymous_label']=r['label'];rr['label']=maps[r['request_id']][r['label']]
++        rr['image_path']=images[r['request_id']]['image_path'];result.append(rr)
++    assert len({(r['request_id'],r['label']) for r in result})==96
++    D.write(ev/'reviews_actual.json',dict(status='COMPLETE',rows=sorted(result,key=lambda r:(r['request_id'],r['label'])),
++        input_review_hashes=sealed,mapping_sha256=D.sha(ev/'private/label_mapping.json'),review_labels_modified=0,unblinding_after_seal=True))
++    print('ACTUAL_REVIEW_SEALED_AND_DECODED 96 rows/32 pages; labels unchanged',flush=True)
++
++if __name__=='__main__':run()
+--- /dev/null
++++ r2/pilots/nft_training_c_frozen_v1/pack.py
+@@ -0,0 +1,69 @@
++"""Small complete-tabular review pack; original meshes and full images stay local."""
++from .bootstrap import bind,ROOT,OUT
++D,E=bind()
++import csv,hashlib,io,json,zipfile,difflib
++from pathlib import Path
++from PIL import Image
++
++def build():
++    assert D.read(OUT/'completion.json')['status']=='COMPLETE'
++    dest=OUT/'evidence_pack';dest.mkdir(exist_ok=True)
++    members={};external=[]
++    def add(p,name=None):
++        p=D.resolve(p);members[name or str(p.relative_to(OUT))]=p.read_bytes()
++    for name in ['REPORT.md','README_RESUME.md','completion.json','registration.json','preflight.json','analysis_source_lock.json','execution_source_lock.json','inputs/manifest.json','evaluation/review_seal_before_unblinding.json','evaluation/reviews_actual.json','evaluation/review_rubric.json','evaluation/review_assignment.json','evaluation/review_gate.json','evaluation/blind_gallery/reviews_anonymous_actual.json','evaluation/blind_gallery/view_receipts.json']:
++        add(OUT/name)
++    for folder in ['evaluation/analysis','audit','numeric_crosscheck']:
++        for q in sorted((OUT/folder).rglob('*')):
++            if q.is_file() and q.suffix in ('.json','.csv','.md','.py'):
++                add(q)
++    for q in sorted((OUT/'inputs/requests').glob('*.npz')):add(q)
++    imgs=D.read(OUT/'evaluation/blind_gallery/manifest.json')['images'];previews=[]
++    for r in imgs:
++        original=D.resolve(r['image_path']);im=Image.open(original).convert('RGB');im.thumbnail((1440,1440))
++        b=io.BytesIO();im.save(b,format='JPEG',quality=82,optimize=True)
++        name='gallery/images/'+original.name;members[name]=b.getvalue()
++        previews.append(dict(request_id=r['request_id'],preview_member=name,preview_sha256=hashlib.sha256(b.getvalue()).hexdigest(),original_path=str(original),original_sha256=r['image_sha256'],original_size=r['pixels'],preview_size=list(im.size)))
++    members['gallery/preview_provenance.json']=(json.dumps(dict(all32_included=True,uniform_resize_only=True,used_for_actual_review=False,actual_reviews_used_full_originals=True,rows=previews),indent=2)+'\n').encode()
++    links=''.join('<h3>'+r['request_id']+'</h3><img style="max-width:100%" src="images/'+Path(r['preview_member']).name+'">' for r in previews)
++    members['gallery/index.html']=('<meta charset="utf-8"><p>All32 paired pages; uniformly reduced previews. Actual reviews used original full resolution.</p>'+links).encode()
++    compact=[]
++    for q in sorted((OUT/'evaluation').glob('*/scores/*/*/score.json')):
++        a=D.read(q)
++        compact.append(dict(score_path=str(q),score_sha256=D.sha(q),identity=a['identity'],metrics=a['metrics'],free_face_denominator=a['free_face_denominator'],C_preserved_exact=a['C_preserved_exact'],topology={k:v for k,v in a['topology'].items() if not isinstance(v,(list,dict))}))
++    assert len(compact)==192
++    members['scores_compact.json']=(json.dumps({'rows':compact,'original_geometric_detail_arrays_external':True},separators=(',',':'))+'\n').encode()
++    sources={}
++    for q in (ROOT/'r2/pilots/nft_training_c_frozen_v1').glob('*'):
++        if q.is_file() and q.suffix in ('.py','.ps1'):sources[str(q)]=D.sha(q)
++    sources.update(D.read(OUT/'execution_source_lock.json')['hashes'])
++    sources.update(compact[0]['identity']['definition_hashes'])
++    source_rows=[];diff=''
++    for i,(path,h) in enumerate(sorted(sources.items())):
++        q=D.resolve(path);assert D.sha(q)==h
++        rel=str(q.relative_to(ROOT)) if q.is_relative_to(ROOT) else 'external/'+str(i)+'_'+q.name
++        name='source/'+rel;add(q,name);source_rows.append({'path':str(q),'sha256':h,'member':name})
++        if q.parent==ROOT/'r2/pilots/nft_training_c_frozen_v1':diff+=''.join(difflib.unified_diff([],q.read_text(encoding='utf-8-sig').splitlines(True),fromfile='/dev/null',tofile=rel))
++    members['source/code.diff']=diff.encode()
++    members['source/source_hashes.json']=(json.dumps(source_rows,indent=2)+'\n').encode()
++    manifest=D.read(OUT/'inputs/manifest.json')
++    for label in ['BASE','NFT','SELF_FM']:
++        for q in manifest['evaluation_requests']:
++            rid=q['request_id'];base=OUT/'evaluation'/label
++            for path in [base/'raw'/rid/'raw.npz',base/'post'/rid/'post.npz',base/'proposal'/rid/'proposal.npz']:
++                external.append(dict(path=str(path),bytes=path.stat().st_size,sha256=D.sha(path),reason='Full mesh/trajectory remains local; numerical tables and all image previews included'))
++    members['external_mesh_assets.json']=(json.dumps(external,indent=2)+'\n').encode()
++    members['PACK_SCOPE.txt']=b'All96 output rows, all192 RAW/POST metric rows, all32 paired image previews, actual review receipts and source code are included. Original full-resolution images, full geometry and detailed scorer arrays remain at their recorded local paths; this ZIP supports numeric aggregation review, not independent geometric rescoring without external meshes. Frozen model weights are unchanged and are external.\n'
++    checks={name:hashlib.sha256(data).hexdigest() for name,data in members.items()}
++    members['checksums.json']=(json.dumps(checks,indent=2)+'\n').encode()
++    target=dest/'NFT_TRAINING_C_FROZEN_REVIEW.zip'
++    if target.exists():raise RuntimeError('Pack already exists; no overwrite')
++    with zipfile.ZipFile(target,'x',compression=zipfile.ZIP_DEFLATED,compresslevel=6) as z:
++        for name,data in sorted(members.items()):z.writestr(name,data)
++    with zipfile.ZipFile(target) as z:
++        assert z.testzip() is None
++        for name,h in checks.items():assert hashlib.sha256(z.read(name)).hexdigest()==h
++    result=dict(status='COMPLETE',path=str(target),bytes=target.stat().st_size,sha256=D.sha(target),members=len(members),all_member_hashes_verified=True,CRC_PASS=True,all96_outputs_included=True,all32_preview_pages=True,negative_and_unknown_rows_retained=True,model_calls=0)
++    D.write(dest/'receipt.json',result);print(json.dumps(result),flush=True)
++
++if __name__=='__main__':build()
+--- /dev/null
++++ r2/pilots/nft_training_c_frozen_v1/prepare.py
+@@ -0,0 +1,73 @@
++"""Register all32 unseen Gaussian arrays and identical source queries before GPU."""
++from .bootstrap import bind, OLD, OUT, ROOT
++D,E=bind()
++from collections import Counter
++import json
++
++VERSION='R2_NFT_TRAINING_C_FROZEN_V1'
++
++def run():
++    target=OUT/'inputs/manifest.json'
++    if target.exists():
++        m=D.read(target)
++        for q in m['evaluation_requests']:D.load_request(q)
++        for p,h in m['protected_hashes'].items():
++            if D.sha(p)!=h:raise ValueError('Protected source changed: '+p)
++        return m
++    old_path=OLD/'inputs/manifest.json'
++    m0=D.read(old_path)
++    queries_path=OLD/'inputs/training_queries.json'
++    queries=D.read(queries_path)['queries']
++    conditions=m0['train_conditions']
++    if len(conditions)!=8 or len(queries)!=8:raise ValueError('Must retain all original8 reward-training conditions')
++    protected={str(old_path):D.sha(old_path),str(queries_path):D.sha(queries_path)}
++    def protect(p,expected=None):
++        h=D.sha(p)
++        if expected is not None and h!=expected:raise ValueError('Source mismatch: '+str(p))
++        protected[str(D.resolve(p))]=h
++    protect(m0['source_binding']['path'],m0['source_binding']['sha256'])
++    for arm in ['NFT','SELF_FM']:
++        cp=OLD/f'checkpoints/{arm}/round15.pt';receipt=D.read(cp.with_suffix('.json'))
++        if (receipt['step'],receipt['round_index'])!=(256,15):raise ValueError('Final endpoint differs')
++        protect(cp,receipt['sha256']);protect(cp.with_suffix('.json'))
++    oldqs=m0['training_requests']+m0['evaluation_requests']
++    oldseeds={q['noise_seed'] for q in oldqs}
++    oldhash={q['Gaussian_sha256'] for q in oldqs}
++    oldfree={q.get('free_Gaussian_sha256') for q in oldqs}
++    qs=[]
++    for c in conditions:
++        protect(c['condition_source'],c['condition_source_sha256'])
++        ca=D.arrays(c['condition_source'])['C'].reshape(c['K'],3,3)
++        q0=next(q for q in m0['training_requests'] if q['condition_id']==c['condition_id'])
++        if D.array_sha(ca)!=q0['C_sha256']:raise ValueError('Condition changed')
++        for ni in range(4):
++            rid='NFTTRAINCFRESH__'+c['task_id']+'__n'+str(ni)
++            q={k:q0[k] for k in ['condition_id','parent_id','task_id','N','K','condition_source','condition_source_sha256','split','condition_type','region_type','tier','variant','alpha','selection_order']}
++            q.update(request_id=rid,base_request_id=rid,candidate=ni,evaluation_noise_partition='FRESH',panel='REWARD_TRAIN_C_FRESH_NOISE_FROZEN',reward_training_condition=True)
++            q=D._freeze_request(q,ca,VERSION+'/EVAL_ONLY',OUT)
++            if q['noise_seed'] in oldseeds or q['Gaussian_sha256'] in oldhash or q['free_Gaussian_sha256'] in oldfree:
++                raise ValueError('Old-noise collision; no silent redraw')
++            qs.append(q)
++    if len({q['noise_seed'] for q in qs})!=32 or set(Counter(q['condition_id'] for q in qs).values())!={4}:
++        raise ValueError('Fresh-noise count or uniqueness mismatch')
++    if {c['condition_id'] for c in conditions}!={q['condition_id'] for q in queries}:raise ValueError('Query identity mismatch')
++    for q in queries:protect(q['path'],q['sha256'])
++    manifest=dict(status='FROZEN',version=VERSION,train_conditions=conditions,evaluation_requests=qs,evaluation_queries=queries,queries=queries,
++        source_binding=m0['source_binding'],protected_hashes=protected,source_manifest=str(old_path),source_manifest_sha256=D.sha(old_path),
++        noise_novelty=dict(compared_old_training_requests=512,compared_old_final_requests=36,seed_collisions=0,full_array_collisions=0,free_array_collisions=0,new_arrays=32,method='Same MT19937 FP32 free-only Gaussian; new fixed SHA256 namespace, no outcome selection'),
++        budgets=dict(new_RAW=96,new_POST=96,generator_forwards=4800,D0_forwards=96,training_updates=0,extra_validation_forwards=0),
++        scope='Same eight reward-supervised C on unseen noise, not new-parent generalization; all8 preserved; no checkpoint selection')
++    D.write(target,manifest)
++    registration=dict(experiment=VERSION,status='FROZEN',manifest_sha256=D.sha(target),sampling=D.read(OLD/'registration.json')['sampling'],budgets=manifest['budgets'],
++        reward=dict(definition='UNCHANGED geometry_review_reward raw R; no within-group normalization for model comparison',source=str(ROOT/'r2/pilots/terminal_reward_nft_v1/evaluation.py'),sha256=D.sha(ROOT/'r2/pilots/terminal_reward_nft_v1/evaluation.py'),unknown='ABSTAIN, matched-known pairs and explicit unknown bounds; never imputed as0'),
++        comparison=['FULL_S6000 frozen','NFT final256','SELF_REFLOW final256'],queries='Reuse original eight2048 frozen C query banks exactly; zero new queries',
++        visual_review='All32 paired pages, all96 outputs; actual AI_PROXY model-blind with original RAW/POST adoption/body rubric',
++        interpretation='Four user-specified exits; mixed or insufficient evidence remains inconclusive, no forced positive decision',
++        stop='After96 RAW/POST, fullpaired scoring/review and report; no further training/default/commit/push')
++    D.write(OUT/'registration.json',registration)
++    from r2.pilots.terminal_reward_nft_v1 import common as W
++    D.write(OUT/'resources_before_execution.json',W.resource_snapshot())
++    print(json.dumps({'status':'FROZEN','requests':len(qs),'conditions':len(conditions),'new_noise_arrays':32,'model_calls':0}),flush=True)
++    return manifest
++
++if __name__=='__main__':run()
+--- /dev/null
++++ r2/pilots/nft_training_c_frozen_v1/resume.ps1
+@@ -0,0 +1,4 @@
++param([ValidateSet("status", "all")][string]$Stage = "status")
++$ErrorActionPreference = "Stop"
++wsl -d Ubuntu --cd /mnt/e/MeshFlow -- env PYTHONPATH=/mnt/e/MeshFlow/r2/src:/mnt/e/MeshFlow OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 /mnt/e/MeshFlow-Control-artifacts/venv/bin/python -B -m r2.pilots.nft_training_c_frozen_v1.run --stage $Stage
++exit $LASTEXITCODE
+--- /dev/null
++++ r2/pilots/nft_training_c_frozen_v1/run.py
+@@ -0,0 +1,560 @@
++"""Frozen training-C evaluation: 96 new RAW, 96 D0 calls, then anonymous review.
++
++This coordinator never imports torch. GPU computation belongs to explicit child
++workers. Three sampling methods may overlap only after measured admission;
++all 96 RAW precede one resident official D0 batch. All outputs are new; no training.
++Original experiment inputs, checkpoints, and resource evidence stay read-only.
++"""
++from __future__ import annotations
++
++from . import bootstrap
++D, E = bootstrap.bind()
++from r2.pilots.terminal_reward_nft_v1 import common as W
++import argparse
++import csv
++import io
++import json
++import math
++import os
++from pathlib import Path
++import subprocess
++import sys
++import time
++
++VERSION = "nft_training_c_frozen_run_v1"
++OLD = Path(bootstrap.OLD).resolve()
++PACKAGE = "r2.pilots.nft_training_c_frozen_v1"
++NEW_RAW = 96
++DISTINCT_REQUESTS = 32
++SAMPLING_FORWARDS = 4800
++LABELS = ("NFT", "SELF_FM", "BASE")
++COUNTS = {"BASE": 32, "NFT": 32, "SELF_FM": 32}
++CONTROL = D.OUT / "evaluation/final_controller"
++FINAL_D0 = D.OUT / "evaluation/denoise_all_worker"
++MAX_SAMPLING_WORKERS = 3
++if D.OUT.resolve() == OLD or D.OUT.resolve().is_relative_to(OLD) or OLD.is_relative_to(D.OUT.resolve()):
++    raise RuntimeError("New output root must be disjoint from the original experiment")
++
++
++def _event(event_name, **fields):
++    CONTROL.mkdir(parents=True, exist_ok=True)
++    with (CONTROL / "events.jsonl").open("a", encoding="utf8") as f:
++        f.write(json.dumps(D.clean(dict(event=event_name, utc=W.utc(), **fields)), allow_nan=False) + "\n")
++        f.flush()
++        os.fsync(f.fileno())
++
++
++def source_verify():
++    lock = D.OUT / "execution_source_lock.json"
++    if not lock.exists():
++        raise RuntimeError("Frozen execution source lock required")
++    hashes = D.read(lock)["hashes"]
++    required = {str((Path(__file__).parent / name).resolve()) for name in
++                ("bootstrap.py", "run.py", "sample_worker.py", "denoise_worker.py", "final_cpu.py")}
++    locked = {str(D.resolve(path).resolve()) for path in hashes}
++    if not required <= locked:
++        raise RuntimeError("Execution lock misses new runtime modules: " + repr(sorted(required - locked)))
++    for path, expected in hashes.items():
++        if D.sha(path) != expected:
++            raise RuntimeError("Execution source changed: " + path)
++    final_lock = CONTROL / "contract.json"
++    if final_lock.exists():
++        contract = D.read(final_lock)
++        if D.sha(lock) != contract["execution_source_lock_sha256"]:
++            raise RuntimeError("Frozen execution source lock changed")
++        if D.sha(D.OUT / "inputs/manifest.json") != contract["manifest_sha256"]:
++            raise RuntimeError("Frozen evaluation manifest changed")
++        for path, expected in contract["source_input_sha256"].items():
++            if D.sha(path) != expected:
++                raise RuntimeError("Original experiment input changed: " + path)
++        for path, expected in contract["code_sha256"].items():
++            if D.sha(path) != expected:
++                raise RuntimeError("Final-stage source changed: " + path)
++
++
++def checkpoint_gate():
++    """Accept canonical completed transactions and explicit recovery evidence."""
++    accepted, missing = {}, []
++    for arm in ("NFT", "SELF_FM"):
++        checkpoint = OLD / f"checkpoints/{arm}/round15.pt"
++        receipt_path = checkpoint.with_suffix(".json")
++        if not checkpoint.exists() or not receipt_path.exists():
++            missing.append(arm + ": final checkpoint/receipt missing")
++            continue
++        receipt = D.read(receipt_path)
++        digest = D.sha(checkpoint)
++        if (receipt.get("step"), receipt.get("round_index"), receipt.get("sha256")) != (256, 15, digest):
++            raise RuntimeError("Final checkpoint hash/clock mismatch: " + arm)
++        original = OLD / f"training/round_15/train_{arm}"
++        candidates = [original / "completion.json", original / "completion_recovery.json", original / "complete_recovery.json",
++                      original.with_name(original.name + "_recovery01") / "completion.json"]
++        proof = None
++        for path in candidates:
++            if not path.exists():
++                continue
++            value = D.read(path)
++            if value.get("status") != "COMPLETE":
++                continue
++            identity = value.get("identity", value)
++            identity_arm = identity.get("arm", value.get("arm"))
++            identity_round = identity.get("round_index", value.get("round_index"))
++            if identity_arm != arm or identity_round != 15:
++                raise RuntimeError("Completion proof identity differs: " + str(path))
++            if path.name in ("completion_recovery.json", "complete_recovery.json"):
++                if value.get("step") != 256 or value.get("checkpoint_sha256") != digest:
++                    raise RuntimeError("Recovery proof must bind final checkpoint hash and step")
++            elif identity.get("stop_step") != 256:
++                raise RuntimeError("Phase completion does not certify stop_step256")
++            metric_path = path.parent / "training_metrics.json"
++            if not metric_path.exists() and path.name in ("completion_recovery.json", "complete_recovery.json"):
++                metric_path = original / "training_metrics.json"
++            metrics = D.read(metric_path)
++            if (metrics.get("status"), metrics.get("arm"), metrics.get("round_index"),
++                    metrics.get("completed_updates"), metrics.get("stop_step")) != ("COMPLETE", arm, 15, 16, 256):
++                raise RuntimeError("Final training metrics do not certify completed round")
++            expected_metrics = value.get("metrics_sha", value.get("metrics_sha256"))
++            if expected_metrics is not None and D.sha(metric_path) != expected_metrics:
++                raise RuntimeError("Recovery metrics hash differs")
++            if value.get("original_failure_path"):
++                expected_failure = value.get("original_failure_sha", value.get("original_failure_sha256"))
++                if not expected_failure or D.sha(value["original_failure_path"]) != expected_failure:
++                    raise RuntimeError("Recovery original failure record changed")
++            proof = dict(path=str(path), sha256=D.sha(path), metrics_path=str(metric_path),
++                         metrics_sha256=D.sha(metric_path), recovered=path != candidates[0])
++            break
++        if proof is None:
++            missing.append(arm + ": final complete Phase/recovery proof missing")
++        else:
++            accepted[arm] = dict(checkpoint=str(checkpoint), checkpoint_sha256=digest,
++                                 receipt_path=str(receipt_path), receipt_sha256=D.sha(receipt_path), proof=proof)
++    return dict(status="PASS" if not missing else "WAITING_FROZEN_CHECKPOINTS", accepted=accepted, missing=missing)
++
++
++def require_frozen_endpoints():
++    gate = checkpoint_gate()
++    if gate["status"] != "PASS":
++        raise RuntimeError("Both frozen final endpoints need completion proof before GPU launch: " + "; ".join(gate["missing"]))
++    return gate
++
++
++def freeze_contract(gate):
++    source_lock = D.OUT / "execution_source_lock.json"
++    package_root = Path(__file__).parent.resolve()
++    code = sorted({D.resolve(p).resolve() for p in D.read(source_lock)["hashes"]
++                   if D.resolve(p).resolve().is_relative_to(package_root)})
++    source_inputs = [OLD / "inputs/manifest.json", OLD / "inputs/training_queries.json", OLD / "registration.json"]
++    contract = dict(version=VERSION, checkpoint_gate=gate,
++        manifest_sha256=D.sha(D.OUT / "inputs/manifest.json"),
++        execution_source_lock_sha256=D.sha(source_lock),
++        source_input_sha256={str(p): D.sha(p) for p in source_inputs},
++        code_sha256={str(p): D.sha(p) for p in code},
++        budgets=dict(new_RAW=NEW_RAW, new_RAW_by_label=COUNTS, sampling_forwards=SAMPLING_FORWARDS,
++                     single_D0_calls=NEW_RAW, original_BASE_RAW_POST_reuse=0,
++                     logical_RAW=NEW_RAW, logical_POST=NEW_RAW, distinct_requests=DISTINCT_REQUESTS,
++                     score_cells=2 * NEW_RAW, validation_forwards=0, final_training_updates=0),
++        dispatch=dict(max_sampling_processes=3, first_real_rollout_before_next_worker=True,
++            incremental_slots="floor(max(0,free-headroom)/(1.2*observed_sampling_process_peak))",
++            headroom="max(2048MiB,10%total)", utilization_wait_at=85,
++            separate_D0_memory_estimate=True, D0_resident_instances=1,
++            CPU_scoring_workers=2, no_resource_probe_jobs=True),
++        finish="WAITING_ACTUAL_ANONYMOUS_REVIEW; no labels assigned by coordinator")
++    D.write(CONTROL / "contract.json", contract)
++    return contract
++
++
++def gpu_values(snapshot):
++    result = snapshot["gpu"]
++    if result["returncode"] != 0:
++        raise RuntimeError("nvidia-smi resource query failed")
++    rows = list(csv.reader(io.StringIO(result["stdout"])))
++    if len(rows) != 1 or len(rows[0]) != 5:
++        raise RuntimeError("Expected one measured GPU")
++    name, total, used, free, util = rows[0]
++    return dict(name=name.strip(), total=float(total), used=float(used), free=float(free), util=float(util))
++
++
++def mem_available_mib(snapshot):
++    for line in (snapshot.get("meminfo") or "").splitlines():
++        if line.startswith("MemAvailable:"):
++            return float(line.split()[1]) / 1024
++    raise RuntimeError("Available system RAM could not be measured")
++
++
++def snapshot():
++    value = W.resource_snapshot()
++    value["available_CPU_cores"] = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count()
++    value["load_average"] = list(os.getloadavg()) if hasattr(os, "getloadavg") else None
++    p = subprocess.run(["ps", "-eo", "pid,comm,pcpu,pmem", "--sort=-pcpu"],
++                       capture_output=True, text=True, timeout=10)
++    value["CPU_process_load"] = dict(returncode=p.returncode, stdout="\n".join(p.stdout.splitlines()[:17]))
++    return value
++
++
++def process_rss_mib(pid):
++    path = Path(f"/proc/{pid}/status")
++    if not path.exists():
++        return 0.0
++    for line in path.read_text().splitlines():
++        if line.startswith("VmRSS:"):
++            return float(line.split()[1]) / 1024
++    return 0.0
++
++
++def process_gpu_mib(snap, pid):
++    values = []
++    for row in csv.reader(io.StringIO(snap["processes"]["stdout"])):
++        if len(row) >= 3 and row[0].strip() == str(pid):
++            try:
++                values.append(float(row[-1].strip()))
++            except ValueError:
++                pass  # WDDM can report N/A; retain the device-delta bound.
++    return max(values, default=0.0)
++
++
++def admission(snap, *, process_peak_mib, ram_peak_mib, active):
++    g = gpu_values(snap)
++    headroom = max(2048.0, 0.1 * g["total"])
++    slots = (math.floor(max(0.0, g["free"] - headroom) / (1.2 * process_peak_mib))
++             if process_peak_mib > 0 else int(g["free"] > headroom))
++    ram_free = mem_available_mib(snap)
++    ram_need = max(1024.0, 1.2 * ram_peak_mib) + 1024.0
++    cores = int(snap["available_CPU_cores"])
++    load = snap.get("load_average")
++    reasons = []
++    if slots < 1:
++        reasons.append("VRAM_HEADROOM_OR_SLOT_LIMIT")
++    if g["util"] >= 85:
++        reasons.append("GPU_COMPUTE_AT_LEAST_85_PERCENT")
++    if ram_free < ram_need:
++        reasons.append("SYSTEM_RAM_HEADROOM")
++    if cores < 2 * (active + 1) or (load is not None and load[0] >= max(1, 0.9 * cores)):
++        reasons.append("CPU_THREADS_OR_LOAD")
++    return dict(admitted=not reasons, reasons=reasons, incremental_slots=slots,
++                headroom_MiB=headroom, process_peak_estimate_MiB=process_peak_mib,
++                estimate_margin=1.2, available_RAM_MiB=ram_free, required_RAM_MiB=ram_need,
++                active_owned_processes=active, gpu=g)
++
++
++def prior_measurement(kind):
++    """Use only existing real sampling or D0 evidence, separately by phase."""
++    if kind == "sampling":
++        phase = OLD / "training/round_00/sampling_worker/resources.json"
++        receipts = list((OLD / "training/round_00/raw").glob("*/receipt.json"))
++        peak_key = "sampling"
++    elif kind == "D0":
++        phase = OLD / "training/round_00/denoise_worker/resources.json"
++        receipts = list((OLD / "training/round_00/proposal").glob("*/receipt.json"))
++        peak_key = None
++    else:
++        raise ValueError(kind)
++    peak = 0.0
++    if phase.exists():
++        evidence = D.read(phase)
++        baseline = gpu_values(evidence["initial"])["used"]
++        observations = [evidence["initial"], *evidence.get("samples", []), evidence["final"]]
++        peak = max((max(0.0, gpu_values(s)["used"] - baseline) for s in observations if "gpu" in s), default=0.0)
++    reserved = 0.0
++    for path in receipts:
++        r = D.read(path)
++        r = r[peak_key] if peak_key else r
++        reserved = max(reserved, r.get("cuda_peak_reserved_bytes", 0) / 2**20)
++    # Device deltas can be confounded and WDDM can hide process bytes. Include
++    # allocator-reserved memory plus 512 MiB context margin, never allocated-only.
++    if reserved:
++        peak = max(peak, reserved + 512.0)
++    return dict(kind=kind, estimate_MiB=peak, allocator_reserved_MiB=reserved,
++                process_exact=False, source_resources=str(phase), real_receipts=len(receipts),
++                scope="existing real same-model phase; conservative device delta/reserved+context bound")
++
++
++def launch(name, module, args, snap, decision):
++    source_verify()
++    root = D.OUT / "dispatch" / name
++    if root.exists():
++        raise RuntimeError("Unresolved/prior dispatch cannot be silently replayed: " + name)
++    D.write(root / "admission.json", dict(resources=snap, decision=decision, command=[module, *args]))
++    log = (root / "stdout.log").open("x", encoding="utf8")
++    cmd = [sys.executable, "-u", "-B", "-m", module, *args]
++    try:
++        proc = subprocess.Popen(cmd, cwd=D.ROOT, stdout=log, stderr=subprocess.STDOUT, env=os.environ.copy())
++    except BaseException:
++        log.close()
++        raise
++    job = dict(name=name, proc=proc, log=log, path=root, initial=snap,
++               started=time.perf_counter(), gpu_peak=0.0, ram_peak=0.0, label=None)
++    try:
++        _event("LAUNCH", name=name, pid=proc.pid, command=cmd, decision=decision)
++        print("LAUNCH", name, "PID", proc.pid, flush=True)
++    except BaseException:
++        # The owned process already started: logging errors must not terminate
++        # its parent WSL invocation while it is still computing.
++        while proc.poll() is None:
++            time.sleep(1)
++        finish(job)
++        raise
++    return job
++
++
++def finish(job):
++    code = job["proc"].poll()
++    if code is None:
++        return None
++    if not job.get("closed"):
++        job["log"].close()
++        D.write(job["path"] / "exit.json", dict(returncode=code,
++            seconds=time.perf_counter() - job["started"], resources=snapshot(),
++            observed_GPU_bound_MiB=job["gpu_peak"], observed_process_RSS_MiB=job["ram_peak"]))
++        job["closed"] = True
++        _event("EXIT", name=job["name"], returncode=code)
++        print("EXIT", job["name"], code, flush=True)
++    return code
++
++
++def validate_raw(label, *, require_phase=True):
++    from .denoise_worker import prepare_jobs
++    manifest = D.read(D.OUT / "inputs/manifest.json")
++    path = D.OUT / "evaluation" / label / "raw_index.json"
++    if not path.exists():
++        return False
++    if require_phase:
++        completion = path.parent / "sampling_worker/completion.json"
++        if not completion.exists() or D.read(completion).get("status") != "COMPLETE":
++            raise RuntimeError("Final RAW index lacks completed sampling Phase: " + label)
++    _, _, jobs, _ = prepare_jobs(manifest, evaluation=label)
++    index = D.read(path)
++    if len(jobs) != COUNTS[label] or index["actual_new_rollouts"] != COUNTS[label] or index["actual_sampling_forwards"] != 50 * COUNTS[label]:
++        raise RuntimeError("Final RAW budget mismatch: " + label)
++    return True
++
++
++def sample_all():
++    pending = [label for label in LABELS if not validate_raw(label)]
++    evidence = prior_measurement("sampling")
++    _event("SAMPLING_PRIOR_EVIDENCE", evidence=evidence)
++    peak, ram_peak = evidence["estimate_MiB"], 0.0
++    jobs, latest, failure = [], None, None
++    tick = 0
++    try:
++        while pending or jobs:
++            snap = snapshot()
++            g = gpu_values(snap)
++            for job in list(jobs):
++                job["gpu_peak"] = max(job["gpu_peak"], process_gpu_mib(snap, job["proc"].pid),
++                                      max(0.0, g["used"] - gpu_values(job["initial"])["used"]))
++                job["ram_peak"] = max(job["ram_peak"], process_rss_mib(job["proc"].pid))
++                peak, ram_peak = max(peak, job["gpu_peak"]), max(ram_peak, job["ram_peak"])
++                if job["proc"].poll() is not None:
++                    code = finish(job)
++                    jobs.remove(job)
++                    if code:
++                        failure = "Sampling worker failed; no further dispatch: " + job["name"]
++                    elif not validate_raw(job["label"]):
++                        raise RuntimeError("Successful sampling process lacks complete RAW index: " + job["label"])
++            ready = latest is None
++            if latest is not None:
++                raw = D.OUT / "evaluation" / latest["label"] / "raw"
++                completed = list(raw.glob("*/receipt.json"))
++                ready = bool(completed)
++                if completed:
++                    r = D.read(completed[0])["sampling"]
++                    peak = max(peak, r["cuda_peak_reserved_bytes"] / 2**20 + 512.0)
++            decision = admission(snap, process_peak_mib=peak, ram_peak_mib=ram_peak, active=len(jobs))
++            if tick % 5 == 0:
++                _event("RESOURCE_OBSERVATION", resources=snap, admission=decision,
++                       first_real_rollout_observed=ready, active=[j["name"] for j in jobs])
++            if failure:
++                pending.clear()  # Already running authorized workers finish; nothing is killed.
++            elif pending and len(jobs) < MAX_SAMPLING_WORKERS and ready and decision["admitted"]:
++                label = pending.pop(0)
++                latest = launch("final_sample_" + label, PACKAGE + ".sample_worker",
++                                ["--evaluation", label], snap, decision)
++                latest["label"] = label
++                jobs.append(latest)
++            if jobs or pending:
++                time.sleep(1)
++            tick += 1
++    finally:
++        # If admission, validation or logging fails, let every already launched
++        # authorized child finish before this owning WSL process exits.
++        while any(job["proc"].poll() is None for job in jobs):
++            time.sleep(1)
++        for job in jobs:
++            finish(job)
++    if failure:
++        raise RuntimeError(failure)
++    if not all(validate_raw(label) for label in LABELS):
++        raise RuntimeError("All 96 new RAW must complete before D0")
++
++
++def all_d0_jobs():
++    from .denoise_worker import prepare_jobs
++    manifest = D.read(D.OUT / "inputs/manifest.json")
++    jobs = []
++    for label in LABELS:
++        if not validate_raw(label):
++            raise RuntimeError("All final RAW required before resident D0 batch")
++        jobs.extend(prepare_jobs(manifest, evaluation=label)[2])
++    if len(jobs) != NEW_RAW:
++        raise RuntimeError("Exactly 96 new D0 jobs required")
++    return jobs
++
++
++def validate_d0():
++    path = D.OUT / "evaluation/final_proposal_index.json"
++    if not path.exists():
++        return False
++    value = D.read(path)
++    phase = FINAL_D0 / "completion.json"
++    if value.get("status") != "COMPLETE" or not phase.exists() or D.read(phase).get("status") != "COMPLETE":
++        raise RuntimeError("Incomplete final D0 transaction")
++    if value["jobs"] != NEW_RAW or value["new_D0_forwards"] != NEW_RAW or value["resident_models_loaded"] != 1:
++        raise RuntimeError("Final D0 budgets differ")
++    from r2.pilots.terminal_reward_nft_v1.denoise_worker import OFFICIAL_D0_SHA256
++    expected = {(j["label"], j["request_id"]): j for j in all_d0_jobs()}
++    receipts = value["receipts"]
++    if len(receipts) != NEW_RAW or {(r["label"], r["request_id"]) for r in receipts} != set(expected):
++        raise RuntimeError("D0 receipts differ from the 96 registered identities")
++    for r in receipts:
++        job = expected[r["label"], r["request_id"]]
++        if (r.get("status") != "PROPOSAL_COMPLETE" or r.get("model_forwards") != 1
++                or D.resolve(r["proposal_path"]) != D.resolve(job["proposal_dir"]) / "proposal.npz"
++                or D.resolve(r["proposal_receipt"]) != D.resolve(job["proposal_dir"]) / "receipt.json"
++                or D.resolve(r["raw_path"]) != D.resolve(job["raw_path"])):
++            raise RuntimeError("Final D0 proposal ownership differs")
++        proof = D.read(r["proposal_receipt"])
++        if (proof.get("status") != "PASS" or proof["model_forwards"] != 1
++                or proof["checkpoint_sha256"] != OFFICIAL_D0_SHA256
++                or proof["request_id"] != r["request_id"] or proof["raw_sha256"] != job["raw_sha256"]):
++            raise RuntimeError("Final proposal is not a single official D0 for this RAW")
++        if D.sha(r["proposal_path"]) != r["proposal_sha256"] or proof["output_sha256"] != r["proposal_sha256"]:
++            raise RuntimeError("Final proposal hash changed")
++    return True
++
++
++def denoise_worker():
++    require_frozen_endpoints()
++    source_verify()
++    jobs = all_d0_jobs()
++    from r2.pilots.terminal_reward_nft_v1.denoise_worker import retained_d0_binding
++    binding = retained_d0_binding()
++    if any(D.resolve(j["proposal_dir"]).exists() for j in jobs):
++        raise RuntimeError("Prior proposal activity requires explicit accounting recovery, not another D0 batch")
++    with W.Phase(FINAL_D0, dict(stage="FROZEN_TRAIN_C_RESIDENT_D0", jobs=NEW_RAW, checkpoint=binding)) as phase:
++        D.write(FINAL_D0 / "resources_initial.json", phase.initial)
++        result = E.postprocess_batch(jobs, binding["path"], FINAL_D0 / "batch",
++            resource_snapshot_path=FINAL_D0 / "resources_initial.json", proposal_only=True)
++        if (result["jobs"], result["new_D0_forwards"], result["resident_models_loaded"]) != (NEW_RAW, NEW_RAW, 1):
++            raise RuntimeError("Batch must perform exactly 96 D0 calls using one model")
++        D.write(D.OUT / "evaluation/final_proposal_index.json", result)
++        for label in LABELS:
++            receipts = [r for r in result["receipts"] if r["label"] == label]
++            if len(receipts) != COUNTS[label]:
++                raise RuntimeError("D0 per-label count differs")
++            D.write(D.OUT / "evaluation" / label / "proposal_index.json",
++                    dict(status="COMPLETE", jobs=len(receipts), receipts=receipts, label=label,
++                         new_D0_forwards=len(receipts), proposal_only=True,
++                         resident_batch_receipt=str(D.OUT / "evaluation/final_proposal_index.json")))
++
++
++def wait_single(name, module, args, *, gpu_kind=None):
++    evidence = prior_measurement(gpu_kind) if gpu_kind else None
++    tick = 0
++    while True:
++        snap = snapshot()
++        decision = (admission(snap, process_peak_mib=evidence["estimate_MiB"], ram_peak_mib=0, active=0)
++                    if gpu_kind else dict(admitted=(mem_available_mib(snap) >= 2048
++                        and snap["available_CPU_cores"] >= 2
++                        and (snap.get("load_average") is None
++                             or snap["load_average"][0] < .9 * snap["available_CPU_cores"])),
++                        reason="two CPU workers with available RAM/cores/load; model-free stage"))
++        if decision["admitted"]:
++            break
++        if tick % 5 == 0:
++            _event("WAIT_RESOURCE", name=name, resources=snap, decision=decision, prior=evidence)
++        tick += 1
++        time.sleep(1)
++    job = launch(name, module, args, snap, decision)
++    tick = 0
++    try:
++        while job["proc"].poll() is None:
++            snap = snapshot()
++            g = gpu_values(snap)
++            job["gpu_peak"] = max(job["gpu_peak"], process_gpu_mib(snap, job["proc"].pid),
++                                  max(0.0, g["used"] - gpu_values(job["initial"])["used"]) if gpu_kind else 0.0)
++            job["ram_peak"] = max(job["ram_peak"], process_rss_mib(job["proc"].pid))
++            if tick % 5 == 0:
++                _event("RESOURCE_OBSERVATION", name=name, resources=snap, GPU_kind=gpu_kind,
++                       observed_GPU_bound_MiB=job["gpu_peak"], observed_process_RSS_MiB=job["ram_peak"])
++            tick += 1
++            time.sleep(1)
++    finally:
++        while job["proc"].poll() is None:
++            time.sleep(1)
++        finish(job)
++    if job["proc"].returncode:
++        raise RuntimeError("Worker failed; no automatic retry: " + name)
++
++
++def run():
++    gate = require_frozen_endpoints()
++    source_verify()
++    freeze_contract(gate)
++    sample_all()
++    if not validate_d0():
++        wait_single("frozen_D0_all96", PACKAGE + ".run",
++                    ["--stage", "denoise-worker"], gpu_kind="D0")
++    if not validate_d0():
++        raise RuntimeError("Final D0 did not complete")
++    cpu_done = D.OUT / "evaluation/cpu/post_score_render_complete.json"
++    if not cpu_done.exists():
++        wait_single("frozen_CPU_all", PACKAGE + ".final_cpu",
++                    ["--stage", "all", "--workers", "2"])
++    cpu = D.read(cpu_done)
++    if (cpu.get("status"), cpu.get("requests"), cpu.get("required_new_POST"), cpu.get("distinct_requests")) != ("COMPLETE", NEW_RAW, NEW_RAW, DISTINCT_REQUESTS):
++        raise RuntimeError("Final CPU count/completion mismatch")
++    for path, expected in cpu["files"].items():
++        if D.sha(path) != expected:
++            raise RuntimeError("Final CPU artifact changed: " + path)
++    gallery = D.OUT / "evaluation/blind_gallery/manifest.json"
++    if not gallery.exists():
++        raise RuntimeError("Anonymous gallery not completed")
++    result = dict(status="WAITING_ACTUAL_ANONYMOUS_REVIEW", version=VERSION,
++        new_RAW=NEW_RAW, new_sampling_forwards=SAMPLING_FORWARDS, new_D0_forwards=NEW_RAW,
++        BASE_cached_RAW_POST=0, logical_RAW=NEW_RAW, logical_POST=NEW_RAW,
++        distinct_requests=DISTINCT_REQUESTS, score_cells=2 * NEW_RAW, validation_forwards=0,
++        CPU_completion_path=str(cpu_done), CPU_completion_sha256=D.sha(cpu_done),
++        gallery_manifest=str(gallery), gallery_sha256=D.sha(gallery),
++        review_labels_created=0, review_scope="32 requests x anonymous local A/B/C aliases; actual review required",
++        private_mapping_must_not_be_sent_to_reviewer=True,
++        scientific_training_updates_in_final_stage=0)
++    D.write(D.OUT / "evaluation/review_gate.json", result)
++    print(json.dumps(result, sort_keys=True), flush=True)
++    return result
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--stage", choices=("all", "status", "denoise-worker"), default="all")
++    args = parser.parse_args()
++    if args.stage == "status":
++        print(json.dumps(checkpoint_gate(), sort_keys=True))
++        return
++    if args.stage == "denoise-worker":
++        denoise_worker()
++        return
++    # One coordinator owns admission; this does not lock or stop user processes.
++    import fcntl
++    CONTROL.mkdir(parents=True, exist_ok=True)
++    with (CONTROL / "owner.lock").open("a") as owner:
++        fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
++        try:
++            run()
++        except BaseException as exc:
++            _event("FINAL_STAGE_STOPPED", error=repr(exc), automatic_retry=False)
++            raise
++        finally:
++            fcntl.flock(owner, fcntl.LOCK_UN)
++
++
++if __name__ == "__main__":
++    main()
+--- /dev/null
++++ r2/pilots/nft_training_c_frozen_v1/sample_worker.py
+@@ -0,0 +1,24 @@
++"""Frozen-policy sampling; old sampler and runtime unchanged, zero updates."""
++from .bootstrap import bind, OLD
++D, E = bind()
++from r2.pilots.terminal_reward_nft_v1 import sample_worker as S
++
++def select_stage(m, round_index=None, evaluation=None):
++    if round_index is not None or evaluation not in ('BASE','NFT','SELF_FM'):
++        raise ValueError('Only frozen evaluation is authorized')
++    qs = m['evaluation_requests']
++    if len(qs) != 32 or len({q['condition_id'] for q in qs}) != 8:
++        raise ValueError('Require eight unchanged conditions times four new noises')
++    checkpoint = None if evaluation == 'BASE' else OLD / f'checkpoints/{evaluation}/round15.pt'
++    return list(qs), D.OUT/'evaluation'/evaluation, evaluation, checkpoint
++
++S.select_stage = select_stage
++
++if __name__ == '__main__':
++    import argparse,json
++    p=argparse.ArgumentParser();p.add_argument('--evaluation',required=True,choices=['BASE','NFT','SELF_FM'])
++    a=p.parse_args()
++    from .run import source_verify, require_frozen_endpoints
++    source_verify();require_frozen_endpoints()
++    result=S.run_worker(D.read(D.OUT/'inputs/manifest.json'),evaluation=a.evaluation)
++    print(json.dumps({'status':result['status'],'rollouts':result['actual_new_rollouts'],'forwards':result['actual_sampling_forwards']}),flush=True)
+--- /dev/null
++++ r2/pilots/nft_training_c_frozen_v1/write_report.py
+@@ -0,0 +1,52 @@
++"""Render complete paired evidence, using a separately authored decision."""
++from .bootstrap import bind,OUT
++D,E=bind()
++def run():
++    s=D.read(OUT/'evaluation/analysis/summary.json');assert s['status']=='COMPLETE'
++    decision=D.read(OUT/'report_decision.json')
++    pairs=D.read(OUT/'evaluation/analysis/paired_summary.json')
++    cond=D.read(OUT/'evaluation/analysis/per_condition.json')
++    pc=D.read(OUT/'evaluation/analysis/paired_per_condition.json')
++    groups={g['label']:g for g in s['groups']};names={'BASE':'FULL_S6000','NFT':'NFT','SELF_FM':'SELF_REFLOW'}
++    def f(x,d=4):return 'NA' if x is None else format(float(x),'.'+str(d)+'f')
++    def event(g,k):
++        e=g['events'][k];return str(e['YES'])+'/'+str(e['total'])+' (UNKNOWN '+str(e['UNKNOWN'])+')'
++    def table(h,rows):
++        return '| '+' | '.join(h)+' |\n| '+' | '.join(['---']*len(h))+' |\n'+''.join('| '+' | '.join(map(str,r))+' |\n' for r in rows)+'\n'
++    text='# R2_NFT_TRAINING_C_FROZEN_V1\n\n'+decision['conclusion']+'\n\n'
++    text+='## 合同与实际完成\n\n原八条奖励训练C全部保留，每C四份新噪声，三模型共96份RAW及96份POST。实际4,800生成前向、96单次D0、192原评分单元、32页原图匿名AI_PROXY审阅、96条标签。零训练、零反向、零额外验证前向、零失败重试。这是已获奖励监督C上的新噪声检查，不是新父泛化。\n\n'
++    text+='FULL_S6000仍为原live global12000（非EMA）；NFT与SELF均固定round15/256更新终点。原Euler50、BF16前向/FP32参数与积分、确定性math SDPA、单次官方D0/GEO_C/来源C绕序合同不变。三模型共享32份数组，种子和数组hash与旧512训练、36评估请求无重复；八个原2048查询bank直接复用。没有挑checkpoint、改变奖励、条件、噪声或评分定义。SELF_REFLOW继承上一轮使用同一NFT生成端点池与重加噪流的无奖励对照；它是共享端点的off-policy对照，不是原GT上的普通续训，也没有自己的在线生成池。\n\n'
++    text+='## 全32请求\n\n'
++    text+=table(['模型','RAW采用','POST合法接口','联合：RAW采用且接口','严格联合：两阶段采用+主体+接口'],[[names[l],event(groups[l],'RAW_adoption_known'),str(groups[l]['POST_interface_outputs'])+'/32',event(groups[l],'joint_RAW_adoption_POST_legal_CF'),event(groups[l],'joint_both_adoptions_body_and_CF')] for l in names])
++    text+='UNKNOWN不填NO。至少一条合法共边不等于整圈接好或成品可用；图像采用/主体标签不认证几何拓扑。三模型的RAW采用、POST采用与主体标签逐请求完全一致。e6ea5e的采用虽未知，但接口确定为0，因此联合事件确定为0，并非把未知采用填成NO。\n\n## 八条C完整分布\n\n'
++    rows=[]
++    for cid in sorted({c['condition_id'] for c in cond}):
++        g={c['label']:c for c in cond if c['condition_id']==cid}
++        rows.append([g['BASE']['parent_id'][:8]]+[event(g[l],'joint_both_adoptions_body_and_CF') for l in names]+[str(g[l]['POST_interface_outputs'])+'/4' for l in names])
++    text+=table(['C父前缀','FULL严格联合','NFT严格联合','SELF严格联合','FULL接口','NFT接口','SELF接口'],rows)
++    text+='全部采用、主体和数值分布见per_condition.csv，所有噪声配对见paired_per_request.csv；八条C没有筛选删除。\n\n## 固定原始奖励\n\n'
++    text+='原样调用geometry_review_reward，不用各模型自行组标准化的r_NFT作比较。共同已知奖励在同一请求上作差，先C内平均再对可用C等权；UNKNOWN原始R保持缺失，并另报全32请求差值的可行区间。这不是统计置信区间，也不是把未知填零。\n\n'
++    rows=[]
++    for r in pairs:
++        rows.append([names[r['candidate_model']]+' − '+names[r['reference_model']],r['reward_common_known_pairs'],r['reward_common_known_condition_count'],f(r['reward_common_known_candidate_equal_condition']['mean']),f(r['reward_common_known_reference_equal_condition']['mean']),f(r['reward_common_known_delta_equal_condition']['mean']),'['+f(r['reward_all_registered_delta_lower'])+', '+f(r['reward_all_registered_delta_upper'])+']'])
++    text+=table(['比较','共同已知/32','可用C/8','候选R','参照R','配对ΔR','含未知全32差区间'],rows)
++    rows=[]
++    for r in pc:
++        if r['reference_model']=='BASE':
++            e=r['events']['joint_both_adoptions_body_and_CF']
++            rows.append([r['parent_id'][:8],names[r['candidate_model']],r['reward_common_known_pairs'],f(r['reward_common_known_delta']['mean']),e['gained'],e['lost'],e['unknown_pairs']])
++    text+=table(['C','相对FULL','共同已知/4','ΔR','严格联合新增','丢失','未知配对'],rows)
++    text+='## 质量代价\n\n'
++    keys=['POST_CF_illegal_fraction','POST_FF_illegal_fraction','POST_I_lower','POST_free_small_angle_fraction','POST_free_retained_fraction']
++    text+=table(['模型','CF %','FF %','I下界 %','小角面 %','free保留 %'],[[names[l]]+[f(100*groups[l]['metrics'][k]['equal_condition_distribution']['mean'],3) for k in keys] for l in names])
++    text+='CF/FF分母为每POST实际free面数；I沿用ConflictCov_C，不是相交体积。全部192 I状态PASS且上下界一致；小角不自动等于不可用。全部指标和不利尾部均保存。\n\n'+decision['quality_interpretation']+'\n\n'
++    text+='## 本次出口与决定\n\n'+decision['exit_interpretation']+'\n\n'
++    text+='## 限制、图审和资源\n\n每C仅四噪声，不能宣称统计稳定优势。全部C属于奖励监督范围；不与上轮不同噪声的在线奖励均值混比。图审由独立新上下文AI_PROXY实际逐张查看32页原图，匿名A/B/C逐请求重新排列，未提供私有映射、数值、模型目录和历史标签；96标签与32实际查看回执先封存后解盲。它不是人类评估，薄层和遮挡仍可不确定。view_image曾遇Windows1385，改用提权只读同一原图字节原尺寸展示，保留回执；没有改图、换样本。\n\n'
++    text+='RTX5080总显存16,303 MiB；最高并发3采样进程。353次快照整卡峰值10,803 MiB，最低空闲5,177 MiB，利用率最高76%；24CPU核，可用RAM最低57,955 MiB。采样并集187.55秒、D0阶段58.16秒（含加载46.61秒）、CPU247.92秒（2worker×1thread），不含准备、图审和整理，不是孤立吞吐基准。WDDM进程显存NA保留，采样可能漏瞬时尖峰。\n\n独立数值复核14,128项通过、零异常，最大浮点差1.42e−14。预算、配对、RAW全51态C、POST来源C、冻结检查点和来源hash均通过；本轮没有训练更新、默认切换、commit或push，固定检查完成后停止。\n\n'
++    text+='## 交付入口\n\n- evaluation/analysis/per_output.csv：96逐输出；per_output_stage.csv：192阶段指标。\n- evaluation/analysis/paired_per_request.csv、paired_per_condition.csv：三组完整配对。\n- evaluation/blind_gallery/index.html：32张原尺寸图；reviews_anonymous_actual.json、view_receipts.json为真实图审。\n- audit/latest.json、numeric_crosscheck/comparison.json：执行/数值独立核验。\n- inputs/manifest.json：C、噪声、查询与权重身份；所有RAW/POST在evaluation各模型目录。\n- README_RESUME.md与r2/pilots/nft_training_c_frozen_v1/resume.ps1：恢复入口，默认status只读。\n- evidence_pack/NFT_TRAINING_C_FROZEN_REVIEW.zip：全表格、全部32页统一预览、实际源码/diff/hash；大网格与原尺寸图保留本地并列外部路径。\n'
++    target=OUT/'REPORT.md'
++    if target.exists() and target.read_text()!=text:raise RuntimeError('Refuse report overwrite')
++    target.write_text(text,encoding='utf-8')
++    D.write(OUT/'report_receipt.json',dict(status='COMPLETE',report_sha256=D.sha(target),decision_sha256=D.sha(OUT/'report_decision.json'),analysis_sha256=D.sha(OUT/'evaluation/analysis/summary.json'),source_sha256=D.sha(__file__),model_calls=0))
++    print('REPORT_WRITTEN',D.sha(target),flush=True)
++if __name__=='__main__':run()

@@ -1,0 +1,3091 @@
+--- /dev/null
++++ b/r2/pilots/bench_local_shape_mix_v1/analysis.py
+@@ -0,0 +1,554 @@
++"""Read-only arithmetic over the fixed local-shape experiment's completed outputs.
++
++No model, scorer, intersection detector, GEO, optimizer, or semantic labelling.
++All original177 values are retained; additional quantities have explicit domains.
++"""
++from __future__ import annotations
++
++import os
++os.environ['CUDA_VISIBLE_DEVICES'] = ''
++for _name in ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS', 'NUMEXPR_NUM_THREADS'):
++    os.environ[_name] = '1'
++import argparse
++import csv
++import hashlib
++import json
++import math
++import statistics
++import sys
++from collections import Counter
++from datetime import datetime, timezone
++from pathlib import Path
++
++import numpy as np
++
++ROOT = Path(__file__).resolve().parents[3]
++OUT = ROOT / 'experiments/r2_bench_local_shape_mix_v1'
++LABELS = ('D0_ALL', 'ASSIST11', 'RAW_ALL', 'LOCKED_RAW', 'LOCAL_SHAPE')
++ARMS = ('LOCKED_RAW', 'LOCAL_SHAPE')
++STAGES = ('BASE_POST', 'CLEAN_FINAL_POST')
++VERSION = 'local_shape_readonly_accounting_v1'
++CORE = ('CF_illegal_affected_free_fraction', 'FF_illegal_affected_free_fraction',
++        'CF_illegal_pair_count', 'FF_illegal_pair_count', 'ConflictCov_C',
++        'C_F_valid_edge_count', 'C_F_valid_edge_total_length', 'C_F_has_valid_edge',
++        'actual_free_faces', 'deleted_free_faces', 'free_minimum_angle_lt5_fraction',
++        'nonmanifold_edges', 'hinge_diag_isolated_1face_edge_components',
++        'hinge_diag_legal_opposed_edge_C_reached_free_area_fraction')
++
++
++def utc():
++    return datetime.now(timezone.utc).isoformat()
++
++
++def resolve(value):
++    value = str(value).replace('\\', '/')
++    for prefix in ('E:/MeshFlow/', '/mnt/e/MeshFlow/'):
++        if value.startswith(prefix):
++            return ROOT / value[len(prefix):]
++    path = Path(value)
++    return path if path.is_absolute() else ROOT / path
++
++
++def read(path):
++    return json.loads(resolve(path).read_text(encoding='utf-8-sig'))
++
++
++def sha(path):
++    result = hashlib.sha256()
++    with resolve(path).open('rb') as f:
++        for block in iter(lambda: f.read(1024 * 1024), b''):
++            result.update(block)
++    return result.hexdigest()
++
++
++def canonical_hash(value):
++    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':'),
++                                    allow_nan=False).encode()).hexdigest()
++
++
++def arrays(path):
++    with np.load(resolve(path), allow_pickle=False) as z:
++        return {key: z[key].copy() for key in z.files}
++
++
++def assert_cpu():
++    if 'torch' in sys.modules:
++        raise RuntimeError('Neural framework imported into read-only analysis/render')
++
++
++def verify(book):
++    for path, expected in book.items():
++        if sha(path) != expected:
++            raise ValueError('File identity changed: ' + str(path))
++
++
++def record(path, book, expected=None):
++    path = resolve(path)
++    actual = sha(path)
++    if expected is not None and actual != expected:
++        raise ValueError('Hash differs: ' + str(path))
++    if str(path) in book and book[str(path)] != actual:
++        raise ValueError('Previously read input changed: ' + str(path))
++    book[str(path)] = actual
++    return path
++
++
++def write(path, value):
++    path = resolve(path)
++    if not path.is_relative_to(OUT):
++        raise ValueError('Writes are confined to this experiment')
++    path.parent.mkdir(parents=True, exist_ok=True)
++    with path.open('x', encoding='utf-8') as f:
++        json.dump(value, f, ensure_ascii=False, indent=2, allow_nan=False)
++
++
++def csvwrite(path, rows, fields=None):
++    path = resolve(path)
++    if not path.is_relative_to(OUT):
++        raise ValueError('Writes are confined to this experiment')
++    path.parent.mkdir(parents=True, exist_ok=True)
++    fields = fields or list(dict.fromkeys(key for row in rows for key in row))
++    with path.open('x', encoding='utf-8-sig', newline='') as f:
++        writer = csv.DictWriter(f, fieldnames=fields)
++        writer.writeheader()
++        for row in rows:
++            writer.writerow({key: json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list, tuple)) else value
++                             for key, value in row.items()})
++
++
++def number(value):
++    if isinstance(value, bool):
++        return float(value)
++    try:
++        value = float(value)
++    except (TypeError, ValueError):
++        return None
++    return value if math.isfinite(value) else None
++
++
++def mean(values):
++    values = [value for value in values if value is not None]
++    return statistics.mean(values) if values else None
++
++
++def divide(a, b):
++    return a / b if b else None
++
++
++def area(triangles):
++    t = np.asarray(triangles, dtype=np.float64)
++    return .5 * np.linalg.norm(np.cross(t[:, 1] - t[:, 0], t[:, 2] - t[:, 0]), axis=1)
++
++
++def source_fields(row):
++    return dict(request_id=row['request_id'], parent_id=row['parent_id'],
++                condition_id=row['condition_id'], noise_index=row['noise_index'],
++                report_group=row.get('report_group', row.get('split', row.get('group'))))
++
++
++def load_context(path=None):
++    """Validate final producers and load metadata only; safe for render reuse."""
++    assert_cpu()
++    path = resolve(path or OUT / 'jobs.json')
++    if path != OUT / 'jobs.json':
++        raise ValueError('Only this experiment registration is accepted')
++    reg = read(path)
++    if reg.get('status') != 'FROZEN' or reg.get('schema') != 'bench_local_shape_mix_v1':
++        raise ValueError('Expected frozen local-shape registration')
++    if tuple(reg['labels']) != ARMS or tuple(reg['stages']) != STAGES:
++        raise ValueError('Registered arms/stages differ')
++    fields = reg['metric_fields']
++    if len(fields) != len(set(fields)) or len(fields) != 177:
++        raise ValueError('Expected the complete original177 metric fields')
++    verify(reg['protected'])
++    verify(reg['source_hashes'])
++    book = {}
++    record(path, book)
++    rh = book[str(path)]
++    refs = reg['references']
++    if len(refs) != 6 or len({r['request_id'] for r in refs}) != 6:
++        raise ValueError('Expected six unique references')
++    qmap = {r['request_id']: r['request'] for r in refs}
++    if len({q['parent_id'] for q in qmap.values()}) != 3:
++        raise ValueError('Expected three fixed parents')
++    for parent in {q['parent_id'] for q in qmap.values()}:
++        if sorted(q['noise_index'] for q in qmap.values() if q['parent_id'] == parent) != [0, 1]:
++            raise ValueError('Each parent must retain both original noises')
++    artifacts, receipts, jobs = {}, {}, {}
++    for ref in refs:
++        rid = ref['request_id']
++        if ref['request']['request_id'] != rid:
++            raise ValueError('Reference request alias differs')
++        record(ref['input_bundle']['path'], book, ref['input_bundle']['sha256'])
++        rr = ref['reference_receipts']
++        if set(rr) != {'D0_ALL', 'ASSIST11', 'RAW_ALL'}:
++            raise ValueError('Expected all three historical reference labels')
++        for label, info in rr.items():
++            cp = record(info['complete_path'], book, info['complete_sha256'])
++            completed = read(cp)
++            if completed.get('status') != 'COMPLETE':
++                raise ValueError('Reference producer incomplete')
++            verify(completed['files'])
++            # Registration binds the artifact routing; do not substitute same-name files.
++            artifacts[label, rid] = info['artifacts']
++            for name in ('base', 'final', 'metric_rows'):
++                p = record(info['artifacts'][name], book)
++                registered = {str(resolve(k)): v for k, v in reg['protected'].items()}
++                if str(p) not in registered or book[str(p)] != registered[str(p)]:
++                    raise ValueError('Reference artifact is not protected: ' + str(p))
++    if len(reg['jobs']) != 12:
++        raise ValueError('Expected twelve authorized jobs')
++    for job in reg['jobs']:
++        label, rid = job['label'], job['request']['request_id']
++        key = label, rid
++        if label not in ARMS or rid not in qmap or key in jobs or job['request'] != qmap[rid]:
++            raise ValueError('Unexpected or duplicated job identity')
++        cp = record(OUT / 'runs' / job['job_id'] / 'complete.json', book)
++        completed = read(cp)
++        if completed.get('status') != 'COMPLETE' or completed['registration_sha256'] != rh:
++            raise ValueError('Wait for all registered jobs to complete')
++        if completed.get('job_sha256') != canonical_hash(job):
++            raise ValueError('Completed job definition differs')
++        if completed.get('request_id') != rid or completed.get('label') != label:
++            raise ValueError('Producer request/label differs')
++        if completed.get('model_calls', 0) or completed.get('D0_calls', 0) or completed.get('GEO_calls', 0):
++            raise ValueError('Unexpected scientific calls')
++        verify(completed['files'])
++        for name in ('base', 'final', 'metric_rows', 'ledger_BASE_POST', 'ledger_CLEAN_FINAL_POST', 'geometry'):
++            p = resolve(completed['artifacts'][name])
++            hashes = {str(resolve(k)): v for k, v in completed['files'].items()}
++            if str(p) not in hashes:
++                raise ValueError('Unsealed producer artifact: ' + str(p))
++            record(p, book, hashes[str(p)])
++        jobs[key], receipts[key], artifacts[key] = job, completed, completed['artifacts']
++    if set(jobs) != {(label, rid) for label in ARMS for rid in qmap}:
++        raise ValueError('Incomplete fixed job grid')
++    return dict(reg=reg, registration_sha256=rh, qmap=qmap,
++                references={r['request_id']: r for r in refs}, jobs=jobs,
++                receipts=receipts, artifacts=artifacts, sources=book)
++
++
++def load_metric_rows(context):
++    rows = []
++    fields = context['reg']['metric_fields']
++    for label in LABELS:
++        for rid, q in context['qmap'].items():
++            path = record(context['artifacts'][label, rid]['metric_rows'], context['sources'])
++            original = read(path)
++            if not isinstance(original, list) or len(original) != 2 or {r['stage'] for r in original} != set(STAGES):
++                raise ValueError('Expected exactly two original metric rows')
++            for r in original:
++                if any(r.get(k) != q[k] for k in ('request_id', 'parent_id', 'condition_id', 'noise_index', 'N', 'K')):
++                    raise ValueError('Metric row request identity differs')
++                expected_label = label if label in ARMS else context['references'][rid]['reference_receipts'][label]['original_label']
++                if r.get('label') != expected_label:
++                    raise ValueError('Original metric producer label differs')
++                if any(field not in r for field in fields):
++                    raise ValueError('Original metric field missing')
++                row = dict(r)
++                row.update(runtime_label=r['label'], label=label,
++                           report_group=source_fields(q)['report_group'], original_metric_rows=str(path))
++                if any(row[field] != r[field] for field in fields):
++                    raise ValueError('A metadata alias overlaps an original metric field')
++                rows.append(row)
++    if len(rows) != 60 or len({(r['label'], r['request_id'], r['stage']) for r in rows}) != 60:
++        raise ValueError('Expected sixty unique output-stage rows')
++    return rows
++
++
++def mesh(path, k, n, book):
++    path = record(path, book)
++    z = arrays(path)
++    tri = z['output']
++    ids = np.asarray(z.get('parent_source_raw_slot', z.get('source_face_ids')), dtype=np.int64)
++    corners = np.asarray(z.get('source_corner_ids', z.get('base_source_corner_ids')), dtype=np.int64)
++    if tri.dtype != np.float32 or tri.ndim != 3 or tri.shape[1:] != (3, 3) or not np.isfinite(tri).all():
++        raise ValueError('Invalid FP32 output geometry')
++    if ids.shape != (len(tri),):
++        raise ValueError('Missing original face/corner identity')
++    original = ids >= 0
++    if corners.shape == (int(original.sum()), 3) and not original.all():
++        if not np.all(original[:int(original.sum())]):
++            raise ValueError('Legacy corner identity requires append-only bridge faces')
++        corners = np.vstack((corners, np.tile(np.arange(3), (int((~original).sum()), 1))))
++    if corners.shape != (len(tri), 3):
++        raise ValueError('Missing original corner identity')
++    if len(set(ids[original].tolist())) != int(original.sum()) or np.any(ids[original] >= n):
++        raise ValueError('Duplicated/out-of-domain original face identity')
++    if not np.array_equal(ids[:k], np.arange(k)) or np.any((ids[k:] >= 0) & (ids[k:] < k)):
++        raise ValueError('C ordering or free-slot identity differs')
++    if not np.all(np.sort(corners[original], axis=1) == np.arange(3)):
++        raise ValueError('Invalid canonical corner permutation')
++    indices = np.flatnonzero(original)
++    canonical = np.take_along_axis(tri[original], np.argsort(corners[original], axis=1)[:, :, None], axis=1)
++    aa = area(tri)
++    return dict(arrays=z, ids=ids, areas=aa,
++                coords={int(ids[i]): canonical[j] for j, i in enumerate(indices)},
++                slot_area={int(ids[i]): float(aa[i]) for i in indices},
++                bridge_area=float(aa[~original].sum()), bridge_faces=int((~original).sum()))
++
++
++def ledger_state(ledger, new):
++    edges = {kind: {} for kind in ('CF', 'FF')}
++    pairs = {kind: set() for kind in ('CF', 'FF')}
++    for r in ledger['edge_fates']:
++        if r['fate'] in (('RETAINED', 'NEW') if new else ('RETAINED', 'LOST')):
++            key = tuple(tuple(int(v) for v in part) for part in r['source_edge_key'])
++            edges[r['kind']][key] = r['new_length' if new else 'old_length']
++    for r in ledger['illegal_pair_fates']:
++        if r['fate'] in (('PERSISTENT', 'NEW') if new else ('PERSISTENT', 'RESOLVED_RETAINED', 'FACE_REMOVED')):
++            pairs[r['kind']].add((int(r['raw_slot_a']), int(r['raw_slot_b'])))
++    faces = {int(r['raw_slot']) for r in ledger['face_fates']
++             if r['fate'] in (('RETAINED', 'NEWLY_RETAINED') if new else ('RETAINED', 'LOST'))}
++    return dict(edges=edges, pairs=pairs, faces=faces)
++
++
++def compare_states(a, b, meta):
++    row, detail = dict(meta), []
++    for kind in ('CF', 'FF'):
++        ae, be, ap, bp = a['edges'][kind], b['edges'][kind], a['pairs'][kind], b['pairs'][kind]
++        aa, bb = set(ae), set(be)
++        gone = ap - bp
++        removed = {p for p in gone if not set(p) <= b['faces']}
++        row.update({kind + '_old_legal_edges': len(aa), kind + '_retained_legal_edges': len(aa & bb),
++                    kind + '_lost_legal_edges': len(aa - bb), kind + '_new_legal_edges': len(bb - aa),
++                    kind + '_lost_length': sum(ae[e] for e in aa - bb), kind + '_new_length': sum(be[e] for e in bb - aa),
++                    kind + '_old_illegal_pairs': len(ap), kind + '_candidate_illegal_pairs': len(bp),
++                    kind + '_persistent_illegal_pairs': len(ap & bp), kind + '_new_illegal_pairs': len(bp - ap),
++                    kind + '_resolved_retained': len(gone - removed), kind + '_face_removed_unobservable': len(removed)})
++        for key in sorted(aa | bb):
++            detail.append(dict(meta, kind=kind, entity='LEGAL_EDGE', key=key,
++                               fate='RETAINED' if key in aa & bb else 'LOST' if key in aa else 'NEW',
++                               reference_length=ae.get(key), candidate_length=be.get(key)))
++        for key in sorted(ap | bp):
++            detail.append(dict(meta, kind=kind, entity='ILLEGAL_PAIR', key=key,
++                               fate='PERSISTENT' if key in ap & bp else 'NEW' if key in bp else
++                               'FACE_REMOVED' if key in removed else 'RESOLVED_RETAINED'))
++    row.update(original_faces_lost=len(a['faces'] - b['faces']), original_faces_newly_retained=len(b['faces'] - a['faces']))
++    return row, detail
++
++
++def coordinate_comparison(reference, candidate, slots, meta):
++    rows = []
++    for slot in sorted(slots):
++        a, b = reference['coords'].get(slot), candidate['coords'].get(slot)
++        both = a is not None and b is not None
++        rows.append(dict(meta, raw_slot=slot, reference_retained=a is not None, candidate_retained=b is not None,
++                         fate='RETAINED' if both else 'LOST' if a is not None else 'NEWLY_RETAINED' if b is not None else 'ABSENT_BOTH',
++                         canonical_corner_coordinates_bitwise_equal=a.tobytes() == b.tobytes() if both else None,
++                         maximum_corner_displacement=float(np.linalg.norm(a.astype(float) - b.astype(float), axis=1).max()) if both else None,
++                         reference_area=reference['slot_area'].get(slot), candidate_area=candidate['slot_area'].get(slot)))
++    return rows
++
++
++def run(path=None):
++    dest = OUT / 'analysis'
++    if (dest / 'COMPLETE.json').exists():
++        done = read(dest / 'COMPLETE.json')
++        verify(done['source_files']); verify(done['files'])
++        if done['source_code_sha256'] != sha(__file__):
++            raise ValueError('Analysis source differs from completed receipt')
++        return done
++    context = load_context(path)
++    fields, qmap, book = context['reg']['metric_fields'], context['qmap'], context['sources']
++    rows = load_metric_rows(context)
++    by = {(r['label'], r['request_id'], r['stage']): r for r in rows}
++    parents = sorted({q['parent_id'] for q in qmap.values()})
++    common_i = {stage: {rid for rid in qmap if all(by[label, rid, stage].get('I_status') == 'PASS'
++                and number(by[label, rid, stage]['ConflictCov_C']) is not None for label in LABELS)} for stage in STAGES}
++    parent_rows, support, paired, paired_parent, macro = [], [], [], [], []
++    for stage in STAGES:
++        for label in LABELS:
++            for parent in parents:
++                rr = [r for r in rows if (r['stage'], r['label'], r['parent_id']) == (stage, label, parent)]
++                out = dict(label=label, stage=stage, parent_id=parent, report_group=rr[0]['report_group'], request_count=len(rr))
++                for field in fields:
++                    values = [number(r[field]) for r in rr]
++                    out[field] = mean(values)
++                    support.append(dict(label=label, stage=stage, parent_id=parent, field=field,
++                                        numeric_n=sum(v is not None for v in values), total_n=len(values),
++                                        original_value_counts=dict(Counter(json.dumps(r[field], ensure_ascii=False, sort_keys=True) for r in rr))))
++                ii = [r for r in rr if r['request_id'] in common_i[stage]]
++                out['I_common_PASS'] = mean([number(r['ConflictCov_C']) for r in ii])
++                out['I_common_PASS_requests'] = len(ii)
++                parent_rows.append(out)
++    for reference, label in [('LOCKED_RAW', 'LOCAL_SHAPE'), *[(reference, label) for reference in ('D0_ALL', 'ASSIST11', 'RAW_ALL') for label in ARMS]]:
++        for stage in STAGES:
++            for rid, q in qmap.items():
++                a, b = by[reference, rid, stage], by[label, rid, stage]
++                row = dict(source_fields(q), stage=stage, reference=reference, label=label,
++                           primary_comparison=reference == 'LOCKED_RAW', I_common_all_five_PASS=rid in common_i[stage],
++                           reference_I_status=a.get('I_status'), candidate_I_status=b.get('I_status'))
++                for field in fields:
++                    av, bv = number(a[field]), number(b[field])
++                    row['delta_' + field] = bv - av if av is not None and bv is not None else None
++                row['delta_I_common_PASS'] = row['delta_ConflictCov_C'] if rid in common_i[stage] else None
++                paired.append(row)
++            for parent in parents:
++                rr = [r for r in paired if (r['reference'], r['label'], r['stage'], r['parent_id']) == (reference, label, stage, parent)]
++                row = dict(reference=reference, label=label, stage=stage, parent_id=parent,
++                           report_group=rr[0]['report_group'], request_count=len(rr), primary_comparison=reference == 'LOCKED_RAW')
++                for field in [*('delta_' + f for f in fields), 'delta_I_common_PASS']:
++                    row[field] = mean([r[field] for r in rr])
++                    row[field + '__valid_requests'] = sum(r[field] is not None for r in rr)
++                paired_parent.append(row)
++    meshes, states, area_rows, region_rows, slot_rows, external_rows, geometry_rows = {}, {}, [], [], [], [], []
++    c_rows, topology_rows = [], []
++    for rid, q in qmap.items():
++        k, n = int(q['K']), int(q['N'])
++        ref = context['references'][rid]
++        inp = arrays(ref['input_bundle']['path'])
++        raw_area = area(inp['raw']); raw_total = float(raw_area[k:].sum())
++        selected = set(np.flatnonzero(inp['support_face_mask']).tolist())
++        for label in LABELS:
++            art = context['artifacts'][label, rid]
++            for stage in STAGES:
++                current = mesh(art['base' if stage == 'BASE_POST' else 'final'], k, n, book)
++                meshes[label, rid, stage] = current
++                kept = set(current['coords']) & set(range(k, n))
++                lost = set(range(k, n)) - kept
++                mass = float(raw_area[list(kept)].sum()) if kept else 0.
++                actual = sum(current['slot_area'][s] for s in kept)
++                meta = dict(source_fields(q), label=label, stage=stage)
++                area_rows.append(dict(meta, original_free_faces=n-k, retained_original_free_faces=len(kept),
++                                      deleted_original_free_faces=len(lost), RAW_reference_area=raw_total,
++                                      retained_RAW_reference_area=mass, deleted_RAW_reference_area=raw_total-mass,
++                                      retained_RAW_reference_area_fraction=divide(mass, raw_total),
++                                      deleted_RAW_reference_area_fraction=divide(raw_total-mass, raw_total),
++                                      actual_original_free_area=actual, bridge_faces=current['bridge_faces'], bridge_area=current['bridge_area'],
++                                      actual_free_area_including_bridges=actual+current['bridge_area'],
++                                      actual_free_area_over_RAW=divide(actual+current['bridge_area'], raw_total)))
++                for slot in range(k, n):
++                    slot_rows.append(dict(meta, raw_slot=slot, selected=slot in selected, region_id=int(inp['assisted_region_ids'][slot]),
++                                          retained=slot in kept, RAW_reference_area=float(raw_area[slot]),
++                                          actual_output_area=current['slot_area'].get(slot)))
++                for region in [*ref['regions'], dict(region_id='P1_UNION_P2', source_face_ids=sorted(selected))]:
++                    ids = set(region['source_face_ids']); survive = ids & kept
++                    total = float(raw_area[list(ids)].sum()); retained = float(raw_area[list(survive)].sum()) if survive else 0.
++                    output_area = sum(current['slot_area'][s] for s in survive)
++                    region_rows.append(dict(meta, region_id=region['region_id'], source_RAW_faces=len(ids),
++                                            retained_original_faces=len(survive), deleted_original_faces=len(ids-survive),
++                                            RAW_reference_area=total, retained_RAW_reference_area=retained,
++                                            retained_RAW_reference_area_fraction=divide(retained, total),
++                                            actual_output_area=output_area, actual_area_over_RAW=divide(output_area, total),
++                                            retained_RAW_slots=sorted(survive), deleted_RAW_slots=sorted(ids-survive)))
++                if label != 'D0_ALL':
++                    lp = record(art['ledger_' + stage], book)
++                    ledger = read(lp)
++                    old, new = ledger_state(ledger, False), ledger_state(ledger, True)
++                    baseline_key = 'D0_ALL', rid, stage
++                    if baseline_key in states and states[baseline_key] != old:
++                        raise ValueError('Reference D0 ledger differs across candidates')
++                    states[baseline_key], states[label, rid, stage] = old, new
++        d0_base = meshes['D0_ALL', rid, 'BASE_POST']
++        external_slots = (set(d0_base['coords']) & set(range(k, n))) - selected
++        for label in ARMS:
++            for stage in STAGES:
++                candidate = meshes[label, rid, stage]
++                meta = dict(source_fields(q), label=label, stage=stage)
++                for reference_scope, reference in [('D0_BASE_FUSION_ANCHOR', d0_base),
++                         ('D0_SAME_STAGE', meshes['D0_ALL', rid, stage]),
++                         ('OWN_BASE_BACKEND_INCREMENT', meshes[label, rid, 'BASE_POST'])]:
++                    er = coordinate_comparison(reference, candidate, external_slots, dict(meta, reference_scope=reference_scope, domain='EXTERNAL_D0_BASE_SURVIVING_UNSELECTED'))
++                    external_rows.extend(er)
++                    if stage == 'BASE_POST' and reference_scope == 'D0_BASE_FUSION_ANCHOR' and any(r['fate'] != 'RETAINED' or not r['canonical_corner_coordinates_bitwise_equal'] for r in er):
++                        raise ValueError('External D0 fusion-stage coordinates/survival violated')
++                cr = coordinate_comparison(d0_base, candidate, range(k), dict(meta, reference_scope='D0_BASE_C', domain='FIXED_C'))
++                external_rows.extend(cr)
++                if any(r['fate'] != 'RETAINED' or not r['canonical_corner_coordinates_bitwise_equal'] for r in cr):
++                    raise ValueError('Fixed C coordinates changed')
++                winding_exact = candidate['arrays']['output'][:k].tobytes() == d0_base['arrays']['output'][:k].tobytes()
++                def c_incidence(m):
++                    result = {}
++                    for face, corners_ in enumerate(m['arrays']['faces'][:k]):
++                        for corner, vertex in enumerate(corners_):
++                            result.setdefault(int(vertex), []).append((face, corner))
++                    return sorted(sorted(group) for group in result.values())
++                c_topology_exact = c_incidence(candidate) == c_incidence(d0_base)
++                c_rows.append(dict(meta, C_source_order_coordinates_bitwise_equal=winding_exact,
++                                   C_index_incidence_by_original_face_corner_equal=c_topology_exact,
++                                   C_canonical_coordinates_bitwise_equal=True))
++                if not winding_exact or not c_topology_exact:
++                    raise ValueError('Fixed C winding/index incidence changed')
++            gp = context['artifacts'][label, rid]['geometry']
++            geometry_rows.append(dict(source_fields(q), label=label, geometry_path=str(resolve(gp)),
++                                      geometry_sha256=sha(gp), original_geometry_ledger=read(gp)))
++        a = meshes['LOCKED_RAW', rid, 'BASE_POST']['arrays']
++        b = meshes['LOCAL_SHAPE', rid, 'BASE_POST']['arrays']
++        topology_rows.append(dict(source_fields(q), stage='BASE_POST',
++            indexed_faces_equal=np.array_equal(a['faces'], b['faces']),
++            source_face_ids_equal=np.array_equal(a['source_face_ids'], b['source_face_ids']),
++            source_corner_ids_equal=np.array_equal(a['source_corner_ids'], b['source_corner_ids']),
++            vertex_array_shape_equal=a['vertices'].shape == b['vertices'].shape,
++            interpretation='Delivered BASE topology comparison; operator geometry ledger separately records the shared pre-fit assembly.'))
++    comparisons, details = [], []
++    for rid, q in qmap.items():
++        for stage in STAGES:
++            for reference, label in [('D0_ALL', 'LOCKED_RAW'), ('D0_ALL', 'LOCAL_SHAPE'), ('LOCKED_RAW', 'LOCAL_SHAPE')]:
++                meta = dict(source_fields(q), stage=stage, reference=reference, label=label)
++                row, detail = compare_states(states[reference, rid, stage], states[label, rid, stage], meta)
++                comparisons.append(row); details.extend(detail)
++    groups = ['ALL', *sorted({source_fields(q)['report_group'] for q in qmap.values()})]
++    summary = dict(status='COMPLETE', version=VERSION, stages={},
++        primary_comparison='LOCAL_SHAPE minus LOCKED_RAW on the same fixed assembly',
++        definitions=dict(average='Mean of valid noises within parent, then equal parent mean; support counts recorded.',
++            I='Main I uses the intersection of requests with I_status PASS and finite ConflictCov_C for all five methods, separately per stage. Raw177 fields are unchanged.',
++            area='RAW reference area measures retained original slots; actual output area measures deformed triangles. Bridges are separate. Neither certifies support.',
++            external='External domain is original D0 BASE surviving unselected free slots. BASE is checked bitwise after canonical corner restoration. FINAL movement/deletion is reported, not asserted absent.',
++            connectivity='Arithmetic set differences of existing exact source-slot/corner ledgers. Bridge faces are excluded from correspondence and remain in full177 metrics. No new intersection scan.',
++            inference='Six repeatedly inspected development requests, three parents; no generalization or automatic-region claim.',
++            visual='No semantic ratings are read or generated by this script.'),
++        model_calls=0, scoring_calls=0, detector_calls=0, GEO_calls=0)
++    for stage in STAGES:
++        summary['stages'][stage] = {}
++        for group in groups:
++            ids = {rid for rid, q in qmap.items() if group == 'ALL' or source_fields(q)['report_group'] == group}
++            pids = sorted({qmap[rid]['parent_id'] for rid in ids})
++            entry = dict(parent_count=len(pids), request_count=len(ids), I_common_PASS_request_ids=sorted(ids & common_i[stage]), labels={})
++            for label in LABELS:
++                rr = [r for r in parent_rows if r['label'] == label and r['stage'] == stage and r['parent_id'] in pids]
++                oo = [by[label, rid, stage] for rid in ids]
++                metrics = {}
++                for field in fields:
++                    value = dict(parent_equal_mean=mean([r[field] for r in rr]),
++                                 valid_parent_count=sum(r[field] is not None for r in rr),
++                                 valid_request_count=sum(number(r[field]) is not None for r in oo))
++                    metrics[field] = value
++                    macro.append(dict(stage=stage, group=group, label=label, field=field, **value))
++                entry['labels'][label] = dict(metrics=metrics,
++                    I_common_PASS_parent_mean=mean([r['I_common_PASS'] for r in rr]),
++                    I_common_PASS_parent_count=sum(r['I_common_PASS'] is not None for r in rr),
++                    I_status_counts=dict(Counter(r.get('I_status', 'MISSING') for r in oo)),
++                    CF_illegal_pair_sum=sum(number(r['CF_illegal_pair_count']) or 0 for r in oo),
++                    FF_illegal_pair_sum=sum(number(r['FF_illegal_pair_count']) or 0 for r in oo))
++            summary['stages'][stage][group] = entry
++    assert_cpu(); verify(book)
++    if dest.exists():
++        raise RuntimeError('Partial analysis retained; do not silently overwrite')
++    dest.mkdir()
++    tables = [('per_output_full177.csv', rows), ('per_parent.csv', parent_rows), ('parent_macro.csv', macro),
++              ('per_parent_field_support.csv', support), ('paired_per_request.csv', paired), ('paired_per_parent.csv', paired_parent),
++              ('area_costs_per_output.csv', area_rows), ('region_survival.csv', region_rows), ('per_slot_area_accounting.csv', slot_rows),
++              ('external_D0_coordinate_fates.csv', external_rows), ('connectivity_pairwise.csv', comparisons),
++              ('connectivity_pairwise_details.csv', details), ('operator_geometry_ledgers.csv', geometry_rows),
++              ('C_identity_per_output.csv', c_rows), ('assembly_topology_comparison.csv', topology_rows)]
++    for filename, table in tables:
++        csvwrite(dest / filename, table)
++    write(dest / 'metric_rows_original_values.json', rows)
++    write(dest / 'summary.json', summary)
++    done = dict(status='COMPLETE', utc=utc(), version=VERSION, registration_sha256=context['registration_sha256'],
++                original_metric_fields=177, output_rows=len(rows), parent_rows=len(parent_rows), paired_request_rows=len(paired),
++                region_rows=len(region_rows), connectivity_comparisons=len(comparisons), source_code_sha256=sha(__file__),
++                source_files=book, model_calls=0, scoring_calls=0, detector_calls=0, GEO_calls=0, visual_labels=0,
++                files={str(p): sha(p) for p in dest.iterdir() if p.is_file()})
++    write(dest / 'COMPLETE.json', done)
++    return done
++
++
++if __name__ == '__main__':
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('action', choices=('run',))
++    parser.add_argument('--jobs')
++    args = parser.parse_args()
++    result = run(args.jobs)
++    print(json.dumps({k: v for k, v in result.items() if k not in ('files', 'source_files')}, indent=2))
+--- /dev/null
++++ b/r2/pilots/bench_local_shape_mix_v1/analysis_v2.py
+@@ -0,0 +1,596 @@
++"""Read-only arithmetic over the fixed local-shape experiment's completed outputs.
++
++No model, scorer, intersection detector, GEO, optimizer, or semantic labelling.
++All original177 values are retained; additional quantities have explicit domains.
++"""
++from __future__ import annotations
++
++import os
++os.environ['CUDA_VISIBLE_DEVICES'] = ''
++for _name in ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS', 'NUMEXPR_NUM_THREADS'):
++    os.environ[_name] = '1'
++import argparse
++import csv
++import hashlib
++import json
++import math
++import statistics
++import sys
++from collections import Counter
++from datetime import datetime, timezone
++from pathlib import Path
++
++import numpy as np
++
++ROOT = Path(__file__).resolve().parents[3]
++OUT = ROOT / 'experiments/r2_bench_local_shape_mix_v1'
++LABELS = ('D0_ALL', 'ASSIST11', 'RAW_ALL', 'LOCKED_RAW', 'LOCAL_SHAPE')
++ARMS = ('LOCKED_RAW', 'LOCAL_SHAPE')
++STAGES = ('BASE_POST', 'CLEAN_FINAL_POST')
++VERSION = 'local_shape_readonly_accounting_v2_producer_alias'
++CORE = ('CF_illegal_affected_free_fraction', 'FF_illegal_affected_free_fraction',
++        'CF_illegal_pair_count', 'FF_illegal_pair_count', 'ConflictCov_C',
++        'C_F_valid_edge_count', 'C_F_valid_edge_total_length', 'C_F_has_valid_edge',
++        'actual_free_faces', 'deleted_free_faces', 'free_minimum_angle_lt5_fraction',
++        'nonmanifold_edges', 'hinge_diag_isolated_1face_edge_components',
++        'hinge_diag_legal_opposed_edge_C_reached_free_area_fraction')
++
++
++def utc():
++    return datetime.now(timezone.utc).isoformat()
++
++
++def resolve(value):
++    value = str(value).replace('\\', '/')
++    for prefix in ('E:/MeshFlow/', '/mnt/e/MeshFlow/'):
++        if value.startswith(prefix):
++            return ROOT / value[len(prefix):]
++    path = Path(value)
++    return path if path.is_absolute() else ROOT / path
++
++
++def read(path):
++    return json.loads(resolve(path).read_text(encoding='utf-8-sig'))
++
++
++def sha(path):
++    result = hashlib.sha256()
++    with resolve(path).open('rb') as f:
++        for block in iter(lambda: f.read(1024 * 1024), b''):
++            result.update(block)
++    return result.hexdigest()
++
++
++def canonical_hash(value):
++    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':'),
++                                    allow_nan=False).encode()).hexdigest()
++
++
++def arrays(path):
++    with np.load(resolve(path), allow_pickle=False) as z:
++        return {key: z[key].copy() for key in z.files}
++
++
++def assert_cpu():
++    if 'torch' in sys.modules:
++        raise RuntimeError('Neural framework imported into read-only analysis/render')
++
++
++def verify(book):
++    for path, expected in book.items():
++        if sha(path) != expected:
++            raise ValueError('File identity changed: ' + str(path))
++
++
++def record(path, book, expected=None):
++    path = resolve(path)
++    actual = sha(path)
++    if expected is not None and actual != expected:
++        raise ValueError('Hash differs: ' + str(path))
++    if str(path) in book and book[str(path)] != actual:
++        raise ValueError('Previously read input changed: ' + str(path))
++    book[str(path)] = actual
++    return path
++
++
++def write(path, value):
++    path = resolve(path)
++    if not path.is_relative_to(OUT):
++        raise ValueError('Writes are confined to this experiment')
++    path.parent.mkdir(parents=True, exist_ok=True)
++    with path.open('x', encoding='utf-8') as f:
++        json.dump(value, f, ensure_ascii=False, indent=2, allow_nan=False)
++
++
++def csvwrite(path, rows, fields=None):
++    path = resolve(path)
++    if not path.is_relative_to(OUT):
++        raise ValueError('Writes are confined to this experiment')
++    path.parent.mkdir(parents=True, exist_ok=True)
++    fields = fields or list(dict.fromkeys(key for row in rows for key in row))
++    with path.open('x', encoding='utf-8-sig', newline='') as f:
++        writer = csv.DictWriter(f, fieldnames=fields)
++        writer.writeheader()
++        for row in rows:
++            writer.writerow({key: json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list, tuple)) else value
++                             for key, value in row.items()})
++
++
++def number(value):
++    if isinstance(value, bool):
++        return float(value)
++    try:
++        value = float(value)
++    except (TypeError, ValueError):
++        return None
++    return value if math.isfinite(value) else None
++
++
++def mean(values):
++    values = [value for value in values if value is not None]
++    return statistics.mean(values) if values else None
++
++
++def divide(a, b):
++    return a / b if b else None
++
++
++def area(triangles):
++    t = np.asarray(triangles, dtype=np.float64)
++    return .5 * np.linalg.norm(np.cross(t[:, 1] - t[:, 0], t[:, 2] - t[:, 0]), axis=1)
++
++
++def source_fields(row):
++    return dict(request_id=row['request_id'], parent_id=row['parent_id'],
++                condition_id=row['condition_id'], noise_index=row['noise_index'],
++                report_group=row.get('report_group', row.get('split', row.get('group'))))
++
++
++def load_context(path=None):
++    """Validate final producers and load metadata only; safe for render reuse."""
++    assert_cpu()
++    path = resolve(path or OUT / 'jobs.json')
++    if path != OUT / 'jobs.json':
++        raise ValueError('Only this experiment registration is accepted')
++    reg = read(path)
++    if reg.get('status') != 'FROZEN' or reg.get('schema') != 'bench_local_shape_mix_v1':
++        raise ValueError('Expected frozen local-shape registration')
++    if tuple(reg['labels']) != ARMS or tuple(reg['stages']) != STAGES:
++        raise ValueError('Registered arms/stages differ')
++    fields = reg['metric_fields']
++    if len(fields) != len(set(fields)) or len(fields) != 177:
++        raise ValueError('Expected the complete original177 metric fields')
++    verify(reg['protected'])
++    verify(reg['source_hashes'])
++    book = {}
++    record(path, book)
++    rh = book[str(path)]
++    refs = reg['references']
++    if len(refs) != 6 or len({r['request_id'] for r in refs}) != 6:
++        raise ValueError('Expected six unique references')
++    qmap = {r['request_id']: r['request'] for r in refs}
++    if len({q['parent_id'] for q in qmap.values()}) != 3:
++        raise ValueError('Expected three fixed parents')
++    for parent in {q['parent_id'] for q in qmap.values()}:
++        if sorted(q['noise_index'] for q in qmap.values() if q['parent_id'] == parent) != [0, 1]:
++            raise ValueError('Each parent must retain both original noises')
++    artifacts, receipts, jobs = {}, {}, {}
++    for ref in refs:
++        rid = ref['request_id']
++        if ref['request']['request_id'] != rid:
++            raise ValueError('Reference request alias differs')
++        record(ref['input_bundle']['path'], book, ref['input_bundle']['sha256'])
++        rr = ref['reference_receipts']
++        if set(rr) != {'D0_ALL', 'ASSIST11', 'RAW_ALL'}:
++            raise ValueError('Expected all three historical reference labels')
++        for label, info in rr.items():
++            cp = record(info['complete_path'], book, info['complete_sha256'])
++            completed = read(cp)
++            if completed.get('status') != 'COMPLETE':
++                raise ValueError('Reference producer incomplete')
++            verify(completed['files'])
++            # Registration binds the artifact routing; do not substitute same-name files.
++            artifacts[label, rid] = info['artifacts']
++            for name in ('base', 'final', 'metric_rows'):
++                p = record(info['artifacts'][name], book)
++                registered = {str(resolve(k)): v for k, v in reg['protected'].items()}
++                if str(p) not in registered or book[str(p)] != registered[str(p)]:
++                    raise ValueError('Reference artifact is not protected: ' + str(p))
++    if len(reg['jobs']) != 12:
++        raise ValueError('Expected twelve authorized jobs')
++    for job in reg['jobs']:
++        label, rid = job['label'], job['request']['request_id']
++        key = label, rid
++        if label not in ARMS or rid not in qmap or key in jobs or job['request'] != qmap[rid]:
++            raise ValueError('Unexpected or duplicated job identity')
++        cp = record(OUT / 'runs' / job['job_id'] / 'complete.json', book)
++        completed = read(cp)
++        if completed.get('status') != 'COMPLETE' or completed['registration_sha256'] != rh:
++            raise ValueError('Wait for all registered jobs to complete')
++        if completed.get('job_sha256') != canonical_hash(job):
++            raise ValueError('Completed job definition differs')
++        if completed.get('request_id') != rid or completed.get('label') != label:
++            raise ValueError('Producer request/label differs')
++        if completed.get('model_calls', 0) or completed.get('D0_calls', 0) or completed.get('GEO_calls', 0):
++            raise ValueError('Unexpected scientific calls')
++        verify(completed['files'])
++        for name in ('base', 'final', 'metric_rows', 'ledger_BASE_POST', 'ledger_CLEAN_FINAL_POST', 'geometry'):
++            p = resolve(completed['artifacts'][name])
++            hashes = {str(resolve(k)): v for k, v in completed['files'].items()}
++            if str(p) not in hashes:
++                raise ValueError('Unsealed producer artifact: ' + str(p))
++            record(p, book, hashes[str(p)])
++        jobs[key], receipts[key], artifacts[key] = job, completed, completed['artifacts']
++    if set(jobs) != {(label, rid) for label in ARMS for rid in qmap}:
++        raise ValueError('Incomplete fixed job grid')
++    return dict(reg=reg, registration_sha256=rh, qmap=qmap,
++                references={r['request_id']: r for r in refs}, jobs=jobs,
++                receipts=receipts, artifacts=artifacts, sources=book)
++
++
++def metric_producer(context, label, rid):
++    """Bind the source row label to its actual hash-protected CPU producer.
++
++    A historical logical RAW_ALL job legitimately reuses a HYBRID producer.
++    The display alias must not be mistaken for the producer's stored label.
++    """
++    artifacts = context['artifacts'][label, rid]
++    cpu_path = resolve(artifacts['cpu_complete'])
++    if label in ARMS:
++        hashes = context['receipts'][label, rid]['files']
++        logical_label = label
++    else:
++        hashes = context['reg']['protected']
++        logical_label = context['references'][rid]['reference_receipts'][label]['original_label']
++    hashes = {str(resolve(p)): h for p, h in hashes.items()}
++    if str(cpu_path) not in hashes:
++        raise ValueError('Actual metric producer receipt is not hash-protected')
++    record(cpu_path, context['sources'], hashes[str(cpu_path)])
++    cpu = read(cpu_path)
++    if cpu.get('status') != 'COMPLETE' or cpu.get('request_id') != rid:
++        raise ValueError('Actual CPU metric producer identity differs')
++    identity = cpu['identity']
++    producer_label = identity['label']
++    if cpu.get('label') != producer_label or identity.get('request_id') != rid:
++        raise ValueError('CPU producer top-level and nested identity disagree')
++    metric_path = resolve(artifacts['metric_rows'])
++    producer_files = {str(resolve(p)): h for p, h in cpu['files'].items()}
++    if str(metric_path) not in producer_files:
++        raise ValueError('Actual CPU receipt does not own the routed metric rows')
++    record(metric_path, context['sources'], producer_files[str(metric_path)])
++    result = dict(label=label, request_id=rid, logical_reference_label=logical_label,
++                  stored_metric_producer_label=producer_label, cpu_complete=str(cpu_path),
++                  cpu_complete_sha256=sha(cpu_path), metric_rows=str(metric_path),
++                  metric_rows_sha256=sha(metric_path))
++    context.setdefault('metric_producers', {})[label, rid] = result
++    return result
++
++
++def load_metric_rows(context):
++    rows = []
++    fields = context['reg']['metric_fields']
++    for label in LABELS:
++        for rid, q in context['qmap'].items():
++            path = record(context['artifacts'][label, rid]['metric_rows'], context['sources'])
++            original = read(path)
++            if not isinstance(original, list) or len(original) != 2 or {r['stage'] for r in original} != set(STAGES):
++                raise ValueError('Expected exactly two original metric rows')
++            producer = metric_producer(context, label, rid)
++            for r in original:
++                if any(r.get(k) != q[k] for k in ('request_id', 'parent_id', 'condition_id', 'noise_index', 'N', 'K')):
++                    raise ValueError('Metric row request identity differs')
++                expected_label = producer['stored_metric_producer_label']
++                if r.get('label') != expected_label:
++                    raise ValueError('Original metric producer label differs')
++                if any(field not in r for field in fields):
++                    raise ValueError('Original metric field missing')
++                row = dict(r)
++                row.update(runtime_label=r['label'], label=label,
++                           report_group=source_fields(q)['report_group'], original_metric_rows=str(path),
++                           logical_reference_label=producer['logical_reference_label'],
++                           original_cpu_complete=producer['cpu_complete'])
++                if any(row[field] != r[field] for field in fields):
++                    raise ValueError('A metadata alias overlaps an original metric field')
++                rows.append(row)
++    if len(rows) != 60 or len({(r['label'], r['request_id'], r['stage']) for r in rows}) != 60:
++        raise ValueError('Expected sixty unique output-stage rows')
++    return rows
++
++
++def mesh(path, k, n, book):
++    path = record(path, book)
++    z = arrays(path)
++    tri = z['output']
++    ids = np.asarray(z.get('parent_source_raw_slot', z.get('source_face_ids')), dtype=np.int64)
++    corners = np.asarray(z.get('source_corner_ids', z.get('base_source_corner_ids')), dtype=np.int64)
++    if tri.dtype != np.float32 or tri.ndim != 3 or tri.shape[1:] != (3, 3) or not np.isfinite(tri).all():
++        raise ValueError('Invalid FP32 output geometry')
++    if ids.shape != (len(tri),):
++        raise ValueError('Missing original face/corner identity')
++    original = ids >= 0
++    if corners.shape == (int(original.sum()), 3) and not original.all():
++        if not np.all(original[:int(original.sum())]):
++            raise ValueError('Legacy corner identity requires append-only bridge faces')
++        corners = np.vstack((corners, np.tile(np.arange(3), (int((~original).sum()), 1))))
++    if corners.shape != (len(tri), 3):
++        raise ValueError('Missing original corner identity')
++    if len(set(ids[original].tolist())) != int(original.sum()) or np.any(ids[original] >= n):
++        raise ValueError('Duplicated/out-of-domain original face identity')
++    if not np.array_equal(ids[:k], np.arange(k)) or np.any((ids[k:] >= 0) & (ids[k:] < k)):
++        raise ValueError('C ordering or free-slot identity differs')
++    if not np.all(np.sort(corners[original], axis=1) == np.arange(3)):
++        raise ValueError('Invalid canonical corner permutation')
++    indices = np.flatnonzero(original)
++    canonical = np.take_along_axis(tri[original], np.argsort(corners[original], axis=1)[:, :, None], axis=1)
++    aa = area(tri)
++    return dict(arrays=z, ids=ids, areas=aa,
++                coords={int(ids[i]): canonical[j] for j, i in enumerate(indices)},
++                slot_area={int(ids[i]): float(aa[i]) for i in indices},
++                bridge_area=float(aa[~original].sum()), bridge_faces=int((~original).sum()))
++
++
++def ledger_state(ledger, new):
++    edges = {kind: {} for kind in ('CF', 'FF')}
++    pairs = {kind: set() for kind in ('CF', 'FF')}
++    for r in ledger['edge_fates']:
++        if r['fate'] in (('RETAINED', 'NEW') if new else ('RETAINED', 'LOST')):
++            key = tuple(tuple(int(v) for v in part) for part in r['source_edge_key'])
++            edges[r['kind']][key] = r['new_length' if new else 'old_length']
++    for r in ledger['illegal_pair_fates']:
++        if r['fate'] in (('PERSISTENT', 'NEW') if new else ('PERSISTENT', 'RESOLVED_RETAINED', 'FACE_REMOVED')):
++            pairs[r['kind']].add((int(r['raw_slot_a']), int(r['raw_slot_b'])))
++    faces = {int(r['raw_slot']) for r in ledger['face_fates']
++             if r['fate'] in (('RETAINED', 'NEWLY_RETAINED') if new else ('RETAINED', 'LOST'))}
++    return dict(edges=edges, pairs=pairs, faces=faces)
++
++
++def compare_states(a, b, meta):
++    row, detail = dict(meta), []
++    for kind in ('CF', 'FF'):
++        ae, be, ap, bp = a['edges'][kind], b['edges'][kind], a['pairs'][kind], b['pairs'][kind]
++        aa, bb = set(ae), set(be)
++        gone = ap - bp
++        removed = {p for p in gone if not set(p) <= b['faces']}
++        row.update({kind + '_old_legal_edges': len(aa), kind + '_retained_legal_edges': len(aa & bb),
++                    kind + '_lost_legal_edges': len(aa - bb), kind + '_new_legal_edges': len(bb - aa),
++                    kind + '_lost_length': sum(ae[e] for e in aa - bb), kind + '_new_length': sum(be[e] for e in bb - aa),
++                    kind + '_old_illegal_pairs': len(ap), kind + '_candidate_illegal_pairs': len(bp),
++                    kind + '_persistent_illegal_pairs': len(ap & bp), kind + '_new_illegal_pairs': len(bp - ap),
++                    kind + '_resolved_retained': len(gone - removed), kind + '_face_removed_unobservable': len(removed)})
++        for key in sorted(aa | bb):
++            detail.append(dict(meta, kind=kind, entity='LEGAL_EDGE', key=key,
++                               fate='RETAINED' if key in aa & bb else 'LOST' if key in aa else 'NEW',
++                               reference_length=ae.get(key), candidate_length=be.get(key)))
++        for key in sorted(ap | bp):
++            detail.append(dict(meta, kind=kind, entity='ILLEGAL_PAIR', key=key,
++                               fate='PERSISTENT' if key in ap & bp else 'NEW' if key in bp else
++                               'FACE_REMOVED' if key in removed else 'RESOLVED_RETAINED'))
++    row.update(original_faces_lost=len(a['faces'] - b['faces']), original_faces_newly_retained=len(b['faces'] - a['faces']))
++    return row, detail
++
++
++def coordinate_comparison(reference, candidate, slots, meta):
++    rows = []
++    for slot in sorted(slots):
++        a, b = reference['coords'].get(slot), candidate['coords'].get(slot)
++        both = a is not None and b is not None
++        rows.append(dict(meta, raw_slot=slot, reference_retained=a is not None, candidate_retained=b is not None,
++                         fate='RETAINED' if both else 'LOST' if a is not None else 'NEWLY_RETAINED' if b is not None else 'ABSENT_BOTH',
++                         canonical_corner_coordinates_bitwise_equal=a.tobytes() == b.tobytes() if both else None,
++                         maximum_corner_displacement=float(np.linalg.norm(a.astype(float) - b.astype(float), axis=1).max()) if both else None,
++                         reference_area=reference['slot_area'].get(slot), candidate_area=candidate['slot_area'].get(slot)))
++    return rows
++
++
++def run(path=None):
++    dest = OUT / 'analysis'
++    if (dest / 'COMPLETE.json').exists():
++        done = read(dest / 'COMPLETE.json')
++        verify(done['source_files']); verify(done['files'])
++        if done['source_code_sha256'] != sha(__file__):
++            raise ValueError('Analysis source differs from completed receipt')
++        return done
++    context = load_context(path)
++    fields, qmap, book = context['reg']['metric_fields'], context['qmap'], context['sources']
++    rows = load_metric_rows(context)
++    by = {(r['label'], r['request_id'], r['stage']): r for r in rows}
++    parents = sorted({q['parent_id'] for q in qmap.values()})
++    common_i = {stage: {rid for rid in qmap if all(by[label, rid, stage].get('I_status') == 'PASS'
++                and number(by[label, rid, stage]['ConflictCov_C']) is not None for label in LABELS)} for stage in STAGES}
++    parent_rows, support, paired, paired_parent, macro = [], [], [], [], []
++    for stage in STAGES:
++        for label in LABELS:
++            for parent in parents:
++                rr = [r for r in rows if (r['stage'], r['label'], r['parent_id']) == (stage, label, parent)]
++                out = dict(label=label, stage=stage, parent_id=parent, report_group=rr[0]['report_group'], request_count=len(rr))
++                for field in fields:
++                    values = [number(r[field]) for r in rr]
++                    out[field] = mean(values)
++                    support.append(dict(label=label, stage=stage, parent_id=parent, field=field,
++                                        numeric_n=sum(v is not None for v in values), total_n=len(values),
++                                        original_value_counts=dict(Counter(json.dumps(r[field], ensure_ascii=False, sort_keys=True) for r in rr))))
++                ii = [r for r in rr if r['request_id'] in common_i[stage]]
++                out['I_common_PASS'] = mean([number(r['ConflictCov_C']) for r in ii])
++                out['I_common_PASS_requests'] = len(ii)
++                parent_rows.append(out)
++    for reference, label in [('LOCKED_RAW', 'LOCAL_SHAPE'), *[(reference, label) for reference in ('D0_ALL', 'ASSIST11', 'RAW_ALL') for label in ARMS]]:
++        for stage in STAGES:
++            for rid, q in qmap.items():
++                a, b = by[reference, rid, stage], by[label, rid, stage]
++                row = dict(source_fields(q), stage=stage, reference=reference, label=label,
++                           primary_comparison=reference == 'LOCKED_RAW', I_common_all_five_PASS=rid in common_i[stage],
++                           reference_I_status=a.get('I_status'), candidate_I_status=b.get('I_status'))
++                for field in fields:
++                    av, bv = number(a[field]), number(b[field])
++                    row['delta_' + field] = bv - av if av is not None and bv is not None else None
++                row['delta_I_common_PASS'] = row['delta_ConflictCov_C'] if rid in common_i[stage] else None
++                paired.append(row)
++            for parent in parents:
++                rr = [r for r in paired if (r['reference'], r['label'], r['stage'], r['parent_id']) == (reference, label, stage, parent)]
++                row = dict(reference=reference, label=label, stage=stage, parent_id=parent,
++                           report_group=rr[0]['report_group'], request_count=len(rr), primary_comparison=reference == 'LOCKED_RAW')
++                for field in [*('delta_' + f for f in fields), 'delta_I_common_PASS']:
++                    row[field] = mean([r[field] for r in rr])
++                    row[field + '__valid_requests'] = sum(r[field] is not None for r in rr)
++                paired_parent.append(row)
++    meshes, states, area_rows, region_rows, slot_rows, external_rows, geometry_rows = {}, {}, [], [], [], [], []
++    c_rows, topology_rows = [], []
++    for rid, q in qmap.items():
++        k, n = int(q['K']), int(q['N'])
++        ref = context['references'][rid]
++        inp = arrays(ref['input_bundle']['path'])
++        raw_area = area(inp['raw']); raw_total = float(raw_area[k:].sum())
++        selected = set(np.flatnonzero(inp['support_face_mask']).tolist())
++        for label in LABELS:
++            art = context['artifacts'][label, rid]
++            for stage in STAGES:
++                current = mesh(art['base' if stage == 'BASE_POST' else 'final'], k, n, book)
++                meshes[label, rid, stage] = current
++                kept = set(current['coords']) & set(range(k, n))
++                lost = set(range(k, n)) - kept
++                mass = float(raw_area[list(kept)].sum()) if kept else 0.
++                actual = sum(current['slot_area'][s] for s in kept)
++                meta = dict(source_fields(q), label=label, stage=stage)
++                area_rows.append(dict(meta, original_free_faces=n-k, retained_original_free_faces=len(kept),
++                                      deleted_original_free_faces=len(lost), RAW_reference_area=raw_total,
++                                      retained_RAW_reference_area=mass, deleted_RAW_reference_area=raw_total-mass,
++                                      retained_RAW_reference_area_fraction=divide(mass, raw_total),
++                                      deleted_RAW_reference_area_fraction=divide(raw_total-mass, raw_total),
++                                      actual_original_free_area=actual, bridge_faces=current['bridge_faces'], bridge_area=current['bridge_area'],
++                                      actual_free_area_including_bridges=actual+current['bridge_area'],
++                                      actual_free_area_over_RAW=divide(actual+current['bridge_area'], raw_total)))
++                for slot in range(k, n):
++                    slot_rows.append(dict(meta, raw_slot=slot, selected=slot in selected, region_id=int(inp['assisted_region_ids'][slot]),
++                                          retained=slot in kept, RAW_reference_area=float(raw_area[slot]),
++                                          actual_output_area=current['slot_area'].get(slot)))
++                for region in [*ref['regions'], dict(region_id='P1_UNION_P2', source_face_ids=sorted(selected))]:
++                    ids = set(region['source_face_ids']); survive = ids & kept
++                    total = float(raw_area[list(ids)].sum()); retained = float(raw_area[list(survive)].sum()) if survive else 0.
++                    output_area = sum(current['slot_area'][s] for s in survive)
++                    region_rows.append(dict(meta, region_id=region['region_id'], source_RAW_faces=len(ids),
++                                            retained_original_faces=len(survive), deleted_original_faces=len(ids-survive),
++                                            RAW_reference_area=total, retained_RAW_reference_area=retained,
++                                            retained_RAW_reference_area_fraction=divide(retained, total),
++                                            actual_output_area=output_area, actual_area_over_RAW=divide(output_area, total),
++                                            retained_RAW_slots=sorted(survive), deleted_RAW_slots=sorted(ids-survive)))
++                if label != 'D0_ALL':
++                    lp = record(art['ledger_' + stage], book)
++                    ledger = read(lp)
++                    old, new = ledger_state(ledger, False), ledger_state(ledger, True)
++                    baseline_key = 'D0_ALL', rid, stage
++                    if baseline_key in states and states[baseline_key] != old:
++                        raise ValueError('Reference D0 ledger differs across candidates')
++                    states[baseline_key], states[label, rid, stage] = old, new
++        d0_base = meshes['D0_ALL', rid, 'BASE_POST']
++        external_slots = (set(d0_base['coords']) & set(range(k, n))) - selected
++        for label in ARMS:
++            for stage in STAGES:
++                candidate = meshes[label, rid, stage]
++                meta = dict(source_fields(q), label=label, stage=stage)
++                for reference_scope, reference in [('D0_BASE_FUSION_ANCHOR', d0_base),
++                         ('D0_SAME_STAGE', meshes['D0_ALL', rid, stage]),
++                         ('OWN_BASE_BACKEND_INCREMENT', meshes[label, rid, 'BASE_POST'])]:
++                    er = coordinate_comparison(reference, candidate, external_slots, dict(meta, reference_scope=reference_scope, domain='EXTERNAL_D0_BASE_SURVIVING_UNSELECTED'))
++                    external_rows.extend(er)
++                    if stage == 'BASE_POST' and reference_scope == 'D0_BASE_FUSION_ANCHOR' and any(r['fate'] != 'RETAINED' or not r['canonical_corner_coordinates_bitwise_equal'] for r in er):
++                        raise ValueError('External D0 fusion-stage coordinates/survival violated')
++                cr = coordinate_comparison(d0_base, candidate, range(k), dict(meta, reference_scope='D0_BASE_C', domain='FIXED_C'))
++                external_rows.extend(cr)
++                if any(r['fate'] != 'RETAINED' or not r['canonical_corner_coordinates_bitwise_equal'] for r in cr):
++                    raise ValueError('Fixed C coordinates changed')
++                winding_exact = candidate['arrays']['output'][:k].tobytes() == d0_base['arrays']['output'][:k].tobytes()
++                def c_incidence(m):
++                    result = {}
++                    for face, corners_ in enumerate(m['arrays']['faces'][:k]):
++                        for corner, vertex in enumerate(corners_):
++                            result.setdefault(int(vertex), []).append((face, corner))
++                    return sorted(sorted(group) for group in result.values())
++                c_topology_exact = c_incidence(candidate) == c_incidence(d0_base)
++                c_rows.append(dict(meta, C_source_order_coordinates_bitwise_equal=winding_exact,
++                                   C_index_incidence_by_original_face_corner_equal=c_topology_exact,
++                                   C_canonical_coordinates_bitwise_equal=True))
++                if not winding_exact or not c_topology_exact:
++                    raise ValueError('Fixed C winding/index incidence changed')
++            gp = context['artifacts'][label, rid]['geometry']
++            geometry_rows.append(dict(source_fields(q), label=label, geometry_path=str(resolve(gp)),
++                                      geometry_sha256=sha(gp), original_geometry_ledger=read(gp)))
++        a = meshes['LOCKED_RAW', rid, 'BASE_POST']['arrays']
++        b = meshes['LOCAL_SHAPE', rid, 'BASE_POST']['arrays']
++        topology_rows.append(dict(source_fields(q), stage='BASE_POST',
++            indexed_faces_equal=np.array_equal(a['faces'], b['faces']),
++            source_face_ids_equal=np.array_equal(a['source_face_ids'], b['source_face_ids']),
++            source_corner_ids_equal=np.array_equal(a['source_corner_ids'], b['source_corner_ids']),
++            vertex_array_shape_equal=a['vertices'].shape == b['vertices'].shape,
++            interpretation='Delivered BASE topology comparison; operator geometry ledger separately records the shared pre-fit assembly.'))
++    comparisons, details = [], []
++    for rid, q in qmap.items():
++        for stage in STAGES:
++            for reference, label in [('D0_ALL', 'LOCKED_RAW'), ('D0_ALL', 'LOCAL_SHAPE'), ('LOCKED_RAW', 'LOCAL_SHAPE')]:
++                meta = dict(source_fields(q), stage=stage, reference=reference, label=label)
++                row, detail = compare_states(states[reference, rid, stage], states[label, rid, stage], meta)
++                comparisons.append(row); details.extend(detail)
++    groups = ['ALL', *sorted({source_fields(q)['report_group'] for q in qmap.values()})]
++    summary = dict(status='COMPLETE', version=VERSION, stages={},
++        primary_comparison='LOCAL_SHAPE minus LOCKED_RAW on the same fixed assembly',
++        definitions=dict(average='Mean of valid noises within parent, then equal parent mean; support counts recorded.',
++            I='Main I uses the intersection of requests with I_status PASS and finite ConflictCov_C for all five methods, separately per stage. Raw177 fields are unchanged.',
++            area='RAW reference area measures retained original slots; actual output area measures deformed triangles. Bridges are separate. Neither certifies support.',
++            external='External domain is original D0 BASE surviving unselected free slots. BASE is checked bitwise after canonical corner restoration. FINAL movement/deletion is reported, not asserted absent.',
++            connectivity='Arithmetic set differences of existing exact source-slot/corner ledgers. Bridge faces are excluded from correspondence and remain in full177 metrics. No new intersection scan.',
++            inference='Six repeatedly inspected development requests, three parents; no generalization or automatic-region claim.',
++            visual='No semantic ratings are read or generated by this script.'),
++        model_calls=0, scoring_calls=0, detector_calls=0, GEO_calls=0)
++    for stage in STAGES:
++        summary['stages'][stage] = {}
++        for group in groups:
++            ids = {rid for rid, q in qmap.items() if group == 'ALL' or source_fields(q)['report_group'] == group}
++            pids = sorted({qmap[rid]['parent_id'] for rid in ids})
++            entry = dict(parent_count=len(pids), request_count=len(ids), I_common_PASS_request_ids=sorted(ids & common_i[stage]), labels={})
++            for label in LABELS:
++                rr = [r for r in parent_rows if r['label'] == label and r['stage'] == stage and r['parent_id'] in pids]
++                oo = [by[label, rid, stage] for rid in ids]
++                metrics = {}
++                for field in fields:
++                    value = dict(parent_equal_mean=mean([r[field] for r in rr]),
++                                 valid_parent_count=sum(r[field] is not None for r in rr),
++                                 valid_request_count=sum(number(r[field]) is not None for r in oo))
++                    metrics[field] = value
++                    macro.append(dict(stage=stage, group=group, label=label, field=field, **value))
++                entry['labels'][label] = dict(metrics=metrics,
++                    I_common_PASS_parent_mean=mean([r['I_common_PASS'] for r in rr]),
++                    I_common_PASS_parent_count=sum(r['I_common_PASS'] is not None for r in rr),
++                    I_status_counts=dict(Counter(r.get('I_status', 'MISSING') for r in oo)),
++                    CF_illegal_pair_sum=sum(number(r['CF_illegal_pair_count']) or 0 for r in oo),
++                    FF_illegal_pair_sum=sum(number(r['FF_illegal_pair_count']) or 0 for r in oo))
++            summary['stages'][stage][group] = entry
++    assert_cpu(); verify(book)
++    if dest.exists():
++        raise RuntimeError('Partial analysis retained; do not silently overwrite')
++    dest.mkdir()
++    tables = [('per_output_full177.csv', rows), ('per_parent.csv', parent_rows), ('parent_macro.csv', macro),
++              ('per_parent_field_support.csv', support), ('paired_per_request.csv', paired), ('paired_per_parent.csv', paired_parent),
++              ('area_costs_per_output.csv', area_rows), ('region_survival.csv', region_rows), ('per_slot_area_accounting.csv', slot_rows),
++              ('external_D0_coordinate_fates.csv', external_rows), ('connectivity_pairwise.csv', comparisons),
++              ('connectivity_pairwise_details.csv', details), ('operator_geometry_ledgers.csv', geometry_rows),
++              ('C_identity_per_output.csv', c_rows), ('assembly_topology_comparison.csv', topology_rows)]
++    for filename, table in tables:
++        csvwrite(dest / filename, table)
++    write(dest / 'metric_rows_original_values.json', rows)
++    write(dest / 'summary.json', summary)
++    done = dict(status='COMPLETE', utc=utc(), version=VERSION, registration_sha256=context['registration_sha256'],
++                original_metric_fields=177, output_rows=len(rows), parent_rows=len(parent_rows), paired_request_rows=len(paired),
++                region_rows=len(region_rows), connectivity_comparisons=len(comparisons), source_code_sha256=sha(__file__),
++                source_files=book, metadata_label_routing=list(context['metric_producers'].values()),
++                model_calls=0, scoring_calls=0, detector_calls=0, GEO_calls=0, visual_labels=0,
++                files={str(p): sha(p) for p in dest.iterdir() if p.is_file()})
++    write(dest / 'COMPLETE.json', done)
++    return done
++
++
++if __name__ == '__main__':
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('action', choices=('run',))
++    parser.add_argument('--jobs')
++    args = parser.parse_args()
++    result = run(args.jobs)
++    print(json.dumps({k: v for k, v in result.items() if k not in ('files', 'source_files')}, indent=2))
+--- /dev/null
++++ b/r2/pilots/bench_local_shape_mix_v1/closeout.py
+@@ -0,0 +1,174 @@
++"""Package completed CPU evidence; no geometry, model, scorer, or inferred ratings.
++
++The root's ratings below are a transcription of four actually viewed pages.
++Other reviewers' original records remain unchanged.
++"""
++from __future__ import annotations
++import csv
++import hashlib
++import html
++import json
++import statistics
++from collections import Counter
++from datetime import datetime, timezone
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[3]
++OUT = ROOT / 'experiments/r2_bench_local_shape_mix_v1'
++DEST = OUT / 'closure'
++STAGE = 'CLEAN_FINAL_POST'
++
++def read(p):
++    return json.loads(Path(p).read_text(encoding='utf-8-sig'))
++
++def sha(p):
++    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
++
++def write(p, v):
++    p = Path(p); p.parent.mkdir(parents=True, exist_ok=True)
++    text = json.dumps(v, ensure_ascii=False, indent=2, allow_nan=False) + '\n'
++    if p.exists():
++        if read(p) != v:
++            raise RuntimeError('Existing closure evidence differs: ' + str(p))
++        return
++    p.write_text(text, encoding='utf-8')
++
++def csvread(p):
++    with Path(p).open(encoding='utf-8-sig', newline='') as f:
++        return list(csv.DictReader(f))
++
++def csvwrite(p, rows):
++    keys = list(dict.fromkeys(k for row in rows for k in row))
++    with Path(p).open('x', encoding='utf-8-sig', newline='') as f:
++        w = csv.DictWriter(f, fieldnames=keys); w.writeheader()
++        for r in rows:
++            w.writerow({k: json.dumps(v, ensure_ascii=False) if isinstance(v, (list, dict)) else v for k,v in r.items()})
++
++def root_review():
++    path = OUT / 'visual_review/reviewer_a8.json'
++    if path.exists():
++        return read(path)
++    # Manual observations, explicitly transcribed after actual tools.view_image.
++    ratings = {
++        'RAW': ('REASONABLE', 'PLAUSIBLE', 'PRESENT', 'UNCERTAIN', 'NO_OBVIOUS'),
++        'D0_ALL': ('INCOMPLETE', 'PLAUSIBLE', 'MISSING_OR_DAMAGED', 'YES', 'NO_OBVIOUS'),
++        'ASSIST11': ('REASONABLE', 'PLAUSIBLE', 'PRESENT', 'YES', 'NO_OBVIOUS'),
++        'LOCKED_RAW': ('REASONABLE', 'PLAUSIBLE', 'PRESENT', 'YES', 'NO_OBVIOUS'),
++        'LOCAL_SHAPE': ('REASONABLE', 'PLAUSIBLE', 'PRESENT', 'YES', 'NO_OBVIOUS'),
++    }
++    notes = {
++        'RAW': 'Two oblique views show four substantial legs under the slatted blue C seat. Front section retains a long underside and side sections have slat widths; fine gaps are ambiguous, not proof of a physical crack. No clear replacement seat.',
++        'D0_ALL': 'The gray supports are largely reduced to needle-like lines or missing major faces in both oblique views. Blue C remains the seat. Sections show lost side/underside portions; some disconnected strokes alone do not certify cracks.',
++        'ASSIST11': 'Four supports retain visible width; blue C remains the seat. Slat side/underside deficits persist compared with RAW. Restoring supports does not certify closed or intersection-free geometry.',
++        'LOCKED_RAW': 'Four supports again have width. Macro appearance matches ASSIST11; side/underside deficits remain at the fixed sections. The section is a visual observation rather than a topology test.',
++        'LOCAL_SHAPE': 'No clear macro improvement or new damage relative to LOCKED_RAW in either oblique view or the inherited front/side cuts. Legs remain substantial; the same slat side/underside deficits persist.',
++    }
++    displays, unique, events = [], {}, []
++    now = datetime.now(timezone.utc).isoformat()
++    for idx in (0, 1):
++        for stage in ('BASE_POST', STAGE):
++            page = f'R{idx:02d}_{stage}'
++            r = read(OUT / 'gallery' / (page + '.json'))
++            img = OUT / 'gallery' / (page + '.png')
++            assert sha(img) == r['image_sha256']
++            event = dict(event_id='root_actual_view_' + page, page_id=page,
++                         tool='functions.exec -> tools.view_image',
++                         evidence='Root viewed all four pages together in the active turn, after an earlier individual review; 2915x1485 images displayed at 2048x1043.',
++                         transcription_utc=now, image_sha256=sha(img))
++            events.append(event)
++            for cell in r['cells']:
++                key = r['request_id'] + '|' + cell['model'] + '|' + cell['stage']
++                row = dict(unique_id=key, request_id=r['request_id'], parent_id=r['parent_id'],
++                           noise_index=r['noise_index'], model=cell['model'], stage=cell['stage'],
++                           display_stage=stage, page_id=page, image_path=str(img), image_sha256=sha(img),
++                           mesh_path=cell['path'], mesh_sha256=r['source_meshes'][cell['path']],
++                           reviewer='root', review_type='AI_PROXY_NONBLIND', actually_viewed=True,
++                           views_and_sections_checked=True, view_event_id=event['event_id'],
++                           transcription_utc=now, note=notes[cell['model']])
++                row.update(dict(zip(('overall','C_use','support','visible_fragment_or_gap','layering_or_fold'), ratings[cell['model']])))
++                displays.append(row)
++                if key in unique:
++                    unique[key].setdefault('additional_view_events', []).append(event)
++                else:
++                    unique[key] = dict(row)
++    result = dict(status='COMPLETE_ACTUAL_VIEW', schema='local_shape_five_axis_review_v1',
++                  reviewer='root', review_type='AI_PROXY_NONBLIND', metric_scores_read=True,
++                  score_exposure='Root read quantitative results before visual review; not blind or independent human assessment.',
++                  old_labels_copied=False, unique_source_style_not_required=True,
++                  sections_do_not_certify_topology=True, display_count=20, unique_count=18,
++                  actual_view_events=events, rows=list(unique.values()), display_records=displays)
++    write(path, result)
++    return result
++
++def aggregate_review():
++    root_review()
++    rows, displays, books = [], [], {}
++    for name in ('reviewer_a8.json', 'reviewer_27.json', 'reviewer_459.json'):
++        p = OUT / 'visual_review' / name
++        r = read(p); assert r['status'] in ('COMPLETE_ACTUAL_VIEW','ACTUAL_VIEW_COMPLETE')
++        books[str(p)] = sha(p)
++        assert len(r['rows']) == 18 and len(r['display_records']) == 20
++        for row in r['rows']:
++            assert row['actually_viewed'] and row['views_and_sections_checked']
++            for k in ('overall','C_use','support','visible_fragment_or_gap','layering_or_fold'):
++                assert row[k]
++        rows.extend(r['rows']); displays.extend(r['display_records'])
++    assert len(rows) == len({r['unique_id'] for r in rows}) == 54
++    counts = []
++    for stage in ('RAW','BASE_POST',STAGE):
++        for label in ('RAW','D0_ALL','ASSIST11','LOCKED_RAW','LOCAL_SHAPE'):
++            selected = [r for r in rows if r['stage'] == stage and r['model'] == label]
++            if not selected: continue
++            assert len(selected) == 6
++            x = dict(stage=stage,label=label,requests=len(selected))
++            for axis,val in [('overall','REASONABLE'),('C_use','PLAUSIBLE'),('support','PRESENT'),('visible_fragment_or_gap','YES'),('layering_or_fold','YES')]:
++                x[axis+'_'+val] = sum(r[axis] == val for r in selected)
++                x[axis+'_UNCERTAIN'] = sum(r[axis] == 'UNCERTAIN' for r in selected)
++            x['three_axis_intersection'] = sum(r['overall']=='REASONABLE' and r['C_use']=='PLAUSIBLE' and r['support']=='PRESENT' for r in selected)
++            counts.append(x)
++    csvwrite(DEST / 'visual_unique54.csv', rows)
++    csvwrite(DEST / 'visual_display60.csv', displays)
++    csvwrite(DEST / 'visual_counts.csv', counts)
++    write(DEST / 'visual_review_complete.json', dict(status='COMPLETE_ACTUAL_VIEW',
++          source_records=books,unique_outputs=54,display_cells=60,actual_pages=12,
++          reviewers=['root','n_range_audit','backend_runtime'],review_type='AI_PROXY_NONBLIND',
++          limitations='Three AI reviewer identities, not independent humans; score/context exposure disclosed individually. Fixed sections do not prove cracks. Same-asset historical rating drift is not a model improvement.', counts=counts))
++    return counts
++
++def key_accounting():
++    finals = [r for r in csvread(OUT/'analysis/per_output_full177.csv') if r['stage']==STAGE]
++    assert len(finals)==30
++    for r in finals:
++        assert r['ConflictCov_C_status']=='PASS'
++    macros = csvread(OUT/'analysis/parent_macro.csv')
++    fields = ['CF_illegal_affected_free_fraction','FF_illegal_affected_free_fraction','ConflictCov_C',
++              'actual_free_faces','deleted_free_faces','free_minimum_angle_lt5_fraction','free_q_gt10_fraction',
++              'C_F_valid_edge_count','C_F_valid_edge_total_length','nonmanifold_edges',
++              'hinge_diag_isolated_1face_edge_components','hinge_diag_legal_opposed_edge_C_reached_free_area_fraction']
++    summary = {}
++    for label in ('D0_ALL','ASSIST11','RAW_ALL','LOCKED_RAW','LOCAL_SHAPE'):
++        summary[label] = {r['field']:float(r['parent_equal_mean']) for r in macros if r['group']=='ALL' and r['stage']==STAGE and r['label']==label and r['field'] in fields}
++        assert len(summary[label])==len(fields)
++    solvers=[]
++    for i in range(6):
++        p=OUT/'runs'/f'J{i:02d}_LOCAL_SHAPE'/'geometry.json'
++        g=read(p); s=g['solver']
++        solvers.append(dict(request_id=g['request_id'],solver=s))
++    comparisons=csvread(OUT/'analysis/connectivity_pairwise.csv')
++    connectivity=[]
++    for r in comparisons:
++        if r['reference']=='LOCKED_RAW' and r['label']=='LOCAL_SHAPE':
++            connectivity.append(r)
++    write(DEST/'key_accounting.json',dict(final_parent_equal=summary,solvers=solvers,
++          local_vs_locked_connectivity=connectivity, all_final_I_status='PASS 30/30',
++          scientific_dispatch=read(OUT/'dispatch/complete.json'),render_dispatch=read(OUT/'gallery/dispatch_complete.json')))
++    return summary
++
++def main():
++    DEST.mkdir(parents=True, exist_ok=True)
++    if (DEST/'visual_review_complete.json').exists():
++        raise RuntimeError('Closure already transcribed; verify rather than overwrite')
++    counts=aggregate_review(); metrics=key_accounting()
++    print(json.dumps(dict(visual_counts=counts,final_macro=metrics),ensure_ascii=False,indent=2))
++
++if __name__=='__main__': main()
+--- /dev/null
++++ b/r2/pilots/bench_local_shape_mix_v1/dispatch.py
+@@ -0,0 +1,68 @@
++"""Incremental measured CPU dispatch; only registered jobs, no silent retries."""
++from __future__ import annotations
++import json,os,subprocess,sys,time
++from . import runtime as R
++
++def run():
++    reg,rh,by_id=R.load_jobs();folder=R.OUT/'dispatch';folder.mkdir(exist_ok=True)
++    done=folder/'complete.json'
++    if done.exists():
++        old=R.read(done);R.verify(old['completions'])
++        if old['registration_sha256']!=rh:raise ValueError('Dispatch identity changed')
++        return old
++    pending=[];completed=[]
++    for j in reg['jobs']:
++        d=R.OUT/'runs'/j['job_id'];p=d/'complete.json'
++        if p.exists():R.verify_result(R.read(p));completed.append(j['job_id'])
++        elif d.exists():raise RuntimeError('Partial scientific attempt must be reviewed before dispatch: '+j['job_id'])
++        else:pending.append(j)
++    event_path=folder/'events.jsonl'
++    def event(kind,**kw):
++        row=dict(utc=R.utc(),kind=kind,**kw)
++        with event_path.open('a',encoding='utf-8') as f:f.write(json.dumps(R.clean(row),ensure_ascii=False)+'\n')
++        print(json.dumps(R.clean(row),ensure_ascii=False),flush=True)
++    active={};tick=time.perf_counter();peak=0;workers=1
++    initial=R.resources();event('RESOURCES_INITIAL',resources=initial,already_completed=completed)
++    if not (R.OUT/'resources_initial.json').exists():R.write(R.OUT/'resources_initial.json',initial)
++    def launch(job,phase):
++        snap=R.resources();reserve=max(2*(1<<30),.1*snap['ram_total_bytes'])
++        if peak and snap['ram_available_bytes']-reserve<1.2*peak:return False
++        logpath=folder/(job['job_id']+'.log')
++        if logpath.exists():raise RuntimeError('Existing attempt log: '+str(logpath))
++        log=logpath.open('xb');env=os.environ.copy();env['CUDA_VISIBLE_DEVICES']=''
++        for name in ('OMP_NUM_THREADS','MKL_NUM_THREADS','OPENBLAS_NUM_THREADS','NUMEXPR_NUM_THREADS'):env[name]='1'
++        p=subprocess.Popen([sys.executable,'-B','-m','r2.pilots.bench_local_shape_mix_v1.runtime','run-one','--job-id',job['job_id']],cwd=R.ROOT,env=env,stdout=log,stderr=subprocess.STDOUT)
++        active[p.pid]=(p,job,log,time.perf_counter());event('START',job_id=job['job_id'],pid=p.pid,phase=phase,resources=snap,active_workers=len(active));return True
++    def collect(pid):
++        nonlocal peak
++        p,j,log,start=active.pop(pid);log.close();path=R.OUT/'runs'/j['job_id']/'complete.json'
++        if p.returncode or not path.exists():
++            event('FAILED',job_id=j['job_id'],returncode=p.returncode);return False
++        result=R.verify_result(R.read(path));peak=max(peak,result['peak_RSS_KiB']*1024);completed.append(j['job_id'])
++        event('COMPLETE',job_id=j['job_id'],seconds=time.perf_counter()-start,peak_RSS_KiB=result['peak_RSS_KiB'],resources_after=R.resources());return True
++    if pending:
++        first=pending.pop(0);launch(first,'FIRST_AUTHORIZED_JOB_MEASUREMENT');pid=next(iter(active))
++        while active[pid][0].poll() is None:time.sleep(1)
++        if not collect(pid):raise RuntimeError('First job failed; no retry')
++        snap=R.resources();reserve=max(2*(1<<30),.1*snap['ram_total_bytes'])
++        slots=int(max(0,snap['ram_available_bytes']-reserve)//(1.2*peak)) if peak else 1
++        workers=min(2,slots,max(1,snap['cpu_logical']//2),max(1,len(pending)))
++        if workers<1:raise RuntimeError('No measured resource slot')
++        event('MEASURED_DISPATCH',workers=workers,observed_process_peak_bytes=peak,resource_scope='CPU fresh subprocess lifetime',concurrent_wall_times_not_isolated_benchmarks=True)
++    failed=[]
++    while pending or active:
++        while pending and len(active)<workers and not failed:
++            if not launch(pending[0],'INCREMENTAL_CPU'):break
++            pending.pop(0)
++        for pid,(p,_,_,_) in list(active.items()):
++            if p.poll() is not None and not collect(pid):failed.append(pid)
++        if failed and not active:raise RuntimeError('Failure retained; remaining unstarted')
++        if pending and not active:raise RuntimeError('No memory slot; unstarted jobs retained')
++        if pending or active:time.sleep(1)
++    R.verify(reg['protected']);R.verify(reg['source_hashes'])
++    result=dict(status='COMPLETE',registration_sha256=rh,jobs=len(completed),workers=workers,seconds=time.perf_counter()-tick,
++        peak_worker_RSS_bytes=peak,resources_final=R.resources(),budget=reg['budget'],
++        completions={str(R.OUT/'runs'/j['job_id']/'complete.json'):R.sha(R.OUT/'runs'/j['job_id']/'complete.json') for j in reg['jobs']})
++    R.write(done,result);event('ALL_COMPLETE',jobs=len(completed),seconds=result['seconds']);return result
++
++if __name__=='__main__':run()
+--- /dev/null
++++ b/r2/pilots/bench_local_shape_mix_v1/operator.py
+@@ -0,0 +1,380 @@
++"""Fixed indexed RAW/D0 assembly and one bounded local edge-vector fit.
++
++No model, GEO, proximity welding, intersection detector or score calls occur
++here. Original face/corner identities, not source-Y geometry, define matching.
++The two arms share one topology and the same full-slot HINGE motion reference.
++"""
++from __future__ import annotations
++
++import hashlib
++import os
++from pathlib import Path
++import warnings
++
++import numpy as np
++from scipy import sparse
++from scipy.sparse.linalg import MatrixRankWarning, spsolve
++
++VERSION = 'fixed_namespace_local_edge_vector_v1'
++ROOT = Path(__file__).resolve().parents[3]
++R = .015 / (.95 * .3762)
++L = np.sqrt(3.) * 2. / .3762
++CONFIG = dict(version='local_edge_vector_fit_v1', regularization_lambda=1.,
++              maximum_displacement_R=2., area_ratio_floor=.8,
++              normal_cosine_floor=.5, region_span_ratio_floor=.9,
++              nonzero_span_epsilon_L=1e-10, line_search_halvings=10)
++
++
++def _path(path):
++    path = str(path).replace('\\', '/')
++    if os.name == 'nt' and path.startswith('/mnt/e/'):
++        path = 'E:/' + path[7:]
++    elif os.name != 'nt' and path.lower().startswith('e:/'):
++        path = '/mnt/e/' + path[3:]
++    p = Path(path)
++    return p if p.is_absolute() else ROOT / p
++
++
++def _arrays(path):
++    with np.load(_path(path), allow_pickle=False) as z:
++        return {k: z[k] for k in z.files}
++
++
++def _exact(a, b):
++    return a.dtype == b.dtype and a.shape == b.shape and a.tobytes() == b.tobytes()
++
++
++def _mesh(mesh, N, K):
++    v, f = mesh['vertices'], np.asarray(mesh['faces'], np.int64)
++    sf = np.asarray(mesh['source_face_ids'], np.int64)
++    sc = np.asarray(mesh['source_corner_ids'], np.int64)
++    if v.dtype != np.float32 or v.ndim != 2 or v.shape[1] != 3:
++        raise ValueError('Expected FP32 indexed vertices')
++    if f.shape != (len(sf), 3) or sc.shape != f.shape or not np.isfinite(v).all():
++        raise ValueError('Malformed indexed/provenance arrays')
++    if not _exact(v[f], mesh['output']) or np.any(f < 0) or np.any(f >= len(v)):
++        raise ValueError('Output differs from indexed mesh')
++    if len(set(sf.tolist())) != len(sf) or np.any(sf < 0) or np.any(sf >= N):
++        raise ValueError('Original slot lineage must be unique')
++    if not np.array_equal(sf[:K], np.arange(K)) or int(mesh['known_faces']) != K:
++        raise ValueError('Source C faces must be first and in original face order')
++    if not np.all(np.sort(sc, axis=1) == np.arange(3)):
++        raise ValueError('Each face needs an invertible canonical corner map')
++    if not _exact(mesh['C'], v[f[:K]]):
++        raise ValueError('Source C export mismatch')
++    return v, f, sf, sc
++
++
++def assemble(d0, raw_base, raw, d0_pre, selected, regions, raw_metadata):
++    """Use cached BASE indices; only original C vertex identity crosses sources.
++
++    Returned vertex IDs are compact. Both source-to-new maps preserve internal
++    sharing up to this bijective renumbering; no unreferenced vertices remain.
++    """
++    raw = np.asarray(raw)
++    d0_pre = np.asarray(d0_pre)
++    N, K = len(raw), int(d0['known_faces'])
++    selected = np.asarray(selected, bool)
++    if raw.dtype != np.float32 or raw.shape != (N, 3, 3) or not _exact(raw[:K], d0_pre[:K]):
++        raise ValueError('Expected matching canonical FP32 input C')
++    if d0_pre.dtype != np.float32 or d0_pre.shape != raw.shape or not np.isfinite(raw).all() or not np.isfinite(d0_pre).all():
++        raise ValueError('Invalid canonical RAW/D0_PRE')
++    if selected.shape != (N,) or selected[:K].any():
++        raise ValueError('Selection must be free original slots only')
++    if set(regions) != {'P1', 'P2'}:
++        raise ValueError('Exactly frozen P1/P2 required')
++    regions = {k: np.asarray(a, bool) for k, a in regions.items()}
++    if any(a.shape != (N,) or a[:K].any() for a in regions.values()):
++        raise ValueError('Invalid region domain')
++    if np.any(regions['P1'] & regions['P2']) or not np.array_equal(selected, regions['P1'] | regions['P2']):
++        raise ValueError('Selection must equal disjoint P1 union P2')
++    dv, df, ds, dc = _mesh(d0, N, K)
++    rv, rf, rs, rc = _mesh(raw_base, N, K)
++    if not _exact(d0['C'], raw_base['C']) or not np.array_equal(dc[:K], rc[:K]):
++        raise ValueError('Source-oriented C/corner identities disagree')
++    if not _exact(raw[np.arange(K)[:, None], dc[:K]], d0['C']):
++        raise ValueError('C provenance does not reconstruct original canonical C')
++    raw_C_to_d0 = {}
++    reverse_C = {}
++    for r, d in zip(rf[:K].ravel(), df[:K].ravel()):
++        r, d = int(r), int(d)
++        if r in raw_C_to_d0 and raw_C_to_d0[r] != d:
++            raise ValueError('C vertex identity is not consistent')
++        if d in reverse_C and reverse_C[d] != r:
++            raise ValueError('C topology differs across cached BASE meshes')
++        if not _exact(rv[r], dv[d]):
++            raise ValueError('Corresponding C vertex coordinate differs')
++        raw_C_to_d0[r], reverse_C[d] = d, r
++
++    drows = {int(s): i for i, s in enumerate(ds)}
++    rrows = {int(s): i for i, s in enumerate(rs)}
++    records = []
++    absent = np.full(N, '', dtype='<U48')
++    for s in range(N):
++        use_raw = bool(selected[s])
++        rows = rrows if use_raw else drows
++        if s not in rows:
++            absent[s] = 'ABSENT_RAW_BASE' if use_raw else 'ABSENT_D0_BASE'
++            continue
++        i = rows[s]
++        oldface, corners = (rf[i], rc[i]) if use_raw else (df[i], dc[i])
++        keys = []
++        for old in oldface:
++            old = int(old)
++            keys.append(('D0', raw_C_to_d0[old]) if use_raw and old in raw_C_to_d0
++                        else ('RAW', old) if use_raw else ('D0', old))
++        records.append((s, corners.copy(), keys, use_raw, i))
++    keys = sorted({k for rec in records for k in rec[2]}, key=lambda k: (k[0] == 'RAW', k[1]))
++    index = {k: i for i, k in enumerate(keys)}
++    v = np.asarray([dv[i] if ns == 'D0' else rv[i] for ns, i in keys], np.float32)
++    f = np.asarray([[index[k] for k in rec[2]] for rec in records], np.int64)
++    sf = np.asarray([rec[0] for rec in records], np.int64)
++    sc = np.asarray([rec[1] for rec in records], np.int64)
++    selected_rows = selected[sf]
++    variable = np.asarray([ns == 'RAW' for ns, _ in keys], bool)
++    cv = np.full((N, 3), -1, np.int64)
++    cv[sf[:, None], sc] = f
++    members = [np.flatnonzero(cv.ravel() == i) for i in range(len(v))]
++    if any(not len(m) for m in members):
++        raise AssertionError('Unused assembly vertex has no canonical corner member')
++    targets = v.astype(np.float64)
++    for i in np.flatnonzero(variable):
++        targets[i] = d0_pre.reshape(-1, 3)[members[i]].astype(np.float64).mean(axis=0)
++    pre = d0_pre.copy()
++    pre[selected] = raw[selected]
++    dmap = np.full(len(dv), -1, np.int64)
++    rmap = np.full(len(rv), -1, np.int64)
++    for key, i in index.items():
++        (dmap if key[0] == 'D0' else rmap)[key[1]] = i
++    for ri, di in raw_C_to_d0.items():
++        rmap[ri] = dmap[di]
++    raw_anchors = np.asarray(raw_metadata['raw_anchor_ids'], np.int64)
++    raw_seam = np.asarray(raw_metadata['raw_seam_slot_mask'], bool)
++    if raw_anchors.shape != (N, 3) or raw_seam.shape != (N,) or raw_seam.any() or (raw_anchors[K:] >= 0).any():
++        raise ValueError('Expected original Native anchors/no seam')
++    post = dict(vertices=v, faces=f, output=v[f], C=v[f[:K]], free=v[f[K:]],
++                known_faces=np.asarray(K, np.int64), input_faces=np.asarray(N, np.int64),
++                source_face_ids=sf, source_corner_ids=sc, raw_slot_ids=sf.copy(),
++                source_face_kept=np.isin(np.arange(N), sf), source_face_reason=absent,
++                duplicate_of_source_face=np.full(N, -1, np.int64),
++                corner_vertex_ids=cv, input_corner_vertex_ids=cv.copy(), output_corner_vertex_ids=f.copy(),
++                vertex_source_input_corner_ids=np.asarray([m[0] for m in members], np.int64),
++                raw_anchor_ids=raw_anchors.copy(), output_anchor_ids=raw_anchors[sf[:, None], sc],
++                raw_seam_slot_mask=raw_seam.copy(), retained_seam_mask=raw_seam[sf],
++                index_domain=np.asarray('FIXED_BASE_C_ID_ONLY_CROSS_NAMESPACE_V1'),
++                identity_domain=np.asarray('GENERATED_RAW_SLOT_NOT_GT'),
++                lineage_semantics=np.asarray('MEMBER_IDS_ARE_PROVENANCE_NOT_EXACT_COORDINATE_CLAIMS'),
++                source_winding_stage=np.asarray('CACHED_BASE_SOURCE_ORIENTED_ASSEMBLY'))
++    for name in ('raw_slot_edge_id', 'occupied', 'occupancy_logits', 'edge_records',
++                 'C_vertices', 'C_faces_original', 'C_faces_model'):
++        if name in raw_metadata:
++            post[name] = raw_metadata[name].copy()
++    for name in ('C_original', 'C_original_source_vertex_ids', 'C_original_source_face_ids',
++                 'C_canonical_source_vertex_ids', 'C_source_corner_permutations',
++                 'C_inverse_corner_permutation', 'source_winding_schema', 'source_winding_trust',
++                 'source_winding_provenance', 'source_vertex_id_status', 'source_face_id_status',
++                 'source_C_vertex_ID_topology_status'):
++        if name in d0:
++            post[name] = d0[name].copy()
++    if 'compact_C_vertex_to_post' in d0:
++        post['compact_C_vertex_to_post'] = dmap[d0['compact_C_vertex_to_post']]
++    post['source_face_reason'][sf] = np.where(selected_rows, 'RETAINED_RAW_BASE', 'RETAINED_D0_BASE')
++    _motion_metadata(post, pre, variable)
++    if not _exact(post['C'], d0['C']):
++        raise AssertionError('C changed in assembly')
++    unselected = ~selected_rows
++    for i in np.flatnonzero(unselected):
++        if not _exact(post['output'][i], d0['output'][drows[int(sf[i])]]):
++            raise AssertionError('D0 unselected geometry changed')
++    mapping = dict(d0_vertex_to_composite=dmap, raw_vertex_to_composite=rmap,
++                   variable_vertex_mask=variable, selected_output_face_mask=selected_rows,
++                   rest_vertices=v.copy(), d0_target_vertices=targets,
++                   support_face_mask=selected.copy(), region_P1=regions['P1'], region_P2=regions['P2'],
++                   output_namespace=np.asarray(['RAW' if x else 'D0' for x in selected_rows]),
++                   vertex_namespace=np.asarray([k[0] for k in keys]),
++                   vertex_namespace_source_id=np.asarray([k[1] for k in keys], np.int64))
++    summary = dict(version=VERSION, original_faces=N, kept_faces=len(f), C_faces=K,
++                   selected_requested_faces=int(selected.sum()), selected_kept_faces=int(selected_rows.sum()),
++                   unselected_D0_kept_faces=int((~selected_rows[K:]).sum()),
++                   selected_absent_slots=np.flatnonzero(selected & ~post['source_face_kept']).tolist(),
++                   unselected_absent_slots=np.flatnonzero(~selected & ~post['source_face_kept']).tolist(),
++                   vertices=len(v), variable_vertices=int(variable.sum()), fixed_vertices=int((~variable).sum()),
++                   shared_C_vertices=len(raw_C_to_d0), no_new_welding=True, no_GEO=True,
++                   topology_cost='RAW/D0 free namespaces remain distinct even at coincident coordinates; internal sharing and C identity retained',
++                   exact_D0_external_BASE_geometry=True, exact_C_coordinate_winding_topology=True,
++                   post_only_vertex_compaction=True, no_source_Y=True,
++                   HINGE_reference='Same canonical mixed original RAW/D0_PRE for both arms, never fitted coordinates')
++    return dict(post=post, pre=pre, mappings=mapping, summary=summary)
++
++
++def _motion_metadata(post, pre, variable):
++    cv, v = post['corner_vertex_ids'], post['vertices']
++    sf, sc = post['source_face_ids'], post['source_corner_ids']
++    good = cv >= 0
++    displacement = np.zeros(pre.shape, np.float64)
++    displacement[good] = v[cv[good]].astype(np.float64) - pre[good].astype(np.float64)
++    norms = np.linalg.norm(displacement, axis=-1)
++    ids = np.full(cv.shape, -1, np.int64)
++    ids[good] = post['vertex_source_input_corner_ids'][cv[good]]
++    status = np.full(cv.shape, 'ABSENT_OUTPUT_FACE', dtype='<U48')
++    status[good] = np.where(variable[cv[good]], 'RAW_NAMESPACE_REST_OR_FITTED', 'FIXED_D0_NAMESPACE')
++    # No radius-search candidate counts are fabricated: this operator never ran GEO.
++    for name, value in (('displacement', norms), ('displacement_vector', displacement),
++                        ('target_input_ids', ids), ('status', status)):
++        post['corner_' + name] = value
++        post['input_corner_' + name] = value.copy()
++        post['output_corner_' + name] = value[sf[:, None], sc]
++
++
++def _shape(vertices, faces):
++    tri = vertices.astype(np.float64)[faces]
++    cross = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
++    norm = np.linalg.norm(cross, axis=1)
++    return norm / 2., cross / np.maximum(norm[:, None], np.finfo(np.float64).tiny)
++
++
++def _objective(vertices, rest, targets, variable, edges, lam):
++    u = vertices.astype(np.float64) - rest.astype(np.float64)
++    data = float(np.square(vertices[variable].astype(np.float64) - targets[variable]).sum(axis=1).mean()) if variable.any() else 0.
++    reg = float(np.square(u[edges[:, 0]] - u[edges[:, 1]]).sum(axis=1).mean()) if len(edges) else 0.
++    return dict(data_mean=data, edge_mean=reg, total=data + lam * reg)
++
++
++def fit(assembly, config=None):
++    """One FP64 sparse solve, per-vertex cap, then shared-step shape guards."""
++    cfg = dict(CONFIG if config is None else config)
++    for key, value in CONFIG.items():
++        if cfg.get(key) != value:
++            raise ValueError('Operator configuration differs from fixed definition: ' + key)
++    post, mapping = assembly['post'], assembly['mappings']
++    rest, faces = post['vertices'].copy(), post['faces']
++    variable = mapping['variable_vertex_mask']
++    selected_faces = mapping['selected_output_face_mask']
++    targets = mapping['d0_target_vertices']
++    v_ids = np.flatnonzero(variable)
++    f = faces[selected_faces]
++    edges = np.unique(np.sort(np.concatenate((f[:, [0, 1]], f[:, [1, 2]], f[:, [2, 0]])), axis=1), axis=0) if len(f) else np.empty((0, 2), np.int64)
++    before = _objective(rest, rest, targets, variable, edges, cfg['regularization_lambda'])
++    info = dict(version=cfg['version'], calls_sparse_solve=0, free_variables=len(v_ids), unique_selected_edges=len(edges),
++                objective_before=before, objective_normalization='mean variable squared Euclidean distance plus mean unique selected-edge squared vector difference',
++                maximum_displacement_model=cfg['maximum_displacement_R'] * R,
++                trials=[], fallback=False, accepted_alpha=0., numerical_precision='FP64 solve; all guards on delivered FP32 vertices',
++                detector_calls=0, score_calls=0, parameter_retries=0)
++    if not len(v_ids):
++        info.update(status='NO_VARIABLES_EXACT_LOCKED_RAW', objective_after=before)
++        return {**assembly, 'summary': {**assembly['summary'], 'solver': info}}
++    area0, normal0 = _shape(rest, f)
++    if np.any(area0 <= 0) or not np.isfinite(area0).all():
++        info.update(status='INVALID_REST_EXACT_FALLBACK', fallback=True, objective_after=before,
++                    failure_reason='Zero/nonfinite selected rest face; no face removed or modified')
++        return {**assembly, 'summary': {**assembly['summary'], 'solver': info}}
++    local = np.full(len(rest), -1, np.int64)
++    local[v_ids] = np.arange(len(v_ids))
++    rows, cols, vals = [], [], []
++    for ei, (u, w) in enumerate(edges):
++        if variable[u]:
++            rows.append(ei); cols.append(int(local[u])); vals.append(1.)
++        if variable[w]:
++            rows.append(ei); cols.append(int(local[w])); vals.append(-1.)
++    incidence = sparse.csr_matrix((vals, (rows, cols)), shape=(len(edges), len(v_ids)), dtype=np.float64)
++    weight = cfg['regularization_lambda'] / len(edges) if len(edges) else 0.
++    matrix = sparse.eye(len(v_ids), dtype=np.float64, format='csc') / len(v_ids) + weight * (incidence.T @ incidence).tocsc()
++    rhs = (targets[v_ids] - rest[v_ids].astype(np.float64)) / len(v_ids)
++    with warnings.catch_warnings():
++        warnings.simplefilter('error', MatrixRankWarning)
++        displacement = np.asarray(spsolve(matrix, rhs, permc_spec='NATURAL', use_umfpack=False), np.float64).reshape(len(v_ids), 3)
++    info['calls_sparse_solve'] = 1
++    if not np.isfinite(displacement).all():
++        raise FloatingPointError('Nonfinite unique sparse solution; no retry')
++    residual = matrix @ displacement - rhs
++    info['linear_residual_max_abs'] = float(np.abs(residual).max())
++    unconstrained = rest.astype(np.float64)
++    unconstrained[v_ids] += displacement
++    info['objective_unconstrained'] = _objective(unconstrained, rest, targets, variable, edges, cfg['regularization_lambda'])
++    lengths = np.linalg.norm(displacement, axis=1)
++    cap = cfg['maximum_displacement_R'] * R
++    scale = np.minimum(1., cap / np.maximum(lengths, np.finfo(np.float64).tiny))
++    displacement *= scale[:, None]
++    info['vertices_capped'] = int(np.sum(lengths > cap))
++    info['unconstrained_max_displacement'] = float(lengths.max())
++    sf = post['source_face_ids']
++    region_vids = {name: np.unique(faces[mask[sf]]) for name, mask in
++                   (('P1', mapping['region_P1']), ('P2', mapping['region_P2']))}
++    spans = {name: np.ptp(rest[ids].astype(np.float64), axis=0) if len(ids) else np.zeros(3)
++             for name, ids in region_vids.items()}
++    accepted = None
++    for power in range(cfg['line_search_halvings'] + 1):
++        alpha = 2. ** (-power)
++        trial = rest.copy()
++        trial[v_ids] = (rest[v_ids].astype(np.float64) + alpha * displacement).astype(np.float32)
++        area, normal = _shape(trial, f)
++        cosine = (normal * normal0).sum(axis=1)
++        motion = np.linalg.norm(trial[v_ids].astype(np.float64) - rest[v_ids], axis=1)
++        reasons = []
++        if not np.isfinite(trial).all(): reasons.append('NONFINITE')
++        if not _exact(trial[~variable], rest[~variable]): reasons.append('FIXED_VERTEX_CHANGED')
++        if np.any(motion > cap): reasons.append('PER_VERTEX_DISPLACEMENT_CAP')
++        if np.any(area < cfg['area_ratio_floor'] * area0): reasons.append('AREA_RATIO')
++        if np.any(cosine < cfg['normal_cosine_floor']): reasons.append('NORMAL_COSINE')
++        span_detail = {}
++        for name, ids in region_vids.items():
++            active = spans[name] > cfg['nonzero_span_epsilon_L'] * L
++            after = np.ptp(trial[ids].astype(np.float64), axis=0) if len(ids) else np.zeros(3)
++            if np.any(after[active] < cfg['region_span_ratio_floor'] * spans[name][active]):
++                reasons.append(name + '_AXIAL_SPAN')
++            span_detail[name] = dict(rest=spans[name].tolist(), trial=after.tolist(), active_axes=active.tolist())
++        row = dict(alpha=alpha, reasons=reasons, passed=not reasons,
++                   min_area_ratio=float((area / area0).min()), min_normal_cosine=float(cosine.min()),
++                   max_actual_displacement=float(motion.max()), region_spans=span_detail)
++        info['trials'].append(row)
++        if not reasons:
++            accepted = trial
++            info['accepted_alpha'] = alpha
++            break
++    if accepted is None:
++        accepted = rest.copy()
++        info.update(status='NO_FEASIBLE_STEP_EXACT_FALLBACK', fallback=True)
++    else:
++        info['status'] = 'ACCEPTED' if not _exact(accepted, rest) else 'ZERO_MOTION_EXACT_LOCKED_RAW'
++    out = {k: a.copy() for k, a in post.items()}
++    out.update(vertices=accepted, output=accepted[faces], C=accepted[faces[:int(post['known_faces'])]],
++               free=accepted[faces[int(post['known_faces']):]])
++    _motion_metadata(out, assembly['pre'], variable)
++    if not _exact(out['C'], post['C']) or not _exact(out['faces'], post['faces']):
++        raise AssertionError('C or indexed topology changed')
++    if not _exact(out['output'][~selected_faces], post['output'][~selected_faces]):
++        raise AssertionError('Far D0 geometry changed during fusion')
++    info['objective_after'] = _objective(accepted, rest, targets, variable, edges, cfg['regularization_lambda'])
++    info['maximum_actual_displacement'] = float(np.linalg.norm(accepted.astype(float) - rest, axis=1).max())
++    info['moved_vertices'] = int(np.any(accepted.view(np.uint32) != rest.view(np.uint32), axis=1).sum())
++    new_mapping = {k: a.copy() for k, a in mapping.items()}
++    new_mapping.update(unconstrained_vertices=unconstrained, capped_displacement=np.zeros(rest.shape, np.float64))
++    new_mapping['capped_displacement'][v_ids] = displacement
++    return dict(post=out, pre=assembly['pre'].copy(), mappings=new_mapping,
++                summary={**assembly['summary'], 'solver': info,
++                         'hard_lock_scope': 'Fusion BASE only; unchanged downstream HINGE/ALPHA/HOLE separately audited'})
++
++
++def build_from_job(job):
++    bundle_spec = job['input_bundle']
++    path = _path(bundle_spec['path'])
++    if hashlib.sha256(path.read_bytes()).hexdigest() != bundle_spec['sha256']:
++        raise ValueError('Frozen input bundle hash differs')
++    bundle = _arrays(path)
++    raw_meta = _arrays(job['paths']['raw'])
++    if not _exact(raw_meta['raw'], bundle['raw']):
++        raise ValueError('Canonical RAW identity differs')
++    refs = job['references']
++    result = assemble(_arrays(refs['D0_ALL']['base']), _arrays(refs['RAW_ALL']['base']),
++                      bundle['raw'], bundle['d0_pre'], bundle['support_face_mask'],
++                      {name: bundle['region_' + name] for name in ('P1', 'P2')}, raw_meta)
++    label = job['label']
++    if label == 'LOCAL_SHAPE':
++        result = fit(result, job['operator_config'])
++    elif label == 'LOCKED_RAW':
++        result['summary']['solver'] = dict(status='CONTROL_NO_FIT', calls_sparse_solve=0, parameter_retries=0)
++    else:
++        raise ValueError('Unknown arm: ' + label)
++    result['summary'].update(label=label, request_id=job['request']['request_id'],
++                             no_detector_or_score_calls=True, new_GEO_calls=0, model_calls=0)
++    return result
+--- /dev/null
++++ b/r2/pilots/bench_local_shape_mix_v1/operator_tests.py
+@@ -0,0 +1,210 @@
++"""CPU synthetic contract tests only; no real requests, GEO or scoring."""
++from __future__ import annotations
++
++import argparse
++import copy
++import hashlib
++import json
++from pathlib import Path
++import sys
++import unittest
++
++import numpy as np
++
++from . import operator as O
++
++
++def fixture():
++    v = np.asarray([[0, 0, 0], [1, 0, 0], [0, 1, 0],
++                    [0, 0, -1], [1, 0, -1], [0, 1, -1],
++                    [2, 0, 0], [3, 0, 0], [2, 1, 0]], np.float32)
++    canonical = np.asarray([[0, 1, 2], [1, 0, 3], [1, 3, 4],
++                            [4, 3, 5], [6, 7, 8], [2, 3, 5]], np.int64)
++    raw = v[canonical]
++    N, K = len(raw), 1
++    d0pre = raw.copy()
++    rsc = np.tile(np.arange(3), (N, 1)); rsc[0] = [0, 2, 1]
++    dsc = rsc.copy(); dsc[1] = [1, 2, 0]; dsc[2] = [2, 0, 1]
++    def mesh(sc, slots):
++        sf = np.asarray(slots, np.int64)
++        faces = canonical[sf[:, None], sc[sf]]
++        return dict(vertices=v.copy(), faces=faces, output=v[faces], C=v[faces[:K]],
++                    known_faces=np.asarray(K), input_faces=np.asarray(N),
++                    source_face_ids=sf, source_corner_ids=sc[sf])
++    d0, rawbase = mesh(dsc, range(N)), mesh(rsc, range(N - 1))
++    selected = np.asarray([0, 1, 1, 0, 1, 1], bool)
++    regions = dict(P1=np.asarray([0, 1, 1, 0, 0, 1], bool),
++                   P2=np.asarray([0, 0, 0, 0, 1, 0], bool))
++    anchors = np.full((N, 3), -1, np.int64); anchors[0] = np.arange(3)
++    meta = dict(raw_anchor_ids=anchors, raw_seam_slot_mask=np.zeros(N, bool))
++    return d0, rawbase, raw, d0pre, selected, regions, meta
++
++
++class OperatorTests(unittest.TestCase):
++    def assembly(self):
++        return O.assemble(*fixture())
++
++    def test_c_and_external_byte_identity_and_namespace_split(self):
++        args = fixture(); a = O.assemble(*args); p, m = a['post'], a['mappings']
++        self.assertTrue(O._exact(p['C'], args[0]['C']))
++        row = np.flatnonzero(p['source_face_ids'] == 3)[0]
++        self.assertTrue(O._exact(p['output'][row], args[0]['output'][3]))
++        self.assertNotEqual(m['d0_vertex_to_composite'][3], m['raw_vertex_to_composite'][3])
++        self.assertTrue(O._exact(p['vertices'][m['d0_vertex_to_composite'][3]],
++                                p['vertices'][m['raw_vertex_to_composite'][3]]))
++        for old in (0, 1, 2):
++            self.assertEqual(m['d0_vertex_to_composite'][old], m['raw_vertex_to_composite'][old])
++
++    def test_retained_face_set_no_synthetic_revival(self):
++        a = self.assembly(); p = a['post']
++        self.assertEqual(p['source_face_ids'].tolist(), [0, 1, 2, 3, 4])
++        self.assertEqual(p['source_face_reason'][5], 'ABSENT_RAW_BASE')
++        self.assertEqual(a['summary']['selected_absent_slots'], [5])
++        self.assertEqual(len(set(p['raw_slot_ids'].tolist())), len(p['faces']))
++
++    def test_canonical_corner_maps_and_member_coverage(self):
++        a = self.assembly(); p = a['post']; sf, sc = p['source_face_ids'], p['source_corner_ids']
++        np.testing.assert_array_equal(p['corner_vertex_ids'][sf[:, None], sc], p['faces'])
++        self.assertEqual(set(p['corner_vertex_ids'][p['corner_vertex_ids'] >= 0]), set(range(len(p['vertices']))))
++        for i, member in enumerate(p['vertex_source_input_corner_ids']):
++            self.assertEqual(p['corner_vertex_ids'].ravel()[member], i)
++        self.assertTrue((p['corner_vertex_ids'][5] == -1).all())
++        self.assertEqual(p['source_corner_ids'][3].tolist(), fixture()[0]['source_corner_ids'][3].tolist())
++
++    def test_targets_are_member_means_in_original_corner_domain(self):
++        args = list(fixture())
++        args[3][1, 2] += np.asarray([.02, .03, .01], np.float32)
++        args[3][2, 1] += np.asarray([.06, .01, .03], np.float32)
++        a = O.assemble(*args); i = int(a['mappings']['raw_vertex_to_composite'][3])
++        expected = args[3][[1, 2], [2, 1]].astype(float).mean(axis=0)
++        np.testing.assert_array_equal(a['mappings']['d0_target_vertices'][i], expected)
++        self.assertTrue(O._exact(a['pre'][args[4]], args[2][args[4]]))
++        self.assertTrue(O._exact(a['pre'][~args[4]], args[3][~args[4]]))
++
++    def test_source_C_identity_error_is_not_coordinate_welded_away(self):
++        args = list(fixture()); d = copy.deepcopy(args[0]); rb = copy.deepcopy(args[1])
++        # Add a second C face sharing an existing known vertex, then split that
++        # identity in only one source without changing its rendered coordinates.
++        for mesh in (d, rb):
++            mesh['known_faces'] = np.asarray(2)
++        # Fixture slot1 is now known and canonical pre/raw remain identical.
++        # Existing different corner order at C slot1 is itself a valid refusal.
++        args[0], args[1] = d, rb
++        args[4][1] = False; args[5]['P1'][1] = False
++        with self.assertRaises(ValueError):
++            O.assemble(*args)
++
++    def test_identity_fit_is_exact_and_topology_is_shared(self):
++        a = self.assembly(); result = O.fit(a); s = result['summary']['solver']
++        self.assertEqual(s['calls_sparse_solve'], 1)
++        self.assertEqual(s['objective_after']['total'], 0.)
++        self.assertTrue(O._exact(result['post']['vertices'], a['post']['vertices']))
++        self.assertTrue(O._exact(result['post']['faces'], a['post']['faces']))
++        self.assertTrue(O._exact(result['pre'], a['pre']))
++
++    def test_unconstrained_solution_satisfies_independent_dense_equations(self):
++        a = self.assembly(); m = a['mappings']; variable = m['variable_vertex_mask']
++        m['d0_target_vertices'][variable] += [.002, -.001, .003]
++        result = O.fit(a); s = result['summary']['solver']
++        self.assertEqual(s['calls_sparse_solve'], 1)
++        self.assertLess(s['linear_residual_max_abs'], 1e-13)
++        ids = np.flatnonzero(variable); lookup = {int(v): i for i, v in enumerate(ids)}
++        edges = set()
++        for face in a['post']['faces'][m['selected_output_face_mask']]:
++            for k in range(3): edges.add(tuple(sorted((int(face[k]), int(face[(k + 1) % 3])))))
++        matrix = np.eye(len(ids)) / len(ids)
++        for u, v in edges:
++            vec = np.zeros(len(ids))
++            if u in lookup: vec[lookup[u]] = 1.
++            if v in lookup: vec[lookup[v]] = -1.
++            matrix += np.outer(vec, vec) / len(edges)
++        rhs = (m['d0_target_vertices'][ids] - a['post']['vertices'][ids]) / len(ids)
++        expected = np.linalg.solve(matrix, rhs)
++        actual = result['mappings']['unconstrained_vertices'][ids] - a['post']['vertices'][ids]
++        np.testing.assert_allclose(actual, expected, atol=1e-14, rtol=1e-12)
++        self.assertTrue(O._exact(result['post']['vertices'][~variable], a['post']['vertices'][~variable]))
++
++    def test_per_vertex_cap_not_uniform_solution_scaling(self):
++        a = self.assembly(); m = a['mappings']; ids = np.flatnonzero(m['variable_vertex_mask'])
++        m['d0_target_vertices'][ids] += np.arange(1, len(ids) + 1)[:, None] * np.asarray([2., -1., .5])
++        result = O.fit(a); disp = result['mappings']['capped_displacement'][ids]
++        lengths = np.linalg.norm(disp, axis=1)
++        self.assertTrue(np.all(lengths <= 2 * O.R + 1e-16))
++        unconstrained = result['mappings']['unconstrained_vertices'][ids] - a['post']['vertices'][ids]
++        ratio = lengths / np.linalg.norm(unconstrained, axis=1)
++        self.assertGreater(np.ptp(ratio), 1e-4)
++        self.assertTrue(result['summary']['solver']['trials'][-1]['passed'])
++        self.assertLessEqual(result['summary']['solver']['maximum_actual_displacement'], 2 * O.R)
++
++    def test_backtracking_records_constraints_on_fp32_delivery(self):
++        a = self.assembly(); m = a['mappings']; ids = np.flatnonzero(m['variable_vertex_mask'])
++        # Small rest triangles make full capped compression infeasible; later
++        # shared alpha must retain their actual minimum area and axis spans.
++        selected = m['selected_output_face_mask']; local = a['post']['faces'][selected]
++        variable = m['variable_vertex_mask']
++        a['post']['vertices'][variable] *= np.float32(.05)
++        a['post']['output'] = a['post']['vertices'][a['post']['faces']]
++        a['post']['C'] = a['post']['output'][:1]; a['post']['free'] = a['post']['output'][1:]
++        m['rest_vertices'] = a['post']['vertices'].copy()
++        m['d0_target_vertices'][ids] = 0.
++        result = O.fit(a); s = result['summary']['solver']
++        self.assertGreater(len(s['trials']), 1)
++        self.assertTrue(any('AREA_RATIO' in r['reasons'] or any('AXIAL_SPAN' in x for x in r['reasons']) for r in s['trials']))
++        if not s['fallback']:
++            final = s['trials'][-1]
++            self.assertGreaterEqual(final['min_area_ratio'], .8)
++            self.assertGreaterEqual(final['min_normal_cosine'], .5)
++            self.assertTrue(final['passed'])
++        self.assertLessEqual(len(s['trials']), 11)
++
++    def test_invalid_rest_exact_fallback_not_deletion(self):
++        a = self.assembly(); m = a['mappings']; face = a['post']['faces'][np.flatnonzero(m['selected_output_face_mask'])[-1]]
++        a['post']['vertices'][face[1]] = a['post']['vertices'][face[0]]
++        a['post']['output'] = a['post']['vertices'][a['post']['faces']]
++        a['post']['C'] = a['post']['output'][:1]; a['post']['free'] = a['post']['output'][1:]
++        result = O.fit(a)
++        self.assertTrue(result['summary']['solver']['fallback'])
++        self.assertEqual(result['summary']['solver']['calls_sparse_solve'], 0)
++        self.assertTrue(O._exact(result['post']['output'], a['post']['output']))
++        self.assertTrue(O._exact(result['post']['faces'], a['post']['faces']))
++
++    def test_no_variable_closed_rest_is_noop(self):
++        a = self.assembly(); a['mappings']['variable_vertex_mask'][:] = False
++        result = O.fit(a)
++        self.assertEqual(result['summary']['solver']['calls_sparse_solve'], 0)
++        self.assertTrue(O._exact(result['post']['vertices'], a['post']['vertices']))
++
++    def test_scoring_metadata_validate_only_no_scoring(self):
++        # validate() performs array/provenance assertions only. It does not
++        # invoke score(), scan(), query construction or geometry processing.
++        from r2.tools.hinge_v2_cpu_v1.scoring import validate
++        a = self.assembly(); p = a['post']
++        checked = validate(p, dict(K=1, N=6))
++        self.assertEqual(len(checked[0]['faces']), 5)
++        self.assertFalse(checked[0]['bridge_mask'].any())
++        self.assertEqual(checked[0]['face_role'].tolist(), ['C', 'BULK', 'BULK', 'BULK', 'BULK'])
++
++    def test_no_radius_or_score_tuning_permitted(self):
++        cfg = dict(O.CONFIG); cfg['maximum_displacement_R'] = 3.
++        with self.assertRaises(ValueError): O.fit(self.assembly(), cfg)
++        self.assertNotIn('torch', sys.modules)
++
++
++def main():
++    p = argparse.ArgumentParser(); p.add_argument('--receipt')
++    args = p.parse_args()
++    suite = unittest.defaultTestLoader.loadTestsFromTestCase(OperatorTests)
++    result = unittest.TextTestRunner(verbosity=2).run(suite)
++    record = dict(status='PASS' if result.wasSuccessful() else 'FAIL', tests=result.testsRun,
++                  failures=len(result.failures), errors=len(result.errors), synthetic_only=True,
++                  real_request_operator_calls=0, model_calls=0, GEO_calls=0, detector_calls=0, score_calls=0,
++                  source_sha256={str(path): hashlib.sha256(path.read_bytes()).hexdigest()
++                                 for path in (Path(O.__file__), Path(__file__))})
++    if args.receipt:
++        target = O._path(args.receipt); target.parent.mkdir(parents=True, exist_ok=True)
++        with target.open('x', encoding='utf-8') as f:
++            json.dump(record, f, indent=2); f.write('\n')
++    if not result.wasSuccessful(): raise SystemExit(1)
++
++
++if __name__ == '__main__': main()
+--- /dev/null
++++ b/r2/pilots/bench_local_shape_mix_v1/prepare.py
+@@ -0,0 +1,283 @@
++"""Freeze existing six-request inputs for LOCKED_RAW / LOCAL_SHAPE.
++
++Preparation only: no fusion solver, GEO, pair detector, scorer, rendering,
++neural framework or RNG. Historical modules and output globals are untouched.
++Run only after root has frozen protocol.json.
++"""
++from __future__ import annotations
++import argparse
++import csv
++import hashlib
++import json
++import os
++from pathlib import Path
++import subprocess
++import sys
++from datetime import datetime, timezone
++
++import numpy as np
++
++ROOT = Path(__file__).resolve().parents[3]
++CODE = Path(__file__).resolve().parent
++OUT = ROOT / 'experiments/r2_bench_local_shape_mix_v1'
++OLD = ROOT / 'experiments/r2_bench_regional_mix_dual_v1'
++RAW_GEO = ROOT / 'experiments/r2_bench_four_routes_v1/hybrid'
++LABELS = ('LOCKED_RAW', 'LOCAL_SHAPE')
++PARENTS = {'a8e987a6a6486b962d6c8e51365a5a87', '27eb79ddf26fd7ac7898580cb9d16864',
++           '459f90aa2162b1f1d46c340938e2ff1c'}
++
++
++def resolve(path):
++    path = str(path)
++    if os.name == 'nt' and path.startswith('/mnt/e/'):
++        return Path('E:/' + path[len('/mnt/e/'):])
++    if os.name != 'nt' and path.lower().startswith('e:/'):
++        return Path('/mnt/e/' + path[3:])
++    p = Path(path)
++    return p if p.is_absolute() else ROOT / p
++
++
++def read(path):
++    return json.loads(resolve(path).read_text(encoding='utf-8-sig'))
++
++
++def sha(path):
++    return hashlib.sha256(resolve(path).read_bytes()).hexdigest()
++
++
++def arrays(path):
++    with np.load(resolve(path), allow_pickle=False) as z:
++        return {k: z[k] for k in z.files}
++
++
++def verify(book):
++    for p, expected in book.items():
++        if sha(p) != expected:
++            raise ValueError('Protected file identity differs: ' + str(p))
++
++
++def write_new(path, obj):
++    path = resolve(path)
++    payload = (json.dumps(obj, ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False) + '\n').encode('utf-8')
++    if path.exists():
++        if path.read_bytes() != payload:
++            raise RuntimeError('Immutable preparation output differs: ' + str(path))
++        return
++    path.parent.mkdir(parents=True, exist_ok=True)
++    with path.open('xb') as f:
++        f.write(payload)
++
++
++def immutable_arrays(path, values):
++    path = resolve(path)
++    if path.exists():
++        previous = arrays(path)
++        if set(previous) != set(values):
++            raise RuntimeError('Existing bundle fields differ')
++        for key, value in values.items():
++            if previous[key].dtype != value.dtype or previous[key].shape != value.shape or previous[key].tobytes() != value.tobytes():
++                raise RuntimeError('Existing bundle data differs: ' + key)
++        return
++    path.parent.mkdir(parents=True, exist_ok=True)
++    with path.open('xb') as f:
++        np.savez_compressed(f, **values)
++
++
++def resource_snapshot():
++    import psutil
++    snapshot = dict(utc=datetime.now(timezone.utc).isoformat(), cpu_logical=os.cpu_count(),
++                    cpu_percent=psutil.cpu_percent(interval=.1), RAM_available_bytes=psutil.virtual_memory().available,
++                    threads={k: os.environ.get(k) for k in ('OMP_NUM_THREADS', 'MKL_NUM_THREADS', 'OPENBLAS_NUM_THREADS')})
++    for name, command in [('gpu', ['nvidia-smi', '--query-gpu=name,memory.total,memory.used,memory.free,utilization.gpu', '--format=csv,noheader']),
++                          ('gpu_processes', ['nvidia-smi', '--query-compute-apps=pid,process_name,used_memory', '--format=csv,noheader'])]:
++        result = subprocess.run(command, capture_output=True, text=True, check=False)
++        snapshot[name] = dict(returncode=result.returncode, stdout=result.stdout, stderr=result.stderr)
++    return snapshot
++
++
++def run(protocol_path=None):
++    protocol_path = resolve(protocol_path or OUT / 'protocol.json')
++    protocol = read(protocol_path)
++    if protocol.get('status') != 'FROZEN':
++        raise ValueError('Root must freeze protocol.json before preparation')
++    if tuple(protocol.get('arms', protocol.get('labels', LABELS))) != LABELS:
++        raise ValueError('Only the two authorized fixed labels are allowed')
++    config = protocol.get('operator_config')
++    if not isinstance(config, dict):
++        raise ValueError('Frozen protocol must contain operator_config')
++    operator_paths = protocol.get('operator_source_paths', [str(CODE / 'operator.py')])
++    operator_paths = [resolve(p) for p in operator_paths]
++    if not all(p.is_file() and p.is_relative_to(CODE) for p in operator_paths):
++        raise ValueError('Operator sources must already exist in the independent new code directory')
++    target = OUT / 'jobs.json'
++    if target.exists():
++        registered = read(target)
++        verify(registered['protected'])
++        verify(registered['source_hashes'])
++        if registered['protocol_sha256'] != sha(protocol_path):
++            raise ValueError('Completed preparation uses a different protocol')
++        return registered
++
++    OUT.mkdir(parents=True, exist_ok=True)
++    (OUT / 'data').mkdir(exist_ok=True)
++    write_new(OUT / 'data/resources_before.json', resource_snapshot())
++    previous_path, panel_path = OLD / 'jobs.json', OLD / 'panel/manifest.json'
++    previous, panel = read(previous_path), read(panel_path)
++    if previous['status'] != 'FROZEN' or panel['status'] != 'FROZEN':
++        raise ValueError('Historical reference registration is not frozen')
++    verify(previous['protected'])
++    verify(previous['source_hashes'])
++    if len(panel['requests']) != 6 or {r['request']['parent_id'] for r in panel['requests']} != PARENTS:
++        raise ValueError('The fixed three-parent six-request panel differs')
++    if len(previous['metric_fields']) != 177 or len(set(previous['metric_fields'])) != 177:
++        raise ValueError('Full original177 metric set is required')
++    oldjobs = {(j['request']['request_id'], j['label']): j for j in previous['jobs']}
++    protected = dict(previous['protected'])
++    for path in (previous_path, panel_path, protocol_path):
++        protected[str(path)] = sha(path)
++    jobs, references, data_rows = [], [], []
++    for index, item in enumerate(panel['requests']):
++        rid, q = item['request_id'], item['request']
++        oldjob = oldjobs[(rid, 'ASSIST11')]
++        if q != oldjob['request']:
++            raise ValueError('Historical query/camera/condition identity changed')
++        paths = oldjob['paths']
++        rawdata, predata = arrays(paths['raw']), arrays(paths['pre'])
++        raw, pre = rawdata['raw'], predata['output']
++        N, K = int(q['N']), int(q['K'])
++        if raw.dtype != np.float32 or pre.dtype != np.float32 or raw.shape != (N, 3, 3) or pre.shape != raw.shape:
++            raise ValueError('Canonical RAW/D0 domain differs')
++        if not np.isfinite(raw).all() or not np.isfinite(pre).all() or raw[:K].tobytes() != pre[:K].tobytes():
++            raise ValueError('Nonfinite input or canonical C mismatch')
++        if rawdata['raw_seam_slot_mask'].any() or (rawdata['raw_anchor_ids'][K:] >= 0).any():
++            raise ValueError('This fixed panel is Native only')
++        masks = {}
++        region_ids = np.zeros(N, np.int64)
++        for region in item['regions']:
++            key = region['region_id']
++            if key not in ('P1', 'P2') or key in masks:
++                raise ValueError('Expected exactly the original two regions')
++            ids = np.asarray(region['source_face_ids'], np.int64)
++            if not len(ids) or len(set(ids.tolist())) != len(ids) or np.any(ids < K) or np.any(ids >= N):
++                raise ValueError('Invalid original region slot identity')
++            mask = np.zeros(N, bool)
++            mask[ids] = True
++            masks[key] = mask
++            if np.any(region_ids[ids] != 0):
++                raise ValueError('Original regions overlap')
++            region_ids[ids] = int(key[1])
++        if set(masks) != {'P1', 'P2'}:
++            raise ValueError('Both original regions are required')
++        union = masks['P1'] | masks['P2']
++        original_proposal = resolve(oldjob['proposal']['path'])
++        verify({str(original_proposal): oldjob['proposal']['sha256']})
++        if not np.array_equal(arrays(original_proposal)['selected_RAW'], union):
++            raise ValueError('Frozen ASSIST11 mask differs from P1 union P2')
++        mapping_path = RAW_GEO / 'outputs' / rid / 'selection.npz'
++        mapping_receipt_path = mapping_path.with_name('complete.json')
++        mapping_receipt = read(mapping_receipt_path)
++        if mapping_receipt['status'] != 'COMPLETE':
++            raise ValueError('Original RAW-GEO producer is incomplete')
++        verify(mapping_receipt['files'])
++        mapping = arrays(mapping_path)
++        if mapping['raw'].tobytes() != raw.tobytes() or mapping['d0_pre'].tobytes() != pre.tobytes():
++            raise ValueError('RAW-GEO map belongs to different coordinate arrays')
++        if mapping['cluster_ids'].shape != (N, 3):
++            raise ValueError('Original RAW-GEO cluster map has wrong domain')
++        bundle = OUT / 'data' / rid / 'input.npz'
++        values = dict(raw=raw, d0_pre=pre, known_faces=np.asarray(K, np.int64),
++                      N=np.asarray(N, np.int64), raw_slot_ids=np.arange(N, dtype=np.int64),
++                      source_corner_ids=np.tile(np.arange(3, dtype=np.int64), (N, 1)),
++                      region_P1=masks['P1'], region_P2=masks['P2'], support_face_mask=union,
++                      assisted_region_ids=region_ids,
++                      raw_cluster_ids=mapping['cluster_ids'],
++                      raw_corner_target_input_ids=mapping['raw_corner_target_input_ids'],
++                      raw_corner_vertex_ids=mapping['raw_corner_vertex_ids'])
++        immutable_arrays(bundle, values)
++        for path in (bundle, mapping_path, mapping_receipt_path, original_proposal):
++            protected[str(path)] = sha(path)
++        ref = {}
++        for label in ('ASSIST11', 'RAW_ALL'):
++            rjob = oldjobs[(rid, label)]
++            receipt_path = OLD / 'runs' / rjob['job_id'] / 'complete.json'
++            receipt = read(receipt_path)
++            if receipt['status'] != 'COMPLETE' or receipt['registration_sha256'] != sha(previous_path):
++                raise ValueError('Reference candidate producer differs')
++            verify(receipt['files'])
++            protected[str(receipt_path)] = sha(receipt_path)
++            protected.update(receipt['files'])
++            ref[label] = dict(complete_path=str(receipt_path), complete_sha256=sha(receipt_path),
++                              artifacts=receipt['artifacts'], original_label=label)
++        d0_complete = resolve(paths['original_final']).parent.parent / 'complete.json'
++        d0 = read(d0_complete)
++        if d0['status'] != 'COMPLETE':
++            raise ValueError('Original D0 chain is incomplete')
++        verify(d0['files'])
++        protected[str(d0_complete)] = sha(d0_complete)
++        protected.update(d0['files'])
++        ref['D0_ALL'] = dict(complete_path=str(d0_complete), complete_sha256=sha(d0_complete), original_label='M',
++                            artifacts=dict(base=paths['original_base'], pre=paths['pre'], pairs=paths['original_base_pairs'],
++                                           final=paths['original_final'], final_pairs=paths['original_final_pairs'],
++                                           metric_rows=str(d0_complete.with_name('metric_rows.json')),
++                                           cpu_complete=str(d0_complete)))
++        artifacts_by_label = {label: reference['artifacts'] for label, reference in ref.items()}
++        entry = dict(request_id=rid, request=q, paths=paths, regions=item['regions'],
++                     input_bundle=dict(path=str(bundle), sha256=sha(bundle)), reference_receipts=ref,
++                     references=artifacts_by_label, artifacts_by_label=artifacts_by_label,
++                     raw_GEO_mapping=dict(path=str(mapping_path), sha256=sha(mapping_path),
++                                          identity='Original RAW-GEO pre-cleanup corner coordinate classes; not updated final topology'))
++        references.append(entry)
++        data_rows.append(dict(request_id=rid, parent_id=q['parent_id'], noise_index=q['noise_index'], N=N, K=K,
++                              P1_faces=int(masks['P1'].sum()), P2_faces=int(masks['P2'].sum()),
++                              support_faces=int(union.sum()), input_bundle=str(bundle), input_sha256=sha(bundle)))
++        for label in LABELS:
++            jid = f'J{index:02d}_{label}'
++            jobs.append(dict(job_id=jid, label=label, **entry, operator_config=config,
++                             output_dir=str(OUT / 'runs' / jid), proposal_status='NOT_EXECUTED'))
++
++    sources = dict(previous['source_hashes'])
++    for path in sorted(CODE.glob('*.py')):
++        sources[str(path)] = sha(path)
++    for path in operator_paths:
++        sources[str(path)] = sha(path)
++    registration = dict(status='FROZEN', schema='bench_local_shape_mix_v1', utc=datetime.now(timezone.utc).isoformat(),
++                        jobs=jobs, references=references, metric_fields=previous['metric_fields'],
++                        panel_sha256=sha(panel_path), previous_registration_sha256=sha(previous_path),
++                        protocol_path=str(protocol_path), protocol_sha256=sha(protocol_path),
++                        operator_config=config,
++                        protected=protected, source_hashes=sources, L=previous['L'], R=previous['R'],
++                        budget=dict(logical_jobs=12, maximum_new_proposals=12, maximum_new_GEO_calls=0,
++                                    maximum_indexed_assemblies=12, maximum_local_fits=6,
++                                    maximum_full_cascades=12, maximum_new_score_rows=24,
++                                    reference_outputs=18, reference_stage_rows=36,
++                                    model_calls=0, D0_calls=0, training_updates=0, new_noise=0, new_queries=0),
++                        stages=['BASE_POST', 'CLEAN_FINAL_POST'], labels=list(LABELS),
++                        reference_labels=['D0_ALL', 'ASSIST11', 'RAW_ALL'],
++                        scheduling=dict(maximum_workers=2, threads_per_worker=1, incremental_resource_measurement=True),
++                        input_contract='Generated RAW canonical original slots/corners; unchanged C/P1/P2/request/query/camera. No Y targets or semantic success GT.',
++                        preparation_only=True, scientific_execution_started=False)
++    if len(jobs) != 12 or len({j['request']['request_id'] for j in jobs}) != 6:
++        raise AssertionError('Fixed budget differs')
++    verify(protected)
++    verify(sources)
++    if 'torch' in sys.modules:
++        raise AssertionError('Preparation imported a neural framework')
++    write_new(OUT / 'data/manifest.json', dict(status='READY', requests=data_rows,
++                                            original_panel_sha256=sha(panel_path), labels=list(LABELS),
++                                            schema=list(values), scientific_calls=0))
++    write_new(target, registration)
++    write_new(OUT / 'data/COMPLETE.json', dict(status='PASS', requests=6, jobs=12,
++              input_arrays_preserved=True, masks_equal_original_ASSIST11=True, canonical_corner_identity=True,
++              original_query_camera_source_hashes_verified=True, original_fields=177,
++              registration_sha256=sha(target), manifest_sha256=sha(OUT / 'data/manifest.json'),
++              source_code_sha256=sha(__file__), model_calls=0, GEO_calls=0, detector_calls=0,
++              scoring_calls=0, operator_calls=0, generated_outputs=0))
++    return registration
++
++
++if __name__ == '__main__':
++    parser = argparse.ArgumentParser()
++    parser.add_argument('--protocol', default=str(OUT / 'protocol.json'))
++    args = parser.parse_args()
++    value = run(args.protocol)
++    print(json.dumps(dict(status=value['status'], jobs=len(value['jobs']), budget=value['budget']), indent=2))
+--- /dev/null
++++ b/r2/pilots/bench_local_shape_mix_v1/render.py
+@@ -0,0 +1,252 @@
++"""Twelve fixed five-column geometry pages; metadata always awaits actual viewing.
++
++No score reads, automatic ratings, model calls, reprocessing, or frame fitting.
++The root dispatches render-one jobs after the CPU producers are complete.
++"""
++from __future__ import annotations
++
++import argparse
++import concurrent.futures
++import io
++import json
++import multiprocessing
++import os
++import resource
++import subprocess
++import time
++from pathlib import Path
++
++from . import analysis as A
++import numpy as np
++
++OUT = A.OUT
++DEST = OUT / 'gallery'
++VERSION = 'local_shape_five_column_gallery_v1'
++MODELS = ('RAW', 'D0_ALL', 'ASSIST11', 'LOCKED_RAW', 'LOCAL_SHAPE')
++
++
++def render_one(request_index, stage, jobs=None):
++    if stage not in A.STAGES or not 0 <= request_index < 6:
++        raise ValueError('Only six registered requests times two stages')
++    context = A.load_context(jobs)
++    ref = context['reg']['references'][request_index]
++    q, rid = ref['request'], ref['request_id']
++    key = 'base' if stage == 'BASE_POST' else 'final'
++    cells = [dict(model='RAW', runtime_model='RAW', stage='RAW', path=ref['paths']['raw'])]
++    for label in MODELS[1:]:
++        cells.append(dict(model=label, runtime_model='M_D0' if label == 'D0_ALL' else label,
++                          stage=stage, path=context['artifacts'][label, rid][key]))
++    page_id = f'R{request_index:02d}_{stage}'
++    definition = dict(version=VERSION, page_id=page_id, request_index=request_index, request=q,
++                      stage=stage, cells=cells, registration_sha256=context['registration_sha256'],
++                      views=[dict(azimuth=-60, elevation=23), dict(azimuth=120, elevation=23)],
++                      sections='Original front/side position index1; no frame refitting',
++                      renderer_sha256=A.sha(__file__), helper_sha256=A.sha(A.__file__))
++    digest = A.canonical_hash(definition)
++    image, receipt_path = DEST / (page_id + '.png'), DEST / (page_id + '.json')
++    if receipt_path.exists():
++        receipt = A.read(receipt_path)
++        if receipt['definition_sha256'] != digest or A.sha(image) != receipt['image_sha256']:
++            raise ValueError('Existing render identity differs')
++        A.verify(receipt['source_meshes'])
++        return receipt
++    if image.exists():
++        raise RuntimeError('Unsealed prior image retained; no silent rerender')
++    from r2.pilots.chair_multipart_seam_v1 import gallery as G
++    A.assert_cpu()
++    D, H = G.D, G.H
++    plt = H._mpl()
++    start = time.perf_counter()
++    DEST.mkdir(parents=True, exist_ok=True)
++    k, length = int(q['K']), float(context['reg']['L'])
++    inp = A.arrays(q['inference_npz'])
++    original = inp['C_vertices'][inp['C_faces_original']]
++    bounds, depth = q['gallery_bounds'], q['gallery_depth_bounds']
++    sources = {str(A.resolve(q['inference_npz'])): A.sha(q['inference_npz'])}
++    display = []
++    fig = plt.figure(figsize=(26.5, 13.5), dpi=110, facecolor='white')
++    grid = fig.add_gridspec(4, 5, left=.02, right=.99, bottom=.045, top=.92, wspace=.15, hspace=.23)
++    try:
++        for col, cell in enumerate(cells):
++            tri, role = G.roles(A.arrays(cell['path']), k)
++            sources[str(A.resolve(cell['path']))] = A.sha(cell['path'])
++            geometry = dict(C=tri[:k], F=tri[k:], C_original=original, tri=tri)
++            facts = dict(model=cell['model'], runtime_model=cell['runtime_model'], stage=cell['stage'],
++                         role_counts={r: int((role == r).sum()) for r in ('C', 'SEAM', 'BULK', 'BRIDGE')}, views=[], sections=[])
++            for row, azimuth in enumerate((-60, 120)):
++                raster, scope = G.role_raster(tri, role, k, D.basis(azimuth, 23), np.asarray(depth['center']), depth['span'])
++                ax = fig.add_subplot(grid[row, col])
++                ax.imshow(raster); ax.set_axis_off()
++                ax.set_title(f'{cell["model"]} {cell["stage"]} | {azimuth}', fontsize=9)
++                if scope['projected_vertices_outside_inherited_frame']:
++                    ax.text(.01, .01, 'Inherited-frame clipping', transform=ax.transAxes, fontsize=7, color='#b34b27')
++                facts['views'].append(dict(azimuth=azimuth, elevation=23, **scope))
++            for row, view in ((2, 'front'), (3, 'side')):
++                ax = fig.add_subplot(grid[row, col])
++                H.draw_section(ax, geometry, np.flatnonzero(role[k:] == 'SEAM'), bounds, length, view, 1)
++                from matplotlib.collections import LineCollection
++                axis, project = (2, (0, 1)) if view == 'front' else (0, (2, 1))
++                position = bounds['front_positions' if view == 'front' else 'side_positions'][1]
++                segments, ids = H.finite_sections(geometry['F'], axis, position, 1e-12 * length)
++                bridge_mask = role[k:][ids] == 'BRIDGE'
++                if bridge_mask.any():
++                    ax.add_collection(LineCollection(segments[bridge_mask][:, :, project], colors='#41a46c', linewidths=1.6, zorder=3))
++                ax.set_title(f'{cell["model"]} | {view}={position:.5f}', fontsize=8)
++                facts['sections'].append(dict(view=view, position=position, inherited_index=1))
++            display.append(facts)
++        fig.suptitle(f'{rid} | {page_id} | N={q["N"]} K={k}\nOriginal RAW / original D0 chain / prior ASSIST11 / fixed assembly RAW / local shape fit; blue C, gray free, green bridge', fontsize=10)
++        fig.text(.5, .012, 'Nonblind AI_PROXY review is separate and pending. Fixed sections do not certify cracks. No unique-source style ranking.', ha='center', fontsize=8)
++        buffer = io.BytesIO()
++        fig.savefig(buffer, format='png', dpi=110)
++        with image.open('xb') as f:
++            f.write(buffer.getvalue())
++    finally:
++        plt.close(fig)
++    A.assert_cpu(); A.verify(sources)
++    result = dict(status='PENDING_ACTUAL_VIEW', version=VERSION, utc=A.utc(), page_id=page_id,
++                  request_index=request_index, request_id=rid, parent_id=q['parent_id'], noise_index=q['noise_index'],
++                  stage=stage, definition_sha256=digest, registration_sha256=context['registration_sha256'],
++                  image_path=str(image), image_sha256=A.sha(image), cells=cells, source_meshes=sources, display=display,
++                  renderer_sha256=A.sha(__file__), seconds=time.perf_counter()-start,
++                  peak_RSS_KiB=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
++                  peak_scope='Process lifetime CPU RSS high-water mark; includes imports and hash checking',
++                  actually_viewed=False, model_calls=0, scoring_calls=0, ratings_generated=0)
++    A.write(receipt_path, result)
++    return result
++
++
++def collect(jobs=None):
++    """Seal twelve existing render receipts without rendering or claiming review."""
++    context = A.load_context(jobs)
++    if (DEST / 'COMPLETE.json').exists():
++        done = A.read(DEST / 'COMPLETE.json')
++        if done['registration_sha256'] != context['registration_sha256']:
++            raise ValueError('Gallery registration changed')
++        A.verify(done['files'])
++        return done
++    pages, files = [], {}
++    for index, ref in enumerate(context['reg']['references']):
++        for stage in A.STAGES:
++            page_id = f'R{index:02d}_{stage}'
++            path = DEST / (page_id + '.json')
++            receipt = A.read(path)
++            if receipt['request_id'] != ref['request_id'] or receipt['stage'] != stage or receipt['registration_sha256'] != context['registration_sha256']:
++                raise ValueError('Render receipt identity differs')
++            if [c['model'] for c in receipt['cells']] != list(MODELS):
++                raise ValueError('Frozen five-column order differs')
++            A.verify(receipt['source_meshes'])
++            image = A.resolve(receipt['image_path'])
++            if A.sha(image) != receipt['image_sha256']:
++                raise ValueError('Rendered image changed')
++            files[str(path)], files[str(image)] = A.sha(path), receipt['image_sha256']
++            pages.append(dict(page_id=page_id, request_id=ref['request_id'], stage=stage,
++                              receipt_path=str(path), image_path=str(image), image_sha256=receipt['image_sha256']))
++    html = '<!doctype html><meta charset="utf-8"><title>Local shape fixed comparison</title><h1>12 pages; actual review pending</h1>'
++    for page in pages:
++        html += '<p>' + page['page_id'] + '</p><a href="' + Path(page['image_path']).name + '"><img style="width:100%" src="' + Path(page['image_path']).name + '"></a>'
++    with (DEST / 'index.html').open('x', encoding='utf-8') as f:
++        f.write(html)
++    files[str(DEST / 'index.html')] = A.sha(DEST / 'index.html')
++    result = dict(status='COMPLETE', actual_review_status='PENDING_ACTUAL_VIEW', version=VERSION, utc=A.utc(),
++                  registration_sha256=context['registration_sha256'], pages=pages, rendered_pages=12, displayed_cells=60,
++                  unique_geometry_observations=54, repeated_RAW_cells=6, actual_viewed_pages=0, visual_labels_generated=0,
++                  unique_definition='6 original RAW + 4 processed models x 6 requests x 2 stages; RAW repeats across stages',
++                  model_calls=0, scoring_calls=0, files=files)
++    A.write(DEST / 'COMPLETE.json', result)
++    return result
++
++
++def resources():
++    import psutil
++    memory = psutil.virtual_memory()
++    result = dict(utc=A.utc(), cpu_cores=os.cpu_count(), cpu_percent=psutil.cpu_percent(interval=.1),
++                  ram_available_bytes=memory.available, ram_total_bytes=memory.total)
++    for key, cmd in [('gpu', ['nvidia-smi', '--query-gpu=name,memory.total,memory.used,memory.free,utilization.gpu', '--format=csv,noheader']),
++                     ('gpu_processes', ['nvidia-smi', '--query-compute-apps=pid,process_name,used_memory', '--format=csv,noheader'])]:
++        p = subprocess.run(cmd, capture_output=True, text=True, check=False)
++        result[key] = dict(returncode=p.returncode, stdout=p.stdout, stderr=p.stderr)
++    return result
++
++
++def run():
++    """Root-invoked bounded render dispatch: one measured page, then at most two."""
++    context = A.load_context()
++    if (DEST / 'COMPLETE.json').exists():
++        return collect()
++    plan_path = DEST / 'dispatch.json'
++    if plan_path.exists():
++        raise RuntimeError('A prior render dispatch exists; verify/reuse pages with render-one, no automatic replay')
++    tasks = [(index, stage) for index in range(6) for stage in A.STAGES]
++    existing, pending = [], []
++    for index, stage in tasks:
++        receipt_path = DEST / f'R{index:02d}_{stage}.json'
++        if receipt_path.exists():
++            existing.append(render_one(index, stage))
++        else:
++            pending.append((index, stage))
++    if not pending:
++        return collect()
++    before = resources()
++    headroom = max(2 * 1024**3, .1 * before['ram_total_bytes'])
++    if before['ram_available_bytes'] <= headroom:
++        raise RuntimeError('Insufficient RAM margin; root must wait before rendering')
++    DEST.mkdir(parents=True, exist_ok=True)
++    A.write(plan_path, dict(status='STARTED', utc=A.utc(), registration_sha256=context['registration_sha256'],
++                           before=before, maximum_workers=2, threads_per_worker=1,
++                           first_authorized_page=list(pending[0]), pending_pages=[list(t) for t in pending],
++                           reason='First authorized page provides a representative CPU renderer process peak; no probe render.'))
++    started = time.perf_counter()
++    # Spawn gives the first measurement an isolated process lifetime and releases it.
++    ctx = multiprocessing.get_context('spawn')
++    with concurrent.futures.ProcessPoolExecutor(max_workers=1, mp_context=ctx) as pool:
++        first = pool.submit(render_one, *pending.pop(0)).result()
++    measured = first['peak_RSS_KiB'] * 1024
++    completed = [first]
++    scheduling = []
++    # Use bounded waves so each extra launch follows a fresh resource measurement.
++    while pending:
++        snapshot = resources()
++        margin = max(2 * 1024**3, .1 * snapshot['ram_total_bytes'])
++        ram_slots = int(max(0, snapshot['ram_available_bytes'] - margin) // (1.2 * measured))
++        cpu_slots = max(0, int(snapshot['cpu_cores'] * (1 - snapshot['cpu_percent'] / 100)))
++        workers = min(2, len(pending), ram_slots, cpu_slots)
++        if workers == 0:
++            A.write(DEST / 'dispatch_wait.json', dict(status='WAIT_RESOURCE_MARGIN', utc=A.utc(), snapshot=snapshot,
++                    observed_peak_RSS_bytes=measured, remaining_pages=[list(t) for t in pending]))
++            raise RuntimeError('No measured CPU/RAM slot; completed pages retained for explicit continuation')
++        wave = [pending.pop(0) for _ in range(workers)]
++        scheduling.append(dict(resources=snapshot, workers=workers, pages=[list(t) for t in wave],
++                               observed_peak_RSS_bytes=measured, headroom_bytes=margin))
++        with concurrent.futures.ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as pool:
++            values = list(pool.map(_render_task, wave))
++        completed.extend(values)
++        measured = max(measured, *(r['peak_RSS_KiB'] * 1024 for r in values))
++    A.write(DEST / 'dispatch_complete.json', dict(status='COMPLETE', utc=A.utc(), seconds=time.perf_counter()-started,
++            rendered_pages=len(completed), existing_pages=len(existing), first_page_peak_RSS_bytes=first['peak_RSS_KiB']*1024,
++            maximum_observed_worker_RSS_bytes=measured, waves=scheduling, after=resources(),
++            timing_scope='Concurrent render/check/write wall time; not an isolated speed benchmark', model_calls=0, scoring_calls=0))
++    return collect()
++
++
++def _render_task(task):
++    return render_one(*task)
++
++
++if __name__ == '__main__':
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('action', choices=('run', 'render-one', 'collect'))
++    parser.add_argument('--request-index', type=int)
++    parser.add_argument('--stage', choices=A.STAGES)
++    parser.add_argument('--jobs')
++    args = parser.parse_args()
++    if args.action == 'render-one':
++        if args.request_index is None or args.stage is None:
++            parser.error('render-one requires --request-index and --stage')
++        result = render_one(args.request_index, args.stage, args.jobs)
++    elif args.action == 'collect':
++        result = collect(args.jobs)
++    else:
++        if args.jobs:
++            parser.error('run uses the fixed local jobs.json')
++        result = run()
++    print(json.dumps({k: v for k, v in result.items() if k not in ('files', 'cells', 'display', 'source_meshes', 'pages')}, indent=2))
+--- /dev/null
++++ b/r2/pilots/bench_local_shape_mix_v1/render_v2.py
+@@ -0,0 +1,252 @@
++"""Twelve fixed five-column geometry pages; metadata always awaits actual viewing.
++
++No score reads, automatic ratings, model calls, reprocessing, or frame fitting.
++The root dispatches render-one jobs after the CPU producers are complete.
++"""
++from __future__ import annotations
++
++import argparse
++import concurrent.futures
++import io
++import json
++import multiprocessing
++import os
++import resource
++import subprocess
++import time
++from pathlib import Path
++
++from . import analysis_v2 as A
++import numpy as np
++
++OUT = A.OUT
++DEST = OUT / 'gallery'
++VERSION = 'local_shape_five_column_gallery_v1'
++MODELS = ('RAW', 'D0_ALL', 'ASSIST11', 'LOCKED_RAW', 'LOCAL_SHAPE')
++
++
++def render_one(request_index, stage, jobs=None):
++    if stage not in A.STAGES or not 0 <= request_index < 6:
++        raise ValueError('Only six registered requests times two stages')
++    context = A.load_context(jobs)
++    ref = context['reg']['references'][request_index]
++    q, rid = ref['request'], ref['request_id']
++    key = 'base' if stage == 'BASE_POST' else 'final'
++    cells = [dict(model='RAW', runtime_model='RAW', stage='RAW', path=ref['paths']['raw'])]
++    for label in MODELS[1:]:
++        cells.append(dict(model=label, runtime_model='M_D0' if label == 'D0_ALL' else label,
++                          stage=stage, path=context['artifacts'][label, rid][key]))
++    page_id = f'R{request_index:02d}_{stage}'
++    definition = dict(version=VERSION, page_id=page_id, request_index=request_index, request=q,
++                      stage=stage, cells=cells, registration_sha256=context['registration_sha256'],
++                      views=[dict(azimuth=-60, elevation=23), dict(azimuth=120, elevation=23)],
++                      sections='Original front/side position index1; no frame refitting',
++                      renderer_sha256=A.sha(__file__), helper_sha256=A.sha(A.__file__))
++    digest = A.canonical_hash(definition)
++    image, receipt_path = DEST / (page_id + '.png'), DEST / (page_id + '.json')
++    if receipt_path.exists():
++        receipt = A.read(receipt_path)
++        if receipt['definition_sha256'] != digest or A.sha(image) != receipt['image_sha256']:
++            raise ValueError('Existing render identity differs')
++        A.verify(receipt['source_meshes'])
++        return receipt
++    if image.exists():
++        raise RuntimeError('Unsealed prior image retained; no silent rerender')
++    from r2.pilots.chair_multipart_seam_v1 import gallery as G
++    A.assert_cpu()
++    D, H = G.D, G.H
++    plt = H._mpl()
++    start = time.perf_counter()
++    DEST.mkdir(parents=True, exist_ok=True)
++    k, length = int(q['K']), float(context['reg']['L'])
++    inp = A.arrays(q['inference_npz'])
++    original = inp['C_vertices'][inp['C_faces_original']]
++    bounds, depth = q['gallery_bounds'], q['gallery_depth_bounds']
++    sources = {str(A.resolve(q['inference_npz'])): A.sha(q['inference_npz'])}
++    display = []
++    fig = plt.figure(figsize=(26.5, 13.5), dpi=110, facecolor='white')
++    grid = fig.add_gridspec(4, 5, left=.02, right=.99, bottom=.045, top=.92, wspace=.15, hspace=.23)
++    try:
++        for col, cell in enumerate(cells):
++            tri, role = G.roles(A.arrays(cell['path']), k)
++            sources[str(A.resolve(cell['path']))] = A.sha(cell['path'])
++            geometry = dict(C=tri[:k], F=tri[k:], C_original=original, tri=tri)
++            facts = dict(model=cell['model'], runtime_model=cell['runtime_model'], stage=cell['stage'],
++                         role_counts={r: int((role == r).sum()) for r in ('C', 'SEAM', 'BULK', 'BRIDGE')}, views=[], sections=[])
++            for row, azimuth in enumerate((-60, 120)):
++                raster, scope = G.role_raster(tri, role, k, D.basis(azimuth, 23), np.asarray(depth['center']), depth['span'])
++                ax = fig.add_subplot(grid[row, col])
++                ax.imshow(raster); ax.set_axis_off()
++                ax.set_title(f'{cell["model"]} {cell["stage"]} | {azimuth}', fontsize=9)
++                if scope['projected_vertices_outside_inherited_frame']:
++                    ax.text(.01, .01, 'Inherited-frame clipping', transform=ax.transAxes, fontsize=7, color='#b34b27')
++                facts['views'].append(dict(azimuth=azimuth, elevation=23, **scope))
++            for row, view in ((2, 'front'), (3, 'side')):
++                ax = fig.add_subplot(grid[row, col])
++                H.draw_section(ax, geometry, np.flatnonzero(role[k:] == 'SEAM'), bounds, length, view, 1)
++                from matplotlib.collections import LineCollection
++                axis, project = (2, (0, 1)) if view == 'front' else (0, (2, 1))
++                position = bounds['front_positions' if view == 'front' else 'side_positions'][1]
++                segments, ids = H.finite_sections(geometry['F'], axis, position, 1e-12 * length)
++                bridge_mask = role[k:][ids] == 'BRIDGE'
++                if bridge_mask.any():
++                    ax.add_collection(LineCollection(segments[bridge_mask][:, :, project], colors='#41a46c', linewidths=1.6, zorder=3))
++                ax.set_title(f'{cell["model"]} | {view}={position:.5f}', fontsize=8)
++                facts['sections'].append(dict(view=view, position=position, inherited_index=1))
++            display.append(facts)
++        fig.suptitle(f'{rid} | {page_id} | N={q["N"]} K={k}\nOriginal RAW / original D0 chain / prior ASSIST11 / fixed assembly RAW / local shape fit; blue C, gray free, green bridge', fontsize=10)
++        fig.text(.5, .012, 'Nonblind AI_PROXY review is separate and pending. Fixed sections do not certify cracks. No unique-source style ranking.', ha='center', fontsize=8)
++        buffer = io.BytesIO()
++        fig.savefig(buffer, format='png', dpi=110)
++        with image.open('xb') as f:
++            f.write(buffer.getvalue())
++    finally:
++        plt.close(fig)
++    A.assert_cpu(); A.verify(sources)
++    result = dict(status='PENDING_ACTUAL_VIEW', version=VERSION, utc=A.utc(), page_id=page_id,
++                  request_index=request_index, request_id=rid, parent_id=q['parent_id'], noise_index=q['noise_index'],
++                  stage=stage, definition_sha256=digest, registration_sha256=context['registration_sha256'],
++                  image_path=str(image), image_sha256=A.sha(image), cells=cells, source_meshes=sources, display=display,
++                  renderer_sha256=A.sha(__file__), seconds=time.perf_counter()-start,
++                  peak_RSS_KiB=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
++                  peak_scope='Process lifetime CPU RSS high-water mark; includes imports and hash checking',
++                  actually_viewed=False, model_calls=0, scoring_calls=0, ratings_generated=0)
++    A.write(receipt_path, result)
++    return result
++
++
++def collect(jobs=None):
++    """Seal twelve existing render receipts without rendering or claiming review."""
++    context = A.load_context(jobs)
++    if (DEST / 'COMPLETE.json').exists():
++        done = A.read(DEST / 'COMPLETE.json')
++        if done['registration_sha256'] != context['registration_sha256']:
++            raise ValueError('Gallery registration changed')
++        A.verify(done['files'])
++        return done
++    pages, files = [], {}
++    for index, ref in enumerate(context['reg']['references']):
++        for stage in A.STAGES:
++            page_id = f'R{index:02d}_{stage}'
++            path = DEST / (page_id + '.json')
++            receipt = A.read(path)
++            if receipt['request_id'] != ref['request_id'] or receipt['stage'] != stage or receipt['registration_sha256'] != context['registration_sha256']:
++                raise ValueError('Render receipt identity differs')
++            if [c['model'] for c in receipt['cells']] != list(MODELS):
++                raise ValueError('Frozen five-column order differs')
++            A.verify(receipt['source_meshes'])
++            image = A.resolve(receipt['image_path'])
++            if A.sha(image) != receipt['image_sha256']:
++                raise ValueError('Rendered image changed')
++            files[str(path)], files[str(image)] = A.sha(path), receipt['image_sha256']
++            pages.append(dict(page_id=page_id, request_id=ref['request_id'], stage=stage,
++                              receipt_path=str(path), image_path=str(image), image_sha256=receipt['image_sha256']))
++    html = '<!doctype html><meta charset="utf-8"><title>Local shape fixed comparison</title><h1>12 pages; actual review pending</h1>'
++    for page in pages:
++        html += '<p>' + page['page_id'] + '</p><a href="' + Path(page['image_path']).name + '"><img style="width:100%" src="' + Path(page['image_path']).name + '"></a>'
++    with (DEST / 'index.html').open('x', encoding='utf-8') as f:
++        f.write(html)
++    files[str(DEST / 'index.html')] = A.sha(DEST / 'index.html')
++    result = dict(status='COMPLETE', actual_review_status='PENDING_ACTUAL_VIEW', version=VERSION, utc=A.utc(),
++                  registration_sha256=context['registration_sha256'], pages=pages, rendered_pages=12, displayed_cells=60,
++                  unique_geometry_observations=54, repeated_RAW_cells=6, actual_viewed_pages=0, visual_labels_generated=0,
++                  unique_definition='6 original RAW + 4 processed models x 6 requests x 2 stages; RAW repeats across stages',
++                  model_calls=0, scoring_calls=0, files=files)
++    A.write(DEST / 'COMPLETE.json', result)
++    return result
++
++
++def resources():
++    import psutil
++    memory = psutil.virtual_memory()
++    result = dict(utc=A.utc(), cpu_cores=os.cpu_count(), cpu_percent=psutil.cpu_percent(interval=.1),
++                  ram_available_bytes=memory.available, ram_total_bytes=memory.total)
++    for key, cmd in [('gpu', ['nvidia-smi', '--query-gpu=name,memory.total,memory.used,memory.free,utilization.gpu', '--format=csv,noheader']),
++                     ('gpu_processes', ['nvidia-smi', '--query-compute-apps=pid,process_name,used_memory', '--format=csv,noheader'])]:
++        p = subprocess.run(cmd, capture_output=True, text=True, check=False)
++        result[key] = dict(returncode=p.returncode, stdout=p.stdout, stderr=p.stderr)
++    return result
++
++
++def run():
++    """Root-invoked bounded render dispatch: one measured page, then at most two."""
++    context = A.load_context()
++    if (DEST / 'COMPLETE.json').exists():
++        return collect()
++    plan_path = DEST / 'dispatch.json'
++    if plan_path.exists():
++        raise RuntimeError('A prior render dispatch exists; verify/reuse pages with render-one, no automatic replay')
++    tasks = [(index, stage) for index in range(6) for stage in A.STAGES]
++    existing, pending = [], []
++    for index, stage in tasks:
++        receipt_path = DEST / f'R{index:02d}_{stage}.json'
++        if receipt_path.exists():
++            existing.append(render_one(index, stage))
++        else:
++            pending.append((index, stage))
++    if not pending:
++        return collect()
++    before = resources()
++    headroom = max(2 * 1024**3, .1 * before['ram_total_bytes'])
++    if before['ram_available_bytes'] <= headroom:
++        raise RuntimeError('Insufficient RAM margin; root must wait before rendering')
++    DEST.mkdir(parents=True, exist_ok=True)
++    A.write(plan_path, dict(status='STARTED', utc=A.utc(), registration_sha256=context['registration_sha256'],
++                           before=before, maximum_workers=2, threads_per_worker=1,
++                           first_authorized_page=list(pending[0]), pending_pages=[list(t) for t in pending],
++                           reason='First authorized page provides a representative CPU renderer process peak; no probe render.'))
++    started = time.perf_counter()
++    # Spawn gives the first measurement an isolated process lifetime and releases it.
++    ctx = multiprocessing.get_context('spawn')
++    with concurrent.futures.ProcessPoolExecutor(max_workers=1, mp_context=ctx) as pool:
++        first = pool.submit(render_one, *pending.pop(0)).result()
++    measured = first['peak_RSS_KiB'] * 1024
++    completed = [first]
++    scheduling = []
++    # Use bounded waves so each extra launch follows a fresh resource measurement.
++    while pending:
++        snapshot = resources()
++        margin = max(2 * 1024**3, .1 * snapshot['ram_total_bytes'])
++        ram_slots = int(max(0, snapshot['ram_available_bytes'] - margin) // (1.2 * measured))
++        cpu_slots = max(0, int(snapshot['cpu_cores'] * (1 - snapshot['cpu_percent'] / 100)))
++        workers = min(2, len(pending), ram_slots, cpu_slots)
++        if workers == 0:
++            A.write(DEST / 'dispatch_wait.json', dict(status='WAIT_RESOURCE_MARGIN', utc=A.utc(), snapshot=snapshot,
++                    observed_peak_RSS_bytes=measured, remaining_pages=[list(t) for t in pending]))
++            raise RuntimeError('No measured CPU/RAM slot; completed pages retained for explicit continuation')
++        wave = [pending.pop(0) for _ in range(workers)]
++        scheduling.append(dict(resources=snapshot, workers=workers, pages=[list(t) for t in wave],
++                               observed_peak_RSS_bytes=measured, headroom_bytes=margin))
++        with concurrent.futures.ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as pool:
++            values = list(pool.map(_render_task, wave))
++        completed.extend(values)
++        measured = max(measured, *(r['peak_RSS_KiB'] * 1024 for r in values))
++    A.write(DEST / 'dispatch_complete.json', dict(status='COMPLETE', utc=A.utc(), seconds=time.perf_counter()-started,
++            rendered_pages=len(completed), existing_pages=len(existing), first_page_peak_RSS_bytes=first['peak_RSS_KiB']*1024,
++            maximum_observed_worker_RSS_bytes=measured, waves=scheduling, after=resources(),
++            timing_scope='Concurrent render/check/write wall time; not an isolated speed benchmark', model_calls=0, scoring_calls=0))
++    return collect()
++
++
++def _render_task(task):
++    return render_one(*task)
++
++
++if __name__ == '__main__':
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('action', choices=('run', 'render-one', 'collect'))
++    parser.add_argument('--request-index', type=int)
++    parser.add_argument('--stage', choices=A.STAGES)
++    parser.add_argument('--jobs')
++    args = parser.parse_args()
++    if args.action == 'render-one':
++        if args.request_index is None or args.stage is None:
++            parser.error('render-one requires --request-index and --stage')
++        result = render_one(args.request_index, args.stage, args.jobs)
++    elif args.action == 'collect':
++        result = collect(args.jobs)
++    else:
++        if args.jobs:
++            parser.error('run uses the fixed local jobs.json')
++        result = run()
++    print(json.dumps({k: v for k, v in result.items() if k not in ('files', 'cells', 'display', 'source_meshes', 'pages')}, indent=2))
+--- /dev/null
++++ b/r2/pilots/bench_local_shape_mix_v1/resume.py
+@@ -0,0 +1,30 @@
++"""Recovery entry: unchanged producers plus versioned metadata-only aggregation fix."""
++from __future__ import annotations
++import os
++os.environ['CUDA_VISIBLE_DEVICES']=''
++for key in ('OMP_NUM_THREADS','MKL_NUM_THREADS','OPENBLAS_NUM_THREADS','NUMEXPR_NUM_THREADS'):os.environ[key]='1'
++import argparse,json
++from . import runtime as R
++
++def main():
++    p=argparse.ArgumentParser();p.add_argument('stage',choices=('all','analyze','render','verify','status'));a=p.parse_args()
++    if a.stage in ('all','verify','status'):
++        reg,rh,jobs=R.load_jobs();states=[]
++        for jid in jobs:
++            cp=R.OUT/'runs'/jid/'complete.json'
++            if cp.exists():
++                r=R.verify_result(R.read(cp))
++                if r['registration_sha256']!=rh:raise ValueError('Changed producer')
++                states.append(dict(job_id=jid,status='COMPLETE'))
++            else:states.append(dict(job_id=jid,status='PARTIAL' if cp.parent.exists() else 'NOT_STARTED'))
++        if a.stage in ('all','verify') and any(s['status']!='COMPLETE' for s in states):
++            raise RuntimeError('This metadata-only recovery never replays scientific jobs; inspect original dispatcher status')
++        print(json.dumps(dict(status='VERIFIED',jobs=states)))
++    if a.stage in ('all','analyze'):
++        from . import analysis_v2
++        analysis_v2.run()
++    if a.stage in ('all','render'):
++        from . import render_v2
++        render_v2.run()
++
++if __name__=='__main__':main()
+--- /dev/null
++++ b/r2/pilots/bench_local_shape_mix_v1/run.py
+@@ -0,0 +1,33 @@
++"""Recoverable finite entry point. Existing sealed results are verified, not replayed."""
++from __future__ import annotations
++import os
++os.environ['CUDA_VISIBLE_DEVICES']=''
++for key in ('OMP_NUM_THREADS','OPENBLAS_NUM_THREADS','MKL_NUM_THREADS','NUMEXPR_NUM_THREADS'):os.environ[key]='1'
++import argparse,json
++from . import runtime as R
++
++def main():
++    p=argparse.ArgumentParser();p.add_argument('stage',choices=('prepare','execute','analyze','render','all','status','verify'));a=p.parse_args()
++    if a.stage=='status':
++        jobs=R.read(R.OUT/'jobs.json')['jobs'] if (R.OUT/'jobs.json').exists() else []
++        print(json.dumps(dict(registered=len(jobs),jobs=[dict(job_id=j['job_id'],state='COMPLETE' if (R.OUT/'runs'/j['job_id']/'complete.json').exists() else 'PARTIAL' if (R.OUT/'runs'/j['job_id']).exists() else 'NOT_STARTED') for j in jobs])));return
++    if a.stage in ('prepare','all'):
++        from . import prepare
++        prepare.run()
++    if a.stage in ('execute','all'):
++        from . import dispatch
++        dispatch.run()
++    if a.stage in ('analyze','all'):
++        from . import analysis
++        analysis.run()
++    if a.stage in ('render','all'):
++        from . import render
++        render.run()
++    if a.stage=='verify':
++        reg,rh,jobs=R.load_jobs()
++        for j in jobs:
++            r=R.verify_result(R.read(R.OUT/'runs'/j/'complete.json'))
++            if r['registration_sha256']!=rh:raise ValueError('Producer registration changed')
++        print(json.dumps(dict(status='PASS',jobs=len(jobs),protected_inputs_unchanged=True,models=0)))
++
++if __name__=='__main__':main()
+--- /dev/null
++++ b/r2/pilots/bench_local_shape_mix_v1/runtime.py
+@@ -0,0 +1,116 @@
++"""CPU-only, finite fixed-region assembly/fitting and unchanged scoring cascade."""
++from __future__ import annotations
++import os
++os.environ['CUDA_VISIBLE_DEVICES']=''
++for _name in ('OMP_NUM_THREADS','MKL_NUM_THREADS','OPENBLAS_NUM_THREADS','NUMEXPR_NUM_THREADS'):
++    os.environ[_name]='1'
++import argparse, json, resource, sys, time, traceback
++from pathlib import Path
++import numpy as np
++from r2.pilots.bench_regional_mix_dual_v1 import runtime as H
++
++ROOT=Path(__file__).resolve().parents[3]
++OUT=ROOT/'experiments/r2_bench_local_shape_mix_v1'
++VERSION='bench_local_shape_mix_cpu_runtime_v1'
++read,resolve,sha,arrays=H.read,H.resolve,H.sha,H.arrays
++write,npz,csvwrite=H.write_new,H.npz,H.csvwrite
++verify,clean,utc,resources=H.verify,H.clean,H.utc,H.resources
++
++def load_jobs():
++    path=OUT/'jobs.json';r=read(path)
++    if r['status']!='FROZEN' or len(r['jobs'])!=12:raise ValueError('Expected frozen twelve jobs')
++    if {j['label'] for j in r['jobs']}!={'LOCKED_RAW','LOCAL_SHAPE'}:raise ValueError('Unexpected arm')
++    if len(r['metric_fields'])!=177:raise ValueError('Original metric schema required')
++    verify(r['protected']);verify(r['source_hashes']);H.assert_cpu()
++    return r,sha(path),{j['job_id']:j for j in r['jobs']}
++
++def verify_result(receipt):
++    if receipt['status']!='COMPLETE':raise ValueError('Incomplete producer')
++    verify(receipt['files']);cp=read(receipt['artifacts']['cpu_complete']);verify(cp['files'])
++    if cp['status']!='COMPLETE':raise ValueError('Incomplete original CPU cascade')
++    return receipt
++
++def definition_hashes():
++    book=H.definition_hashes()
++    for p in Path(__file__).parent.glob('*.py'):book[str(p)]=sha(p)
++    return book
++
++def run_one(job_id):
++    reg,rh,jobs=load_jobs();job=jobs[job_id];dest=OUT/'runs'/job_id;done=dest/'complete.json'
++    if done.exists():
++        r=verify_result(read(done))
++        if r['registration_sha256']!=rh or r['job_sha256']!=H.canonical_hash(job):raise ValueError('Changed completed identity')
++        return r
++    if dest.exists():raise RuntimeError('Partial job preserved; no implicit replay: '+str(dest))
++    dest.mkdir(parents=True);tick=time.perf_counter();phase='ASSEMBLY';events=dest/'events.jsonl'
++    write(dest/'attempt.json',dict(version=VERSION,utc=utc(),pid=os.getpid(),job=job,
++        registration_sha256=rh,automatic_retry=False,scientific_budget=dict(assembly=1,fit=int(job['label']=='LOCAL_SHAPE'),GEO=0,score_rows=2)))
++    try:
++        write(dest/'resources_before.json',resources());H.event(events,'START',phase=phase)
++        from . import operator as O
++        result=O.build_from_job(job)
++        post=result['post'];pre=result['pre'];q=job['request'];K=int(q['K']);raw=arrays(job['paths']['raw'])
++        if pre.dtype!=np.float32 or pre.shape!=raw['raw'].shape:raise ValueError('Invalid full-slot reference')
++        if pre[:K].tobytes()!=raw['raw'][:K].tobytes():raise ValueError('Canonical C changed')
++        inp=arrays(q['inference_npz'])
++        if post['C'].tobytes()!=inp['C_vertices'][inp['C_faces_original']].tobytes():raise ValueError('Source C changed')
++        if not np.array_equal(post['output'],post['vertices'][post['faces']]):raise ValueError('Indexed output mismatch')
++        npz(dest/'post.npz',post)
++        npz(dest/'pre_geo.npz',dict(output=pre,known_faces=np.asarray(K),raw_anchor_ids=raw['raw_anchor_ids'],raw_seam_slot_mask=raw['raw_seam_slot_mask'],
++             stage=np.asarray('FIXED_ASSEMBLY_FULL_SLOT_REFERENCE_NO_GEO_EXECUTED')))
++        if result.get('mappings'):npz(dest/'mapping.npz',result['mappings'])
++        write(dest/'geometry.json',result['summary'])
++        from meshflow_control.geo_io import write_indexed_ply
++        write_indexed_ply(dest/'post.ply',post['vertices'],post['faces'])
++        H.event(events,'COMPLETE',phase=phase,seconds=time.perf_counter()-tick)
++        _,_,_,_,CPU,compare=H.modules()
++        phase='BASE_PAIR_SCAN';H.event(events,'START',phase=phase)
++        pairs=CPU.H.scan(post['output'],K);write(dest/'pairs.json',pairs);H.event(events,'COMPLETE',phase=phase)
++        phase='ORIGINAL_CPU_CASCADE';H.event(events,'START',phase=phase)
++        CPU.process_one(q,job['label'],dest/'post.npz',dest/'pre_geo.npz',job['paths']['raw'],dest/'pairs.json',dest/'cpu',False,rh)
++        H.event(events,'COMPLETE',phase=phase)
++        artifacts=dict(base=str(dest/'post.npz'),pre=str(dest/'pre_geo.npz'),pairs=str(dest/'pairs.json'),
++            final=str(dest/'cpu/CLEAN_FINAL_POST/post.npz'),final_pairs=str(dest/'cpu/CLEAN_FINAL_POST/pairs.json'),
++            cpu_dir=str(dest/'cpu'),cpu_complete=str(dest/'cpu/complete.json'),metric_rows=str(dest/'cpu/metric_rows.json'),
++            geometry=str(dest/'geometry.json'),mapping=str(dest/'mapping.npz'))
++        phase='CACHE_LEDGER'
++        for stage,oldkey,oldpairkey,newkey,newpairkey in [('BASE_POST','original_base','original_base_pairs','base','pairs'),
++            ('CLEAN_FINAL_POST','original_final','original_final_pairs','final','final_pairs')]:
++            ledger=compare(arrays(job['paths'][oldkey]),arrays(artifacts[newkey]),read(job['paths'][oldpairkey]),read(artifacts[newpairkey]),K,CPU)
++            lp=dest/('ledger_'+stage+'.json');write(lp,ledger);artifacts['ledger_'+stage]=str(lp)
++        # PRE is the common, frozen HINGE displacement reference, not the fitted geometry.
++        # Keep that distinction explicit in the independently versioned slot ledger.
++        area=H._areas(raw['raw']);ref_area=H._areas(pre);slot_rows=[]
++        for stage,key in [('BASE_POST','base'),('CLEAN_FINAL_POST','final')]:
++            mesh=arrays(artifacts[key]);ids=mesh.get('parent_source_raw_slot',mesh.get('source_face_ids'))
++            actual={int(s):float(a) for s,a in zip(ids,H._areas(mesh['output'])) if s>=0}
++            for slot in range(K,len(pre)):
++                slot_rows.append(dict(stage=stage,raw_slot=slot,retained=slot in actual,raw_area=float(area[slot]),
++                    common_HINGE_reference_area=float(ref_area[slot]),actual_area=actual.get(slot)))
++        csvwrite(dest/'per_slot_deletion_area.csv',slot_rows)
++        rows=read(artifacts['metric_rows'])
++        if len(rows)!=2 or any(any(f not in row for f in reg['metric_fields']) for row in rows):raise ValueError('Missing full metric rows')
++        write(dest/'resources_after.json',resources());verify(reg['protected']);verify(reg['source_hashes']);H.assert_cpu()
++        receipt=dict(status='COMPLETE',version=VERSION,utc=utc(),job_id=job_id,label=job['label'],request_id=q['request_id'],
++            registration_sha256=rh,job_sha256=H.canonical_hash(job),artifacts=artifacts,seconds=time.perf_counter()-tick,
++            peak_RSS_KiB=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,peak_scope='Fresh subprocess lifetime, all scientific phases',
++            assembly_calls=1,fit_calls=int(job['label']=='LOCAL_SHAPE'),GEO_calls=0,base_pair_scan_calls=1,full_cascade_calls=1,new_score_rows=2,
++            model_calls=0,D0_calls=0,training_updates=0,new_noise=0,new_queries=0,
++            files={str(p):sha(p) for p in dest.rglob('*') if p.is_file()})
++        write(done,receipt);print(json.dumps(dict(job_id=job_id,status='COMPLETE',seconds=receipt['seconds'],peak_RSS_KiB=receipt['peak_RSS_KiB'])),flush=True)
++        return receipt
++    except BaseException as error:
++        H.event(events,'FAILED',phase=phase,error=repr(error))
++        write(dest/'failure.json',dict(status='STOPPED_PARTIAL_NO_REPLAY',phase=phase,error=repr(error),traceback=traceback.format_exc(),utc=utc()))
++        raise
++
++def main():
++    p=argparse.ArgumentParser();p.add_argument('command',choices=('resources','code-hashes','run-one','status'));p.add_argument('--job-id');a=p.parse_args()
++    if a.command=='resources':result=resources()
++    elif a.command=='code-hashes':result=definition_hashes()
++    elif a.command=='run-one':result=run_one(a.job_id);result={k:result[k] for k in ('status','job_id','seconds')}
++    else:
++        reg,rh,jobs=load_jobs();result=[dict(job_id=j,state='COMPLETE' if (OUT/'runs'/j/'complete.json').exists() else 'PARTIAL' if (OUT/'runs'/j).exists() else 'NOT_STARTED') for j in jobs]
++    print(json.dumps(clean(result),ensure_ascii=False))
++
++if __name__=='__main__':main()
+--- /dev/null
++++ b/r2/pilots/bench_local_shape_mix_v1/seal.py
+@@ -0,0 +1,104 @@
++"""Verify and archive completed evidence, with no scientific recomputation."""
++from __future__ import annotations
++import difflib
++import html
++import json
++import shutil
++import zipfile
++from datetime import datetime, timezone
++from pathlib import Path
++from .closeout import ROOT, OUT, DEST, read, sha, write
++
++def main():
++    if (OUT/'DELIVERY_COMPLETE.json').exists():
++        old=read(OUT/'DELIVERY_COMPLETE.json')
++        for p,h in old['files'].items():
++            assert sha(OUT/p)==h, p
++        assert sha(OUT/old['review_zip'])==old['zip_sha256']
++        print(json.dumps(dict(status='DELIVERY_VERIFIED',zip=old['review_zip'],bytes=old['zip_bytes'])))
++        return
++    assert (OUT/'REPORT.txt').is_file()
++    reg=read(OUT/'jobs.json')
++    checked={}
++    for group in ('protected','source_hashes'):
++        for p,h in reg[group].items():
++            assert sha(p)==h, p
++            checked[p]=h
++    for cp in (OUT/'analysis/COMPLETE.json',):
++        c=read(cp)
++        for p,h in c['files'].items(): assert sha(p)==h, p
++    receipts=[]
++    for job in reg['jobs']:
++        cp=OUT/'runs'/job['job_id']/'complete.json'; c=read(cp)
++        assert c['status']=='COMPLETE'
++        assert c['registration_sha256']==sha(OUT/'jobs.json')
++        for p,h in c['files'].items(): assert sha(p)==h, p
++        receipts.append(c)
++    assert len(receipts)==12
++    assert sum(r['new_score_rows'] for r in receipts)==24
++    assert sum(r['fit_calls'] for r in receipts)==6
++    assert sum(r['full_cascade_calls'] for r in receipts)==12
++    for key in ('model_calls','D0_calls','training_updates','new_noise','new_queries','GEO_calls'):
++        assert sum(r[key] for r in receipts)==0
++    vr=read(DEST/'visual_review_complete.json')
++    for p,h in vr['source_records'].items(): assert sha(p)==h
++    for cp in sorted((OUT/'gallery').glob('R*.json')):
++        c=read(cp); assert sha(c['image_path'])==c['image_sha256']
++        for p,h in c['source_meshes'].items(): assert sha(p)==h
++    report=html.escape((OUT/'REPORT.txt').read_text(encoding='utf-8'))
++    links=''.join(f'<li><a href="gallery/{p.name}">{p.stem}</a></li>' for p in sorted((OUT/'gallery').glob('R*.png')))
++    (OUT/'REVIEW.html').write_text('<!doctype html><html lang="zh"><meta charset="utf-8"><title>局部保形融合：实际完成</title>'
++        '<style>body{max-width:1200px;margin:30px auto;padding:0 20px;font:16px/1.6 sans-serif;color:#20252c}pre{white-space:pre-wrap;overflow-wrap:anywhere}a{color:#185ba0}</style>'
++        '<h1>局部保形融合：完成，候选不晋级</h1><p>12页均已实际审阅；原图的 pending 脚注为渲染时状态，最终图审记录见下列文件。非盲 AI_PROXY，不能替代独立人类审阅。</p>'
++        '<p><a href="gallery/index.html">完整图集</a> · <a href="analysis/per_output_full177.csv">60条完整指标</a> · '
++        '<a href="closure/visual_unique54.csv">54唯一图审记录</a> · <a href="closure/connectivity_check.json">连接及外部硬锁核查</a> · '
++        '<a href="RUNBOOK.txt">验证与恢复</a></p><details><summary>逐页截面与双视图</summary><ul>'+links+'</ul></details><pre>'+report+'</pre></html>',encoding='utf-8')
++    archive=OUT/'source_archive'; archive.mkdir(exist_ok=True)
++    code=dict(reg['source_hashes'])
++    for p in Path(__file__).parent.glob('*.py'): code[str(p)]=sha(p)
++    manifest=[]
++    for p,h in sorted(code.items()):
++        original=Path(p); assert sha(original)==h
++        rel=Path(p).relative_to('/mnt/e')
++        target=archive/rel; target.parent.mkdir(parents=True,exist_ok=True)
++        if target.exists(): assert sha(target)==h
++        else: shutil.copyfile(original,target)
++        manifest.append(dict(original=p,archive=str(target.relative_to(OUT)),sha256=h,bytes=target.stat().st_size))
++    write(OUT/'source_hashes.json',dict(files=manifest,source_archive_includes_actual_original_scorers=True))
++    diff=[]
++    for p in sorted(Path(__file__).parent.glob('*.py')):
++        diff.extend(difflib.unified_diff([],p.read_text(encoding='utf-8').splitlines(keepends=True),
++                    fromfile='/dev/null',tofile='b/'+str(p.relative_to(ROOT))))
++    (OUT/'code.diff').write_text(''.join(diff),encoding='utf-8')
++    write(DEST/'execution_accounting_final.json',dict(status='COMPLETE',
++          science_jobs=12,indexed_assemblies=12,local_linear_fits=6,new_full_metric_rows=24,
++          reused_metric_rows=36,original_metric_field_count=177,render_pages=12,
++          training_updates=0,model_calls=0,D0_calls=0,new_noise=0,new_GEO_calls=0,
++          scientific_failures=0,scientific_replays=0,model_or_backend_promotions=0,
++          actual_review_unique=54,actual_review_displays=60,
++          protected_and_source_files_verified=len(checked),
++          engineering_notes=[
++              'Original analysis aggregation stopped on logical RAW_ALL / physical HYBRID producer-label alias; frozen source retained, v2 aggregation validates both identities. See engineering_recovery.json.',
++              'Closeout accepted equivalent reviewer status ACTUAL_VIEW_COMPLETE / COMPLETE_ACTUAL_VIEW after one assertion stop. Only root review transcription existed at that stop and was reused; no ratings overwritten and no scientific work repeated.',
++              'RUNBOOK recovery receipt path corrected from audits/engineering_recovery.json to engineering_recovery.json.'],
++          dispatch=read(OUT/'dispatch/complete.json'),render=read(OUT/'gallery/dispatch_complete.json')))
++    # Preserve all experiment output, original tables, images and actual scoring code.
++    files={str(p.relative_to(OUT)):sha(p) for p in sorted(OUT.rglob('*'))
++           if p.is_file() and p.suffix!='.zip' and p.name!='DELIVERY_COMPLETE.json'}
++    # No self-referential hash: manifest covers payload, zip excludes final receipt.
++    write(OUT/'payload_hashes.json',dict(sha256=files,scope='Payload before this manifest and final delivery receipt'))
++    files['payload_hashes.json']=sha(OUT/'payload_hashes.json')
++    zp=OUT/'R2_BENCH_LOCAL_SHAPE_MIX_REVIEW.zip'
++    with zipfile.ZipFile(zp,'x',compression=zipfile.ZIP_DEFLATED,compresslevel=9) as z:
++        for rel in sorted(files): z.write(OUT/rel,rel)
++    with zipfile.ZipFile(zp) as z:
++        assert z.testzip() is None
++        assert len(z.namelist())==len(files)
++    receipt=dict(status='COMPLETE',utc=datetime.now(timezone.utc).isoformat(),
++                 decision='LOCAL_SHAPE_NOT_PROMOTED',review_zip=zp.name,zip_bytes=zp.stat().st_size,
++                 zip_sha256=sha(zp),payload_files=len(files),source_files=len(manifest),files=files,
++                 no_new_experiment_or_default_change=True)
++    write(OUT/'DELIVERY_COMPLETE.json',receipt)
++    print(json.dumps({k:v for k,v in receipt.items() if k!='files'},ensure_ascii=False,indent=2))
++
++if __name__=='__main__': main()

@@ -1,0 +1,16 @@
+封存完整性更正（2026-09-24）
+
+首次封存严格核验发现：128行中112行的NPZ面索引为int64，而原评测账本mesh_hash使用数据模板的int32面索引。array_hash包含dtype，因此这两种数组摘要不同。16行离线教师使用int32，未出现此差异。这是账本字段没有明确注明面索引类型的记录缺陷，不是几何结果变化。
+
+处理保留原始结果：不改任何NPZ、attempt/result.json、results.json、评测缓存、训练权重或训练协议。MESH_INTEGRITY.json逐行绑定原账本、原数据和NPZ文件SHA，并区分：
+
+- mesh_hash：保存顶点 + 原data.faces（int32）的逻辑连接摘要。先严格要求保存的整数面索引与data.faces逐元素相同。
+- stored_array_hash：NPZ实际vertices、faces数组的摘要，包含各自原始dtype。
+- mesh_npz_sha256：NPZ文件全部字节的SHA256。
+
+全部128行重验逻辑摘要、连接值、最终方向半径和文件摘要；不能用类型转换掩盖坐标或连接值变化。旧实验的32份Fixed/原A网格按相同逻辑连接语义比较，顶点和连接值完全一致；这不是声称两个NPZ压缩文件字节相同。
+
+未来evaluate.py在保存NPZ后读取实际文件，直接登记上述两种数组摘要及文件SHA。实际运行本轮评测的旧evaluate.py保存在本目录，保留与eval_invocations的源码哈希对账；新源码只明确记录语义，不改变部署、模型或指标。包内source_snapshot包含修正后的记录代码，本目录保存原始评测源码证据；不会用修改后的代码冒充本轮原始评测代码。
+
+packager拒绝缺失、过期或篡改的sidecar，并同时校验原逻辑摘要和实际存储摘要。新解压后的部署重放也检查两种摘要及保存数组完全相等。具体通过状态以FINAL_AUDIT.json和压缩包旁的fresh报告为准。
+同一问题在跨实验教师身份核验中的另一处表现：TEACHERS.teacher_mesh_hash指向旧教师源文件的实际数组。14个opt_fixed教师源文件使用int64面索引，本轮teacher_reference使用int32；另外2个Fixed教师源文件原本也是int32。不能直接比较源文件摘要与本轮逻辑摘要。封存器分别验证源NPZ的原始哈希、原始清单和本轮哈希，并严格要求16/16教师的顶点、方向与面连接值逐元素完全相同。FINAL_AUDIT保留此身份对账。TEACHERS.json、训练标签和本轮teacher_reference结果均未修改。
